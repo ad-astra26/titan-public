@@ -3213,6 +3213,14 @@ soft_retire_floor          = -0.5   # below → META_SKILL_SOFT_RETIRED log; row
 # match_procedural_skill always returns null (dry-run).
 delegate_live              = false  # default OFF for safety; flip per-Titan
 
+[synthesis.consolidation]
+# RFP_synthesis_spine_reads_real_data §7.D — dream-boundary concept synthesis.
+# Source = the lock-free content sidecar (REAL promoted thoughts), embeddings from
+# the `conversation` FAISS shard (cosine clustering). Override per-Titan via
+# ~/.titan/microkernel_<id>.toml [synthesis.consolidation].
+min_cluster_size = 2     # §7.D/D3 — ≥N semantically-similar thoughts form a concept (was 3; 2 = faster, looser)
+window_hours     = 720   # §7.D/D2 — wide window (~30d) so backfilled history participates; mine caps 500 newest-first
+
 [synthesis.meta]
 # Phase 9 (D-SPEC-PHASE9) — meta-reasoning integration + strict gate + repair
 # forks + Tier-2. Override per-Titan via ~/.titan/microkernel_<id>.toml.

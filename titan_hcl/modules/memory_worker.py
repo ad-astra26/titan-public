@@ -560,6 +560,15 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         "[MemoryWorker] dispatch router ready — read_pool=8 writer_pool=1 "
         "meditation_thread=lazy")
 
+    # RFP_synthesis_spine_reads_real_data §7.D (D4) — one-shot spine backfill of
+    # pre-Phase-B persistent nodes (`timechain_tx_hash IS NULL`) into the spine,
+    # so consolidation + recall draw on ALL promoted memories, not just
+    # post-Phase-B ones. Daemon thread, idempotent, settles before emitting —
+    # never blocks boot or the bus loop.
+    threading.Thread(
+        target=_backfill_thought_sidecar, args=(ctx,),
+        daemon=True, name=f"memory-spine-backfill-{name}").start()
+
     while True:
         # Heartbeat stays on main loop (cheap; needs to fire even during
         # recv_queue idle). Bulk periodic publishes happen in dedicated
@@ -831,6 +840,121 @@ def _lean_mempool_item(m: dict) -> dict:
         "mempool_reinforcements": int(m.get("mempool_reinforcements", 0) or 0),
         "created_at": float(m.get("created_at", 0) or 0),
     }
+
+
+def _get_thought_sidecar(data_dir: str):
+    """Process-lifetime ``ThoughtSidecar`` for ``data_dir`` (one per dir, memoized
+    in ``_THOUGHT_SIDECAR``). Soft-fail → ``None`` (a missing sidecar degrades
+    promotion to emit-only, it never breaks it)."""
+    sc = _THOUGHT_SIDECAR.get(data_dir)
+    if sc is None:
+        try:
+            from titan_hcl.synthesis.thought_sidecar import ThoughtSidecar
+            sc = ThoughtSidecar(data_dir)
+            _THOUGHT_SIDECAR[data_dir] = sc
+        except Exception as _sx:
+            logger.warning(
+                "[MemoryWorker] ThoughtSidecar init failed "
+                "(promotion link degrades to emit-only): %s", _sx)
+            sc = None
+    return sc
+
+
+def _anchor_promoted_node(node: dict, *, now: float, sidecar, ctx):
+    """Anchor ONE promoted ``memory_node`` to the synthesis spine — the single
+    promotion mechanic, shared by the LIVE meditation loop and the Phase-D
+    backfill (RFP_synthesis_spine_reads_real_data Phase B/D, §7.D).
+
+    Emits the per-node Timechain pointer on the node's ACT-R ``memory_type`` fork,
+    stamps the deterministic per-TX hash on the node (``timechain_tx_hash``), and
+    writes the real thought to the lock-free content sidecar keyed by that hash.
+
+    ``now`` is folded into the hash (``promotion_anchor.build_promotion_tx``): the
+    LIVE loop passes ``time.time()``; the BACKFILL passes the node's stored
+    ``created_at`` so re-runs recompute the SAME hash → idempotent. Returns the
+    per-TX hash, or ``None`` on build failure. Soft-fail throughout — an anchor
+    error must never break promotion."""
+    from titan_hcl.synthesis.promotion_anchor import build_promotion_tx
+    node_id = node.get("id")
+    try:
+        payload, tx_hash = build_promotion_tx(node, now=now)
+    except Exception as _bx:
+        logger.warning(
+            "[MemoryWorker] build_promotion_tx failed node %s: %s", node_id, _bx)
+        return None
+    _send_msg(ctx.send_queue, bus.TIMECHAIN_COMMIT, ctx.name, "timechain", payload)
+    try:
+        with ctx.write_lock:
+            ctx.memory.set_timechain_tx_hash(node_id, tx_hash)
+    except Exception as _ux:
+        logger.warning(
+            "[MemoryWorker] stamp timechain_tx_hash node %s failed: %s",
+            node_id, _ux)
+    if sidecar is not None:
+        sidecar.put(
+            tx_hash=tx_hash, node_id=node_id,
+            user_prompt=node.get("user_prompt", "") or "",
+            agent_response=node.get("agent_response", "") or "",
+            memory_type=payload["thought_type"], fork=payload["fork"], ts=now)
+    return tx_hash
+
+
+def _backfill_thought_sidecar(ctx, *, settle_s: float = 45.0,
+                              batch_cap: int = 100000,
+                              chunk: int = 1000,
+                              chunk_pause_s: float = 1.0) -> None:
+    """One-shot backfill: anchor PERSISTENT ``memory_nodes`` that predate Phase B
+    (``timechain_tx_hash IS NULL``) into the spine — so Titan recalls + synthesizes
+    over ALL its promoted memories, not just post-Phase-B ones (RFP §7.D / D4).
+
+    Reuses the SAME single anchor mechanic (``_anchor_promoted_node``) with
+    ``now=node['created_at']`` → deterministic + idempotent (the ``IS NULL`` filter
+    self-watermarks; re-runs find nothing). ``batch_cap`` is a runaway backstop
+    (high enough to drain a realistic backlog in one pass); the pointer emits go in
+    ``chunk``-sized waves with a ``chunk_pause_s`` drain between them so even a large
+    backlog never bursts the bus (the T3 2000-at-once backfill sealed cleanly, 0
+    drops — chunking keeps that true at any fleet scale). Settles ``settle_s`` first
+    so timechain_worker is up. Daemon thread — never blocks boot. Soft-fail."""
+    # Settle wait (interruptible-style Event.wait, not a recv-loop sleep) so the
+    # bus + timechain_worker are up before we emit the chain pointers.
+    threading.Event().wait(settle_s)
+    try:
+        duckdb = getattr(ctx.memory, "_duckdb", None)
+        if duckdb is None:
+            logger.info(
+                "[MemoryWorker] spine backfill: no _duckdb accessor — skipped")
+            return
+        with ctx.write_lock:
+            rows = duckdb.get_nodes_by_status("persistent")
+        pending = [
+            r for r in rows
+            if not (r.get("timechain_tx_hash") or "")
+            and (r.get("user_prompt") or r.get("agent_response"))
+        ]
+        if not pending:
+            logger.info(
+                "[MemoryWorker] spine backfill: 0 unlinked persistent nodes "
+                "(%d persistent total) — spine already complete", len(rows))
+            return
+        data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+        sidecar = _get_thought_sidecar(data_dir)
+        todo = pending[:batch_cap]
+        linked = 0
+        for start in range(0, len(todo), max(1, chunk)):
+            for node in todo[start:start + chunk]:
+                now = node.get("created_at") or time.time()
+                if _anchor_promoted_node(
+                        node, now=float(now), sidecar=sidecar, ctx=ctx) is not None:
+                    linked += 1
+            # Drain pause between waves (skip after the final wave).
+            if start + chunk < len(todo):
+                threading.Event().wait(chunk_pause_s)
+        logger.info(
+            "[MemoryWorker] spine backfill: linked %d/%d unlinked persistent "
+            "node(s) into the spine (cap=%d, chunk=%d) — indexer embeds them "
+            "next tick", linked, len(pending), batch_cap, chunk)
+    except Exception as e:
+        logger.warning("[MemoryWorker] spine backfill failed: %s", e)
 
 
 def _handle_query(msg: dict, ctx: WorkerContext) -> None:
@@ -1361,57 +1485,20 @@ def _handle_query(msg: dict, ctx: WorkerContext) -> None:
                         "chi_coherence": 0.3,
                     })
 
-                # TimeChain: each PROMOTED node → its ACT-R memory_type fork,
-                # with a DURABLE tx_hash link (RFP_synthesis_spine_reads_real_data
-                # Phase B). Fixes the prior `candidates[:promoted]` bug (anchored
-                # the FIRST-N candidates, not the actually-promoted set — the
-                # migrate loop above correctly iterates `promoted_nodes`). For each
-                # promoted node: build the canonical promotion-anchor payload + its
-                # DETERMINISTIC per-TX hash (computed the same way timechain_worker
-                # will → byte-identical), emit it, stamp the hash on the node, and
-                # write the real thought to the lock-free content sidecar (the
-                # chain envelope drops the per-TX content at seal; the deref reads
-                # the sidecar by this hash).
+                # TimeChain: each PROMOTED node → its ACT-R memory_type fork, with a
+                # DURABLE tx_hash link (RFP_synthesis_spine_reads_real_data Phase B).
+                # Delegates to the shared `_anchor_promoted_node` helper — the single
+                # promotion mechanic, also reused by the Phase-D backfill (§7.D): emit
+                # the per-node pointer, stamp the deterministic per-TX hash, write the
+                # real thought to the lock-free sidecar. (The migrate loop above
+                # iterates the actually-promoted `promoted_nodes`, fixing the prior
+                # `candidates[:promoted]` bug.)
                 if promoted_nodes:
-                    from titan_hcl.synthesis.promotion_anchor import build_promotion_tx
-                    from titan_hcl.synthesis.thought_sidecar import ThoughtSidecar
-                    _data_dir = os.environ.get("TITAN_DATA_DIR", "data")
-                    _sidecar = _THOUGHT_SIDECAR.get(_data_dir)
-                    if _sidecar is None:
-                        try:
-                            _sidecar = ThoughtSidecar(_data_dir)
-                            _THOUGHT_SIDECAR[_data_dir] = _sidecar
-                        except Exception as _sx:
-                            logger.warning(
-                                "[MemoryWorker] ThoughtSidecar init failed "
-                                "(promotion link degrades to emit-only): %s", _sx)
-                            _sidecar = None
+                    _sidecar = _get_thought_sidecar(
+                        os.environ.get("TITAN_DATA_DIR", "data"))
                     for _node, _intensity in promoted_nodes:
-                        _now = time.time()
-                        try:
-                            _payload, _tx_hash = build_promotion_tx(_node, now=_now)
-                        except Exception as _bx:
-                            logger.warning(
-                                "[MemoryWorker] build_promotion_tx failed node %s: %s",
-                                _node.get("id"), _bx)
-                            continue
-                        _send_msg(send_queue, bus.TIMECHAIN_COMMIT, name,
-                                  "timechain", _payload)
-                        try:
-                            with ctx.write_lock:
-                                memory.set_timechain_tx_hash(
-                                    _node.get("id"), _tx_hash)
-                        except Exception as _ux:
-                            logger.warning(
-                                "[MemoryWorker] stamp timechain_tx_hash node %s "
-                                "failed: %s", _node.get("id"), _ux)
-                        if _sidecar is not None:
-                            _sidecar.put(
-                                tx_hash=_tx_hash, node_id=_node.get("id"),
-                                user_prompt=_node.get("user_prompt", "") or "",
-                                agent_response=_node.get("agent_response", "") or "",
-                                memory_type=_payload["thought_type"],
-                                fork=_payload["fork"], ts=_now)
+                        _anchor_promoted_node(
+                            _node, now=time.time(), sidecar=_sidecar, ctx=ctx)
 
                 _send_response(send_queue, name, src, result, rid)
             except Exception as e:

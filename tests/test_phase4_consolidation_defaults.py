@@ -1,29 +1,27 @@
-"""Phase 4 — consolidation default mine + LLM-propose tests (§P4.G prod wiring).
+"""Consolidation default mine + LLM-propose tests (§P4.G prod wiring; mine
+re-targeted to the sidecar by RFP_synthesis_spine_reads_real_data §7.D).
 
 Covers `titan_hcl/synthesis/consolidation_defaults.py`:
 - LLM-response parser handles well-formed + malformed input
 - LLM provider exception → reject with diagnostic reason
-- default_mine_recent_txs reads from a real SQLite block_index table
-- mine excludes excluded_forks
-- mine handles missing DB file gracefully
-- prompt builder produces a compact prompt
+- default_mine_recent_thoughts reads PROMOTED THOUGHTS from the content sidecar
+  (real content, keyed by per-TX hash) — newest-first, since_ts-windowed,
+  fork-exclusion defensive, missing-sidecar soft-fail
+- prompt builder carries REAL thought content (D3), not hash prefixes
 """
 from __future__ import annotations
 
-import json
 import os
-import sqlite3
 import tempfile
-
-import pytest
 
 from titan_hcl.synthesis.consolidation import Cluster, LLMProposal, TxCandidate
 from titan_hcl.synthesis.consolidation_defaults import (
     _build_cluster_prompt,
     _parse_llm_response,
-    default_mine_recent_txs,
+    default_mine_recent_thoughts,
     make_default_llm_propose,
 )
+from titan_hcl.synthesis.thought_sidecar import ThoughtSidecar
 
 
 # ── LLM-response parser ─────────────────────────────────────────────
@@ -123,7 +121,8 @@ MEMORY_TYPE: declarative
 REASON: emergent""")
     propose = make_default_llm_propose(fake)
     cluster = Cluster(members=[
-        TxCandidate(tx_hash="t1", fork="declarative", tags=("topic:linux",), embedding=None),
+        TxCandidate(tx_hash="t1", fork="declarative", tags=(), embedding=None,
+                    content_summary="I use the Linux terminal daily."),
     ])
     p = propose(cluster)
     assert p.action == "new_concept"
@@ -134,7 +133,7 @@ def test_llm_propose_provider_exception_returns_reject():
     fake = _FakeProvider(raise_exc=RuntimeError("ollama down"))
     propose = make_default_llm_propose(fake)
     cluster = Cluster(members=[
-        TxCandidate(tx_hash="t1", fork="declarative", tags=("topic:x",), embedding=None),
+        TxCandidate(tx_hash="t1", fork="declarative", tags=(), embedding=None),
     ])
     p = propose(cluster)
     assert p.action == "reject"
@@ -151,131 +150,138 @@ def test_llm_propose_empty_response_returns_reject():
     assert p.action == "reject"
 
 
-# ── Cluster prompt builder ─────────────────────────────────────────
+# ── Cluster prompt builder (now carries REAL content — D3) ──────────
 
 
-def test_cluster_prompt_includes_size_forks_tags():
+def test_cluster_prompt_includes_size_forks_and_real_content():
     cluster = Cluster(members=[
         TxCandidate(
             tx_hash="abcdef1234567890" + "0" * 48,
             fork="declarative",
-            tags=("topic:linux", "topic:terminal"),
+            tags=("topic:linux",),
             embedding=None,
+            content_summary="I prefer the zsh shell on Linux for the terminal.",
         ),
         TxCandidate(
             tx_hash="cafef00d" + "0" * 56,
             fork="declarative",
             tags=("topic:linux",),
             embedding=None,
+            content_summary="The Linux terminal is where I do most of my work.",
         ),
     ])
     prompt = _build_cluster_prompt(cluster)
     assert "Cluster size: 2" in prompt
     assert "declarative" in prompt
     assert "topic:linux" in prompt
-    # Sample hash prefixes use only first 12 chars (per builder).
-    assert "abcdef123456" in prompt
-    assert "cafef00d0000" in prompt
+    # The D3 fix: real content drives the prompt (was hash prefixes).
+    assert "zsh shell" in prompt
+    assert "Linux terminal" in prompt
 
 
-# ── Default mine ────────────────────────────────────────────────────
+def test_cluster_prompt_truncates_long_content():
+    long_text = "x" * 1000
+    cluster = Cluster(members=[
+        TxCandidate(tx_hash="aa" * 32, fork="episodic", tags=(),
+                    embedding=None, content_summary=long_text),
+    ])
+    prompt = _build_cluster_prompt(cluster, max_chars=240)
+    assert "…" in prompt          # truncation marker
+    assert "x" * 1000 not in prompt  # not the full blob
 
 
-def _seed_block_index(db_path: str, rows: list[dict]) -> None:
-    """Create a minimal block_index table matching the timechain_v2 schema
-    + insert the given rows."""
-    conn = sqlite3.connect(db_path)
+def test_cluster_prompt_handles_empty_content():
+    cluster = Cluster(members=[
+        TxCandidate(tx_hash="aa" * 32, fork="episodic", tags=(),
+                    embedding=None, content_summary=""),
+    ])
+    prompt = _build_cluster_prompt(cluster)
+    assert "no content available" in prompt  # never crashes on contentless rows
+
+
+# ── Default mine — sidecar (promoted thoughts) ──────────────────────
+
+
+def _seed_sidecar(data_dir: str, rows: list[dict]) -> None:
+    """Write rows into a real thought_sidecar.db via the production writer."""
+    sc = ThoughtSidecar(data_dir)
     try:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS block_index ("
-            "tx_hash BLOB PRIMARY KEY, fork_name TEXT, tx_type TEXT, "
-            "source TEXT, significance REAL, tags TEXT, ts REAL)"
-        )
         for r in rows:
-            conn.execute(
-                "INSERT OR REPLACE INTO block_index "
-                "(tx_hash, fork_name, tx_type, source, significance, tags, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    bytes.fromhex(r["tx_hash"]),
-                    r["fork_name"], r.get("tx_type", "thought"),
-                    r.get("source", "test"),
-                    r.get("significance", 0.5),
-                    json.dumps(r.get("tags", [])),
-                    r["ts"],
-                ),
+            sc.put(
+                tx_hash=r["tx_hash"], node_id=r.get("node_id", 1),
+                user_prompt=r.get("user_prompt", ""),
+                agent_response=r.get("agent_response", ""),
+                memory_type=r.get("memory_type", "episodic"),
+                fork=r.get("fork", "episodic"), ts=r["ts"],
             )
-        conn.commit()
     finally:
-        conn.close()
+        sc.close()
 
 
-def test_default_mine_returns_tx_candidates():
+def test_mine_thoughts_returns_candidates_newest_first():
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "index.db")
-        _seed_block_index(db, [
-            {"tx_hash": "11" * 32, "fork_name": "declarative",
-             "tags": ["topic:linux"], "ts": 1000.0},
-            {"tx_hash": "22" * 32, "fork_name": "procedural",
-             "tags": ["topic:ssh"], "ts": 1100.0},
+        _seed_sidecar(tmp, [
+            {"tx_hash": "11" * 32, "user_prompt": "I race karts",
+             "fork": "episodic", "ts": 1000.0},
+            {"tx_hash": "22" * 32, "user_prompt": "I love the Brno circuit",
+             "fork": "declarative", "ts": 1100.0},
         ])
-        txs = default_mine_recent_txs(
-            since_ts=500.0, exclude_forks=set(),
-            index_db_path=db,
-        )
+        txs = default_mine_recent_thoughts(
+            since_ts=500.0, exclude_forks=set(), data_dir=tmp)
         assert len(txs) == 2
         assert all(isinstance(t, TxCandidate) for t in txs)
         # Ordered by ts DESC.
         assert txs[0].tx_hash.startswith("22")
         assert txs[1].tx_hash.startswith("11")
-        # Tag parsing.
-        assert "topic:ssh" in txs[0].tags
-        # Embedding None per P4 contract.
+        # Real content is carried (the crux fix), tags empty, embedding deferred.
+        assert "Brno" in txs[0].content_summary
+        assert txs[0].tags == ()
         assert txs[0].embedding is None
+        assert txs[0].fork == "declarative"
 
 
-def test_default_mine_excludes_forks():
+def test_mine_thoughts_concatenates_prompt_and_response():
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "index.db")
-        _seed_block_index(db, [
-            {"tx_hash": "aa" * 32, "fork_name": "meta",
-             "tags": ["topic:noise"], "ts": 1000.0},
-            {"tx_hash": "bb" * 32, "fork_name": "declarative",
-             "tags": ["topic:signal"], "ts": 1100.0},
-            {"tx_hash": "cc" * 32, "fork_name": "conversation",
-             "tags": ["chat"], "ts": 1200.0},
+        _seed_sidecar(tmp, [
+            {"tx_hash": "33" * 32, "user_prompt": "what is my hobby?",
+             "agent_response": "You race go-karts on weekends.",
+             "fork": "episodic", "ts": 1000.0},
         ])
-        txs = default_mine_recent_txs(
-            since_ts=0.0,
-            exclude_forks={"meta", "conversation"},
-            index_db_path=db,
-        )
-        forks = [t.fork for t in txs]
-        assert forks == ["declarative"]
+        txs = default_mine_recent_thoughts(
+            since_ts=0.0, exclude_forks=set(), data_dir=tmp)
+        assert len(txs) == 1
+        assert "hobby" in txs[0].content_summary
+        assert "go-karts" in txs[0].content_summary
 
 
-def test_default_mine_since_ts_filter():
+def test_mine_thoughts_since_ts_filter():
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "index.db")
-        _seed_block_index(db, [
-            {"tx_hash": "11" * 32, "fork_name": "declarative",
-             "tags": [], "ts": 100.0},
-            {"tx_hash": "22" * 32, "fork_name": "declarative",
-             "tags": [], "ts": 2000.0},
+        _seed_sidecar(tmp, [
+            {"tx_hash": "11" * 32, "user_prompt": "old", "ts": 100.0},
+            {"tx_hash": "22" * 32, "user_prompt": "new", "ts": 2000.0},
         ])
-        txs = default_mine_recent_txs(
-            since_ts=1000.0, exclude_forks=set(), index_db_path=db,
-        )
+        txs = default_mine_recent_thoughts(
+            since_ts=1000.0, exclude_forks=set(), data_dir=tmp)
         assert len(txs) == 1
         assert txs[0].tx_hash.startswith("22")
 
 
-def test_default_mine_missing_db_returns_empty():
-    """Production path: chain might not have written index.db yet on first
-    boot. Soft-fail to empty result so the consolidation pass just records
-    a 'skipped' summary and the next pass tries again."""
-    txs = default_mine_recent_txs(
-        since_ts=0.0, exclude_forks=set(),
-        index_db_path="/nonexistent/path/index.db",
-    )
-    assert txs == []
+def test_mine_thoughts_excludes_forks_defensively():
+    with tempfile.TemporaryDirectory() as tmp:
+        _seed_sidecar(tmp, [
+            {"tx_hash": "aa" * 32, "user_prompt": "noise",
+             "fork": "meta", "ts": 1000.0},
+            {"tx_hash": "bb" * 32, "user_prompt": "signal",
+             "fork": "declarative", "ts": 1100.0},
+        ])
+        txs = default_mine_recent_thoughts(
+            since_ts=0.0, exclude_forks={"meta", "conversation"}, data_dir=tmp)
+        assert [t.fork for t in txs] == ["declarative"]
+
+
+def test_mine_thoughts_missing_sidecar_returns_empty():
+    """First boot before any promotion: no sidecar yet → soft-fail to []."""
+    with tempfile.TemporaryDirectory() as tmp:
+        txs = default_mine_recent_thoughts(
+            since_ts=0.0, exclude_forks=set(), data_dir=tmp)
+        assert txs == []

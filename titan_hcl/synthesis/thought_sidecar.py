@@ -159,6 +159,26 @@ class ThoughtSidecarReader:
                 logger.debug("[ThoughtSidecarReader] iter_all failed: %s", e)
                 return []
 
+    def iter_since(self, *, since_ts: float, limit: int = 5000) -> list:
+        """Return up to ``limit`` sidecar rows with ``ts > since_ts`` (newest-first)
+        as dicts — the Phase-D consolidation mine source (real promoted thoughts
+        within the consolidation window). Materializes the result (reader lock not
+        held across the caller's iteration). Soft-fail → ``[]``."""
+        with self._lock:
+            conn = self._ensure()
+            if conn is None:
+                return []
+            try:
+                rows = conn.execute(
+                    "SELECT tx_hash, node_id, user_prompt, agent_response, "
+                    "memory_type, fork, ts FROM thought_content "
+                    "WHERE ts > ? ORDER BY ts DESC LIMIT ?",
+                    (float(since_ts), int(limit))).fetchall()
+                return [dict(r) for r in rows]
+            except Exception as e:
+                logger.debug("[ThoughtSidecarReader] iter_since failed: %s", e)
+                return []
+
     def close(self) -> None:
         with self._lock:
             if self._conn is not None:

@@ -5,18 +5,22 @@ mine + LLM-propose callables (§P4.G).
 module provides the two REAL collaborators production wires at synthesis
 worker boot. Tests use fakes (see test_phase4_consolidation.py).
 
-- `default_mine_recent_txs(since_ts, exclude_forks)` — reads canonical
-  TXs from `data/timechain/index.db.block_index` via a read-only SQLite
-  query (the Phase 2 FORK_READ infra). Returns TxCandidate per row.
-  Embedding is left None because the chain doesn't hold raw 132D vectors
-  (only an `embedding_hash` per arch §7); clustering falls back to
-  Jaccard-only mode for tag-coherent groups, which is functional for P4.
-  Phase 7+ wires real FAISS-by-tx_hash embedding fetch when the chat-TX
-  shape's full 132D vector becomes available cross-worker.
+- `default_mine_recent_thoughts(since_ts, exclude_forks)` — reads recent
+  PROMOTED THOUGHTS from the lock-free content sidecar (`data/thought_sidecar.db`),
+  keyed by their per-TX promotion hash. This is the crux fix (RFP
+  `_synthesis_spine_reads_real_data` §7.D / D1): the old `default_mine_recent_txs`
+  mined the chain `block_index` ENVELOPE (keyed by block_hash, no content) →
+  embeddings double-missed + the proposer saw no content → 0 real concepts. The
+  sidecar key matches the recall deref + the `conversation` FAISS shard, so
+  `synthesis_worker._mine_with_embeddings` fetches each candidate's embedding from
+  that shard (cosine clustering) and the proposer sees real content. One
+  TxCandidate per thought; `embedding` filled by the worker (None here).
 
 - `default_llm_propose(cluster, provider)` — calls the inference module's
   `complete()` to ask the model whether the cluster represents a new
-  concept, a version-bump of an existing one, or nothing coherent.
+  concept, a version-bump of an existing one, or nothing coherent. The cluster
+  prompt now carries a bounded sample of REAL thought content (RFP §7.D / D3) so
+  the proposed concept name + memory_type reflect the actual thoughts.
   Output is parsed via a strict line-prefix protocol so a verbose LLM
   response cannot break clustering. Provider failure / parse error →
   LLMProposal(action="reject", reason=<diagnostic>) — never raises.
@@ -27,10 +31,8 @@ synthesis_worker's bus loop is thread-based (no surrounding event loop).
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import sqlite3
-from typing import Any, Optional
+from typing import Any
 
 from titan_hcl.synthesis.consolidation import (
     Cluster,
@@ -51,99 +53,67 @@ _MINE_ROW_CAP = 500
 # ── Default mine ────────────────────────────────────────────────────
 
 
-def default_mine_recent_txs(
+def default_mine_recent_thoughts(
     *,
     since_ts: float,
     exclude_forks: set[str],
-    index_db_path: str = "data/timechain/index.db",
+    data_dir: str = "data",
     row_cap: int = _MINE_ROW_CAP,
 ) -> list[TxCandidate]:
-    """Read recent canonical TXs from the chain index DB. Read-only; never
-    blocks the chain writer (sqlite WAL semantics + read_only open)."""
+    """Mine recent PROMOTED THOUGHTS from the lock-free content sidecar (RFP
+    `_synthesis_spine_reads_real_data` §7.D / D1) — the REAL thoughts, keyed by
+    their per-TX promotion hash.
+
+    This replaces the old `default_mine_recent_txs`, which mined the chain
+    `block_index` ENVELOPE (keyed by `block_hash`, no thought content): there the
+    embedding fetch double-missed (wrong shard + wrong key) → tag-only clustering
+    on generic envelope tags → 0 real concepts, and the proposer saw no content.
+
+    The sidecar key is the SAME hash the recall deref and the `conversation` FAISS
+    shard use, so `synthesis_worker._mine_with_embeddings` can fetch each
+    candidate's embedding from the conversation shard (cosine clustering) and the
+    proposer sees the real content. One TxCandidate per thought; `embedding` is
+    filled by the worker (None here). Read-only; soft-fail → []."""
     out: list[TxCandidate] = []
     try:
-        # uri-mode read-only open ensures we never accidentally take a
-        # write lock against the chain worker's writer.
-        conn = sqlite3.connect(
-            f"file:{index_db_path}?mode=ro&immutable=0",
-            uri=True, timeout=5.0,
-        )
+        from titan_hcl.synthesis.thought_sidecar import ThoughtSidecarReader
+        reader = ThoughtSidecarReader(data_dir)
     except Exception as e:
         logger.warning(
-            "[consolidation_defaults] mine: failed to open %s: %s",
-            index_db_path, e,
-        )
+            "[consolidation_defaults] mine_thoughts: sidecar reader init "
+            "failed: %s", e)
         return out
-
     try:
-        conn.row_factory = sqlite3.Row
-        # ACTUAL block_index schema (timechain_v2): block_hash BLOB PK, fork_id
-        # INTEGER, block_height, timestamp, tags (JSON), … There is NO `tx_hash`,
-        # NO `fork_name`, NO `ts` column — the prior SQL referenced all three →
-        # every mine threw `no such column` → txs_mined=0 → the ConsolidationPass
-        # NEVER formed a real concept (only E2E-test concepts existed). The canon
-        # tx_hash IS the block_hash (the spine is keyed by block_hash hex, see
-        # tx_index_builder). Forks are stored by chain-local fork_id; resolve to
-        # names via fork_registry (same as TxIndexBuilder._resolve_fork_ids). (2026-06-01)
-        id_to_name: dict[int, str] = {}
-        try:
-            for fr in conn.execute(
-                    "SELECT fork_id, fork_name FROM fork_registry").fetchall():
-                id_to_name[int(fr["fork_id"])] = str(fr["fork_name"])
-        except Exception as fe:
-            logger.warning("[consolidation_defaults] mine: fork_registry read "
-                           "failed (%s) — fork names unavailable", fe)
-        # Exclude noisy forks BY NAME → resolve to chain-local fork_ids.
-        excluded_ids = [fid for fid, nm in id_to_name.items()
-                        if nm in exclude_forks]
-        placeholders = ",".join("?" * len(excluded_ids)) if excluded_ids else ""
-        if excluded_ids:
-            sql = (
-                "SELECT block_hash, fork_id, tags, timestamp FROM block_index "
-                f"WHERE timestamp > ? AND fork_id NOT IN ({placeholders}) "
-                "ORDER BY timestamp DESC LIMIT ?"
-            )
-            params: list[Any] = [float(since_ts), *excluded_ids, int(row_cap)]
-        else:
-            sql = (
-                "SELECT block_hash, fork_id, tags, timestamp FROM block_index "
-                "WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ?"
-            )
-            params = [float(since_ts), int(row_cap)]
-        cursor = conn.execute(sql, params)
-        for row in cursor.fetchall():
-            tx_hash_blob = row["block_hash"]
-            if isinstance(tx_hash_blob, bytes):
-                tx_hex = tx_hash_blob.hex()
-            else:
-                tx_hex = str(tx_hash_blob)
-            fork_name = id_to_name.get(int(row["fork_id"]), str(row["fork_id"]))
-            tags_raw = row["tags"]
-            tags: tuple[str, ...] = ()
-            if isinstance(tags_raw, str) and tags_raw:
-                try:
-                    parsed = json.loads(tags_raw)
-                    if isinstance(parsed, list):
-                        tags = tuple(t for t in parsed if isinstance(t, str))
-                except json.JSONDecodeError:
-                    pass
+        rows = reader.iter_since(since_ts=float(since_ts), limit=int(row_cap))
+        for row in rows:
+            txh = row.get("tx_hash")
+            if not txh:
+                continue
+            # The chain fork (declarative/episodic) is the SEMANTIC anchor and is
+            # decoupled from the embed shard (the worker fetches embeddings from the
+            # `conversation` shard). The sidecar holds ONLY promoted memory thoughts
+            # — there is no chat-turn `conversation`-fork or `meta` noise to filter
+            # — but honor exclude_forks defensively anyway.
+            fork = str(row.get("fork") or "")
+            if fork in exclude_forks:
+                continue
+            prompt = row.get("user_prompt") or ""
+            response = row.get("agent_response") or ""
+            content = (prompt + "\n" + response).strip()
             out.append(TxCandidate(
-                tx_hash=tx_hex,
-                fork=fork_name,
-                tags=tags,
-                # Filled by synthesis_worker._mine_with_embeddings from the
-                # tx_hash FAISS spine (W4) so clustering is cosine, not tags-only.
-                embedding=None,
-                content_summary="",
+                tx_hash=str(txh),
+                fork=fork or "episodic",
+                tags=(),  # sidecar carries none → cosine-primary clustering
+                embedding=None,  # filled from the conversation FAISS shard (D2)
+                content_summary=content,
             ))
     except Exception as e:
         logger.warning(
-            "[consolidation_defaults] mine: query failed (%s) — returning %d rows",
-            e, len(out),
-        )
+            "[consolidation_defaults] mine_thoughts: failed (%s) — %d rows",
+            e, len(out))
     finally:
         try:
-            conn.close()
+            reader.close()
         except Exception:
             pass
 
@@ -173,9 +143,12 @@ _LLM_SYSTEM_PROMPT = (
 )
 
 
-def _build_cluster_prompt(cluster: Cluster, max_tags: int = 30) -> str:
-    """Compact prompt describing a cluster — TX hashes (first 12 chars),
-    fork distribution, top tags. Bounded so the prompt stays small."""
+def _build_cluster_prompt(cluster: Cluster, max_tags: int = 30,
+                          max_samples: int = 5, max_chars: int = 240) -> str:
+    """Compact prompt describing a cluster — a bounded sample of REAL thought
+    content, fork distribution, top tags. The content sample (RFP
+    `_synthesis_spine_reads_real_data` §7.D / D3) is what lets the LLM name a real
+    concept; previously the proposer saw only hash prefixes + tags and could not."""
     n = len(cluster.members)
     tag_counts: dict[str, int] = {}
     fork_counts: dict[str, int] = {}
@@ -188,14 +161,21 @@ def _build_cluster_prompt(cluster: Cluster, max_tags: int = 30) -> str:
     )[:max_tags]
     top_tag_str = ", ".join(f"{t}×{c}" for t, c in top_tags)
     forks_str = ", ".join(f"{f}×{c}" for f, c in fork_counts.items())
-    sample_hashes = ", ".join(
-        m.tx_hash[:12] for m in cluster.members[:8]
-    )
+    # Bounded REAL-content sample — the signal the proposer names the concept from.
+    samples = []
+    for m in cluster.members[:max_samples]:
+        text = (m.content_summary or "").strip().replace("\n", " ")
+        if not text:
+            continue
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip() + "…"
+        samples.append(f"  - {text}")
+    samples_str = "\n".join(samples) if samples else "  (no content available)"
     return (
         f"Cluster size: {n} thought(s)\n"
         f"Forks: {forks_str}\n"
-        f"Top tags: {top_tag_str}\n"
-        f"Sample TX prefixes: {sample_hashes}\n"
+        f"Top tags: {top_tag_str or '(none)'}\n"
+        f"Sample thoughts:\n{samples_str}\n"
     )
 
 
@@ -281,7 +261,7 @@ def make_default_llm_propose(provider: Any) -> Any:
 
 
 __all__ = (
-    "default_mine_recent_txs",
+    "default_mine_recent_thoughts",
     "make_default_llm_propose",
     "_parse_llm_response",
     "_build_cluster_prompt",

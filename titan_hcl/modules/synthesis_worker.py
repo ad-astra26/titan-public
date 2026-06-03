@@ -508,13 +508,29 @@ def _heartbeat_loop(send_queue, name: str,
     `_WORKER_READY` is False so the slot stays in "starting"/"booted"
     until the recv-loop probe handler transitions it to "running".
     """
+    _hb_last = time.monotonic()
     while not stop_event.is_set():
+        _hb_gap = time.monotonic() - _hb_last
+        _hb_last = time.monotonic()
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
         if state_writer is not None and _WORKER_READY:
             try:
                 state_writer.heartbeat()
+                # TRACE (RFP §7.D flap hunt): a large gap = the heartbeat thread
+                # was starved (GIL held by a bulk op on another thread) → SHM slot
+                # goes stale → guardian shm_pid_dead. Surfaces starvation directly.
+                if _hb_gap > HEARTBEAT_INTERVAL_S * 1.5:
+                    logger.warning(
+                        "[synthesis_worker] HB STARVED — gap=%.1fs (expected ~%.1fs)"
+                        " — heartbeat thread blocked by a GIL-holding bulk op; SHM"
+                        " slot went stale", _hb_gap, HEARTBEAT_INTERVAL_S)
             except Exception:  # noqa: BLE001
                 pass
+        elif state_writer is not None:
+            logger.warning(
+                "[synthesis_worker] HB SUPPRESSED — _WORKER_READY=False (probe "
+                "handshake not complete %.0fs into life) — SHM slot stays stale",
+                _hb_gap)
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -1070,7 +1086,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             ConsolidationPass, LLMProposal,
         )
         from titan_hcl.synthesis.consolidation_defaults import (
-            default_mine_recent_txs, make_default_llm_propose,
+            default_mine_recent_thoughts, make_default_llm_propose,
         )
         # Reuse the kuzu_graph_obj constructed above for EngineRecall.
         # Soft-fail if it's missing: the worker keeps running with
@@ -1159,33 +1175,66 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     action="reject", reason="llm_proposer_unconfigured",
                 )
 
-        # Operator-closure Phase B4 (W4) — real embeddings into consolidation.
-        # default_mine_recent_txs returns embedding=None (the "FAISS fetch is
-        # Phase 7" TODO, never done) → tag-only clustering → no real concepts
-        # ever formed. Fill each mined candidate's embedding from the tx_hash
-        # FAISS store (Phase A) so ConsolidationPass clusters by COSINE (0.85)
-        # AND tags, not tags alone — the precondition for real concept synthesis.
+        # RFP_synthesis_spine_reads_real_data §7.D — consolidation reads REAL
+        # promoted thoughts. default_mine_recent_thoughts returns embedding=None
+        # (sidecar holds content, not vectors); fill each candidate's embedding
+        # from the `conversation` FAISS shard (the shard run_sidecar indexes into
+        # and recall SEARCHes) so ConsolidationPass clusters by COSINE over real
+        # thought content — the precondition for real concept synthesis.
         import dataclasses as _dc
 
         def _mine_with_embeddings(since_ts, exclude_forks):
-            # default_mine_recent_txs is keyword-only (def ...(*, since_ts, ...));
-            # a positional call raised TypeError every dream → mine aborted →
-            # txs_mined=0 → no concepts (2026-06-01, with the SQL-column fix).
-            cands = default_mine_recent_txs(
+            # RFP_synthesis_spine_reads_real_data §7.D (D1/D2): mine the REAL
+            # promoted thoughts from the sidecar (content keyed by per-TX hash),
+            # then fill each candidate's embedding from the `conversation` FAISS
+            # shard — the SAME shard the recall helper SEARCHes and run_sidecar
+            # indexes into. (The old chain-block mine keyed candidates by block_hash
+            # on the declarative/episodic shards → double-miss → 0 concepts.)
+            import numpy as _np_emb
+            cands = default_mine_recent_thoughts(
                 since_ts=since_ts, exclude_forks=exclude_forks)
             if synth_vector_store is None:
                 return cands
             # TxCandidate is a FROZEN dataclass — cannot assign c.embedding in
             # place ('cannot assign to field embedding'); rebuild via replace().
+            # Keep the embedding as a numpy float32 ARRAY (not a Python tuple): the
+            # consolidation cosine then runs via numpy (GIL-RELEASING C compute), so
+            # clustering hundreds of vectors on the dream thread never starves the
+            # 30s heartbeat (RFP §7.D flap fix — pure-Python tuple cosine held the
+            # GIL across ~10^5 dot products → shm_pid_dead).
             out = []
             for c in cands:
                 if c.embedding is None:
-                    vec = synth_vector_store.get_vector(c.fork, c.tx_hash)
+                    vec = synth_vector_store.get_vector("conversation", c.tx_hash)
                     if vec is not None:
                         c = _dc.replace(
-                            c, embedding=tuple(float(x) for x in vec))
+                            c, embedding=_np_emb.asarray(vec, dtype=_np_emb.float32))
                 out.append(c)
             return out
+
+        # Tunables (RFP §7.D / D2-D3): cosine clustering over the sidecar source;
+        # wide window so backfilled history participates; min_cluster default 2.
+        consolidation_cfg = (config or {}).get("synthesis", {}).get(
+            "consolidation", {}) or {}
+        _min_cluster = int(consolidation_cfg.get("min_cluster_size", 2))
+        _window_hours = float(consolidation_cfg.get("window_hours", 720.0))
+
+        import numpy as _np_cos
+        def _np_cosine(a, b) -> float:
+            # Vectorized cosine — numpy dot/norm RELEASE the GIL during the C-level
+            # compute, so the dream-thread clustering NO LONGER starves the 30s
+            # heartbeat thread. The default pure-Python `_default_cosine` held the
+            # GIL across ~10^5 dot products over the embedded candidates → heartbeat
+            # went stale → guardian shm_pid_dead flap (RFP §7.D: "no bulk ops on the
+            # hot path" — the hot path here is the shared GIL).
+            try:
+                na = float(_np_cos.linalg.norm(a))
+                nb = float(_np_cos.linalg.norm(b))
+                if na <= 0.0 or nb <= 0.0:
+                    return 0.0
+                return float(_np_cos.dot(a, b) / (na * nb))
+            except Exception:
+                return 0.0
 
         consolidation_pass = ConsolidationPass(
             concept_store=concept_store,
@@ -1193,12 +1242,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             outer_memory_writer=writer,
             mine_recent_txs_fn=_mine_with_embeddings,
             llm_propose_fn=propose_fn,
+            cosine_fn=_np_cosine,
+            window_hours=_window_hours,
+            min_cluster_size=_min_cluster,
         )
         logger.info(
             "[synthesis_worker] ConsolidationPass ready — DREAM_STATE_CHANGED "
             "subscription active; rate-limit = 1 pass / dream window; "
-            "embeddings=%s (cosine clustering)",
-            "tx_hash_store" if synth_vector_store is not None else "tag-only",
+            "source=sidecar(promoted thoughts); embeddings=%s; "
+            "min_cluster=%d window_h=%.0f",
+            "conversation_shard" if synth_vector_store is not None else "tag-only",
+            _min_cluster, _window_hours,
         )
     except Exception as exc:
         logger.warning(
@@ -2016,6 +2070,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         since_ts = dream_start_ts - window_hours * 3600.0
 
         def _run_dream_sequence() -> None:
+            _dseq_t0 = time.monotonic()
+            logger.info(
+                "[synthesis_worker] DREAM SEQUENCE START (window_since=%.0f) — "
+                "compute runs on the synthesis-dream thread", since_ts)
             # 1) Oracle companion-verdict flush FIRST so the just-anchored
             #    verdict refs are in the window the judge + miner read (W6).
             if oracle_router is not None:
@@ -2124,6 +2182,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     logger.warning(
                         "[synthesis_worker] fork_gc sweep crashed: %s", e,
                         exc_info=True)
+            logger.info(
+                "[synthesis_worker] DREAM SEQUENCE END — total=%.1fs (GIL-held "
+                "compute in these steps starves the 30s heartbeat → shm_pid_dead)",
+                time.monotonic() - _dseq_t0)
 
         threading.Thread(
             target=_run_dream_sequence, name="synthesis-dream",
