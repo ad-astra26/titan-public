@@ -25,7 +25,6 @@ from pathlib import Path
 from typing import Callable
 
 from . import state as install_state
-from . import toolchain
 from .backup_config import run_backup_config_phase
 from .binaries import run_binaries_phase
 from .comms import run_comms_phase
@@ -33,7 +32,6 @@ from .console import run_console_phase
 from .config_seed import run_config_seed_phase
 from .inference import run_inference_phase
 from .genesis_runner import run_genesis_phase
-from .provision import run_provision_phase
 from .resurrect import run_resurrect_phase
 from .systemd_runner import run_systemd_phase
 from .modes import Mode, spec_for
@@ -282,10 +280,8 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
                minimal: bool, skip_genesis: bool, tag: str | None = None,
                build_rust: bool = False, prompter: Prompter | None = None,
                resurrect: bool = False, rpc_url: str | None = None,
-               das_rpc_url: str | None = None,
                verify_only: bool = False, config_src: str | None = None,
-               titan_pubkey: str | None = None,
-               toolchain_pins: dict[str, str] | None = None) -> int:
+               titan_pubkey: str | None = None) -> int:
     """Walk the install phases (Phase 1 already ran in preflight). Returns exit code.
 
     ``prompter`` injects the input source: the default :class:`StdinPrompter`
@@ -299,13 +295,9 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
     not re-prompts), then systemd + console.
     """
     prompter = prompter or StdinPrompter()
-    pins = toolchain_pins or toolchain.resolve_versions(None)
 
     if resurrect:
         phases: list[tuple[PhaseDef, Callable[[], list[Result]]]] = [
-            (PhaseDef("phase_provision", "Toolchain provisioning (Rust · Solana · Node)", "RFP-provisioner", None),
-             lambda: run_provision_phase(install_root, mode, pins, resurrect=True,
-                                         prompter=prompter, default=default)),
             (PhaseDef("phase_3", "Venv + Python deps", "W1.b", None),
              lambda: run_venv_phase(install_root)),
             (PhaseDef("phase_bin", "Rust daemon binaries", "W1.b", None),
@@ -313,7 +305,6 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
             (PhaseDef("phase_resurrect", "🜂 Sovereign Resurrection", "W1.5/D1", None),
              lambda: run_resurrect_phase(install_root, venv_python=venv_python(install_root),
                                          titan_id=state.get("titan_id"), rpc_url=rpc_url,
-                                         das_rpc_url=das_rpc_url,
                                          verify_only=verify_only, config_src=config_src,
                                          titan_pubkey=titan_pubkey)),
             (PhaseDef("phase_7", "Systemd install + first start + health", "W1.e", None),
@@ -326,12 +317,6 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
     phases: list[tuple[PhaseDef, Callable[[], list[Result]]]] = [
         (PhaseDef("phase_2", "Mode + Maker wallet", "W1.b", None),
          lambda: run_mode_phase(state, mode, default=default, prompter=prompter)),
-        # Provision the toolchain right after the quick mode/wallet capture and
-        # BEFORE venv/binaries/genesis (INV-PROV-5) — so a bad wallet fails fast
-        # instead of after a multi-minute toolchain install.
-        (PhaseDef("phase_provision", "Toolchain provisioning (Rust · Solana · Anchor · Node)", "RFP-provisioner", None),
-         lambda: run_provision_phase(install_root, mode, pins, resurrect=False,
-                                     prompter=prompter, default=default)),
         (PhaseDef("phase_3", "Venv + Python deps", "W1.b", None),
          lambda: run_venv_phase(install_root)),
         (PhaseDef("phase_bin", "Rust daemon binaries", "W1.b", None),
