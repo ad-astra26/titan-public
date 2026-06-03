@@ -28,7 +28,6 @@ class ModeSpec:
     needs_solana_cli: bool
     needs_anchor: bool
     needs_rust: bool
-    needs_node: bool        # NodeSource 22 — Irys/Arweave (mainnet backups) + the realistic devnet mirror
     needs_rpc: bool
     needs_sol: str          # human description of SOL requirement
     backups_on: bool
@@ -40,7 +39,7 @@ SPECS: dict[Mode, ModeSpec] = {
     Mode.MAINNET: ModeSpec(
         label="MAINNET — full sovereign Titan",
         one_liner="real GenesisNFT + your own ZK Vault program on Solana mainnet",
-        needs_solana_cli=True, needs_anchor=True, needs_rust=True, needs_node=True,
+        needs_solana_cli=True, needs_anchor=True, needs_rust=True,
         needs_rpc=True,
         needs_sol="~1–2 SOL recommended (deploy program + mint + PDA init)",
         backups_on=True, genesis_on_chain=True,
@@ -49,7 +48,7 @@ SPECS: dict[Mode, ModeSpec] = {
     Mode.DEVNET: ModeSpec(
         label="DEVNET — realistic tester path",
         one_liner="same flow on Solana devnet, airdropped test SOL — free and disposable",
-        needs_solana_cli=True, needs_anchor=True, needs_rust=True, needs_node=True,
+        needs_solana_cli=True, needs_anchor=True, needs_rust=True,
         needs_rpc=True,
         needs_sol="airdropped test SOL only — no real cost",
         backups_on=True, genesis_on_chain=True,
@@ -58,7 +57,7 @@ SPECS: dict[Mode, ModeSpec] = {
     Mode.LOCAL: ModeSpec(
         label="LOCAL — simulated, zero deps",
         one_liner="real identity + soul + SSS ceremony, on-chain anchor SKIPPED",
-        needs_solana_cli=False, needs_anchor=False, needs_rust=False, needs_node=False,
+        needs_solana_cli=False, needs_anchor=False, needs_rust=False,
         needs_rpc=False,
         needs_sol="none",
         backups_on=False, genesis_on_chain=False,
