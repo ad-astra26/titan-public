@@ -135,14 +135,6 @@ class PostDispatchOrchestrator:
         # used _x_gateway._last_mention_check_ts; we keep it on the
         # orchestrator instance to avoid mutating the gateway).
         self._last_mention_check_ts: float = 0.0
-        # rFP X-post PART B4 (INV-XENG-4) — organic auto-follow: periodic, gated,
-        # DISABLED by default ([social_x.auto_follow].enabled). Grows the curated
-        # following toward recurring high-relevance voices via gateway.follow().
-        self._last_auto_follow_ts: float = 0.0
-        from titan_hcl.logic.social_x.auto_follow import AutoFollowPolicy
-        self._auto_follow = AutoFollowPolicy(
-            gateway=gateway,
-            social_x_db=getattr(gateway, "_db_path", "./data/social_x.db"))
 
         # F-phase pre-post pending request_ids → (sent_ts, kind).
         # Outcome emission pops these after gateway.post returns.
@@ -954,29 +946,6 @@ class PostDispatchOrchestrator:
 
     # ── Main tick entrypoint ──
 
-    def _maybe_auto_follow(self, *, ctx) -> None:
-        """rFP PART B4: periodic organic auto-follow, gated + OFF by default.
-
-        Cheap no-op unless `[social_x.auto_follow].enabled` is true; then runs at
-        most once per `check_interval_s` (default 1h). Never raises into the tick.
-        """
-        try:
-            sx_cfg = self._gateway._load_config()
-            af = sx_cfg.get("auto_follow", {}) or {}
-            if not af.get("enabled", False):
-                return
-            now = time.time()
-            interval = float(af.get("check_interval_s", 3600))
-            if now - self._last_auto_follow_ts < interval:
-                return
-            self._last_auto_follow_ts = now
-            n = self._auto_follow.run(
-                titan_id=ctx.titan_id, context=ctx, config=sx_cfg)
-            if n:
-                logger.info("[PostDispatch] auto-follow: %d new follow(s)", n)
-        except Exception as _err:
-            logger.warning("[PostDispatch] auto-follow tick failed: %s", _err)
-
     def run_tick(self) -> None:
         """One post-dispatch orchestration tick.
 
@@ -1011,9 +980,6 @@ class PostDispatchOrchestrator:
             full_config=full_config, catalysts=catalysts)
         if ctx is None:
             return  # config load failed earlier; abort tick
-
-        # ── Organic auto-follow (rFP PART B4) — periodic, gated, OFF by default ──
-        self._maybe_auto_follow(ctx=ctx)
 
         # ── Delegate-first rotation decision ──
         delegate_first = self._delegate_first_check()

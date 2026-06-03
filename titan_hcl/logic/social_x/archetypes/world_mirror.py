@@ -32,11 +32,6 @@ WORLD_MIRROR_POST_TYPE = "world_mirror"
 
 # rFP §4.3.2 — relevance floor + recency window + caps.
 RELEVANCE_FLOOR = 0.55
-# B3 (rFP X-post PART B / INV-XENG-3, 2026-06-03): a NON-followed author is
-# engageable only when relevance clears this high bar. Converts the strong
-# inbound signal the is_following gate otherwise discards (~94% of surfaced
-# authors) into engagement, without reaching out to low-signal strangers.
-HIGH_RELEVANCE = 0.8
 RECENCY_WINDOW_S = 48 * 3600
 DEDUP_WINDOW_S = 7 * 86400
 MAX_PER_DAY = 4
@@ -80,10 +75,7 @@ class WorldMirrorArchetype(ArchetypeBase):
         author = candidate_row["author"]
         bio = candidate_row.get("bio") or ""
         excerpt = candidate_row.get("content_excerpt") or candidate_row.get("felt_summary") or ""
-        # B3: a non-followed high-relevance candidate carries an explicit honest
-        # follow_reason (it is NOT in our curated following).
-        follow_reason = (candidate_row.get("follow_reason")
-                         or (bio[:120] if bio else "curated following"))
+        follow_reason = bio[:120] if bio else "curated following"
 
         emot_now = compact_felt_summary(
             getattr(context, "neuromods", {}) or {},
@@ -205,43 +197,28 @@ class WorldMirrorArchetype(ArchetypeBase):
         except Exception as e:
             logger.warning("[world_mirror] community_registry probe failed: %s", e)
             return None
-        # Pick the highest-relevance eligible fe (rows are ORDER BY relevance DESC),
-        # not on per-author cooldown, that is EITHER a followed account OR — B3
-        # (INV-XENG-3) — a non-followed account whose relevance clears HIGH_RELEVANCE.
-        # Followed → full context (bio + quote-tweet the source). Non-followed
-        # high-signal → standalone @mention (no tweet_id; the gateway posts
-        # standalone and ensure_handle_mention still notifies them). Converts the
-        # strong inbound signal the is_following gate would otherwise discard.
+        if not followed:
+            return None
+
+        # Pick highest-relevance fe whose author is in the followed set AND
+        # not on per-author cooldown.
         for r in eligible:
             if (r["author"] or "").lower() in cooldown:
                 continue
             cr = followed.get(r["author"])
-            if cr:
-                tweet_text = cr.get("last_tweet_text") or ""
-                return {
-                    "fe_id": r["id"],
-                    "author": r["author"],
-                    "topic": r["topic"],
-                    "relevance": r["relevance"],
-                    "felt_summary": r["felt_summary"],
-                    "bio": cr.get("bio", ""),
-                    "content_excerpt": tweet_text or r["felt_summary"],
-                    "tweet_id": cr.get("last_tweet_id") or "",
-                }
-            if float(r["relevance"] or 0.0) >= HIGH_RELEVANCE:
-                return {
-                    "fe_id": r["id"],
-                    "author": r["author"],
-                    "topic": r["topic"],
-                    "relevance": r["relevance"],
-                    "felt_summary": r["felt_summary"],
-                    "bio": "",
-                    # non-followed: no curated bio / source tweet → standalone
-                    # @mention from the distilled summary (honest follow_reason).
-                    "follow_reason": "a high-signal voice in my field right now",
-                    "content_excerpt": r["felt_summary"],
-                    "tweet_id": "",
-                }
+            if not cr:
+                continue
+            tweet_text = cr.get("last_tweet_text") or ""
+            return {
+                "fe_id": r["id"],
+                "author": r["author"],
+                "topic": r["topic"],
+                "relevance": r["relevance"],
+                "felt_summary": r["felt_summary"],
+                "bio": cr.get("bio", ""),
+                "content_excerpt": tweet_text or r["felt_summary"],
+                "tweet_id": cr.get("last_tweet_id") or "",
+            }
         return None
 
 

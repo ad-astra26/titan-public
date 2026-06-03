@@ -32,6 +32,7 @@ from .ui import cprint, section
 
 def run_resurrect_phase(install_root: Path, *, venv_python: Path,
                         titan_id: str | None = None, rpc_url: str | None = None,
+                        das_rpc_url: str | None = None,
                         verify_only: bool = False, config_src: str | None = None,
                         shard1: str | None = None,
                         titan_pubkey: str | None = None) -> list[Result]:
@@ -88,6 +89,30 @@ def run_resurrect_phase(install_root: Path, *, venv_python: Path,
                        "The PUBLIC Titan address is required (no local record on a "
                        "fresh box). Re-run with --titan-pubkey <address>.")]
 
+    # ── Mainnet RPC for chain walk + identity (GenesisNFT) discovery. NOT a secret.
+    # A DAS-capable endpoint (Helius/Triton) is recommended: the default
+    # mainnet-beta RPC lacks the DAS API the wallet uses to discover the Genesis
+    # NFT, and serves the chain walk too — so one good endpoint drives BOTH seams.
+    # Enter = engine default (config RPC for the walk; Shard-3 still recovers via
+    # its on-chain tx without DAS). ──
+    if not rpc_url:
+        cprint("Enter a mainnet RPC URL for chain + identity discovery — a "
+               "DAS-capable provider (Helius/Triton) is recommended so GenesisNFT "
+               "discovery works (plain mainnet-beta lacks the DAS API). Press Enter "
+               "to use the engine default.", role="text_strong")
+        try:
+            entered = input("  Mainnet RPC URL [default]: ").strip()
+        except (EOFError, KeyboardInterrupt, OSError):
+            # No tty (piped / CI / captured stdin) → the RPC is optional, so fall
+            # back to the engine default rather than aborting the resurrection.
+            entered = ""
+        if entered:
+            rpc_url = entered
+            # One supplied endpoint drives BOTH the chain walk and DAS identity
+            # discovery unless the caller passed a distinct DAS URL explicitly.
+            if not das_rpc_url:
+                das_rpc_url = entered
+
     cmd = [str(venv_python), str(engine), "--titan", (titan_id or "T1"),
            "--titan-pubkey", titan_pubkey,
            "--shard1-stdin", "--commit", "--install-root", str(install_root)]
@@ -95,6 +120,8 @@ def run_resurrect_phase(install_root: Path, *, venv_python: Path,
         cmd.append("--verify-only")
     if rpc_url:
         cmd += ["--rpc-url", rpc_url]
+    if das_rpc_url:
+        cmd += ["--das-rpc-url", das_rpc_url]
 
     cprint("  Running the sovereign resurrection engine…", role="text_strong")
     try:
