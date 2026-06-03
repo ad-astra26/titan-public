@@ -32,6 +32,7 @@ from setup_titan import (  # noqa: E402
 )
 from setup_titan.__main__ import build_parser  # noqa: E402
 from setup_titan.modes import Mode  # noqa: E402
+from setup_titan import preflight as preflight_mod  # noqa: E402
 
 
 # ── config_model ─────────────────────────────────────────────────────────────
@@ -643,6 +644,18 @@ def test_install_resurrect_flags_parse():
 def test_install_accepts_no_tui_flag():
     args = build_parser().parse_args(["install", "--no-tui", "--mode", "local"])
     assert args.no_tui is True
+
+
+def test_preflight_checks_xdelta3_dependency(tmp_path):
+    """#35 — the installer surfaces the xdelta3 system dependency up front (it
+    powers incremental backup diffs + sovereign restore; applying an incremental
+    on resurrection hard-fails without it). Warn-severity: the Titan still boots."""
+    results = preflight_mod.run_preflight(tmp_path, mode=None)
+    xd = [r for r in results if r.name == "xdelta3"]
+    assert len(xd) == 1, [r.name for r in results]
+    assert xd[0].severity in ("ok", "warn")        # present → ok; absent → warn, never a hard fail
+    if xd[0].severity == "warn":
+        assert "xdelta3" in (xd[0].remediation or "")
 
 
 # ── W1.b.2 — Textual wizard headless pilot (collect-then-execute front-end) ──
