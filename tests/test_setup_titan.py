@@ -251,7 +251,8 @@ def test_materialize_bootable_identity_from_authority(tmp_path: Path):
     assert oct(kp.stat().st_mode)[-3:] == "600"          # 0600 like T2/T3
     assert not (tmp_path / "authority.json").exists()     # stray root copy wiped
     ident = json.loads(genesis_runner.identity_path(tmp_path).read_text())
-    assert ident["titan_id"] == "T1" and ident["titan_pubkey"] == "ZeFUoD…"
+    # DEFAULT_TITAN_ID = "titan" (fresh-install default; fleet sets TITAN_ID explicitly)
+    assert ident["titan_id"] == "titan" and ident["titan_pubkey"] == "ZeFUoD…"
 
 
 def test_materialize_fails_without_keypair(tmp_path: Path):

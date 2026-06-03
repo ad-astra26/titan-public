@@ -21,7 +21,8 @@ from .modes import Mode
 from .preflight import Result
 from .ui import cprint
 
-DEFAULT_TITAN_ID = "T1"   # canonical single-node id (matches resolve_titan_id fallback)
+DEFAULT_TITAN_ID = "titan"   # fresh-install default (fleet T1/T2/T3 set TITAN_ID
+                             # explicitly via systemd, so this only names a NEW user's Titan)
 
 
 def genesis_record_path(install_root: Path) -> Path:

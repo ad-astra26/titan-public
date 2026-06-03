@@ -126,7 +126,7 @@ def load_ceremony_inputs(*, skip_onchain: bool) -> dict:
     on-chain birth (devnet/mainnet) we hard-fail if the Maker pubkey or the
     constitution is absent rather than mint an NFT with a placeholder identity.
     """
-    name, maker, titan_id = "Titan", "", "T1"
+    name, maker, titan_id = "Titan", "", "titan"
     try:
         from titan_hcl.config_loader import load_titan_config
         cfg = load_titan_config()
@@ -134,7 +134,7 @@ def load_ceremony_inputs(*, skip_onchain: bool) -> dict:
         maker = (net.get("maker_pubkey") or "").strip()
         gen = cfg.get("genesis", {}) or {}
         name = (gen.get("titan_name") or cfg.get("titan_id") or "Titan").strip()
-        titan_id = (cfg.get("titan_id") or gen.get("titan_id") or "T1").strip()
+        titan_id = (cfg.get("titan_id") or gen.get("titan_id") or "titan").strip()
     except Exception as e:
         print(f"  [!] Could not load config for inputs: {e}")
 
@@ -180,7 +180,7 @@ def load_ceremony_inputs(*, skip_onchain: bool) -> dict:
     return {
         "name": name or "Titan",
         "maker": maker,
-        "titan_id": titan_id or "T1",
+        "titan_id": titan_id or "titan",
         "constitution_sha": constitution_sha,
         "birth_dna_sha": birth_dna_sha,
     }
@@ -195,15 +195,11 @@ def generate_keypair() -> tuple:
     return key_bytes, pubkey, kp
 
 
-def import_keypair(path: str) -> tuple:
-    """Import an existing keypair from a JSON file."""
-    from solders.keypair import Keypair
-    with open(path, "r") as f:
-        key_array = json.load(f)
-    key_bytes = bytes(key_array[:64])
-    kp = Keypair.from_bytes(key_bytes)
-    pubkey = str(kp.pubkey())
-    return key_bytes, pubkey, kp
+# NOTE: a genesis BIRTH always GENERATES a fresh keypair — never imports one
+# (INV-GEN-BIRTH). Only a freshly-generated key produces a clean 2-of-3 Shamir
+# split, so the Maker receives a real Shard-1. There is deliberately no
+# import-key birth path. (Importing an existing key is the resurrection side's
+# concern, not birth.)
 
 
 # ── Funding pause (INV-GEN-FUND) ──────────────────────────────────────────────
@@ -639,11 +635,10 @@ def save_genesis_record(record: dict):
 def main():
     parser = argparse.ArgumentParser(
         description="Titan Genesis Ceremony — Sovereign Birth Protocol")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--generate", action="store_true",
-                       help="Generate a new Ed25519 keypair for the Titan")
-    group.add_argument("--import-key", type=str, metavar="PATH",
-                       help="Import an existing keypair JSON file")
+    parser.add_argument("--generate", action="store_true", required=True,
+                        help="Generate the Titan's NEW Ed25519 keypair. A birth "
+                             "ALWAYS generates (never imports) so the 2-of-3 Shamir "
+                             "split yields a real Shard-1 for the Maker (INV-GEN-BIRTH).")
     parser.add_argument("--network", choices=["devnet", "mainnet"], default="mainnet",
                         help="Solana network for on-chain anchors "
                              "(Arweave + the Burn are mainnet-only).")
@@ -667,19 +662,14 @@ def main():
     print(f"  Birth-DNA SHA:    {inputs['birth_dna_sha'][:32] or '(none)'}")
     print(f"  Network:          {network if not skip_onchain else 'offline (--skip-onchain)'}")
 
-    # ─── Phase 2: Identity Creation ───
+    # ─── Phase 2: Identity Creation (ALWAYS generate — INV-GEN-BIRTH) ───
     print_phase(2, "Identity Creation")
-    if args.generate:
-        print("  Generating new Ed25519 keypair...")
-        key_bytes, titan_pubkey, keypair = generate_keypair()
-        with open("authority.json", "w") as f:
-            json.dump(list(key_bytes), f)
-        print(f"  Titan Public Address: {titan_pubkey}")
-        print("  Temporary keypair saved: authority.json")
-    else:
-        print(f"  Importing keypair from: {args.import_key}")
-        key_bytes, titan_pubkey, keypair = import_keypair(args.import_key)
-        print(f"  Titan Public Address: {titan_pubkey}")
+    print("  Generating the Titan's NEW Ed25519 keypair (birth always generates)...")
+    key_bytes, titan_pubkey, keypair = generate_keypair()
+    with open("authority.json", "w") as f:
+        json.dump(list(key_bytes), f)
+    print(f"  Titan Public Address: {titan_pubkey}")
+    print("  Temporary keypair saved: authority.json")
 
     # ─── Phase 3: Shamir Splitting + Verification ───
     print_phase(3, "Shamir Secret Splitting (2-of-3) + Exhaustive Verify")

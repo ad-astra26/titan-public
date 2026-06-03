@@ -209,8 +209,12 @@ def wait_for_health(port: int, *, deadline_s: int = HEALTH_TIMEOUT_S) -> bool:
 
 
 def run_systemd_phase(state: dict, install_root: Path, mode: Mode, *,
-                      default: bool, api_port: int = DEFAULT_API_PORT) -> list[Result]:
-    """Install + enable + first-start titan.service, then health-gate."""
+                      default: bool, prompter=None,
+                      api_port: int = DEFAULT_API_PORT) -> list[Result]:
+    """Install the systemd unit, ask the user whether to start now, then (if yes)
+    first-start + health-gate. The unit is ALWAYS installed by the installer — a
+    normal user can't hand-roll a system-supervised service — only the *start* is
+    the user's choice."""
     results: list[Result] = []
     titan_id = resolve_install_titan_id(install_root)
     user = getpass.getuser()
@@ -250,12 +254,22 @@ def run_systemd_phase(state: dict, install_root: Path, mode: Mode, *,
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(unit_text)
 
+    # Ask whether to start now (interactive only; --default auto-starts). The unit
+    # is enabled either way (boot-start); "start now" just adds `--now`.
+    start_now = True
+    if prompter is not None and not default and keypair.exists():
+        start_now = prompter.confirm(
+            "start_titan_now", "Your Titan is ready — start it now?", default_yes=True)
+
+    enable_step = (
+        (["systemctl", "enable", "--now", UNIT_NAME], "enable (start on boot) and start Titan now")
+        if start_now else
+        (["systemctl", "enable", UNIT_NAME], "enable Titan to start on boot (not starting now)"))
     steps = [
         (["cp", str(tmp), str(UNIT_DEST)], f"install the unit file to {UNIT_DEST}"),
         (["chmod", "644", str(UNIT_DEST)], "set unit perms to 0644"),
         (["systemctl", "daemon-reload"], "reload systemd so it sees the new unit"),
-        (["systemctl", "enable", "--now", UNIT_NAME],
-         "enable (start on boot) and start Titan now"),
+        enable_step,
     ]
     for cmd, explain in steps:
         rc = _sudo(cmd, explain=explain).returncode
@@ -266,14 +280,23 @@ def run_systemd_phase(state: dict, install_root: Path, mode: Mode, *,
                                      "Inspect the error above; ensure your user has sudo "
                                      "and systemd is the init system.")]
     tmp.unlink(missing_ok=True)
-    results.append(Result("systemd", "ok", f"{UNIT_NAME} installed + enabled + started"))
 
     if not keypair.exists():
+        results.append(Result("systemd", "ok", f"{UNIT_NAME} installed + enabled (boot-start)"))
         results.append(Result("health", "warn",
-                              "skipping health gate — no identity yet (unit will not start).",
+                              "skipping start/health — no identity yet (unit will not start).",
                               "Run genesis, then `sudo systemctl start titan.service`."))
         return results
 
+    if not start_now:
+        results.append(Result("systemd", "ok",
+                              f"{UNIT_NAME} installed + enabled (starts on boot); not started now"))
+        results.append(Result("start", "warn",
+                              "Titan not started (your choice) — start it anytime:",
+                              f"sudo systemctl start {UNIT_NAME}"))
+        return results
+
+    results.append(Result("systemd", "ok", f"{UNIT_NAME} installed + enabled + started"))
     cprint(f"  First-start health gate — polling http://127.0.0.1:{api_port}/health "
            f"(up to {HEALTH_TIMEOUT_S}s)…", role="text_strong")
     if wait_for_health(api_port):

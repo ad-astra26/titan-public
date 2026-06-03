@@ -147,7 +147,10 @@ class ProceduralArtGen:
 
         iterations = max(3, min(6, 1 + int(total_nodes / 50)))
         thickness = max(1, min(int(10 * scale), int(beliefs_strength / 20 * scale)))
-        angle_spread = 15 + (int(tx_signature[-4:], 16) % 30)
+        # Hash the seed first so any input works (a base58 pubkey is NOT hex —
+        # int("…DihY", 16) raised ValueError during the genesis First Sight).
+        angle_spread = 15 + (
+            int(hashlib.md5(tx_signature.encode()).hexdigest()[-4:], 16) % 30)
 
         def draw_branch(x, y, angle, length, depth, current_thickness):
             if depth == 0:

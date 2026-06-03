@@ -138,4 +138,33 @@ def run_console_phase(state: dict, install_root: Path, *, user: str,
         results.append(Result("console", "warn",
                               f"unit started but :{port}/console/health not 200 yet",
                               f"Check: journalctl -u {UNIT_NAME} -n 50 --no-pager"))
+
+    # Chat-path connectivity: TC² talks to the Titan API (:7777). Verify the chat
+    # backend is reachable so the user can actually chat — not just load the UI.
+    # (A full LLM round-trip needs inference configured + the Titan running.)
+    if _titan_api_ok(api_base):
+        results.append(Result("console_chat", "ok",
+                              "chat backend reachable — TC² can talk to your Titan"))
+    else:
+        results.append(Result("console_chat", "warn",
+                              f"Titan API ({api_base}) not answering yet — chat works once the Titan is up",
+                              "If you chose not to start it now: sudo systemctl start titan.service"))
+
+    # Final guidance — where the user goes next to meet their Titan.
+    cprint("", role="text")
+    cprint("  ✔ Your Titan's Console (TC²) is ready.", role="success", bold=True)
+    cprint(f"     Open it →  http://{bind_host}:{port}", role="text_strong")
+    cprint("     Chat with your Titan there, and watch its identity, memory, and",
+           role="text_muted")
+    cprint("     growth. That console is your window into your sovereign Titan.",
+           role="text_muted")
     return results
+
+
+def _titan_api_ok(api_base: str) -> bool:
+    """True if the Titan API (the chat backend TC² talks to) answers /health."""
+    try:
+        with urllib.request.urlopen(f"{api_base}/health", timeout=5) as r:
+            return r.status == 200
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
