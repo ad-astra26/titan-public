@@ -52,10 +52,6 @@ OINB_POST_TYPE = "outer_inner_bridge"
 
 OUTER_RELEVANCE_FLOOR = 0.5
 OUTER_WINDOW_S = 72 * 3600
-# B3 (rFP X-post PART B / INV-XENG-3, 2026-06-03): a NON-followed author is
-# engageable only when relevance clears this high bar (standalone @mention; no
-# quote-tweet). Converts strong inbound signal the is_following gate discards.
-HIGH_RELEVANCE = 0.8
 INNER_TIMES_ENCOUNTERED_MIN = 5
 INNER_WINDOW_S = 14 * 86400
 CONCEPT_GT_DEDUP_S = 4 * 86400  # cross-archetype with GROUNDED_TODAY (§4.3.5)
@@ -310,23 +306,16 @@ class OuterInnerBridgeArchetype(ArchetypeBase):
         for r in rows:
             if str(r["id"]) in cited:
                 continue
+            if r["author"] not in followed:
+                continue
             if (r["author"] or "").lower() in cooldown:
                 continue
-            cr = followed.get(r["author"])
-            if cr:
-                d = dict(r)
-                d["bio"] = cr.get("bio", "")
-                d["content_excerpt"] = cr.get("last_tweet_text") or r["felt_summary"]
-                d["tweet_id"] = cr.get("last_tweet_id") or ""
-                out.append(d)
-            elif float(r["relevance"] or 0.0) >= HIGH_RELEVANCE:
-                # B3 (INV-XENG-3): non-followed but high-relevance → standalone
-                # @mention (no curated bio / source tweet to quote).
-                d = dict(r)
-                d["bio"] = ""
-                d["content_excerpt"] = r["felt_summary"]
-                d["tweet_id"] = ""
-                out.append(d)
+            d = dict(r)
+            d["bio"] = followed[r["author"]].get("bio", "")
+            d["content_excerpt"] = (followed[r["author"]].get("last_tweet_text")
+                                     or r["felt_summary"])
+            d["tweet_id"] = followed[r["author"]].get("last_tweet_id") or ""
+            out.append(d)
         return out
 
     def _vocab_felt_tensor(self, word: str) -> list[float] | None:

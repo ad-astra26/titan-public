@@ -51,6 +51,8 @@ def run_restore(
     verify_zk: bool = False,
     verify_only: bool = False,
     force: bool = False,
+    rpc_url: str | None = None,
+    das_rpc_url: str | None = None,
 ) -> int:
     """Drive the resurrection. Returns a process exit code (0 = success)."""
     section("Titan Resurrection — sovereign recovery")
@@ -91,10 +93,31 @@ def run_restore(
             cprint("Resurrection cancelled — no address entered.", role="warning")
             return 130
 
+    # ── Mainnet RPC for chain walk + identity (GenesisNFT) discovery. NOT a secret.
+    # A DAS-capable endpoint (Helius/Triton) is recommended — the default
+    # mainnet-beta RPC lacks the DAS API the wallet uses to discover the Genesis
+    # NFT, and serves the chain walk too, so one endpoint drives BOTH. Enter =
+    # engine default (config RPC; Shard-3 still recovers via its on-chain tx). ──
+    if not rpc_url and not shard1_file:
+        cprint("Enter a mainnet RPC URL for chain + identity discovery — a "
+               "DAS-capable provider (Helius/Triton) is recommended so GenesisNFT "
+               "discovery works (plain mainnet-beta lacks the DAS API). Press Enter "
+               "to use the engine default.", role="text_strong")
+        try:
+            entered = input("  Mainnet RPC URL [default]: ").strip()
+        except (EOFError, KeyboardInterrupt, OSError):
+            # No tty (piped / CI / captured stdin) → the RPC is optional, so fall
+            # back to the engine default rather than aborting the resurrection.
+            entered = ""
+        if entered:
+            rpc_url = entered
+            if not das_rpc_url:
+                das_rpc_url = entered
+
     res = _load_resurrection()
     args = SimpleNamespace(
         shard1=shard1, shard1_file=shard1_file, shard2_local=False,
-        titan_id=titan_id, titan_pubkey=titan_pubkey, das_rpc_url=None,
+        titan_id=titan_id, titan_pubkey=titan_pubkey, das_rpc_url=das_rpc_url,
     )
 
     try:
@@ -103,7 +126,7 @@ def run_restore(
         res.phase_2_3_restore(
             key_bytes, titan_pubkey, resolved_titan_id,
             install_root=str(install_root), manifest_path=manifest,
-            network=network, verify_zk=verify_zk, force=force)
+            network=network, verify_zk=verify_zk, force=force, rpc_url=rpc_url)
         res.phase_4_first_breath(
             key_bytes, titan_pubkey, resolved_titan_id,
             install_root=str(install_root), verify_only=verify_only)

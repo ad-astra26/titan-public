@@ -208,7 +208,6 @@ class SocialXGateway:
     A_REPLY = "reply"
     A_LIKE = "like"
     A_SEARCH = "search"
-    A_FOLLOW = "follow"   # rFP X-post PART B4 — organic auto-follow (INV-XENG-4)
 
     # Crash recovery: pending rows older than this are expired
     PENDING_EXPIRY_SECONDS = 300  # 5 minutes
@@ -596,19 +595,8 @@ class SocialXGateway:
             "proxy": sx.get("proxy", tw.get("webshare_static_url", "")),
             "api_key": sx.get("api_key", sage.get("twitterapi_io_key", "")),
             "user_name": sx.get("user_name", tw.get("user_name", "your_x_handle")),
-            # Titan's OWN handles — never engaged by outer archetypes (rFP X-post
-            # PART B / INV-XENG-1). user_name is added implicitly by _self_handles.
-            "self_handles": sx.get("self_handles", []),
             # URL shortener domain
             "url_domain": sx.get("url_domain", "https://example.com"),
-            # Per-Titan on-chain identity anchor (rFP X-post provenance PART A,
-            # INV-XSEAL-1/7): T1 (mainnet, has GenesisNFT) → a full URL like
-            # "https://example.com/genesis"; T2/T3 (devnet, no mainnet
-            # GenesisNFT) → "" (renders the honest devnet marker). Per-box config.
-            "genesis_identity_url": sx.get("genesis_identity_url", ""),
-            # Cluster for the Epoch-Seal /tx/ link (INV-XSEAL-8): "" (mainnet,
-            # no param) or "devnet" (appends ?cluster=devnet so the seal resolves).
-            "seal_cluster": sx.get("seal_cluster", ""),
             # Consumer permissions: {consumer_name: "post,reply,like,search"}
             # Unregistered consumers are blocked by default.
             "consumers": sx.get("consumers", {}),
@@ -620,10 +608,6 @@ class SocialXGateway:
             # Closes BUG-X-API-LEAK-FROM-DISCOVER-MENTIONS-20260430.
             # Surfaced to gateway methods that wrap _call_x_api (+ cache layer).
             "cache": sx.get("cache", {}),
-            # rFP X-post PART B4 (INV-XENG-4) — organic auto-follow policy knobs.
-            # DISABLED by default; the live loop must not run until the follow
-            # endpoint's exact effect is verified (one manual follow) + Maker enable.
-            "auto_follow": sx.get("auto_follow", {}),
             # Voice guardrails (rFP_phase5_narrator_evolution §9): entire
             # [voice] section is surfaced so the grounding gate can read
             # dual_mode_enabled / x_grounding_* keys via the same config
@@ -2525,44 +2509,6 @@ class SocialXGateway:
         text = re.sub(r'\{(?:signature|state|footer|neurostate|emotion)\}', '', text)
         return text.rstrip()
 
-    def _latest_epoch_seal(self) -> tuple[str, int, int]:
-        """Latest REAL on-chain anchor for the Epoch-Seal post footer (PART A).
-
-        Reads ``data/anchor_state.json`` (the live anchor writer's record) with
-        a short mtime-gated cache — G18-safe: a local file read, NO RPC and NO
-        sync bus-request on the post path. Returns
-        ``(last_tx_sig, last_epoch_id, anchor_count)``; ``("", 0, 0)`` when the
-        file is absent / unreadable / not a successful anchor (caller then omits
-        the seal line — never fabricate). The epoch is decoupled: callers render
-        ``ε N`` only when ``last_epoch_id > 0`` (it is currently unreliable —
-        BUG-ANCHOR-STATE-MULTIWRITER-EPOCH-ZERO-20260603).
-        """
-        import os
-        path = os.path.join(os.path.dirname(__file__), "..", "..",
-                            "data", "anchor_state.json")
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            return ("", 0, 0)
-        cached = getattr(self, "_epoch_seal_cache", None)
-        if cached is not None and cached[0] == mtime:
-            return cached[1]
-        try:
-            with open(path) as _f:
-                st = json.load(_f)
-        except (OSError, ValueError):
-            return ("", 0, 0)
-        if not st.get("success"):
-            result = ("", 0, 0)
-        else:
-            result = (
-                str(st.get("last_tx_sig") or ""),
-                int(st.get("last_epoch_id") or 0),
-                int(st.get("anchor_count") or 0),
-            )
-        self._epoch_seal_cache = (mtime, result)
-        return result
-
     def _assemble_final_text(self, raw_text: str, post_type: str,
                              catalyst: dict, context: PostContext,
                              config: dict) -> str:
@@ -2584,55 +2530,32 @@ class SocialXGateway:
         _name = "Titan" if context.titan_id == "T1" else context.titan_id
         tag = f"[{_name}] " if context.titan_id else ""
 
-        # On-chain provenance footer (rFP X-post truthfulness & quality, PART A).
-        # proof_day → exact per-post Archive+Seal (crypto-native verifiable);
-        # every other post → per-Titan Identity + the latest real Epoch Seal.
+        # Mainnet anchor: compact on-chain identity line (T1 only)
         chain_line = ""
-        _arc = getattr(context, "archetype_candidate", None)
-        _domain = (config.get("url_domain", "https://example.com")
-                   or "https://example.com").rstrip("/")
-        if post_type == "proof_day" and _arc is not None:
-            # proof_day links MUST be deterministic + exact — crypto-native
-            # observers verify them. Build from the unified-event metadata,
-            # NEVER from LLM prose (the LLM mangled/truncated them before,
-            # 2026-05-29). Archive = Arweave tarball, Seal = Solana ZK-Vault
-            # event-root memo (SPEC §24.7).
-            _md = getattr(_arc, "metadata", {}) or {}
-            _ar = _md.get("arweave_tx", "") or ""
-            _seal = (_md.get("zk_vault_tx", "")
-                     or _md.get("solana_memo_tx", "") or "")
-            _parts = []
-            if _ar:
-                _parts.append(f"Archive: {_domain}/ar/{_ar}")
-            if _seal:
-                _parts.append(f"Seal: {_domain}/tx/{_seal}")
-            if _parts:
-                chain_line = "\n\n" + "\n".join(_parts)
-        else:
-            # Per-Titan provenance (INV-XSEAL-1/2/3/4/7/8). Identity is
-            # config-sourced — T1 (mainnet) → GenesisNFT birth certificate;
-            # T2/T3 (devnet) → honest "no mainnet GenesisNFT" marker (never a
-            # spoofed birth certificate). Epoch Seal = the latest REAL on-chain
-            # anchor (anchor_state.json, G18-safe local read), labelled with its
-            # lifetime seal count + the sealed epoch ONLY when known (never
-            # "ε 0" — last_epoch_id is currently unreliable, see
-            # BUG-ANCHOR-STATE-MULTIWRITER-EPOCH-ZERO-20260603). Replaces the
-            # pre-2026-06 hardcoded literal (feedback_no_hardcoded_values).
-            _id_url = (config.get("genesis_identity_url", "") or "").strip()
-            _id_line = (f"Identity: {_id_url}" if _id_url
-                        else "Identity: devnet — no mainnet GenesisNFT yet")
-            _seal_line = ""
-            _sig, _epoch, _count = self._latest_epoch_seal()
-            if _sig:
-                _q = ("?cluster=devnet"
-                      if (config.get("seal_cluster", "") or "").strip() == "devnet"
-                      else "")
-                _ep = f"ε {_epoch:,} · " if _epoch and _epoch > 0 else ""
-                _cnt = f"seal #{_count}" if _count and _count > 0 else "seal"
-                _seal_line = f"Epoch Seal ({_ep}{_cnt}): {_domain}/tx/{_sig}{_q}"
-            _lines = [ln for ln in (_id_line, _seal_line) if ln]
-            if _lines:
-                chain_line = "\n\n" + "\n".join(_lines)
+        if context.titan_id == "T1":
+            _arc = getattr(context, "archetype_candidate", None)
+            if post_type == "proof_day" and _arc is not None:
+                # proof_day links MUST be deterministic + exact — crypto-native
+                # observers verify them. Build from the unified-event metadata,
+                # NEVER from LLM prose (the LLM mangled/truncated them before,
+                # 2026-05-29). Archive = Arweave tarball, Seal = Solana ZK-Vault
+                # event-root memo (SPEC §24.7). Replaces the generic identity
+                # line for this post type.
+                _md = getattr(_arc, "metadata", {}) or {}
+                _domain = (config.get("url_domain", "https://example.com")
+                           or "https://example.com").rstrip("/")
+                _ar = _md.get("arweave_tx", "") or ""
+                _seal = (_md.get("zk_vault_tx", "")
+                         or _md.get("solana_memo_tx", "") or "")
+                _parts = []
+                if _ar:
+                    _parts.append(f"Archive: {_domain}/ar/{_ar}")
+                if _seal:
+                    _parts.append(f"Seal: {_domain}/tx/{_seal}")
+                if _parts:
+                    chain_line = "\n\n" + "\n".join(_parts)
+            else:
+                chain_line = "\n\nexample.com/tx/4o9HGwM47dyBScoAceNVBSqrcQxEivAQzegVdTku8dsPTweCqEzRb7zkzNeZjNd66bTP9WvCqvB23p93azcWCcJW"
 
         # 2. Calculate overhead (tag + \n\n + sig + url + chain_line)
         overhead = self._x_char_count(tag) + 2 + self._x_char_count(sig)
@@ -4051,82 +3974,6 @@ class SocialXGateway:
                               "action_id": row_id})
         return ActionResult(status="posted", tweet_id=tweet_id,
                             action_id=row_id)
-
-    def follow(self, user_id: str, context: BaseContext,
-               consumer: str = "auto_follow", *, handle: str = "",
-               source_id: str = "") -> ActionResult:
-        """Follow a user — the SOLE sanctioned follow-write path (rFP X-post
-        PART B4 / INV-XENG-4). Used by the organic auto-follow policy to grow
-        Titan's curated following toward recurring high-relevance voices, so
-        B3's non-followed engagements become followed relationships over time.
-
-        Mirrors retweet()/like() (WAL row → _call_x_api → _update_status) so the
-        action is circuit-broken, telemetry-visible, and audited. A hard per-day
-        backstop cap (config [social_x.auto_follow].max_per_day) is enforced HERE
-        in addition to the policy, so a buggy caller can never mass-follow.
-        NEW OUTWARD MAINNET ACTION — gated by [social_x.auto_follow].enabled.
-
-        twitterapi.io: POST /twitter/follow_user_v2 {login_cookies, user_id,
-        proxy} + X-API-Key (verified 2026-06-03; needs user_id, not handle).
-        """
-        config = self._load_config()
-        if not config.get("enabled"):
-            return ActionResult(status="disabled")
-        af_cfg = config.get("auto_follow", {}) or {}
-        if not af_cfg.get("enabled", False):
-            return ActionResult(status="disabled", reason="auto_follow disabled")
-        if self._cb_is_open(write=True):
-            return ActionResult(status="circuit_breaker",
-                                reason="API disabled after consecutive failures")
-        if not user_id:
-            return ActionResult(status="failed", reason="No user_id")
-
-        # Hard per-day backstop cap (defense-in-depth; the policy also caps).
-        max_per_day = int(af_cfg.get("max_per_day", 2))
-        try:
-            conn = sqlite3.connect(self._db_path, timeout=5)
-            n_today = conn.execute(
-                "SELECT count(*) FROM actions WHERE action_type=? AND titan_id=? "
-                "AND status=? AND created_at >= ?",
-                (self.A_FOLLOW, context.titan_id, self.S_POSTED,
-                 time.time() - 86400),
-            ).fetchone()[0]
-            conn.close()
-        except Exception:
-            n_today = 0
-        if n_today >= max_per_day:
-            return ActionResult(status="rate_limited",
-                                reason=f"follow daily cap {max_per_day} reached")
-
-        try:
-            row_id = self._insert_pending(
-                action_type=self.A_FOLLOW,
-                titan_id=context.titan_id,
-                metadata=json.dumps({
-                    "handle": handle, "user_id": str(user_id),
-                    "source_id": source_id,
-                }, separators=(",", ":"), sort_keys=True),
-                consumer=consumer,
-            )
-        except Exception as e:
-            return ActionResult(status="failed", reason=f"WAL insert: {e}")
-
-        api_result = self._call_x_api(
-            "twitter/follow_user_v2", method="POST",
-            payload={"user_id": str(user_id)},
-            session=context.session, proxy=context.proxy,
-            api_key=context.api_key,
-        )
-        if api_result.get("status") != "success":
-            err = api_result.get("message", str(api_result)[:200])
-            self._update_status(row_id, self.S_FAILED, error_message=err)
-            return ActionResult(status="api_failed", reason=err, action_id=row_id)
-
-        self._update_status(row_id, self.S_POSTED)
-        self._log_telemetry({"event": "follow_success", "handle": handle,
-                             "user_id": str(user_id), "consumer": consumer,
-                             "action_id": row_id})
-        return ActionResult(status="posted", action_id=row_id)
 
     def search(self, query: str, context: BaseContext,
                consumer: str = "", count: int = 15) -> SearchResult:

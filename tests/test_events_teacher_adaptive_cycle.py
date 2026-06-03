@@ -1,18 +1,14 @@
-"""Tests for Events Teacher adaptive 3-source cycle.
+"""Tests for Events Teacher adaptive 3-source cycle (2026-04-30 Maker design).
 
-Original design (2026-04-30): 3 sources (follower/vocab/wide) tried in
-priority order = sum(scores over last N cycles); +1 if stored ≥ land_threshold
-else −1; ALL fetched every cycle (order only).
+Cycle behavior:
+  - 3 sources tried in priority order: follower / vocab / wide
+  - Priority = sum(scores) over last N cycles, sort desc + lex tiebreak
+  - +1 if stored events ≥ land_threshold from this source, else -1
+  - All sources fetched per cycle (single LLM batch downstream)
+  - Wide source ALWAYS in cycle (echo chamber mitigation)
 
-C3 conversion-anchored rewrite (rFP_x_post_onchain_provenance_honesty Part C,
-Maker-ratified 2026-06-03): the score now changes fetch VOLUME, not just order.
-  - REWARD = post CONVERSION (joined fe_id → felt_experiences.source) over a
-    trailing window: +2 if converted ≥1, else −1.
-  - GATE: fetch a source only if score ≥ gate_threshold(0) OR exploration-due.
-  - SCALE: converter → full topic_search_count; explore-probe → scale_floor.
-  - Exploration floor: every source re-probed ≥1× per explore_cycles windows
-    (replaces the old unconditional 'wide always fetched' — echo-chamber
-    mitigation is now the floor, not a blanket fetch).
+Closes BUG-EVENTS-TEACHER-95-PERCENT-EMPTY: shifts content discovery
+from stale follower-timelines to vocab-driven + curated wide-net topics.
 """
 import json
 import sqlite3
@@ -23,8 +19,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from titan_hcl.logic.events_teacher import (
-    EventsTeacher, EventsTeacherDB, _resolve_fe_id)
+from titan_hcl.logic.events_teacher import EventsTeacher, EventsTeacherDB
 
 
 @pytest.fixture
@@ -191,208 +186,63 @@ def test_get_grounded_vocab_filters_short_words(teacher, monkeypatch):
     assert "consciousness" in terms or "emergence" in terms
 
 
-# ── C3 — fe_id resolver (Gap ①: heterogeneous metadata) ───────────────
+# ── Adaptive cycle fetch (priority sort + tag preservation) ───────────
 
-def test_resolve_fe_id_bare_int():
-    assert _resolve_fe_id('{"source_id": "1607", "fe_id": "1607"}') == 1607
-
-
-def test_resolve_fe_id_fea_prefix():
-    """outer_rumination stores 'feA:891' — strip the pool namespace."""
-    assert _resolve_fe_id('{"source_id": "feA:891"}') == 891
-
-
-def test_resolve_fe_id_amplify_and_outer_keys():
-    assert _resolve_fe_id('{"amplify_source_id": "1876"}') == 1876
-    assert _resolve_fe_id('{"outer_id": 1612, "source_id": "1612"}') == 1612
-
-
-def test_resolve_fe_id_non_fe_namespaces_return_none():
-    """mentionC:/livetest: source_ids are NOT felt experiences."""
-    assert _resolve_fe_id('{"source_id": "mentionC:2061027167832568021"}') is None
-    assert _resolve_fe_id('{"source_id": "livetest:2060722172016890084"}') is None
-
-
-def test_resolve_fe_id_missing_or_malformed():
-    assert _resolve_fe_id("") is None
-    assert _resolve_fe_id(None) is None
-    assert _resolve_fe_id("{not json") is None
-    assert _resolve_fe_id('{"archetype": "amplify"}') is None
-    # dict (already-parsed) also accepted
-    assert _resolve_fe_id({"fe_id": 42}) == 42
-
-
-# ── C3 — conversion-score join (REWARD) ───────────────────────────────
-
-def _seed_social_x(path: str):
-    """Minimal social_x.db with the actions columns the join reads."""
-    conn = sqlite3.connect(path)
-    conn.execute(
-        "CREATE TABLE actions (id INTEGER PRIMARY KEY, action_type TEXT, "
-        "status TEXT, post_type TEXT, created_at REAL, posted_at REAL, "
-        "metadata TEXT)")
-    conn.commit()
-    conn.close()
-
-
-def _add_action(path, post_type, metadata, status="verified", age_s=3600.0):
-    conn = sqlite3.connect(path)
-    now = time.time()
-    conn.execute(
-        "INSERT INTO actions (action_type, status, post_type, created_at, "
-        "posted_at, metadata) VALUES ('post', ?, ?, ?, ?, ?)",
-        (status, post_type, now - age_s, now - age_s, json.dumps(metadata)))
-    conn.commit()
-    conn.close()
-
-
-def _add_fe(db: EventsTeacherDB, fe_id: int, source: str, age_s: float = 3600.0):
-    """Insert a felt_experiences row with a fixed id + source."""
-    conn = db._connect()
-    conn.execute(
-        "INSERT INTO felt_experiences (id, titan_id, source, author, topic, "
-        "felt_summary, created_at) VALUES (?, 'T1', ?, 'a', 't', 's', ?)",
-        (fe_id, source, time.time() - age_s))
-    conn.commit()
-    conn.close()
-
-
-def test_conversion_score_converter_vs_waste(temp_db, tmp_path):
-    """vocab converts (+2); wide stores but never converts (−1)."""
-    sx = str(tmp_path / "social_x.db")
-    _seed_social_x(sx)
-    # felt experiences: vocab fe #10 (will convert), wide fe #20 (won't)
-    _add_fe(temp_db, 10, "topic_vocab")
-    _add_fe(temp_db, 20, "topic_wide")
-    _add_fe(temp_db, 30, "follower_timeline")
-    # a posted world_mirror converts the vocab fe; nothing cites the wide fe
-    _add_action(sx, "world_mirror", {"source_id": "10", "fe_id": "10"})
-    scores = temp_db.get_source_conversion_scores("T1", window_s=172800.0,
-                                                   social_db_path=sx)
-    assert scores["topic_vocab"]["converted"] == 1
-    assert scores["topic_vocab"]["score"] == 2
-    assert scores["topic_wide"]["converted"] == 0
-    assert scores["topic_wide"]["stored"] == 1
-    assert scores["topic_wide"]["score"] == -1        # stored-but-unconverted
-    assert scores["follower_timeline"]["score"] == -1  # nothing converted
-
-
-def test_conversion_score_window_excludes_old_posts(temp_db, tmp_path):
-    """A conversion older than the window does not count."""
-    sx = str(tmp_path / "social_x.db")
-    _seed_social_x(sx)
-    _add_fe(temp_db, 11, "topic_vocab", age_s=10 * 86400)
-    _add_action(sx, "outer_rumination", {"source_id": "feA:11"},
-                age_s=10 * 86400)   # 10 days old
-    scores = temp_db.get_source_conversion_scores("T1", window_s=172800.0,
-                                                   social_db_path=sx)
-    assert scores["topic_vocab"]["converted"] == 0
-    assert scores["topic_vocab"]["score"] == -1
-
-
-def test_conversion_score_ignores_non_fe_and_failed(temp_db, tmp_path):
-    """mention-sourced + failed posts never credit a paid cycle source."""
-    sx = str(tmp_path / "social_x.db")
-    _seed_social_x(sx)
-    _add_fe(temp_db, 12, "topic_vocab")
-    _add_action(sx, "outer_rumination",
-                {"source_id": "mentionC:99"})            # non-fe → ignored
-    _add_action(sx, "world_mirror", {"source_id": "12"},
-                status="failed")                          # failed → ignored
-    scores = temp_db.get_source_conversion_scores("T1", window_s=172800.0,
-                                                   social_db_path=sx)
-    assert scores["topic_vocab"]["converted"] == 0
-
-
-# ── C3 — GATE + SCALE + exploration floor ─────────────────────────────
-
-def _fetch_stub(teacher, captured):
-    """Stub fetchers; capture the `count` passed to topic searches."""
-    teacher._fetch_follower_timelines = lambda c: (
-        [{"source": "follower_timeline"}], 1)
-
-    def _topic(q, c, s, count=None):
-        captured[s] = count
-        return ([{"source": s}], 1)
-    teacher._fetch_topic_search = _topic
+def test_priority_sort_desc_by_score(teacher, temp_db):
+    """Highest score first, ties broken lexically."""
+    teacher._db = temp_db
+    # Vocab score = +5, follower = +2, wide = +5 (tie with vocab)
+    for _ in range(5):
+        temp_db.record_source_outcome("T1", "vocab", +1, 1, 1, 1)
+        temp_db.record_source_outcome("T1", "wide", +1, 1, 1, 1)
+    for _ in range(2):
+        temp_db.record_source_outcome("T1", "follower", +1, 1, 1, 1)
+    # Stub all fetchers to return empty
+    teacher._fetch_follower_timelines = lambda c: ([], 0)
+    teacher._fetch_topic_search = lambda q, c, s: ([], 0)
     teacher._compose_dynamic_query = lambda c: "vocab_query"
+    teacher._compose_wide_query = lambda c: "wide_query"
+    items, results = teacher._run_adaptive_cycle_fetch("T1", {})
+    # Tie-break: vocab beats wide alphabetically
+    priorities = list(results.keys())
+    assert priorities[0] in ("vocab", "wide")
+    # Follower should be last (lower score)
+    assert priorities[-1] == "follower"
+
+
+def test_cold_start_default_priority(teacher):
+    """No history → all sources fetched; priorities are score=0 default."""
+    teacher._fetch_follower_timelines = lambda c: ([{"source": "follower_timeline"}], 1)
+    teacher._fetch_topic_search = lambda q, c, s: (
+        [{"source": s}] if q else [], 1 if q else 0)
+    teacher._compose_dynamic_query = lambda c: "consciousness OR emergence"
+    teacher._compose_wide_query = lambda c: "#AI OR #consciousness"
+    items, results = teacher._run_adaptive_cycle_fetch("T1", {})
+    assert len(results) == 3
+    assert "follower" in results
+    assert "vocab" in results
+    assert "wide" in results
+    # 3 fetches × 1 X API each
+    total_calls = sum(r.get("api_calls", 0) for r in results.values())
+    assert total_calls == 3
+
+
+def test_cycle_items_tagged_with_source(teacher):
+    """Items returned must have `source` field set so scoring works."""
+    teacher._fetch_follower_timelines = lambda c: (
+        [{"source": "follower_timeline", "text": "f1"}], 1)
+    teacher._fetch_topic_search = lambda q, c, s: (
+        [{"source": s, "text": "t1"}], 1) if q else ([], 0)
+    teacher._compose_dynamic_query = lambda c: "consciousness"
     teacher._compose_wide_query = lambda c: "#AI"
+    items, results = teacher._run_adaptive_cycle_fetch("T1", {})
+    sources = {i["source"] for i in items}
+    assert "follower_timeline" in sources
+    assert "topic_vocab" in sources
+    assert "topic_wide" in sources
 
 
-def test_cold_start_explore_floor_fetches_all(teacher, temp_db):
-    """No history → every source is exploration-due → all 3 fetched."""
-    teacher._db = temp_db
-    cap = {}
-    _fetch_stub(teacher, cap)
-    items, results = teacher._run_adaptive_cycle_fetch("T1", {}, window_number=1)
-    assert set(results.keys()) == {"follower", "vocab", "wide"}
-    assert sum(r.get("api_calls", 0) for r in results.values()) == 3
-    assert all(not r["gated"] for r in results.values())
-
-
-def test_gate_skips_nonconverter_with_recent_probe(teacher, temp_db):
-    """wide scores −1 AND was probed recently → GATED (call eliminated)."""
-    teacher._db = temp_db
-    # conversion: vocab/follower convert (+2), wide does not (−1)
-    teacher._db.get_source_conversion_scores = lambda titan_id, window_s=0: {
-        "follower_timeline": {"converted": 2, "stored": 5, "score": 2},
-        "topic_vocab": {"converted": 1, "stored": 4, "score": 2},
-        "topic_wide": {"converted": 0, "stored": 6, "score": -1},
-    }
-    # all probed at window 9; current window 10 → wide NOT explore-due (E=3)
-    teacher._db.get_last_fetched_windows = lambda titan_id: {
-        "follower": 9, "vocab": 9, "wide": 9}
-    cap = {}
-    _fetch_stub(teacher, cap)
-    items, results = teacher._run_adaptive_cycle_fetch("T1", {}, window_number=10)
-    assert results["wide"]["gated"] is True
-    assert results["wide"]["api_calls"] == 0           # call eliminated
-    assert results["vocab"]["gated"] is False
-    assert results["follower"]["gated"] is False
-    # 2 paid calls this cycle instead of 3
-    assert sum(r.get("api_calls", 0) for r in results.values()) == 2
-
-
-def test_scale_converter_full_explore_probe_floor(teacher, temp_db):
-    """Converter fetched at full count; an explore-due gated source at floor."""
-    teacher._db = temp_db
-    teacher._db.get_source_conversion_scores = lambda titan_id, window_s=0: {
-        "follower_timeline": {"converted": 0, "stored": 0, "score": -1},
-        "topic_vocab": {"converted": 3, "stored": 5, "score": 2},   # converter
-        "topic_wide": {"converted": 0, "stored": 6, "score": -1},   # waste
-    }
-    # wide last probed at window 1; current 10 → explore-due (>=E) → probed at floor
-    teacher._db.get_last_fetched_windows = lambda titan_id: {
-        "follower": 9, "vocab": 9, "wide": 1}
-    cap = {}
-    _fetch_stub(teacher, cap)
-    cfg = {"events_teacher": {"topic_search_count": 10},
-           "social_x": {"auto_cycle": {"scale_floor": 3, "explore_cycles": 3}}}
-    items, results = teacher._run_adaptive_cycle_fetch("T1", cfg, window_number=10)
-    assert cap["topic_vocab"] == 10        # converter → full
-    assert cap["topic_wide"] == 3          # explore probe → floor
-    assert results["wide"]["explore_due"] is True
-
-
-def test_gate_threshold_zero_passes_cold(teacher, temp_db):
-    """gate_threshold=0: a score-0 source would pass; −1 needs the floor."""
-    teacher._db = temp_db
-    teacher._db.get_source_conversion_scores = lambda titan_id, window_s=0: {
-        "follower_timeline": {"converted": 0, "stored": 0, "score": -1},
-        "topic_vocab": {"converted": 0, "stored": 0, "score": -1},
-        "topic_wide": {"converted": 0, "stored": 0, "score": -1},
-    }
-    # everyone probed last window → none explore-due → all −1 < 0 → all gated
-    teacher._db.get_last_fetched_windows = lambda titan_id: {
-        "follower": 9, "vocab": 9, "wide": 9}
-    cap = {}
-    _fetch_stub(teacher, cap)
-    items, results = teacher._run_adaptive_cycle_fetch("T1", {}, window_number=10)
-    assert all(r["gated"] for r in results.values())   # 0 paid calls
-    assert sum(r.get("api_calls", 0) for r in results.values()) == 0
-
-
-# ── C3 — outcome recording (conversion score + window_number) ─────────
+# ── Outcome scoring (post-distillation) ───────────────────────────────
 
 class _FakeEvent:
     def __init__(self, source: str, relevance: float):
@@ -400,35 +250,49 @@ class _FakeEvent:
         self.relevance = relevance
 
 
-def test_record_outcomes_persists_conversion_score(teacher, temp_db):
-    """The recorded score is the conversion score carried in cycle_results."""
+def test_record_outcomes_lands_correct_source(teacher, temp_db):
+    """events with source='topic_vocab' + relevance>=0.3 = vocab lands +1."""
     teacher._db = temp_db
-    teacher._window_count = 7
     cycle_results = {
-        "vocab": {"items_fetched": 3, "api_calls": 1, "query": "v", "score": 2},
-        "wide": {"items_fetched": 0, "api_calls": 0, "query": "", "score": -1},
+        "follower": {"items_fetched": 5, "api_calls": 1, "query": "f"},
+        "vocab": {"items_fetched": 3, "api_calls": 1, "query": "v"},
+        "wide": {"items_fetched": 4, "api_calls": 1, "query": "w"},
     }
-    events = [_FakeEvent("topic_vocab", 0.6), _FakeEvent("topic_vocab", 0.2)]
-    teacher._record_adaptive_cycle_outcomes("T1", events, cycle_results, {})
-    # priority-sum reads back the persisted +2 / −1
+    events = [
+        _FakeEvent("topic_vocab", 0.6),  # vocab: lands
+        _FakeEvent("topic_vocab", 0.5),
+        _FakeEvent("follower_timeline", 0.1),  # follower: rel<0.3 → not stored
+        _FakeEvent("topic_wide", 0.4),  # wide: lands
+    ]
+    teacher._record_adaptive_cycle_outcomes(
+        "T1", events, cycle_results, {"land_threshold_events": 1})
     scores = temp_db.get_source_priority_scores("T1")
-    assert scores["vocab"] == 2
-    assert scores["wide"] == -1
-    # this-cycle stored count (rel≥0.3) recorded for audit
-    assert cycle_results["vocab"]["items_stored"] == 1
-    # window_number persisted; only the fetched (vocab) row counts as a probe
-    last = temp_db.get_last_fetched_windows("T1")
-    assert last.get("vocab") == 7
-    assert "wide" not in last       # items_fetched=0 → not a probe
+    assert scores["vocab"] == +1
+    assert scores["wide"] == +1
+    assert scores["follower"] == -1  # 0 stored events
+    # cycle_results enriched in place
+    assert cycle_results["vocab"]["items_stored"] == 2
+    assert cycle_results["follower"]["items_stored"] == 0
 
 
-def test_last_fetched_windows_tracks_only_probes(temp_db):
-    """get_last_fetched_windows ignores 0-fetch (gated) rows."""
-    temp_db.record_source_outcome("T1", "vocab", 2, items_fetched=5,
-                                  items_stored=3, api_calls_used=1,
-                                  window_number=4)
-    temp_db.record_source_outcome("T1", "vocab", -1, items_fetched=0,
-                                  items_stored=0, api_calls_used=0,
-                                  window_number=8)   # gated, later window
-    last = temp_db.get_last_fetched_windows("T1")
-    assert last["vocab"] == 4    # the gated window-8 row is NOT a probe
+def test_land_threshold_higher_blocks_low_yield(teacher, temp_db):
+    """land_threshold=2 means 1 stored event = -1 (didn't quite land)."""
+    teacher._db = temp_db
+    events = [_FakeEvent("topic_vocab", 0.5)]  # 1 stored from vocab
+    cycle_results = {"vocab": {"items_fetched": 1, "api_calls": 1, "query": ""}}
+    teacher._record_adaptive_cycle_outcomes(
+        "T1", events, cycle_results, {"land_threshold_events": 2})
+    scores = temp_db.get_source_priority_scores("T1")
+    assert scores["vocab"] == -1  # 1 < 2 threshold
+
+
+# ── Echo chamber mitigation (wide always in cycle) ────────────────────
+
+def test_wide_source_always_fetched(teacher):
+    """Even when scores show wide deeply negative, it's still in the cycle."""
+    teacher._fetch_follower_timelines = lambda c: ([], 1)
+    teacher._fetch_topic_search = lambda q, c, s: ([], 1) if q else ([], 0)
+    teacher._compose_dynamic_query = lambda c: "vocab_query"
+    teacher._compose_wide_query = lambda c: "#AI"
+    items, results = teacher._run_adaptive_cycle_fetch("T1", {})
+    assert "wide" in results  # never skipped
