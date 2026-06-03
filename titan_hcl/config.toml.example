@@ -75,6 +75,11 @@ vault_program_id = "52an8WjtfxpkCqZZ1AYFkaDTGb4RyNFFD9VQRVdxcpJw"
 # Helius mainnet RPC for Photon ZK compression indexer
 helius_rpc_url = "https://devnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
 
+[genesis]
+# The Titan's name — anchored in the GenesisNFT at birth (≤32 chars). The install
+# wizard's identity phase collects this; the genesis ceremony reads it.
+titan_name = "YOUR_TITAN_NAME"
+
 [inference]
 hybrid_inference = true
 # Provider: "openrouter", "venice", "venice_session", "ollama_cloud", or "custom"

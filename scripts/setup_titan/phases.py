@@ -32,6 +32,7 @@ from .comms import run_comms_phase
 from .console import run_console_phase
 from .config_seed import run_config_seed_phase
 from .inference import run_inference_phase
+from .genesis_inputs import run_genesis_inputs_phase
 from .genesis_runner import run_genesis_phase
 from .provision import run_provision_phase
 from .resurrect import run_resurrect_phase
@@ -378,6 +379,9 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
          lambda: run_inference_phase(default=default, install_root=install_root, prompter=prompter)),
         (PhaseDef("phase_5", "Comms (Telegram / X)", "W1.d", None),
          lambda: run_comms_phase(default=default, state=state, prompter=prompter)),
+        (PhaseDef("phase_identity", "Genesis identity (name · Maker · directives)", "W1.f", None),
+         lambda: run_genesis_inputs_phase(install_root, mode, state,
+                                          prompter=prompter, default=default)),
         (PhaseDef("phase_6", "Genesis ceremony", "W1.b", None),
          lambda: ([Result("genesis", "warn", "--skip-genesis requested.")] if skip_genesis
                   else run_genesis_phase(install_root, mode, venv_python=venv_python(install_root)))),

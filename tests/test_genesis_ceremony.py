@@ -10,8 +10,9 @@ import sys
 
 import pytest
 
-# genesis_ceremony lives in scripts/ — import it directly.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+# genesis_ceremony lives in scripts/ — append (NOT insert-at-0): scripts/ has a
+# titan_hcl.py that would shadow the real titan_hcl package (conftest imports it).
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 gc = importlib.import_module("genesis_ceremony")
 
 from titan_hcl.utils.shamir import (  # noqa: E402
