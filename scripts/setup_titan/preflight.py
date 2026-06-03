@@ -185,12 +185,6 @@ def run_preflight(install_root: Path, mode: Mode | None) -> list[Result]:
         check_python(),
         check_cmd("git", "sudo apt install git"),
         check_cmd("rsync", "sudo apt install rsync"),
-        # xdelta3 powers incremental backup diffs AND sovereign restore: applying
-        # an incremental on resurrection HARD-FAILS without it ("xdelta3 binary
-        # unavailable" → restore halt). Not needed for first boot, so warn (the
-        # Titan runs; backups/restore need it) — surfaced now to avoid a silent
-        # halt weeks later. See diff_encoders/xdelta3.py + #35.
-        check_cmd("xdelta3", "sudo apt install xdelta3", severity_if_missing="warn"),
         check_sudo(),
     ]
     results += check_resources(install_root)
