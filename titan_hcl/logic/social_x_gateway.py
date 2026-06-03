@@ -597,14 +597,6 @@ class SocialXGateway:
             "user_name": sx.get("user_name", tw.get("user_name", "your_x_handle")),
             # URL shortener domain
             "url_domain": sx.get("url_domain", "https://example.com"),
-            # Per-Titan on-chain identity anchor (rFP X-post provenance PART A,
-            # INV-XSEAL-1/7): T1 (mainnet, has GenesisNFT) → a full URL like
-            # "https://example.com/genesis"; T2/T3 (devnet, no mainnet
-            # GenesisNFT) → "" (renders the honest devnet marker). Per-box config.
-            "genesis_identity_url": sx.get("genesis_identity_url", ""),
-            # Cluster for the Epoch-Seal /tx/ link (INV-XSEAL-8): "" (mainnet,
-            # no param) or "devnet" (appends ?cluster=devnet so the seal resolves).
-            "seal_cluster": sx.get("seal_cluster", ""),
             # Consumer permissions: {consumer_name: "post,reply,like,search"}
             # Unregistered consumers are blocked by default.
             "consumers": sx.get("consumers", {}),
@@ -2517,44 +2509,6 @@ class SocialXGateway:
         text = re.sub(r'\{(?:signature|state|footer|neurostate|emotion)\}', '', text)
         return text.rstrip()
 
-    def _latest_epoch_seal(self) -> tuple[str, int, int]:
-        """Latest REAL on-chain anchor for the Epoch-Seal post footer (PART A).
-
-        Reads ``data/anchor_state.json`` (the live anchor writer's record) with
-        a short mtime-gated cache — G18-safe: a local file read, NO RPC and NO
-        sync bus-request on the post path. Returns
-        ``(last_tx_sig, last_epoch_id, anchor_count)``; ``("", 0, 0)`` when the
-        file is absent / unreadable / not a successful anchor (caller then omits
-        the seal line — never fabricate). The epoch is decoupled: callers render
-        ``ε N`` only when ``last_epoch_id > 0`` (it is currently unreliable —
-        BUG-ANCHOR-STATE-MULTIWRITER-EPOCH-ZERO-20260603).
-        """
-        import os
-        path = os.path.join(os.path.dirname(__file__), "..", "..",
-                            "data", "anchor_state.json")
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            return ("", 0, 0)
-        cached = getattr(self, "_epoch_seal_cache", None)
-        if cached is not None and cached[0] == mtime:
-            return cached[1]
-        try:
-            with open(path) as _f:
-                st = json.load(_f)
-        except (OSError, ValueError):
-            return ("", 0, 0)
-        if not st.get("success"):
-            result = ("", 0, 0)
-        else:
-            result = (
-                str(st.get("last_tx_sig") or ""),
-                int(st.get("last_epoch_id") or 0),
-                int(st.get("anchor_count") or 0),
-            )
-        self._epoch_seal_cache = (mtime, result)
-        return result
-
     def _assemble_final_text(self, raw_text: str, post_type: str,
                              catalyst: dict, context: PostContext,
                              config: dict) -> str:
@@ -2576,55 +2530,32 @@ class SocialXGateway:
         _name = "Titan" if context.titan_id == "T1" else context.titan_id
         tag = f"[{_name}] " if context.titan_id else ""
 
-        # On-chain provenance footer (rFP X-post truthfulness & quality, PART A).
-        # proof_day → exact per-post Archive+Seal (crypto-native verifiable);
-        # every other post → per-Titan Identity + the latest real Epoch Seal.
+        # Mainnet anchor: compact on-chain identity line (T1 only)
         chain_line = ""
-        _arc = getattr(context, "archetype_candidate", None)
-        _domain = (config.get("url_domain", "https://example.com")
-                   or "https://example.com").rstrip("/")
-        if post_type == "proof_day" and _arc is not None:
-            # proof_day links MUST be deterministic + exact — crypto-native
-            # observers verify them. Build from the unified-event metadata,
-            # NEVER from LLM prose (the LLM mangled/truncated them before,
-            # 2026-05-29). Archive = Arweave tarball, Seal = Solana ZK-Vault
-            # event-root memo (SPEC §24.7).
-            _md = getattr(_arc, "metadata", {}) or {}
-            _ar = _md.get("arweave_tx", "") or ""
-            _seal = (_md.get("zk_vault_tx", "")
-                     or _md.get("solana_memo_tx", "") or "")
-            _parts = []
-            if _ar:
-                _parts.append(f"Archive: {_domain}/ar/{_ar}")
-            if _seal:
-                _parts.append(f"Seal: {_domain}/tx/{_seal}")
-            if _parts:
-                chain_line = "\n\n" + "\n".join(_parts)
-        else:
-            # Per-Titan provenance (INV-XSEAL-1/2/3/4/7/8). Identity is
-            # config-sourced — T1 (mainnet) → GenesisNFT birth certificate;
-            # T2/T3 (devnet) → honest "no mainnet GenesisNFT" marker (never a
-            # spoofed birth certificate). Epoch Seal = the latest REAL on-chain
-            # anchor (anchor_state.json, G18-safe local read), labelled with its
-            # lifetime seal count + the sealed epoch ONLY when known (never
-            # "ε 0" — last_epoch_id is currently unreliable, see
-            # BUG-ANCHOR-STATE-MULTIWRITER-EPOCH-ZERO-20260603). Replaces the
-            # pre-2026-06 hardcoded literal (feedback_no_hardcoded_values).
-            _id_url = (config.get("genesis_identity_url", "") or "").strip()
-            _id_line = (f"Identity: {_id_url}" if _id_url
-                        else "Identity: devnet — no mainnet GenesisNFT yet")
-            _seal_line = ""
-            _sig, _epoch, _count = self._latest_epoch_seal()
-            if _sig:
-                _q = ("?cluster=devnet"
-                      if (config.get("seal_cluster", "") or "").strip() == "devnet"
-                      else "")
-                _ep = f"ε {_epoch:,} · " if _epoch and _epoch > 0 else ""
-                _cnt = f"seal #{_count}" if _count and _count > 0 else "seal"
-                _seal_line = f"Epoch Seal ({_ep}{_cnt}): {_domain}/tx/{_sig}{_q}"
-            _lines = [ln for ln in (_id_line, _seal_line) if ln]
-            if _lines:
-                chain_line = "\n\n" + "\n".join(_lines)
+        if context.titan_id == "T1":
+            _arc = getattr(context, "archetype_candidate", None)
+            if post_type == "proof_day" and _arc is not None:
+                # proof_day links MUST be deterministic + exact — crypto-native
+                # observers verify them. Build from the unified-event metadata,
+                # NEVER from LLM prose (the LLM mangled/truncated them before,
+                # 2026-05-29). Archive = Arweave tarball, Seal = Solana ZK-Vault
+                # event-root memo (SPEC §24.7). Replaces the generic identity
+                # line for this post type.
+                _md = getattr(_arc, "metadata", {}) or {}
+                _domain = (config.get("url_domain", "https://example.com")
+                           or "https://example.com").rstrip("/")
+                _ar = _md.get("arweave_tx", "") or ""
+                _seal = (_md.get("zk_vault_tx", "")
+                         or _md.get("solana_memo_tx", "") or "")
+                _parts = []
+                if _ar:
+                    _parts.append(f"Archive: {_domain}/ar/{_ar}")
+                if _seal:
+                    _parts.append(f"Seal: {_domain}/tx/{_seal}")
+                if _parts:
+                    chain_line = "\n\n" + "\n".join(_parts)
+            else:
+                chain_line = "\n\nexample.com/tx/4o9HGwM47dyBScoAceNVBSqrcQxEivAQzegVdTku8dsPTweCqEzRb7zkzNeZjNd66bTP9WvCqvB23p93azcWCcJW"
 
         # 2. Calculate overhead (tag + \n\n + sig + url + chain_line)
         overhead = self._x_char_count(tag) + 2 + self._x_char_count(sig)
