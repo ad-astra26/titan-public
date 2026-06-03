@@ -349,6 +349,7 @@ def apply_event_components(
     arc_to_target: Callable[[str, str], str],
     arweave_fetch_skipped_sync: Optional[Callable[[str], bytes]] = None,
     verify_patch_hash: bool = True,
+    best_effort: bool = False,
 ) -> dict:
     """Unpack each component tarball and apply per-file diffs into target_dir.
 
@@ -368,13 +369,21 @@ def apply_event_components(
             logged (advisory) instead of raising — safe ONLY for a caller that
             has already authenticated each tarball against its on-chain arc
             (the sovereign restore, INV-MBR-4/12). Default True (strict).
+        best_effort: when True, a per-file APPLY failure (e.g. an xdelta3 patch
+            whose baseline_merkle_root doesn't match the on-disk source — a
+            genuinely unreplayable diff, as in a chain whose baseline diverged
+            from what the producer diffed against) is LOGGED + SKIPPED (the file
+            keeps its last-good / baseline bytes) instead of halting the whole
+            restore. The skipped arc_names are returned in result["skipped"].
+            This recovers the MAXIMUM restorable state from a partially-broken
+            chain — a degraded but real sovereign recovery. Default False (strict).
 
     Returns dict with {restored_files: int, errors: list[str], warnings:
-    list[str]}.
+    list[str], skipped: list[str]}.
 
-    Raises ValueError on apply failure — caller halts.
+    Raises ValueError on apply failure UNLESS best_effort (then skips the file).
     """
-    result = {"restored_files": 0, "errors": [], "warnings": []}
+    result = {"restored_files": 0, "errors": [], "warnings": [], "skipped": []}
 
     for component, tarball_bytes in components.items():
         with unpack_event_tarball(tarball_bytes) as unpacked:
@@ -423,11 +432,20 @@ def apply_event_components(
                             os.unlink(scratch_path)
                         except OSError:
                             pass
-                    raise ValueError(
+                    detail = (
                         f"{HALT_APPLY_FAILED}: component={component} "
                         f"arc_name={arc_name!r} event={unpacked.event_id!r} "
-                        f"diff_mode={diff_mode!r}: {e}"
-                    ) from e
+                        f"diff_mode={diff_mode!r}: {e}")
+                    if not best_effort:
+                        raise ValueError(detail) from e
+                    # best-effort: this diff is unreplayable (e.g. divergent
+                    # baseline). Keep target_path's last-good bytes + record the
+                    # skip; the file recovers to its most recent applicable state.
+                    logger.warning(
+                        "[restore] best-effort SKIP %s/%s: %s — keeping last-good "
+                        "bytes", component, arc_name, e)
+                    result["skipped"].append(f"{component}/{arc_name}")
+                    continue
                 result["restored_files"] += 1
     return result
 

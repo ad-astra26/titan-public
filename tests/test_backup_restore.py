@@ -820,3 +820,29 @@ def test_atomic_swap_missing_target_errors(tmp_path):
     )
     assert result["swapped"] is False
     assert any("does not exist" in e for e in result["errors"])
+
+
+def test_apply_event_components_best_effort_skips_unreplayable(tmp_path):
+    """An unreplayable per-file diff (a 'tail' with no baseline on disk — the same
+    failure shape as a divergent-baseline xdelta in a damaged chain) HARD-RAISES in
+    strict mode, but is SKIPPED + recorded in best_effort mode (file keeps last-good
+    bytes), recovering the MAXIMUM restorable state."""
+    out = tmp_path / "tc.tar.gz"
+    tail_dd = {
+        "diff_mode": "tail", "patch_bytes": b"APPEND", "prev_offset_bytes": 10,
+        "size_bytes": 16, "merkle_root": "aa" * 32, "encoder": "timechain_tail",
+    }
+    pack_event_tarball(
+        event_id="ev_be", event_type="incremental", component="timechain",
+        file_specs=[FileDiffSpec("idx.db", tail_dd)], output_path=str(out))
+    target = tmp_path / "scratch"
+    a2t = _arc_to_target(str(target))
+    # strict (default) → halts
+    with pytest.raises(ValueError, match="apply_failed"):
+        apply_event_components({"timechain": str(out)}, str(target), a2t,
+                               verify_patch_hash=False)
+    # best-effort → skips the unreplayable file, no raise, records it
+    res = apply_event_components({"timechain": str(out)}, str(target), a2t,
+                                 verify_patch_hash=False, best_effort=True)
+    assert res["skipped"] == ["timechain/idx.db"]
+    assert res["restored_files"] == 0

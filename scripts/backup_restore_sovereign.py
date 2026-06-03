@@ -83,13 +83,14 @@ _TIER_COMPONENT = {"PT": "personality", "TC": "timechain", "SL": "soul"}
 
 @dataclass
 class ResurrectionResult:
-    status: str = "pending"          # "resurrected" | "halted"
+    status: str = "pending"          # "resurrected" | "resurrected_partial" | "halted"
     titan_id: str = ""
     events_total: int = 0
     events_applied: int = 0
     components_applied: int = 0
     halt_reason: Optional[str] = None
     errors: list = field(default_factory=list)
+    skipped_files: list = field(default_factory=list)  # best-effort: unreplayable diffs kept at last-good
     chain_head_sig: Optional[str] = None
     genesis_event_id: Optional[str] = None
     target_dir: Optional[str] = None
@@ -110,6 +111,7 @@ async def resurrect_from_chain(
     arc_to_target: ArcToTarget,
     scratch_dir: str,
     arweave_fetch_to_file: Optional[Callable[[str, str], Awaitable[bool]]] = None,
+    best_effort: bool = False,
     verbose: bool = True,
 ) -> ResurrectionResult:
     """Reconstruct a Titan's data/ from the on-chain v=3 backup chain alone.
@@ -376,8 +378,14 @@ async def resurrect_from_chain(
             # then redundant — and STALE for pre-2026-05-31 baselines (the live-log
             # pack race fixed in ed5f4d0c), so a mismatch is logged, not fatal.
             try:
-                apply_event_components(component_paths, scratch_dir, arc_to_target,
-                                       verify_patch_hash=False)
+                _ares = apply_event_components(
+                    component_paths, scratch_dir, arc_to_target,
+                    verify_patch_hash=False, best_effort=best_effort)
+                _sk = _ares.get("skipped") or []
+                if _sk:
+                    out.skipped_files.extend(f"{evt_short}:{s}" for s in _sk)
+                    log(f"  ⚠ best-effort: skipped {len(_sk)} unreplayable file(s) "
+                        f"in event {evt_short} (kept last-good bytes)")
             except Exception as e:
                 out.status = "halted"
                 out.halt_reason = HALT_APPLY_FAILED
@@ -392,9 +400,16 @@ async def resurrect_from_chain(
         log(f"[{idx + 1}/{len(apply_list)}] event {evt_short} ({ev.get('type')}) "
             f"applied ({', '.join(sorted(component_paths))})")
 
-    out.status = "resurrected"
-    log(f"✓ Resurrection complete — {out.events_applied} events, "
-        f"{out.components_applied} components → {scratch_dir}")
+    if out.skipped_files:
+        out.status = "resurrected_partial"
+        log(f"✓ Resurrection PARTIAL — {out.events_applied} events, "
+            f"{out.components_applied} components, "
+            f"{len(out.skipped_files)} file(s) kept at last-good (unreplayable "
+            f"diffs) → {scratch_dir}")
+    else:
+        out.status = "resurrected"
+        log(f"✓ Resurrection complete — {out.events_applied} events, "
+            f"{out.components_applied} components → {scratch_dir}")
     return out
 
 
@@ -422,6 +437,7 @@ def restore_body_from_chain(
     rpc_url: Optional[str] = None,
     network: str = "mainnet",
     commit: bool = False,
+    best_effort: bool = False,
     verbose: bool = True,
 ) -> ResurrectionResult:
     """Canonical sovereign body-restore (INV-MBR-12): rebuild `data/` from the
@@ -468,9 +484,12 @@ def restore_body_from_chain(
         # Streaming fetch-to-disk — constant memory for multi-hundred-MB tarballs
         # (the bytes seam above is the test/fallback path).
         arweave_fetch_to_file=_arweave_fetch_to_file,
+        best_effort=best_effort,
         verbose=verbose))
 
-    if result.status == "resurrected" and commit:
+    # Commit a full OR a best-effort partial recovery (the latter is still the
+    # maximum restorable state — the unreplayable files kept their last-good bytes).
+    if result.status in ("resurrected", "resurrected_partial") and commit:
         _atomic_swap_into_data(scratch_dir, install_root)
     return result
 
@@ -501,6 +520,12 @@ def main(argv: Optional[list] = None) -> int:
                    help="Materialize the bootable identity in RECOVERY observation mode "
                         "(no on-chain writes / backups / X on first boot) — the live "
                         "restore-test isolation guard. Implies --commit.")
+    p.add_argument("--best-effort", action="store_true",
+                   help="Recover the MAXIMUM restorable state from a partially-broken "
+                        "chain: an unreplayable per-file diff (e.g. a divergent baseline) "
+                        "is logged + SKIPPED (file keeps its last-good bytes) instead of "
+                        "halting. Status becomes 'resurrected_partial' with the skipped "
+                        "list. Use when a clean strict restore halts on chain damage.")
     args = p.parse_args(argv)
     if args.verify_only:
         args.commit = True  # a verify-only test must produce a bootable, comparable box
@@ -546,17 +571,26 @@ def main(argv: Optional[list] = None) -> int:
         result = restore_body_from_chain(
             key_bytes=key_bytes, titan_pubkey=titan_pubkey, titan_id=titan_id,
             install_root=install_root, scratch_dir=scratch_dir,
-            rpc_url=args.rpc_url, network=args.network, commit=args.commit)
+            rpc_url=args.rpc_url, network=args.network, commit=args.commit,
+            best_effort=args.best_effort)
     except Exception as e:
         _print(f"Sovereign restore error: {e}")
         return 1
 
-    if result.status != "resurrected":
+    if result.status not in ("resurrected", "resurrected_partial"):
         _print(f"HALTED: {result.halt_reason}")
         for e in result.errors[-5:]:
             _print(f"  · {e}")
         return 1
 
+    if result.status == "resurrected_partial":
+        _print(f"PARTIAL recovery: {result.events_applied} events applied; "
+               f"{len(result.skipped_files)} file(s) kept at last-good (unreplayable "
+               f"diffs — chain damage). This is the MAXIMUM restorable state.")
+        for s in result.skipped_files[:12]:
+            _print(f"  ⚠ kept-last-good: {s}")
+        if len(result.skipped_files) > 12:
+            _print(f"  … +{len(result.skipped_files) - 12} more")
     _print(f"Resurrected {result.events_applied} events into {scratch_dir}")
     if not args.commit:
         _print("Re-run with --commit to swap the reconstruction into data/.")
