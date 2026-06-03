@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 # is suppressed until the worker has finished in-process scaffolding.
 _WORKER_READY: bool = False
 
+# RFP_synthesis_spine_reads_real_data Phase B — process-lifetime ThoughtSidecar
+# (sqlite-WAL tx_hash→thought content), keyed by data_dir. Constructed lazily on
+# the first promotion; one persistent writer per memory_worker process.
+_THOUGHT_SIDECAR: dict = {}
+
 
 def _phase11_hb_loop(send_queue, name: str, stop_event: threading.Event,
                      state_writer) -> None:
@@ -1356,34 +1361,57 @@ def _handle_query(msg: dict, ctx: WorkerContext) -> None:
                         "chi_coherence": 0.3,
                     })
 
-                # TimeChain: each promoted node → declarative fork (permanent memory)
-                for node in candidates[:promoted]:
-                    _node_id = node.get("id", "?")
-                    _node_prompt = node.get("user_prompt", "")[:100]
-                    _node_response = node.get("agent_response", "")[:100]
-                    _send_msg(send_queue, bus.TIMECHAIN_COMMIT, name, "timechain", {
-                        "fork": "declarative",
-                        "thought_type": "declarative",
-                        "source": "memory_promotion",
-                        "content": {
-                            "event": "MEMORY_PROMOTED",
-                            "node_id": _node_id,
-                            "prompt_hash": __import__("hashlib").sha256(
-                                _node_prompt.encode()).hexdigest()[:16],
-                            "response_hash": __import__("hashlib").sha256(
-                                _node_response.encode()).hexdigest()[:16],
-                        },
-                        "significance": 0.5,
-                        "novelty": 0.6,
-                        "coherence": 0.5,
-                        "tags": ["memory_node", "promoted", "persistent"],
-                        "db_ref": f"memory_nodes:{_node_id}",
-                        "neuromods": {},
-                        "chi_available": 0.5,
-                        "attention": 0.5,
-                        "i_confidence": 0.5,
-                        "chi_coherence": 0.3,
-                    })
+                # TimeChain: each PROMOTED node → its ACT-R memory_type fork,
+                # with a DURABLE tx_hash link (RFP_synthesis_spine_reads_real_data
+                # Phase B). Fixes the prior `candidates[:promoted]` bug (anchored
+                # the FIRST-N candidates, not the actually-promoted set — the
+                # migrate loop above correctly iterates `promoted_nodes`). For each
+                # promoted node: build the canonical promotion-anchor payload + its
+                # DETERMINISTIC per-TX hash (computed the same way timechain_worker
+                # will → byte-identical), emit it, stamp the hash on the node, and
+                # write the real thought to the lock-free content sidecar (the
+                # chain envelope drops the per-TX content at seal; the deref reads
+                # the sidecar by this hash).
+                if promoted_nodes:
+                    from titan_hcl.synthesis.promotion_anchor import build_promotion_tx
+                    from titan_hcl.synthesis.thought_sidecar import ThoughtSidecar
+                    _data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+                    _sidecar = _THOUGHT_SIDECAR.get(_data_dir)
+                    if _sidecar is None:
+                        try:
+                            _sidecar = ThoughtSidecar(_data_dir)
+                            _THOUGHT_SIDECAR[_data_dir] = _sidecar
+                        except Exception as _sx:
+                            logger.warning(
+                                "[MemoryWorker] ThoughtSidecar init failed "
+                                "(promotion link degrades to emit-only): %s", _sx)
+                            _sidecar = None
+                    for _node, _intensity in promoted_nodes:
+                        _now = time.time()
+                        try:
+                            _payload, _tx_hash = build_promotion_tx(_node, now=_now)
+                        except Exception as _bx:
+                            logger.warning(
+                                "[MemoryWorker] build_promotion_tx failed node %s: %s",
+                                _node.get("id"), _bx)
+                            continue
+                        _send_msg(send_queue, bus.TIMECHAIN_COMMIT, name,
+                                  "timechain", _payload)
+                        try:
+                            with ctx.write_lock:
+                                memory.set_timechain_tx_hash(
+                                    _node.get("id"), _tx_hash)
+                        except Exception as _ux:
+                            logger.warning(
+                                "[MemoryWorker] stamp timechain_tx_hash node %s "
+                                "failed: %s", _node.get("id"), _ux)
+                        if _sidecar is not None:
+                            _sidecar.put(
+                                tx_hash=_tx_hash, node_id=_node.get("id"),
+                                user_prompt=_node.get("user_prompt", "") or "",
+                                agent_response=_node.get("agent_response", "") or "",
+                                memory_type=_payload["thought_type"],
+                                fork=_payload["fork"], ts=_now)
 
                 _send_response(send_queue, name, src, result, rid)
             except Exception as e:

@@ -932,6 +932,18 @@ class TieredMemoryGraph:
         memory_hash = self._compute_memory_hash(node)
         self._queue_for_compression(memory_hash)
 
+    def set_timechain_tx_hash(self, node_id: int, tx_hash: str) -> None:
+        """Stamp the promotion-anchor Timechain per-TX hash on a node
+        (RFP_synthesis_spine_reads_real_data Phase B). This is the durable
+        chain↔node link: the recall deref resolves this hash → the real thought
+        via the lock-free content sidecar (the chain envelope drops the per-TX
+        content at seal). Sync — a single fast UPDATE; also updates the in-memory
+        node so a same-cycle read is consistent."""
+        node = self._node_store.get(node_id)
+        if node is not None:
+            node["timechain_tx_hash"] = tx_hash
+        self._duckdb.update_node(node_id, timechain_tx_hash=tx_hash)
+
     async def _cognee_ingest(self, node: Dict) -> None:
         """Ingest a persistent memory: embed into FAISS + cognify into Kuzu graph."""
         try:

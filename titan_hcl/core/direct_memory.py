@@ -60,7 +60,8 @@ class TitanDuckDB:
                 embedding_id INTEGER DEFAULT -1,
                 cognified BOOLEAN DEFAULT FALSE,
                 neuromod_context TEXT,
-                memory_type TEXT DEFAULT 'episodic'
+                memory_type TEXT DEFAULT 'episodic',
+                timechain_tx_hash TEXT
             )
         """)
         # Synthesis Engine Phase 1 / D-SPEC-123 — additive memory_type column
@@ -70,6 +71,15 @@ class TitanDuckDB:
         self._conn.execute(
             "ALTER TABLE memory_nodes "
             "ADD COLUMN IF NOT EXISTS memory_type TEXT DEFAULT 'episodic'"
+        )
+        # RFP_synthesis_spine_reads_real_data Phase B — additive tx_hash link:
+        # the promotion-anchor Timechain per-TX hash → this node. The recall
+        # deref resolves it via the lock-free content sidecar (the chain envelope
+        # drops the per-TX content at seal). Idempotent for existing installs;
+        # the CREATE TABLE above carries it for new ones.
+        self._conn.execute(
+            "ALTER TABLE memory_nodes "
+            "ADD COLUMN IF NOT EXISTS timechain_tx_hash TEXT"
         )
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS identity_nodes (
