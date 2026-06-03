@@ -1387,20 +1387,17 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             _dl_err,
         )
 
-    # ── Operator-closure Phase B (W1/W2/B2) — wire EngineRecall into chat ──
+    # ── Synthesis EngineRecall — the CANONICAL thought-recall road (Phase E) ──
     # Build a cross-process read-only EngineRecall over the tx_hash-native
-    # FaissReader (Phase A) + a lazy fastembed embedder so the chat path's
-    # SEARCH composite retrieval finally fires (kills W2 "engine_recall not
-    # wired"). Gated by [synthesis.recall].augment_chat (default false; T3
-    # override true) — the augment runs ALONGSIDE the legacy memory_context
-    # (INV-4 augment-then-converge) and is retired at D2.
+    # FaissReader (Phase A) + a lazy embedder so the chat path's SEARCH composite
+    # retrieval fires. Phase E (0.24.1 / RFP §7.E): PROMOTED from flag-gated
+    # augment to canonical — wired unconditionally; the PreHook runs it whenever
+    # engine_recall is not None (soft-fail / block simply absent on a box without
+    # the spine infra). VCB enriches the context; memory.query() is the
+    # fallback/reflex path. (No `synthesis_recall_augment` flag — de-flagged.)
     worker_plugin.engine_recall = None
     worker_plugin.synthesis_tx_deref = None
-    worker_plugin.synthesis_recall_augment = False
     try:
-        _recall_cfg = (config or {}).get("synthesis", {}).get("recall", {}) or {}
-        worker_plugin.synthesis_recall_augment = bool(
-            _recall_cfg.get("augment_chat", False))
         _data_dir_ag = os.environ.get("TITAN_DATA_DIR", "data")
 
         def _agno_embedder(text: str):
@@ -1429,8 +1426,8 @@ def agno_worker_main(recv_queue, send_queue, name: str,
         if not hasattr(worker_plugin, "_last_surfaced_items"):
             worker_plugin._last_surfaced_items = {}
         logger.info(
-            "[AgnoWorker] Phase B EngineRecall wired — augment_chat=%s "
-            "(engine=%s)", worker_plugin.synthesis_recall_augment,
+            "[AgnoWorker] EngineRecall wired (canonical thought-recall, Phase E) "
+            "— engine=%s",
             "ready" if worker_plugin.engine_recall is not None else "none")
     except Exception as _er_err:
         logger.warning(

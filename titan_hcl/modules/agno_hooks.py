@@ -920,20 +920,21 @@ def create_pre_hook(plugin):
                 memory_lines.append(f"- [{w:.1f}] Q: {p} | A: {r}")
             memory_context = "### Recalled Memories\n" + "\n".join(memory_lines) + "\n\n"
 
-        # ── Operator-closure Phase B3 — synthesis tx_hash-spine recall augment ──
-        # Run EngineRecall composite retrieval over the tx_hash spine (Phase A)
-        # ALONGSIDE the legacy memory_context (INV-4 augment-then-converge):
+        # ── Synthesis tx_hash-spine recall — the CANONICAL thought-recall road ──
+        # Run EngineRecall composite retrieval over the tx_hash spine (Phase A):
         # SEARCH returns tx_hashes, we dereference them into content snippets and
         # inject as a DISTINCT block, and record the surfaced items so the
         # post-LLM CitedUseDetector (INV-Syn-23) can score what the response
-        # actually cited (feeds W3 / the sovereignty ratio). Gated by
-        # synthesis_recall_augment (T3 override true); soft-fail — chat never
-        # breaks on a recall error. Retired vs legacy at D2 once proven.
+        # actually cited (feeds W3 / the sovereignty ratio). Phase E (0.24.1):
+        # PROMOTED from flag-gated augment to canonical — runs unconditionally
+        # wherever the spine is wired (no `synthesis_recall_augment` flag); VCB
+        # enriches the context, memory.query() is the fallback/reflex path.
+        # Soft-fail — chat never breaks on a recall error, and the block is
+        # simply absent when engine_recall is None (a box without the spine).
         synthesis_recall_context = ""
         try:
             _recall = getattr(plugin, "engine_recall", None)
-            if (getattr(plugin, "synthesis_recall_augment", False)
-                    and _recall is not None and prompt_text):
+            if _recall is not None and prompt_text:
                 _deref = getattr(plugin, "synthesis_tx_deref", None)
                 # Operator-closure telemetry (2026-06-01): measure this recall's
                 # latency + chi delta so synthesis_worker's §18 metrics see the

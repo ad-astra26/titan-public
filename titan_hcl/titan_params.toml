@@ -3232,12 +3232,12 @@ user_feedback_delta           = 0.15   # INV-Syn-24 Tier-2 utility delta (vs 0.0
 recall_parity_soft_fallback   = true   # legacy-resolver fallback during parity soak ONLY
 
 [synthesis.recall]
-# Operator-closure (tx_hash spine, INV-15) — live retrieval into the chat path.
-# When true, the agno pre-LLM hook runs EngineRecall composite retrieval over
-# the tx_hash-native FAISS spine and injects the dereferenced hits ALONGSIDE the
-# legacy memory_context (INV-4 augment-then-converge). Default false (safety);
-# T3 canary override = true via ~/.titan/microkernel_T3.toml [synthesis.recall].
-augment_chat                  = false  # tx_hash-spine recall augment in chat (T3 canary = true)
+# Phase E (synthesis-engine 0.24.1 / RFP §7.E): the tx_hash-spine recall was
+# PROMOTED from flag-gated augment to the CANONICAL thought-recall road — it now
+# runs unconditionally wherever EngineRecall is wired (soft-fail / absent on a
+# box without the spine infra). The former `augment_chat` key is REMOVED; any
+# value left in a per-Titan override (e.g. ~/.titan/microkernel_T3.toml
+# [synthesis.recall]) is now ignored and safe to delete.
 
 [synthesis.metrics]
 # Phase 10 (D-SPEC-PHASE10) — observatory + metrics (INV-Syn-25, observation only).
