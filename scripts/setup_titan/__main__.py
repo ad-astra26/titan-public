@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import __version__
 from . import state as install_state
+from . import toolchain
 from .modes import Mode, spec_for
 from .phases import run_phases
 from .preflight import run_preflight, summarize
@@ -90,8 +91,10 @@ def _cmd_resurrect(args: argparse.Namespace, repo_root: Path) -> int:
     return run_phases(state=state, mode=mode, install_root=repo_root, default=args.default,
                       minimal=args.minimal, skip_genesis=False, tag=args.tag,
                       build_rust=args.build_rust, prompter=None,
-                      resurrect=True, rpc_url=args.rpc_url, verify_only=args.verify_only,
-                      config_src=args.config, titan_pubkey=args.titan_pubkey)
+                      resurrect=True, rpc_url=args.rpc_url, das_rpc_url=args.das_rpc_url,
+                      verify_only=args.verify_only,
+                      config_src=args.config, titan_pubkey=args.titan_pubkey,
+                      toolchain_pins=toolchain.resolve_versions(args))
 
 
 def cmd_install(args: argparse.Namespace) -> int:
@@ -108,6 +111,18 @@ def cmd_install(args: argparse.Namespace) -> int:
     # --no-tui) fall back to the CLI "pick a mode" guidance.
     if mode is None and not args.default:
         use_tui = not args.no_tui and sys.stdin.isatty() and sys.stdout.isatty()
+        if use_tui:
+            # The Textual TUI is OPTIONAL — a fresh public box may not have textual
+            # (it is not a base dep, and system `pip install` is PEP-668-locked on
+            # modern Ubuntu). Degrade to the CLI mode-picker instead of crashing;
+            # the --default / --mode paths never need the TUI.
+            try:
+                from .prompts import ScriptedPrompter
+                from .tui import run_install_tui
+            except ImportError as exc:
+                cprint(f"  Textual TUI unavailable ({exc.name}) — falling back to the CLI. "
+                       "Re-run with --default or --mode {mainnet,devnet,local}.", role="warning")
+                use_tui = False
         if not use_tui:
             cprint("No mode selected. Re-run interactively for the guided wizard, or pick a mode:",
                    role="warning")
@@ -120,9 +135,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                 print(f"    {spec.one_liner}")
                 print(f"    {METAL}SOL: {spec.needs_sol}{ANSI.RESET}")
             return 2
-        from .prompts import ScriptedPrompter
-        from .tui import run_install_tui
-        result = run_install_tui()
+        result = run_install_tui()   # imported above (in the use_tui try-block)
         if result is None:
             cprint("Setup cancelled — nothing was written.", role="warning")
             return 130
@@ -171,7 +184,8 @@ def cmd_install(args: argparse.Namespace) -> int:
     install_state.save(state)
     return run_phases(state=state, mode=mode, install_root=repo_root,
                       default=args.default, minimal=args.minimal, skip_genesis=args.skip_genesis,
-                      tag=args.tag, build_rust=args.build_rust, prompter=prompter)
+                      tag=args.tag, build_rust=args.build_rust, prompter=prompter,
+                      toolchain_pins=toolchain.resolve_versions(args))
 
 
 # ── subcommands: stubs ─────────────────────────────────────────────────────
@@ -184,7 +198,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
         repo_root, shard1=args.shard1, shard1_file=args.shard1_file,
         titan_pubkey=args.titan_pubkey, manifest=args.manifest,
         titan_id=args.titan_id, network=args.network,
-        verify_zk=args.verify_zk, verify_only=args.verify_only, force=args.force)
+        verify_zk=args.verify_zk, verify_only=args.verify_only, force=args.force,
+        rpc_url=args.rpc_url, das_rpc_url=args.das_rpc_url)
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -259,7 +274,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "on-chain writes / backups / X) — the live restore-test guard.")
     pi.add_argument("--rpc-url", default=None,
                     help="With --resurrect: Solana RPC for the chain walk "
-                         "(default: public mainnet-beta).")
+                         "(default: public mainnet-beta). Prompted if omitted.")
+    pi.add_argument("--das-rpc-url", default=None,
+                    help="With --resurrect: DAS-capable RPC (Helius/Triton) for "
+                         "GenesisNFT identity discovery. Defaults to --rpc-url when "
+                         "one endpoint serves both.")
     pi.add_argument("--config", default=None,
                     help="With --resurrect: path to your own config.toml to stage "
                          "(for operators who opted config.toml OUT of their backup).")
@@ -269,6 +288,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="With --resurrect: your Titan's PUBLIC wallet address "
                          "(printed alongside Shard-1; not a secret). NO envelope/"
                          "manifest needed — the wallet discovers everything.")
+    # Toolchain pin overrides (auto-provisioner — default to the T1-verified PINS
+    # in toolchain.py; pass to freeze a specific version). See rFP_setup_titan_auto_provisioner.md §6.
+    pi.add_argument("--rust-version", default=None,
+                    help="Override the Rust toolchain pin (default: stable channel + musl target).")
+    pi.add_argument("--solana-version", default=None,
+                    help="Override the Solana CLI pin (default: Agave 3.1.10).")
+    pi.add_argument("--anchor-version", default=None,
+                    help="Override the Anchor CLI pin (default: 0.32.1, via avm).")
+    pi.add_argument("--node-version", default=None,
+                    help="Override the Node.js major pin (default: 22, via NodeSource).")
     pi.set_defaults(func=cmd_install)
 
     pr = sub.add_parser("restore",
@@ -285,6 +314,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="LEGACY/DEBUG ONLY: an off-site UnifiedManifest JSON. Omit "
                          "it — the sovereign v=3 chain restore needs no manifest.")
     pr.add_argument("--titan-id", default=None, help="Titan id (default: from record, else T1).")
+    pr.add_argument("--rpc-url", default=None,
+                    help="Mainnet RPC for the chain walk (default: config/public "
+                         "mainnet-beta). Prompted if omitted.")
+    pr.add_argument("--das-rpc-url", default=None,
+                    help="DAS-capable RPC (Helius/Triton) for GenesisNFT identity "
+                         "discovery. Defaults to --rpc-url when one endpoint serves both.")
     pr.add_argument("--install-root", default=None, help="Target install tree (default: this repo).")
     pr.add_argument("--network", choices=["mainnet", "devnet"], default="mainnet",
                     help="Arweave/Solana network (default: mainnet).")
