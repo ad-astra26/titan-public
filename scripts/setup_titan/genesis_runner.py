@@ -158,6 +158,10 @@ def run_genesis_phase(install_root: Path, mode: Mode, *, venv_python: Path) -> l
     cmd = [str(venv_python), str(script), "--generate"]
     if mode == Mode.LOCAL:
         cmd.append("--skip-onchain")
+    else:
+        # devnet / mainnet — the ceremony's only behavioral switch (Arweave +
+        # the Burn are mainnet-only). mode.value == "devnet" | "mainnet".
+        cmd.extend(["--network", mode.value])
     # Local + devnet keep the plaintext keypair (the T2/T3 boot model): the
     # kernel needs it at data/titan_identity_keypair.json. --keep-plaintext also
     # skips the interactive 'SOVEREIGN' burn prompt → the ceremony runs cleanly

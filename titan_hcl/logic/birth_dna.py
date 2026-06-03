@@ -134,15 +134,40 @@ def serialize_for_arweave(
     }
 
 
+def _resolve_maker_pubkey(explicit: Optional[str] = None) -> str:
+    """The Maker's Solana address for the GenesisNFT (INV-MBR-5).
+
+    MAKER-SUPPLIED — never a hardcoded default. Resolution order:
+      1. the explicit value the ceremony passes (from the install wizard), then
+      2. ``[network].maker_pubkey`` in the merged config (the wizard writes it).
+    Returns "" if neither is set — the caller (ceremony) hard-fails rather than
+    mint an NFT with a wrong/placeholder Maker.
+    """
+    if explicit:
+        return explicit
+    try:
+        from titan_hcl.config_loader import load_titan_config
+        return load_titan_config().get("network", {}).get("maker_pubkey", "") or ""
+    except Exception:
+        return ""
+
+
 def get_genesis_nft_attributes(
     titan_name: str = "Titan",
     dna: dict = None,
     params_path: str = "titan_hcl/titan_params.toml",
+    *,
+    maker_pubkey: str = None,
+    titan_pubkey: str = "",
 ) -> dict:
     """Build the on-chain attributes dict for GenesisNFT.
 
     These go in the NFT metadata `attributes` field (on Solana).
     The extended JSON (with full DNA) goes on Arweave.
+
+    ``maker_pubkey`` is MAKER-SUPPLIED (wizard → ceremony → here); we never bake
+    a default address. ``titan_pubkey`` anchors the soul's own address in the
+    attributes so the NFT is the complete sovereign discovery root (INV-MBR-5).
     """
     if dna is None:
         dna = extract_birth_dna(params_path)
@@ -157,10 +182,10 @@ def get_genesis_nft_attributes(
         pass
 
     import time
-    return {
+    attrs = {
         "titan_name": titan_name,
         "birth_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "maker_pubkey": "YOUR_DEPLOYER_PUBKEY",
+        "maker_pubkey": _resolve_maker_pubkey(maker_pubkey),
         "prime_directives_hash": directive_hash,
         "birth_dna_hash": dna_hash,
         "architecture_version": "v4-132D",
@@ -173,6 +198,9 @@ def get_genesis_nft_attributes(
             "requires_maker_confirmation": True,
         },
     }
+    if titan_pubkey:
+        attrs["titan_pubkey"] = titan_pubkey
+    return attrs
 
 
 # ── GenesisNFT metadata + sovereign recovery pointers (INV-MBR-5/5a) ──────────
@@ -207,15 +235,21 @@ def build_genesis_nft_metadata(
     *,
     recovery: dict = None,
     naming_ceremony: dict = None,
+    maker_pubkey: str = None,
+    titan_pubkey: str = "",
 ) -> dict:
     """Canonical GenesisNFT off-chain (Arweave) metadata — the COMPLETE sovereign
     identity root (INV-MBR-5). Carries the on-chain attributes (Maker, directives
     + DNA hashes), the full birth identity, and — when provided — the `recovery`
     block (INV-MBR-5a) so resurrection finds Shard-3 from the NFT alone. Pure —
     no I/O; the caller uploads it to Arweave and points the NFT `uri` at it.
+
+    ``maker_pubkey``/``titan_pubkey`` are threaded to the attributes (Maker-
+    supplied; never defaulted) so the metadata's Maker anchor is correct.
     """
     import json as _json
-    nft_attrs = get_genesis_nft_attributes(titan_name=titan_name)
+    nft_attrs = get_genesis_nft_attributes(
+        titan_name=titan_name, maker_pubkey=maker_pubkey, titan_pubkey=titan_pubkey)
     metadata = {
         "name": f"Titan Genesis — {titan_name}",
         "symbol": "TITAN",
