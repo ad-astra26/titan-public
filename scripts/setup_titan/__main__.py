@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import __version__
 from . import state as install_state
+from . import toolchain
 from .modes import Mode, spec_for
 from .phases import run_phases
 from .preflight import run_preflight, summarize
@@ -92,7 +93,8 @@ def _cmd_resurrect(args: argparse.Namespace, repo_root: Path) -> int:
                       build_rust=args.build_rust, prompter=None,
                       resurrect=True, rpc_url=args.rpc_url, das_rpc_url=args.das_rpc_url,
                       verify_only=args.verify_only,
-                      config_src=args.config, titan_pubkey=args.titan_pubkey)
+                      config_src=args.config, titan_pubkey=args.titan_pubkey,
+                      toolchain_pins=toolchain.resolve_versions(args))
 
 
 def cmd_install(args: argparse.Namespace) -> int:
@@ -172,7 +174,8 @@ def cmd_install(args: argparse.Namespace) -> int:
     install_state.save(state)
     return run_phases(state=state, mode=mode, install_root=repo_root,
                       default=args.default, minimal=args.minimal, skip_genesis=args.skip_genesis,
-                      tag=args.tag, build_rust=args.build_rust, prompter=prompter)
+                      tag=args.tag, build_rust=args.build_rust, prompter=prompter,
+                      toolchain_pins=toolchain.resolve_versions(args))
 
 
 # ── subcommands: stubs ─────────────────────────────────────────────────────
@@ -275,6 +278,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="With --resurrect: your Titan's PUBLIC wallet address "
                          "(printed alongside Shard-1; not a secret). NO envelope/"
                          "manifest needed — the wallet discovers everything.")
+    # Toolchain pin overrides (auto-provisioner — default to the T1-verified PINS
+    # in toolchain.py; pass to freeze a specific version). See rFP_setup_titan_auto_provisioner.md §6.
+    pi.add_argument("--rust-version", default=None,
+                    help="Override the Rust toolchain pin (default: stable channel + musl target).")
+    pi.add_argument("--solana-version", default=None,
+                    help="Override the Solana CLI pin (default: Agave 3.1.10).")
+    pi.add_argument("--anchor-version", default=None,
+                    help="Override the Anchor CLI pin (default: 0.32.1, via avm).")
+    pi.add_argument("--node-version", default=None,
+                    help="Override the Node.js major pin (default: 22, via NodeSource).")
     pi.set_defaults(func=cmd_install)
 
     pr = sub.add_parser("restore",
