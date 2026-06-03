@@ -337,9 +337,14 @@ class TxIndexBuilder:
             txh = row.get("tx_hash")
             if not txh:
                 continue
-            fork = row.get("fork") or "declarative"
-            if fork not in INDEXED_FORKS:
-                fork = "declarative"
+            # Index into the CONVERSATION shard — that is the shard the default
+            # chat recall helper (`actr_episodic_recall_helper`, fork_scope=
+            # conversation) SEARCHes. The chain fork (declarative/episodic, set
+            # at promotion) stays the SEMANTIC anchor (Phase B); this FAISS shard
+            # is the RECALL INDEX and MUST match what recall queries, or promoted
+            # thoughts are never searched. (RFP Phase C: "replace
+            # conversation-fork-envelope indexing" with real promoted thoughts.)
+            fork = "conversation"
             if self._store.has(fork, txh):
                 summary["skipped"] += 1
                 continue
