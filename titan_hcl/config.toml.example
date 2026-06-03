@@ -451,20 +451,6 @@ archetype_recency_boost_threshold = 0.5   # rank-jump kicks in at 5 days deferre
 archetype_recency_boost_max = 1.0          # cap (10 days saturation)
 # URL shortener domain (nginx redirect: /tx/HASH → solscan)
 url_domain = ""   # e.g. "https://yourdomain.tld" — your URL-shortener domain
-# On-chain provenance footer for non-proof_day posts (rFP X-post truthfulness
-# PART A). A MAINNET Titan with a GenesisNFT → its birth-certificate URL
-# (subsumes mint tx + NFT asset + constitution), e.g. "https://yourdomain.tld/genesis".
-# A DEVNET Titan with no mainnet GenesisNFT → leave "" (renders the honest
-# "devnet — no mainnet GenesisNFT yet" marker; never spoof a birth certificate).
-genesis_identity_url = ""
-# Cluster for the Epoch-Seal /tx/ link: "" (mainnet, no param) | "devnet"
-# (appends ?cluster=devnet so a devnet anchor seal resolves on the explorer).
-seal_cluster = ""
-# Titan's OWN X handles — NEVER engaged by the outer archetypes (world_mirror /
-# outer_inner_bridge / outer_rumination / amplify), rFP X-post PART B / INV-XENG-1.
-# user_name is included automatically; list any extra owned/automation accounts
-# here so Titan never replies to / mirrors / amplifies itself.
-self_handles = []
 
 # Per-Titan hourly limits (personality pacing — T1 most active, T3 quietest)
 [social_x.limits.T1]

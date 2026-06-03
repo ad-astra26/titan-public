@@ -543,7 +543,12 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--install-root", default=_REPO_ROOT, help="Target install tree.")
     p.add_argument("--scratch-dir", default=None,
                    help="Scratch reconstruction dir (default: <install-root>/data.resurrect).")
-    p.add_argument("--rpc-url", default=None, help="Solana RPC URL override.")
+    p.add_argument("--rpc-url", default=None, help="Solana RPC URL override (chain "
+                   "walk: signatures + memos). Any standard RPC works.")
+    p.add_argument("--das-rpc-url", default=None,
+                   help="Optional DAS-capable RPC (Helius/Triton) for GenesisNFT "
+                        "identity discovery. Shard-3 recovery uses --rpc-url and "
+                        "never needs DAS; this only speeds NFT-based discovery.")
     p.add_argument("--network", default="mainnet", choices=["mainnet", "devnet"],
                    help="Arweave/Solana network (default: mainnet).")
     p.add_argument("--commit", action="store_true",
@@ -588,7 +593,7 @@ def main(argv: Optional[list] = None) -> int:
         key_bytes, titan_pubkey, _kp, titan_id = _res.phase_1_identity(
             SimpleNamespace(shard1=shard1, shard1_file=None, shard2_local=False,
                             titan_id=args.titan, titan_pubkey=args.titan_pubkey,
-                            das_rpc_url=None),
+                            das_rpc_url=args.das_rpc_url),
             install_root)
     except SystemExit:
         _print("Identity recovery failed (see above).")

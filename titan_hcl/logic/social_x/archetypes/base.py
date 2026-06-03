@@ -55,11 +55,7 @@ DEFAULT_SAME_ARCHETYPE_SPACING_S = 6 * 3600
 OUTER_ENGAGEMENT_POST_TYPES = (
     "world_mirror", "outer_inner_bridge", "outer_rumination", "amplify",
 )
-DEFAULT_AUTHOR_COOLDOWN_S = 48 * 3600  # 48h (Maker 2026-06-03, rFP X-post PART B
-# / INV-XENG-2). Was 7*86400 — but a 7-day cooldown starved the tiny (~5-author)
-# engagement candidate pool to ≈0 (the engagement archetypes went silent 05-30).
-# 48h matches world_mirror's RECENCY_WINDOW_S so we don't re-engage an author
-# within the very window we look back over.
+DEFAULT_AUTHOR_COOLDOWN_S = 7 * 86400  # ≥ 1 week per Maker
 
 
 def ensure_handle_mention(text: str, handle: str) -> str:
@@ -212,32 +208,6 @@ class ArchetypeBase:
                 out.add(str(sid))
         return out
 
-    def _self_handles(self) -> set[str]:
-        """Titan's OWN X handles — PERMANENTLY ineligible for outer engagement
-        (never reply to / mirror / amplify our own account). Seeds the cooldown
-        set so every outer archetype's existing `if author in cooldown` check
-        skips them in one place. Config-sourced ([social_x] `self_handles` +
-        `user_name`), cached per instance. (rFP X-post PART B / INV-XENG-1,
-        2026-06-03 — `@iamtitantech` is followed + generated 42 felt_experiences,
-        so world_mirror was mirroring our own automation account.)"""
-        cached = getattr(self, "_self_handles_cache", None)
-        if cached is not None:
-            return cached
-        handles: set[str] = set()
-        try:
-            cfg = self.gateway._load_config() if self.gateway else {}
-            for raw in [cfg.get("user_name", "")] + list(cfg.get("self_handles", []) or []):
-                h = str(raw or "").strip().lstrip("@").lower()
-                if h:
-                    handles.add(h)
-        except Exception:
-            pass
-        if not handles:
-            # Defensive fallback to the agent's own identity (not a tunable).
-            handles = {"your_x_handle", "iamtitantech"}
-        self._self_handles_cache = handles
-        return handles
-
     def authors_on_cooldown(
         self,
         *,
@@ -264,13 +234,10 @@ class ArchetypeBase:
                 (titan_id, *OUTER_ENGAGEMENT_POST_TYPES, cutoff),
             ).fetchall()
         except Exception:
-            return set(self._self_handles())
+            return set()
         finally:
             conn.close()
-        # B1 (INV-XENG-1): own handles are PERMANENTLY on cooldown — never engage
-        # our own account. Seeds the set so all 4 outer archetypes' cooldown check
-        # skips them; recently-engaged external authors are added below.
-        out: set[str] = set(self._self_handles())
+        out: set[str] = set()
         for r in rows:
             try:
                 m = json.loads(r["metadata"] or "{}")

@@ -32,6 +32,7 @@ from setup_titan import (  # noqa: E402
 )
 from setup_titan.__main__ import build_parser  # noqa: E402
 from setup_titan.modes import Mode  # noqa: E402
+from setup_titan import preflight as preflight_mod  # noqa: E402
 
 
 # ── config_model ─────────────────────────────────────────────────────────────
@@ -572,6 +573,44 @@ def test_resurrect_builds_cmd_and_pipes_shard_off_argv(tmp_path, monkeypatch):
     assert "deadbeef" not in " ".join(cmd)            # shard NEVER on the command line
 
 
+def test_resurrect_prompted_rpc_threads_to_both_chain_and_das(tmp_path, monkeypatch):
+    """#32 — when no --rpc-url is passed, the phase PROMPTS; one supplied endpoint
+    drives BOTH the chain walk (--rpc-url) and GenesisNFT identity discovery
+    (--das-rpc-url), so a fresh-box resurrection actually uses the user's DAS RPC."""
+    venv_python = _fake_resurrect_tree(tmp_path)
+    (tmp_path / "titan_hcl" / "config.toml").write_text("[api]\n")
+    cap = {}
+    monkeypatch.setattr("setup_titan.resurrect.subprocess.run",
+                        lambda cmd, input=None, text=None, cwd=None: cap.update(cmd=cmd) or _Proc())
+    monkeypatch.setattr("builtins.input", lambda _p: "  https://helius.example/das  ")
+    res = run_resurrect_phase(tmp_path, venv_python=venv_python, titan_id="T1",
+                              shard1="ab", titan_pubkey="J1cdk4f1")
+    assert all(r.severity != "fail" for r in res)
+    cmd = cap["cmd"]
+    assert cmd[cmd.index("--rpc-url") + 1] == "https://helius.example/das"
+    assert cmd[cmd.index("--das-rpc-url") + 1] == "https://helius.example/das"
+
+
+def test_resurrect_no_tty_falls_back_to_default_rpc(tmp_path, monkeypatch):
+    """#32 — a non-interactive context (input() raises OSError under captured stdin)
+    must NOT abort: the optional RPC silently falls back to the engine default
+    (neither --rpc-url nor --das-rpc-url appears on the cmd)."""
+    venv_python = _fake_resurrect_tree(tmp_path)
+    (tmp_path / "titan_hcl" / "config.toml").write_text("[api]\n")
+    cap = {}
+    monkeypatch.setattr("setup_titan.resurrect.subprocess.run",
+                        lambda cmd, input=None, text=None, cwd=None: cap.update(cmd=cmd) or _Proc())
+
+    def _raise(_p):
+        raise OSError("pytest: reading from stdin while output is captured!")
+
+    monkeypatch.setattr("builtins.input", _raise)
+    res = run_resurrect_phase(tmp_path, venv_python=venv_python, titan_id="T1",
+                              shard1="ab", titan_pubkey="J1cdk4f1")
+    assert all(r.severity != "fail" for r in res)
+    assert "--rpc-url" not in cap["cmd"] and "--das-rpc-url" not in cap["cmd"]
+
+
 def test_resurrect_stages_supplied_config_for_opt_out(tmp_path, monkeypatch):
     venv_python = _fake_resurrect_tree(tmp_path)  # no config.toml restored
     src = tmp_path / "my_config.toml"
@@ -596,14 +635,27 @@ def test_resurrect_warns_when_no_config(tmp_path, monkeypatch):
 def test_install_resurrect_flags_parse():
     ns = build_parser().parse_args(
         ["install", "--resurrect", "--verify-only", "--config", "/x.toml",
-         "--rpc-url", "https://r", "--titan-id", "T1"])
+         "--rpc-url", "https://r", "--das-rpc-url", "https://das", "--titan-id", "T1"])
     assert ns.resurrect and ns.verify_only and ns.config == "/x.toml"
-    assert ns.rpc_url == "https://r" and ns.titan_id == "T1"
+    assert ns.rpc_url == "https://r" and ns.das_rpc_url == "https://das"
+    assert ns.titan_id == "T1"
 
 
 def test_install_accepts_no_tui_flag():
     args = build_parser().parse_args(["install", "--no-tui", "--mode", "local"])
     assert args.no_tui is True
+
+
+def test_preflight_checks_xdelta3_dependency(tmp_path):
+    """#35 — the installer surfaces the xdelta3 system dependency up front (it
+    powers incremental backup diffs + sovereign restore; applying an incremental
+    on resurrection hard-fails without it). Warn-severity: the Titan still boots."""
+    results = preflight_mod.run_preflight(tmp_path, mode=None)
+    xd = [r for r in results if r.name == "xdelta3"]
+    assert len(xd) == 1, [r.name for r in results]
+    assert xd[0].severity in ("ok", "warn")        # present → ok; absent → warn, never a hard fail
+    if xd[0].severity == "warn":
+        assert "xdelta3" in (xd[0].remediation or "")
 
 
 # ── W1.b.2 — Textual wizard headless pilot (collect-then-execute front-end) ──
