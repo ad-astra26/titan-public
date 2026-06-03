@@ -35,6 +35,7 @@ from .inference import run_inference_phase
 from .genesis_runner import run_genesis_phase
 from .provision import run_provision_phase
 from .resurrect import run_resurrect_phase
+from .services import run_services_phase
 from .systemd_runner import run_systemd_phase
 from .modes import Mode, spec_for
 from .preflight import Result, summarize
@@ -148,6 +149,12 @@ GGUF_FILENAME = "bge-small-en-v1.5-f16.gguf"
 GGUF_SHA256 = "f0b2fef971e8366438bfd2d9aefea1b0115919389448806d290237f638bae999"
 GGUF_URL = f"https://huggingface.co/{GGUF_REPO}/resolve/main/{GGUF_FILENAME}"
 
+# CPU-only torch index (INV-PROV-9): on a vCPU server, PEP 440 ranks the `+cpu`
+# local-version wheel ABOVE the PyPI default (CUDA) build, so torch resolves to
+# the ~200MB CPU wheel instead of the ~5GB CUDA stack. Used for BOTH the base
+# `-e .` install and the `[research]` extra (unstructured-inference can pull torch).
+TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+
 
 def _sha256(path: Path) -> str:
     import hashlib
@@ -207,7 +214,27 @@ def _seed_embedding_gguf(install_root: Path, py: Path) -> list[Result]:
     return results
 
 
-def run_venv_phase(install_root: Path) -> list[Result]:
+def _pip_install_research(pip: Path, install_root: Path, *, minimal: bool) -> list[Result]:
+    """Install the `[research]` extra (Crawl4AI · unstructured · OCR libs) into the
+    venv with the CPU torch index (INV-PROV-9 — never CUDA). Skipped under
+    `--minimal`. `knowledge_worker` + `SageRecorder` depend on this (INV-PROV-8)."""
+    if minimal:
+        return [Result("research", "warn",
+                       "--minimal: research pipeline ([research] extra) skipped.",
+                       "Re-run without --minimal for Crawl4AI + unstructured (knowledge/Sage).")]
+    cprint("  Installing the research pipeline ([research] — Crawl4AI · unstructured · OCR libs), "
+           "CPU wheels only…", role="text_strong")
+    try:
+        subprocess.check_call([str(pip), "install", "--extra-index-url", TORCH_CPU_INDEX,
+                               "-e", f"{install_root}[research]"])
+    except subprocess.CalledProcessError as e:
+        return [Result("research", "fail", f"[research] install exited {e.returncode}",
+                       "Inspect the pip output above; re-run (or use --minimal to skip the research stack).")]
+    return [Result("research", "ok",
+                   "research pipeline installed (Crawl4AI · unstructured · html2text · CPU-only)")]
+
+
+def run_venv_phase(install_root: Path, *, minimal: bool = False) -> list[Result]:
     """Create venv at install_root/test_env; pip install -e . + import check.
 
     Uses the system `python3` for the venv creation step (any 3.11+ works);
@@ -242,7 +269,6 @@ def run_venv_phase(install_root: Path) -> list[Result]:
     # resolves to the ~200MB CPU wheel instead of dragging in the ~5GB CUDA
     # stack — which would blow a 4GB / small-disk min-tier box (RFP P3).
     # The CPU index is additive: every non-torch package still comes from PyPI.
-    TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
     try:
         subprocess.check_call([str(pip), "install", "--extra-index-url", TORCH_CPU_INDEX,
                                "-e", str(install_root)])
@@ -259,6 +285,10 @@ def run_venv_phase(install_root: Path) -> list[Result]:
                                   f"core imports failed: {r.stderr.strip().splitlines()[-1] if r.stderr else 'unknown'}",
                                   "Re-run pip install; check that titan-hcl is in pyproject.toml.")]
     results.append(Result("imports", "ok", "titan_hcl + duckdb + faiss + torch + llama_cpp importable"))
+
+    # Research pipeline ([research] extra — Crawl4AI/unstructured/html2text), CPU-only,
+    # gated by --minimal. knowledge_worker + SageRecorder depend on it (INV-PROV-8/9).
+    results.extend(_pip_install_research(pip, install_root, minimal=minimal))
 
     # Seed the sovereign embedding GGUF + run the §3J.1 self-test (a halting
     # 'fail' Result if the embedder can't produce non-zero vectors).
@@ -307,7 +337,9 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
              lambda: run_provision_phase(install_root, mode, pins, resurrect=True,
                                          prompter=prompter, default=default)),
             (PhaseDef("phase_3", "Venv + Python deps", "W1.b", None),
-             lambda: run_venv_phase(install_root)),
+             lambda: run_venv_phase(install_root, minimal=minimal)),
+            (PhaseDef("phase_services", "Research services (SearXNG + OCR)", "RFP-provisioner", None),
+             lambda: run_services_phase(install_root, minimal=minimal)),
             (PhaseDef("phase_bin", "Rust daemon binaries", "W1.b", None),
              lambda: run_binaries_phase(install_root, tag=tag or "main", build_rust=build_rust)),
             (PhaseDef("phase_resurrect", "🜂 Sovereign Resurrection", "W1.5/D1", None),
@@ -333,7 +365,9 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
          lambda: run_provision_phase(install_root, mode, pins, resurrect=False,
                                      prompter=prompter, default=default)),
         (PhaseDef("phase_3", "Venv + Python deps", "W1.b", None),
-         lambda: run_venv_phase(install_root)),
+         lambda: run_venv_phase(install_root, minimal=minimal)),
+        (PhaseDef("phase_services", "Research services (SearXNG + OCR)", "RFP-provisioner", None),
+         lambda: run_services_phase(install_root, minimal=minimal)),
         (PhaseDef("phase_bin", "Rust daemon binaries", "W1.b", None),
          lambda: run_binaries_phase(install_root, tag=tag or "main", build_rust=build_rust)),
         (PhaseDef("phase_cfg", "Seed config.toml + chat auth key", "W1.f", None),
