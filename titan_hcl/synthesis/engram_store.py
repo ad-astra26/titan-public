@@ -544,7 +544,7 @@ class EngramStore:
         concepts: list[dict] = []
         try:
             qr = self._graph._conn.execute(
-                "MATCH (c:Concept) "
+                "MATCH (c:Engram) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                 "c.groundedness, c.anchor_tx, c.created_at"
             )
@@ -572,7 +572,7 @@ class EngramStore:
                             ("COMPOSED_INTO", edges_into)):
             try:
                 qr = self._graph._conn.execute(
-                    f"MATCH (a:Concept)-[:{rel}]->(b:Concept) "
+                    f"MATCH (a:Engram)-[:{rel}]->(b:Engram) "
                     f"RETURN a.concept_id, a.version, b.concept_id, b.version"
                 )
                 while qr.has_next():
@@ -659,8 +659,8 @@ class EngramStore:
             declarative.append(own_anchor)
         try:
             qr = self._graph._conn.execute(
-                "MATCH (a:Concept {concept_id: $cid, version: $v})"
-                "-[:COMPOSED_FROM]->(b:Concept) "
+                "MATCH (a:Engram {concept_id: $cid, version: $v})"
+                "-[:COMPOSED_FROM]->(b:Engram) "
                 "RETURN b.memory_type, b.anchor_tx",
                 {"cid": concept_id, "v": resolved_version},
             )
