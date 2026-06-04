@@ -166,6 +166,7 @@ class LLMProposal:
     memory_type: Optional[str] = None  # declarative|procedural|episodic|meta
     base_concept_refs: tuple[tuple[str, int], ...] = ()
     reason: str = ""
+    domain_hint: str = ""  # §7.F — advisory free-text domain (mutable; never gates)
 
 
 @dataclass
@@ -483,6 +484,7 @@ class ConsolidationPass:
                 memory_type=memory_type,
                 composed_from=list(proposal.base_concept_refs),
                 derivation_evidence=evidence,
+                domain_hint=proposal.domain_hint,  # §7.F advisory
             )
         except (WriterFailure, ValueError) as e:
             logger.warning(
@@ -537,6 +539,7 @@ class ConsolidationPass:
                 concept_id=proposal.concept_id,
                 composed_from=list(proposal.base_concept_refs),
                 derivation_evidence=evidence,
+                domain_hint=proposal.domain_hint,  # §7.F advisory
             )
         except (ParentVersionMissing, WriterFailure) as e:
             logger.warning(

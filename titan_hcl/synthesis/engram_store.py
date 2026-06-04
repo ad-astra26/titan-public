@@ -346,6 +346,7 @@ class EngramStore:
         derivation_evidence: Optional[list[str]] = None,
         derivation_merkle_root: Optional[str] = None,
         oracle_verdict: Optional[dict] = None,
+        domain_hint: str = "",
     ) -> Engram:
         """Materialize a brand-new spine concept at v=1.
 
@@ -426,6 +427,7 @@ class EngramStore:
             concept_id=concept_id, version=1, name=name,
             memory_type=memory_type, groundedness=initial_groundedness,
             anchor_tx=tx_hash, created_at=self._clock(),
+            domain_hint=domain_hint,
         )
         if not created:
             # Pre-existing row at v=1 — surfaces a logic error in the
@@ -461,6 +463,7 @@ class EngramStore:
         groundedness_at_bump: Optional[float] = None,
         derivation_merkle_root: Optional[str] = None,
         oracle_verdict: Optional[dict] = None,
+        domain_hint: str = "",
     ) -> Engram:
         """Insert v(n+1) for an existing concept. INV-3: parent stays
         immutable; INV-10: parent MUST exist or ParentVersionMissing raises.
@@ -532,6 +535,7 @@ class EngramStore:
             concept_id=concept_id, version=new_version, name=name,
             memory_type=memory_type, groundedness=groundedness_at_bump,
             anchor_tx=tx_hash, created_at=self._clock(),
+            domain_hint=domain_hint,
         )
         if not created:
             logger.warning(
@@ -762,7 +766,7 @@ class EngramStore:
                 "MATCH (c:Engram) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                 "c.groundedness, c.anchor_tx, c.created_at, c.axis_used, "
-                "c.axis_verified, c.axis_felt, c.axis_fluent"
+                "c.axis_verified, c.axis_felt, c.axis_fluent, c.domain_hint"
             )
             while qr.has_next():
                 row = qr.get_next()
@@ -779,6 +783,8 @@ class EngramStore:
                     "axis_verified": float(row[8]) if row[8] is not None else 0.0,
                     "axis_felt": float(row[9]) if row[9] is not None else 0.0,
                     "axis_fluent": float(row[10]) if row[10] is not None else 0.0,
+                    # §7.F advisory domain hint (free-text; "" when unset).
+                    "domain_hint": row[11] if row[11] is not None else "",
                 })
         except Exception as e:
             logger.warning(

@@ -140,6 +140,8 @@ _LLM_SYSTEM_PROMPT = (
     "CONCEPT_ID: <id_with_underscores>\n"
     "NAME: <human-readable name, empty for reject>\n"
     "MEMORY_TYPE: declarative | procedural | episodic | meta\n"
+    "DOMAIN: <broad knowledge domain, e.g. biology | mathematics | music | "
+    "self; empty if unclear>\n"
     "REASON: <one short sentence>\n"
 )
 
@@ -191,7 +193,8 @@ def _parse_llm_response(text: str) -> LLMProposal:
             continue
         key, _, val = line.partition(":")
         key = key.strip().upper()
-        if key in ("ACTION", "CONCEPT_ID", "NAME", "MEMORY_TYPE", "REASON"):
+        if key in ("ACTION", "CONCEPT_ID", "NAME", "MEMORY_TYPE", "DOMAIN",
+                   "REASON"):
             fields[key] = val.strip()
 
     action_raw = fields.get("ACTION", "reject").lower()
@@ -218,6 +221,12 @@ def _parse_llm_response(text: str) -> LLMProposal:
     if memory_type not in ("declarative", "procedural", "episodic", "meta"):
         memory_type = "meta"
 
+    # §7.F — advisory domain_hint (free-text, normalized; "" if the LLM omitted
+    # it or returned the placeholder). Never gates behaviour; mutable.
+    domain_hint = fields.get("DOMAIN", "").strip().lower()
+    if domain_hint.startswith("<") or domain_hint in ("empty", "unclear", "none"):
+        domain_hint = ""
+
     return LLMProposal(
         action=action_raw,  # type: ignore[arg-type]
         concept_id=concept_id,
@@ -225,6 +234,7 @@ def _parse_llm_response(text: str) -> LLMProposal:
         memory_type=memory_type,
         base_concept_refs=(),
         reason=fields.get("REASON", ""),
+        domain_hint=domain_hint,
     )
 
 

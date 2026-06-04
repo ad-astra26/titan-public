@@ -628,9 +628,11 @@ class TitanKnowledgeGraph:
     def spine_create_concept_node(
         self, concept_id: str, version: int, name: str, memory_type: str,
         groundedness: float, anchor_tx: str, created_at: float,
+        domain_hint: str = "",
     ) -> bool:
         """INSERT one Concept row keyed by synthetic pk = `<id>:v<ver>` so the
         same concept_id can carry multiple versions (§10 versioning invariant).
+        `domain_hint` (§7.F) is an advisory free-text domain stored on the node.
 
         Returns True on insert, False if the row already exists (idempotent —
         safe to call on replay). Raises only on unexpected Cypher errors.
@@ -640,11 +642,11 @@ class TitanKnowledgeGraph:
             self._conn.execute(
                 "CREATE (c:Engram {pk: $pk, concept_id: $cid, version: $ver, "
                 "name: $name, memory_type: $mt, groundedness: $g, "
-                "anchor_tx: $atx, created_at: $ts})",
+                "anchor_tx: $atx, created_at: $ts, domain_hint: $dh})",
                 {"pk": pk, "cid": concept_id, "ver": int(version),
                  "name": name, "mt": memory_type,
                  "g": float(groundedness), "atx": anchor_tx,
-                 "ts": float(created_at)},
+                 "ts": float(created_at), "dh": str(domain_hint or "")},
             )
             return True
         except Exception as e:
