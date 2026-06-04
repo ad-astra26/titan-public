@@ -72,10 +72,12 @@ class ThoughtSidecar:
 
     def put(self, *, tx_hash: str, node_id, user_prompt: str,
             agent_response: str, memory_type: str, fork: str,
-            ts: Optional[float] = None) -> None:
+            ts: Optional[float] = None, felt: Optional[str] = None) -> None:
         """Upsert one promoted thought's content keyed by its per-TX hash.
-        Idempotent (INSERT OR REPLACE) — re-promotion / re-run is safe. Never
-        raises (a sidecar write must not break promotion)."""
+        ``felt`` = the felt-at-lived-time JSON (``neuromod_context``) the thought
+        carried (§7.C); ``None`` for thoughts with no felt snapshot. Idempotent
+        (INSERT OR REPLACE) — re-promotion / re-run is safe. Never raises (a
+        sidecar write must not break promotion)."""
         if not tx_hash:
             return
         with self._lock:
@@ -83,9 +85,9 @@ class ThoughtSidecar:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO thought_content "
                     "(tx_hash, node_id, user_prompt, agent_response, "
-                    "memory_type, fork, ts) VALUES (?,?,?,?,?,?,?)",
+                    "memory_type, fork, felt, ts) VALUES (?,?,?,?,?,?,?,?)",
                     (tx_hash, node_id, user_prompt, agent_response,
-                     memory_type, fork,
+                     memory_type, fork, felt,
                      ts if ts is not None else time.time()),
                 )
                 self._conn.commit()
@@ -141,7 +143,7 @@ class ThoughtSidecarReader:
             try:
                 row = conn.execute(
                     "SELECT tx_hash, node_id, user_prompt, agent_response, "
-                    "memory_type, fork, ts FROM thought_content "
+                    "memory_type, fork, felt, ts FROM thought_content "
                     "WHERE tx_hash = ? LIMIT 1", (tx_hash,)).fetchone()
                 return dict(row) if row is not None else None
             except Exception as e:
@@ -161,7 +163,7 @@ class ThoughtSidecarReader:
             try:
                 rows = conn.execute(
                     "SELECT tx_hash, node_id, user_prompt, agent_response, "
-                    "memory_type, fork, ts FROM thought_content "
+                    "memory_type, fork, felt, ts FROM thought_content "
                     "ORDER BY ts DESC LIMIT ?", (int(limit),)).fetchall()
                 return [dict(r) for r in rows]
             except Exception as e:
@@ -180,7 +182,7 @@ class ThoughtSidecarReader:
             try:
                 rows = conn.execute(
                     "SELECT tx_hash, node_id, user_prompt, agent_response, "
-                    "memory_type, fork, ts FROM thought_content "
+                    "memory_type, fork, felt, ts FROM thought_content "
                     "WHERE ts > ? ORDER BY ts DESC LIMIT ?",
                     (float(since_ts), int(limit))).fetchall()
                 return [dict(r) for r in rows]

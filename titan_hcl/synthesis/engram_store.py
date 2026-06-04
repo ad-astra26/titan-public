@@ -473,8 +473,11 @@ class EngramStore:
             felt_coverage=felt_coverage,
             params=self._params,
         )
+        # Store the felt axis absolute (§7.C) alongside the derived scalar —
+        # axis_felt is independently visible on /v6/synthesis/concepts and is
+        # what Phase D's compute_axes/reduction consumes.
         updated = self._graph.spine_update_groundedness(
-            concept_id, version, new_value,
+            concept_id, version, new_value, axis_felt=felt_coverage,
         )
         if not updated:
             return 0.0
@@ -546,7 +549,7 @@ class EngramStore:
             qr = self._graph._conn.execute(
                 "MATCH (c:Engram) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
-                "c.groundedness, c.anchor_tx, c.created_at"
+                "c.groundedness, c.anchor_tx, c.created_at, c.axis_felt"
             )
             while qr.has_next():
                 row = qr.get_next()
@@ -558,6 +561,7 @@ class EngramStore:
                     "groundedness": float(row[4]),
                     "anchor_tx": row[5],
                     "created_at": float(row[6]),
+                    "axis_felt": float(row[7]) if row[7] is not None else 0.0,
                 })
         except Exception as e:
             logger.warning(

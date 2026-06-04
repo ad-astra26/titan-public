@@ -52,6 +52,7 @@ construction — production synthesis_worker wires the real implementations
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -69,6 +70,69 @@ from titan_hcl.synthesis.outer_memory_writer import OuterMemoryEvent, OuterMemor
 logger = logging.getLogger(__name__)
 
 
+# ── Felt-at-lived-time coverage (RFP_synthesis_engram_grounding §7.C / §6.2 Q2) ──
+
+# The neuromod homeostatic centre — `Neuromodulator.initial_setpoint`
+# (titan_hcl/logic/neuromodulator.py:115; bounded [0.3,0.7]). The live per-modulator
+# dynamic setpoint is not available cross-process at consolidation, so the felt
+# intensity is measured as deviation from this canonical centre (not a magic
+# number — the documented setpoint default). Sanity-checked vs emotional_intensity.
+_NEUROMOD_SETPOINT_CENTRE = 0.5
+# felt-dict keys that are metadata, NOT neuromod levels (see cognitive_worker:2563).
+_FELT_META_KEYS = frozenset({"emotion", "emotion_confidence", "dream_cycle", "ts"})
+
+
+def _parse_felt(felt: Any) -> dict:
+    """Coerce a felt value (sidecar JSON string | dict | None) → dict. Soft-fail → {}."""
+    if not felt:
+        return {}
+    if isinstance(felt, dict):
+        return felt
+    if isinstance(felt, str):
+        try:
+            d = json.loads(felt)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _felt_magnitude(felt: dict) -> float:
+    """Normalized felt intensity ∈ [0,1] = ‖levels − setpoint_centre‖ / max_dev over
+    the numeric neuromod levels (metadata excluded). Key-agnostic (robust to
+    5HT/5-HT naming). Empty / level-less felt → 0.0."""
+    levels = [
+        float(v) for k, v in felt.items()
+        if k not in _FELT_META_KEYS and isinstance(v, (int, float))
+    ]
+    if not levels:
+        return 0.0
+    dev = math.sqrt(sum((x - _NEUROMOD_SETPOINT_CENTRE) ** 2 for x in levels))
+    max_dev = math.sqrt(len(levels)) * _NEUROMOD_SETPOINT_CENTRE  # each |x-0.5| ≤ 0.5
+    if max_dev <= 0.0:
+        return 0.0
+    return min(1.0, dev / max_dev)
+
+
+def felt_coverage_from_members(members: list) -> float:
+    """felt_coverage = (members_with_felt / total) × mean_magnitude  (§6.2 Q2:
+    consistency × intensity). ∈ [0,1]. Members carry `.felt` (sidecar JSON)."""
+    if not members:
+        return 0.0
+    mags = []
+    for m in members:
+        felt = _parse_felt(getattr(m, "felt", None))
+        if felt:
+            mag = _felt_magnitude(felt)
+            if mag > 0.0:
+                mags.append(mag)
+    if not mags:
+        return 0.0
+    coverage = len(mags) / len(members)
+    mean_magnitude = sum(mags) / len(mags)
+    return coverage * mean_magnitude
+
+
 # ── DTOs ────────────────────────────────────────────────────────────
 
 
@@ -81,6 +145,7 @@ class TxCandidate:
     tags: tuple[str, ...]
     embedding: Optional[tuple[float, ...]]  # None → tag-only clustering
     content_summary: str = ""
+    felt: Optional[str] = None  # felt-at-lived-time JSON (neuromod_context); §7.C
 
 
 @dataclass
@@ -395,14 +460,24 @@ class ConsolidationPass:
             )
             return False
 
-        # 3. Recompute groundedness from cluster stats.
+        # 3. Recompute groundedness + store the felt axis (§7.C). felt_coverage
+        #    feeds the legacy scalar (w_f=0 → no scalar change yet) AND is stored
+        #    to Engram.axis_felt so it's independently visible (Phase D consumes it).
+        felt_coverage = felt_coverage_from_members(cluster.members)
         self._store.recompute_groundedness(
             cv.concept_id, cv.version,
             episodic_encounters=len(cluster.members),
             distinct_contexts=len(cluster.centroid_tags),
             procedural_links=len(proposal.base_concept_refs),
-            felt_coverage=0.0,
+            felt_coverage=felt_coverage,
         )
+        if felt_coverage > 0.0:
+            logger.info(
+                "[ConsolidationPass] Engram %s v%d axis_felt=%.4f (%d/%d members "
+                "felt-laden)", cv.concept_id, cv.version, felt_coverage,
+                sum(1 for m in cluster.members
+                    if _parse_felt(getattr(m, "felt", None))),
+                len(cluster.members))
 
         result.concepts_created.append((cv.concept_id, cv.version))
         return True
@@ -434,13 +509,21 @@ class ConsolidationPass:
             )
             return False
 
+        felt_coverage = felt_coverage_from_members(cluster.members)
         self._store.recompute_groundedness(
             cv.concept_id, cv.version,
             episodic_encounters=len(cluster.members),
             distinct_contexts=len(cluster.centroid_tags),
             procedural_links=len(proposal.base_concept_refs),
-            felt_coverage=0.0,
+            felt_coverage=felt_coverage,
         )
+        if felt_coverage > 0.0:
+            logger.info(
+                "[ConsolidationPass] Engram %s v%d axis_felt=%.4f (bump; %d/%d "
+                "members felt-laden)", cv.concept_id, cv.version, felt_coverage,
+                sum(1 for m in cluster.members
+                    if _parse_felt(getattr(m, "felt", None))),
+                len(cluster.members))
 
         result.concepts_bumped.append((cv.concept_id, cv.version))
         return True

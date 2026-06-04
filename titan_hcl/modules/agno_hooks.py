@@ -2314,21 +2314,33 @@ def create_post_hook(plugin):
         # returns immediately; memory persistence completes in background.
         # Task exceptions logged via the done_callback. agno_worker.py
         # awaits all background tasks at SHUTDOWN to avoid orphans.
-        async def _log_to_mempool_bg(user_prompt_v, response_text_v, user_id_v):
+        # Felt-at-lived-time (§7.C — RFP_synthesis_engram_grounding): capture the
+        # neuromod levels the turn was lived under so the promoted chat thought
+        # carries felt into the synthesis felt axis. `_pre_chat_neuromods` is the
+        # {name: level} snapshot taken in the PreHook (set at the V5 fetch, ~:1086);
+        # copy it so a later turn's mutation can't alias this thought's felt. Empty
+        # → None (graceful; no felt for this thought).
+        _felt_snapshot = dict(getattr(plugin, "_pre_chat_neuromods", {}) or {})
+        _felt_snapshot = _felt_snapshot or None
+
+        async def _log_to_mempool_bg(user_prompt_v, response_text_v, user_id_v,
+                                     neuromod_context_v=None):
             try:
                 await plugin.memory.add_to_mempool(
                     user_prompt_v, response_text_v,
-                    user_identifier=user_id_v)
+                    user_identifier=user_id_v,
+                    neuromod_context=neuromod_context_v)
                 logger.info(
-                    "[PostHook][bg] Memory logged: user=%s prompt=%s... (%d chars)",
-                    user_id_v, user_prompt_v[:40], len(response_text_v))
+                    "[PostHook][bg] Memory logged: user=%s prompt=%s... (%d chars, "
+                    "felt=%s)", user_id_v, user_prompt_v[:40], len(response_text_v),
+                    bool(neuromod_context_v))
             except Exception as e:
                 logger.warning(
                     "[PostHook][bg] Memory logging failed: %s", e)
 
         try:
             asyncio.create_task(_log_to_mempool_bg(
-                user_prompt, response_text, user_id))
+                user_prompt, response_text, user_id, _felt_snapshot))
         except Exception as e:
             # asyncio.create_task can only fail if there's no running loop;
             # the post_hook is invoked from agent.arun's loop so this is

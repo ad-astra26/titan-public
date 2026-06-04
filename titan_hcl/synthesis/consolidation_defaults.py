@@ -106,6 +106,7 @@ def default_mine_recent_thoughts(
                 tags=(),  # sidecar carries none → cosine-primary clustering
                 embedding=None,  # filled from the conversation FAISS shard (D2)
                 content_summary=content,
+                felt=row.get("felt"),  # felt-at-lived-time JSON (§7.C)
             ))
     except Exception as e:
         logger.warning(

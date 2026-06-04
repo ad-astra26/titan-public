@@ -716,21 +716,26 @@ class TitanKnowledgeGraph:
 
     def spine_update_groundedness(
         self, concept_id: str, version: int, new_groundedness: float,
+        *, axis_felt: Optional[float] = None,
     ) -> bool:
-        """UPDATE one Concept row's groundedness column. Allowed by INV-3
-        because groundedness is a *derived metric column*, not the row's
-        identity / version / lineage — it can be recomputed at any time
-        without violating the immutability of the version itself. Returns
-        True on update, False if the row is missing."""
+        """UPDATE one Engram row's derived-metric columns (`groundedness`, and
+        optionally `axis_felt`). Allowed by INV-3 because these are *derived
+        metric columns*, not the row's identity / version / lineage — they can
+        be recomputed at any time without violating version immutability.
+        Returns True on update, False if the row is missing."""
         pk = self._spine_pk(concept_id, version)
         try:
             # Verify row exists first (Kuzu MATCH+SET silently succeeds with
             # zero rows; we want a definite signal).
             if self.spine_get_concept_version(concept_id, version) is None:
                 return False
+            set_clause = "SET c.groundedness = $g"
+            params = {"pk": pk, "g": float(new_groundedness)}
+            if axis_felt is not None:
+                set_clause += ", c.axis_felt = $af"
+                params["af"] = float(axis_felt)
             self._conn.execute(
-                "MATCH (c:Engram {pk: $pk}) SET c.groundedness = $g",
-                {"pk": pk, "g": float(new_groundedness)},
+                f"MATCH (c:Engram {{pk: $pk}}) {set_clause}", params,
             )
             return True
         except Exception as e:

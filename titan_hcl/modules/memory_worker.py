@@ -7,6 +7,7 @@ sends responses via send_queue. This isolates Cognee's ~500MB footprint.
 Entry point: memory_worker_main(recv_queue, send_queue, name, config)
 """
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -891,11 +892,17 @@ def _anchor_promoted_node(node: dict, *, now: float, sidecar, ctx):
             "[MemoryWorker] stamp timechain_tx_hash node %s failed: %s",
             node_id, _ux)
     if sidecar is not None:
+        # Felt-at-lived-time (§7.C): the node carries the neuromod_context it was
+        # lived under (chat-add / dream / inject); serialize to the sidecar `felt`
+        # column so consolidation can compute the felt axis. None when absent.
+        _nc = node.get("neuromod_context")
+        _felt = json.dumps(_nc) if isinstance(_nc, dict) and _nc else None
         sidecar.put(
             tx_hash=tx_hash, node_id=node_id,
             user_prompt=node.get("user_prompt", "") or "",
             agent_response=node.get("agent_response", "") or "",
-            memory_type=payload["thought_type"], fork=payload["fork"], ts=now)
+            memory_type=payload["thought_type"], fork=payload["fork"],
+            ts=now, felt=_felt)
     return tx_hash
 
 
