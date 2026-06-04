@@ -1159,6 +1159,21 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         spine_exporter_holder["fn"] = (
             lambda: engram_store.export_snapshot(spine_snapshot_path)
         )
+        # Phase D (§7.D) — one-time boot recompute of the population grounding
+        # scalar. This MIGRATES the existing population onto the percentile-blend
+        # (backfilling axis_used from the stored provisional for pre-D Engrams) so
+        # groundedness discriminates immediately on deploy — independent of whether
+        # a dream creates new concepts. Idempotent + cheap (bounded Engram count);
+        # ongoing re-ranking happens at each dream boundary (ConsolidationPass.run).
+        try:
+            migrated = engram_store.recompute_population_groundedness()
+            logger.info(
+                "[synthesis_worker] boot population groundedness recompute: "
+                "%d Engrams percentile-blended (§7.D)", migrated)
+        except Exception as _pop_err:
+            logger.warning(
+                "[synthesis_worker] boot population recompute failed: %s", _pop_err)
+
         # Initial export so the snapshot is non-empty + present before
         # the first 60s tick (api process gets data immediately on first
         # poll after worker boot).
