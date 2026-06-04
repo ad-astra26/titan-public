@@ -99,6 +99,7 @@ from titan_hcl.synthesis.standing_store import (
 from titan_hcl.synthesis.recall import EngineRecall
 from titan_hcl.synthesis.writer import (
     SynthesisWriter,
+    BOOT_SYNC_TIMEOUT_S,
     guard_conn,
     resolve_writer,
 )
@@ -142,6 +143,14 @@ _WORKER_READY: bool = False
 
 
 HEARTBEAT_INTERVAL_S = 30.0
+# Bounded boot-alive window (root-cause fix 2026-06-04): the heartbeat thread
+# emits the SHM heartbeat DURING boot (not just after _WORKER_READY) up to this
+# many seconds, so a slow boot under a respawn cascade reports ALIVE instead of
+# being false-detected as CRASHED (shm_pid_dead). Generous enough to ride out a
+# cascade; bounded so a GENUINELY stuck boot still stops heartbeating and gets
+# restarted (no hidden hang). State stays starting/booted; readiness stays
+# probe-gated (SPEC §11.I.2 / §11.I.7).
+BOOT_HEARTBEAT_GRACE_S = 300.0
 RECOMPUTE_INTERVAL_S = 60.0          # arch §5.2 60s recompute cadence
 SYNTH_STATUS_SLOT_NAME = "synth_status"     # /dev/shm/titan_<id>/synth_status.bin
 SYNTH_STATUS_PAYLOAD_BYTES = 24             # struct '<ddII'
@@ -311,15 +320,20 @@ class ActivationStore:
         # cross-process readers use atomic JSON snapshots, never this handle.)
         self._writer = resolve_writer(writer)
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        # BOOT_SYNC_TIMEOUT_S (not the 30s steady-state default): this is the
+        # boot-CRITICAL connect+schema+load. Under a respawn cascade the writer
+        # thread can be CPU-starved, so it gets room to complete instead of a
+        # TimeoutError crash on init (root-cause fix 2026-06-04 — T1 mainnet).
         self._conn = guard_conn(
             self._writer,
-            self._writer.submit_sync(lambda: duckdb.connect(db_path)))
+            self._writer.submit_sync(
+                lambda: duckdb.connect(db_path), timeout=BOOT_SYNC_TIMEOUT_S))
         # Cache resumes ACT-R activation across restarts. Schema + resume-load
         # run on the writer thread (boot is single-threaded, so they complete
         # before any other thread submits an op).
         self._cache: dict[str, ActivationState] = {}
-        self._writer.submit_sync(self._init_schema)
-        self._writer.submit_sync(self._load_existing)
+        self._writer.submit_sync(self._init_schema, timeout=BOOT_SYNC_TIMEOUT_S)
+        self._writer.submit_sync(self._load_existing, timeout=BOOT_SYNC_TIMEOUT_S)
 
     def _init_schema(self) -> None:
         # CREATE TABLE IF NOT EXISTS is idempotent across restarts. Mirrors the
@@ -498,7 +512,8 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
 
 def _heartbeat_loop(send_queue, name: str,
                     stop_event: threading.Event,
-                    state_writer: Optional[Any] = None) -> None:
+                    state_writer: Optional[Any] = None,
+                    boot_deadline: Optional[float] = None) -> None:
     """Daemon thread — MODULE_HEARTBEAT every 30s.
 
     Phase 11 §11.I.5 (Chunk 11N): also publishes
@@ -513,24 +528,36 @@ def _heartbeat_loop(send_queue, name: str,
         _hb_gap = time.monotonic() - _hb_last
         _hb_last = time.monotonic()
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
-        if state_writer is not None and _WORKER_READY:
-            try:
-                state_writer.heartbeat()
-                # TRACE (RFP §7.D flap hunt): a large gap = the heartbeat thread
-                # was starved (GIL held by a bulk op on another thread) → SHM slot
-                # goes stale → guardian shm_pid_dead. Surfaces starvation directly.
-                if _hb_gap > HEARTBEAT_INTERVAL_S * 1.5:
-                    logger.warning(
-                        "[synthesis_worker] HB STARVED — gap=%.1fs (expected ~%.1fs)"
-                        " — heartbeat thread blocked by a GIL-holding bulk op; SHM"
-                        " slot went stale", _hb_gap, HEARTBEAT_INTERVAL_S)
-            except Exception:  # noqa: BLE001
-                pass
-        elif state_writer is not None:
-            logger.warning(
-                "[synthesis_worker] HB SUPPRESSED — _WORKER_READY=False (probe "
-                "handshake not complete %.0fs into life) — SHM slot stays stale",
-                _hb_gap)
+        if state_writer is not None:
+            # Emit the SHM heartbeat once READY (steady state) OR during boot
+            # while still within the boot-grace window (root-cause fix
+            # 2026-06-04). A slow boot under a respawn cascade then reports
+            # ALIVE (state stays starting/booted — heartbeat() preserves state;
+            # readiness stays probe-gated) instead of being false-detected as
+            # CRASHED via a stale slot and killed mid-init. Past the boot
+            # deadline a still-not-ready worker stops heartbeating → a genuinely
+            # stuck boot is caught by EMPTY/CRASHED supervision (no hidden hang).
+            _booting_ok = (boot_deadline is not None
+                           and time.monotonic() < boot_deadline)
+            if _WORKER_READY or _booting_ok:
+                try:
+                    state_writer.heartbeat()
+                    # TRACE (RFP §7.D flap hunt): a large gap once READY = the
+                    # heartbeat thread was starved (GIL held by a bulk op on
+                    # another thread) → SHM slot stale → guardian shm_pid_dead.
+                    if _WORKER_READY and _hb_gap > HEARTBEAT_INTERVAL_S * 1.5:
+                        logger.warning(
+                            "[synthesis_worker] HB STARVED — gap=%.1fs (expected"
+                            " ~%.1fs) — heartbeat thread blocked by a GIL-holding"
+                            " bulk op; SHM slot went stale",
+                            _hb_gap, HEARTBEAT_INTERVAL_S)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                logger.warning(
+                    "[synthesis_worker] HB SUPPRESSED — not READY + past boot "
+                    "grace (%.0fs into life) — SHM slot stale, guardian will "
+                    "restart a genuinely stuck boot", _hb_gap)
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -740,6 +767,26 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             "[synthesis_worker] Phase 11 ModuleStateWriter init failed "
             "(continuing on legacy path): %s", _sw_err)
 
+    # ── Liveness BEFORE the heavy init (root-cause fix 2026-06-04) ──────────
+    # Start the heartbeat thread NOW — before the boot-critical duckdb.connect +
+    # schema/load below — and let it emit the SHM heartbeat DURING boot (bounded
+    # by BOOT_HEARTBEAT_GRACE_S). Previously the hb thread started AFTER the
+    # connect, and the SHM heartbeat was suppressed until _WORKER_READY (end of
+    # boot), so a slow boot under a respawn cascade (box CPU/I/O starved) emitted
+    # no SHM heartbeat → guardian false-detected the alive-but-still-booting
+    # worker as CRASHED (shm_pid_dead) and killed it mid-init. State stays
+    # starting/booted (heartbeat() preserves state); readiness is still
+    # probe-gated (state→running only via the recv-loop probe, post-_WORKER_READY),
+    # so nothing routes work early. SPEC-aligned: §11.I.2 (state machine
+    # unchanged) + §11.I.7 (staleness-supervision is a RUNNING-state concern).
+    stop_event = threading.Event()
+    _boot_hb_deadline = time.monotonic() + BOOT_HEARTBEAT_GRACE_S
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(send_queue, name, stop_event, _state_writer, _boot_hb_deadline),
+        daemon=True, name=f"synthesis-hb-{name}")
+    hb_thread.start()
+
     # DuckDB path — synthesis_worker owns its OWN file (not titan_memory.duckdb)
     # per G21 / INV-Syn-3 to avoid the cross-worker R/W lock conflict
     # (DuckDB v0.8+ rejects two R/W connections to one file across
@@ -806,14 +853,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # doesn't contend with activation recompute.
     cache_lock = threading.Lock()
 
-    stop_event = threading.Event()
-    # Phase 11 §11.I.5 — pass state_writer so heartbeat thread mirrors
-    # MODULE_HEARTBEAT to the SHM slot once _WORKER_READY flips True.
-    hb_thread = threading.Thread(
-        target=_heartbeat_loop,
-        args=(send_queue, name, stop_event, _state_writer),
-        daemon=True, name=f"synthesis-hb-{name}")
-    hb_thread.start()
+    # (stop_event + the heartbeat thread are now started EARLIER — before the
+    # heavy duckdb init above — so liveness covers the boot-critical connect.
+    # See the "Liveness BEFORE the heavy init" block near the top of boot.)
 
     # Phase 4 FU-1 — spine exporter holder (late-bound). Default is a
     # no-op so the recompute loop fires safely before the ConceptStore is
