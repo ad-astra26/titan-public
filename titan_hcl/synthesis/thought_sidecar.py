@@ -38,7 +38,6 @@ _SCHEMA = (
     " agent_response TEXT,"
     " memory_type TEXT,"
     " fork TEXT,"
-    " felt TEXT,"          # Phase B (RFP §7.B) — felt-at-lived-time JSON; filled in C
     " ts DOUBLE)"
 )
 
@@ -60,14 +59,6 @@ class ThoughtSidecar:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute(_SCHEMA)
-        # Phase B (RFP §7.B) — idempotent `felt` add for sidecars created before
-        # Phase B (CREATE TABLE IF NOT EXISTS will not alter an existing table).
-        # Unpopulated here; Phase C threads `neuromod_context` into it.
-        try:
-            self._conn.execute(
-                "ALTER TABLE thought_content ADD COLUMN felt TEXT")
-        except Exception:
-            pass  # already present (sqlite raises "duplicate column name")
         self._conn.commit()
 
     def put(self, *, tx_hash: str, node_id, user_prompt: str,

@@ -8,7 +8,7 @@ Covers `titan_hcl/api/synthesis_concept_handlers.py`:
 
 FU-1 swapped the read source from direct Kuzu to data/spine_snapshot.json
 (written by synthesis_worker each 60s tick). Tests build the spine via
-EngramStore in a tmp dir, call engram_store.export_snapshot() to write
+ConceptStore in a tmp dir, call concept_store.export_snapshot() to write
 the JSON, then close the Kuzu writer and exercise the handlers (which read
 the JSON only — no Kuzu open).
 """
@@ -22,7 +22,7 @@ import pytest
 
 from titan_hcl.api import synthesis_concept_handlers as handlers
 from titan_hcl.core.direct_memory import TitanKnowledgeGraph
-from titan_hcl.synthesis.engram_store import EngramStore
+from titan_hcl.synthesis.concept_store import ConceptStore
 from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter
 
 
@@ -39,7 +39,7 @@ def seeded_kuzu(monkeypatch):
         g = TitanKnowledgeGraph(kuzu_path)
         q = queue.Queue()
         w = OuterMemoryWriter(send_queue=q, src="api_test")
-        store = EngramStore(g, w, clock=lambda: 1000.0)
+        store = ConceptStore(g, w, clock=lambda: 1000.0)
 
         store.create_concept("linux_terminal", "Linux terminal",
                              memory_type="declarative")

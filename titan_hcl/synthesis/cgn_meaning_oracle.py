@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 #     "felt_anchors":        [tx_hash, ...],
 #   }
 # Missing concept → None. Synthesis_worker wires this to
-# ``EngramStore.read_spine_strands(...)`` (or a Kuzu read wrapper).
+# ``ConceptStore.read_spine_strands(...)`` (or a Kuzu read wrapper).
 ConceptReader = Callable[[str, int], Optional[dict]]
 
 # ``cgn_grounder(concept_id, version, valence, arousal, neuromods) -> dict``

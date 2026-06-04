@@ -27,7 +27,7 @@ import pytest
 
 from titan_hcl.core.direct_memory import TitanKnowledgeGraph
 from titan_hcl.synthesis.cgn_bridge import CGNRegistrationBridge
-from titan_hcl.synthesis.engram_store import EngramStore
+from titan_hcl.synthesis.concept_store import ConceptStore
 from titan_hcl.synthesis.consolidation import (
     Cluster,
     ConsolidationPass,
@@ -45,7 +45,7 @@ from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter
 
 @pytest.fixture()
 def env():
-    """Real graph + engram_store + cgn_bridge + writer; collaborators
+    """Real graph + concept_store + cgn_bridge + writer; collaborators
     are stubbed below per-test."""
     with tempfile.TemporaryDirectory() as tmp:
         g = TitanKnowledgeGraph(os.path.join(tmp, "p4g.kuzu"))
@@ -54,7 +54,7 @@ def env():
         bridge = CGNRegistrationBridge(
             os.path.join(tmp, "spine_concepts.json"),
         )
-        store = EngramStore(g, w, clock=lambda: 1000.0)
+        store = ConceptStore(g, w, clock=lambda: 1000.0)
         try:
             yield {
                 "graph": g, "queue": q, "writer": w,
@@ -111,7 +111,7 @@ def _make_pass(env, txs, proposals=None, **kw):
             return LLMProposal(action="reject", reason="exhausted")
 
     return ConsolidationPass(
-        engram_store=env["store"],
+        concept_store=env["store"],
         cgn_bridge=env["bridge"],
         outer_memory_writer=env["writer"],
         mine_recent_txs_fn=mine_fn,
@@ -316,7 +316,7 @@ def test_llm_propose_exception_counted_as_rejected(env):
         raise RuntimeError("ollama down")
 
     cp = ConsolidationPass(
-        engram_store=env["store"], cgn_bridge=env["bridge"],
+        concept_store=env["store"], cgn_bridge=env["bridge"],
         outer_memory_writer=env["writer"],
         mine_recent_txs_fn=mine_fn, llm_propose_fn=propose_fn,
     )
@@ -332,7 +332,7 @@ def test_mine_exception_aborts_pass_anchors_summary(env):
         raise RuntimeError("chain unavailable")
 
     cp = ConsolidationPass(
-        engram_store=env["store"], cgn_bridge=env["bridge"],
+        concept_store=env["store"], cgn_bridge=env["bridge"],
         outer_memory_writer=env["writer"],
         mine_recent_txs_fn=bad_mine,
         llm_propose_fn=lambda _c: LLMProposal(action="reject"),

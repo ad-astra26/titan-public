@@ -27,7 +27,7 @@ This module owns the orchestration logic of one consolidation pass:
        - `reject`: no coherent concept; skip the cluster.
   4. Apply each accepted proposal:
        * Register the concept_id with CGN (P4.C).
-       * Create / bump via EngramStore (P4.B) — which anchors the
+       * Create / bump via ConceptStore (P4.B) — which anchors the
          canonical concept-version TX via OuterMemoryWriter (P4.D) AND
          maintains COMPOSED_FROM / COMPOSED_INTO edges to the cluster's
          contributing concept_ids.
@@ -58,8 +58,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional
 
-from titan_hcl.synthesis.engram_store import (
-    EngramStore,
+from titan_hcl.synthesis.concept_store import (
+    ConceptStore,
     ParentVersionMissing,
     WriterFailure,
 )
@@ -140,7 +140,7 @@ class ConsolidationPass:
 
     def __init__(
         self,
-        engram_store: EngramStore,
+        concept_store: ConceptStore,
         cgn_bridge: CGNRegistrationBridge,
         outer_memory_writer: OuterMemoryWriter,
         mine_recent_txs_fn: Callable[..., list[TxCandidate]],
@@ -161,7 +161,7 @@ class ConsolidationPass:
         llm_calls_max: int = 20,
         source: str = "synthesis_worker",
     ):
-        self._store = engram_store
+        self._store = concept_store
         self._bridge = cgn_bridge
         self._writer = outer_memory_writer
         self._mine = mine_recent_txs_fn
@@ -377,7 +377,7 @@ class ConsolidationPass:
             seed_consumer="synthesis_engine",
         )
 
-        # 2. Create via EngramStore (anchors the TX via OuterMemoryWriter +
+        # 2. Create via ConceptStore (anchors the TX via OuterMemoryWriter +
         #    inserts the Kuzu row + maintains composition edges).
         evidence = [m.tx_hash for m in cluster.members]
         try:

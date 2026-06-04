@@ -93,42 +93,23 @@ class DiffEvent:
 # ── Diff primitives (xdelta3 wrapper) ─────────────────────────────────
 
 
-def _xdelta3_encode(baseline_path: str, current_path: str) -> Optional[str]:
-    """Produce an xdelta3 patch FILE (current - baseline), STREAMED to disk.
-
-    2026-06-04 fix (BUG-BACKUP-RSS-FLAP): previously `capture_output=True`
-    returned the patch BYTES — for a multi-GB DB whose daily diff is GB-scale
-    that buffered the whole patch in this process's RSS → guardian rss_limit
-    kill → backup flap. Now xdelta3 writes the patch to a temp file (trailing
-    output arg, no stdout capture) so the patch never enters RAM here; we return
-    its PATH (the caller streams it into the tar via addfile(fileobj) + unlinks
-    it). The patch CONTENT is byte-identical — only its location changes.
-    Returns the patch path or None on error.
-    """
-    fd, patch_path = tempfile.mkstemp(suffix=".vcdiff")
-    os.close(fd)
+def _xdelta3_encode(baseline_path: str, current_path: str) -> Optional[bytes]:
+    """Produce xdelta3 patch bytes (current - baseline). Returns None on error."""
     try:
+        # -e encode, -s source (baseline), output to stdout (-c)
         result = subprocess.run(
-            [XDELTA3_BIN, "-e", "-s", baseline_path, current_path, patch_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120,
+            [XDELTA3_BIN, "-e", "-s", baseline_path, "-c", current_path],
+            capture_output=True, timeout=120,
         )
         if result.returncode != 0:
             logger.warning(
                 "[local_diff] xdelta3 encode failed (%s vs %s): rc=%d stderr=%s",
                 baseline_path, current_path, result.returncode,
                 result.stderr[:200].decode("utf-8", "replace"))
-            try:
-                os.unlink(patch_path)
-            except OSError:
-                pass
             return None
-        return patch_path
+        return result.stdout
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         logger.warning("[local_diff] xdelta3 encode error: %s", e)
-        try:
-            os.unlink(patch_path)
-        except OSError:
-            pass
         return None
 
 
@@ -441,36 +422,21 @@ def _add_file_to_incremental(
         # File changed — produce xdelta3 patch.
         baseline_path = os.path.join(baseline_files_dir, arc_name)
         if os.path.exists(baseline_path):
-            patch_path = _xdelta3_encode(baseline_path, current_path)
-            if patch_path is not None:
-                patch_size = os.path.getsize(patch_path)
-                if patch_size < current_size:
-                    # Patch smaller than the file — ship it, STREAMED from disk
-                    # via addfile(fileobj) (the patch is never read into RAM).
-                    # TarInfo (name/size/mtime) is identical to the prior path →
-                    # byte-identical tar member; only the source is a file now.
-                    info = tarfile.TarInfo(name=arc_name + ".vcdiff")
-                    info.size = patch_size
-                    info.mtime = int(time.time())
-                    with open(patch_path, "rb") as _pf:
-                        tar.addfile(info, _pf)
-                    files_entries.append(FileEntry(
-                        arc_name=arc_name,
-                        sha256=current_hash,
-                        size_bytes=current_size,
-                        diff_mode="patch",
-                        baseline_sha256=baseline_entry.get("sha256"),
-                    ))
-                    try:
-                        os.unlink(patch_path)
-                    except OSError:
-                        pass
-                    return
-                # Patch not smaller than full-ship → discard it + full-ship below.
-                try:
-                    os.unlink(patch_path)
-                except OSError:
-                    pass
+            patch = _xdelta3_encode(baseline_path, current_path)
+            if patch is not None and len(patch) < current_size:
+                # Patch is smaller than the file — ship the patch.
+                info = tarfile.TarInfo(name=arc_name + ".vcdiff")
+                info.size = len(patch)
+                info.mtime = int(time.time())
+                tar.addfile(info, _io.BytesIO(patch))
+                files_entries.append(FileEntry(
+                    arc_name=arc_name,
+                    sha256=current_hash,
+                    size_bytes=current_size,
+                    diff_mode="patch",
+                    baseline_sha256=baseline_entry.get("sha256"),
+                ))
+                return
         # Patch failed or larger than full — fall through to full-ship.
 
     # New file (not in baseline) or patch produced no gain → ship full.

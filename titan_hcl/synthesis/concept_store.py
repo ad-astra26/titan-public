@@ -1,4 +1,4 @@
-"""EngramStore — sole writer of the Kuzu Concept spine (Phase 4 / §P4.B).
+"""ConceptStore — sole writer of the Kuzu Concept spine (Phase 4 / §P4.B).
 
 Per `ARCHITECTURE_synthesis_engine.md` §6 + §10 + INV-Syn-3 (extended) +
 INV-3 + INV-4 + INV-10, this module is the ONLY surface authorized to
@@ -21,7 +21,7 @@ can use them):
 - **INV-10** — `bump_version()` requires the parent concept_id to exist;
   raises `ParentVersionMissing` rather than silently creating a v=1 ghost.
 
-- **INV-Syn-3 (extended → INV-Syn-7 proposed in P4.K)** — EngramStore is
+- **INV-Syn-3 (extended → INV-Syn-7 proposed in P4.K)** — ConceptStore is
   only ever instantiated inside `synthesis_worker`. Cross-process readers
   go through `BridgeRecall.read_concept_spine()` (P4.H, watermark-gated).
 
@@ -61,7 +61,7 @@ class WriterFailure(Exception):
 
 
 @dataclass(frozen=True)
-class Engram:
+class ConceptVersion:
     """The materialized result of create_concept / bump_version."""
 
     concept_id: str
@@ -74,13 +74,13 @@ class Engram:
 
 
 @dataclass(frozen=True)
-class EngramSpine:
+class ConceptSpine:
     """Aggregate of all versions for one concept_id + composition edges.
     Returned by `read_spine()` / used by spine-aware recall (P4.H)."""
 
     concept_id: str
     latest_version: int
-    versions: tuple[Engram, ...]
+    versions: tuple[ConceptVersion, ...]
     composed_from: tuple[tuple[str, int], ...]  # (parent_concept_id, version)
     composed_into: tuple[tuple[str, int], ...]  # (child_concept_id, version)
 
@@ -88,7 +88,7 @@ class EngramSpine:
 # ── Writer protocol (duck-typed; real impl is P4.D) ─────────────────
 
 
-class _EngramWriter(Protocol):
+class _ConceptVersionWriter(Protocol):
     def write_concept_version(
         self,
         *,
@@ -185,17 +185,17 @@ def compute_groundedness(
     return raw
 
 
-# ── EngramStore ────────────────────────────────────────────────────
+# ── ConceptStore ────────────────────────────────────────────────────
 
 
-class EngramStore:
+class ConceptStore:
     """Sole writer of the Kuzu Concept spine. Instantiate ONCE inside
     `synthesis_worker` (INV-Syn-3 / INV-11)."""
 
     def __init__(
         self,
         graph: Any,                             # TitanKnowledgeGraph
-        outer_memory_writer: _EngramWriter,
+        outer_memory_writer: _ConceptVersionWriter,
         *,
         groundedness_params: _GroundednessParams | None = None,
         clock: Any = time.time,                  # injectable for deterministic tests
@@ -225,7 +225,7 @@ class EngramStore:
         derivation_evidence: Optional[list[str]] = None,
         derivation_merkle_root: Optional[str] = None,
         oracle_verdict: Optional[dict] = None,
-    ) -> Engram:
+    ) -> ConceptVersion:
         """Materialize a brand-new spine concept at v=1.
 
         Caller MUST have registered `concept_id` with CGN first (P4.C). This
@@ -293,7 +293,7 @@ class EngramStore:
                 )
         except Exception as e:
             logger.error(
-                "[EngramStore] create_concept(%s) writer failed: %s",
+                "[ConceptStore] create_concept(%s) writer failed: %s",
                 concept_id, e,
             )
             raise WriterFailure(
@@ -312,7 +312,7 @@ class EngramStore:
             # We don't roll back the TX (it's canonical) but we surface
             # the divergence loudly so the operator notices.
             logger.warning(
-                "[EngramStore] create_concept(%s) found existing v=1 row "
+                "[ConceptStore] create_concept(%s) found existing v=1 row "
                 "after a successful TX anchor — spine + chain may diverge",
                 concept_id,
             )
@@ -325,7 +325,7 @@ class EngramStore:
             composed_from=composed_from,
         )
 
-        return Engram(
+        return ConceptVersion(
             concept_id=concept_id, version=1, name=name,
             memory_type=memory_type, groundedness=initial_groundedness,
             anchor_tx=tx_hash, created_at=self._clock(),
@@ -340,7 +340,7 @@ class EngramStore:
         groundedness_at_bump: Optional[float] = None,
         derivation_merkle_root: Optional[str] = None,
         oracle_verdict: Optional[dict] = None,
-    ) -> Engram:
+    ) -> ConceptVersion:
         """Insert v(n+1) for an existing concept. INV-3: parent stays
         immutable; INV-10: parent MUST exist or ParentVersionMissing raises.
         """
@@ -399,7 +399,7 @@ class EngramStore:
                 )
         except Exception as e:
             logger.error(
-                "[EngramStore] bump_version(%s,v%d) writer failed: %s",
+                "[ConceptStore] bump_version(%s,v%d) writer failed: %s",
                 concept_id, new_version, e,
             )
             raise WriterFailure(
@@ -414,7 +414,7 @@ class EngramStore:
         )
         if not created:
             logger.warning(
-                "[EngramStore] bump_version(%s,v%d) found existing row "
+                "[ConceptStore] bump_version(%s,v%d) found existing row "
                 "after TX anchor — spine + chain may diverge",
                 concept_id, new_version,
             )
@@ -429,7 +429,7 @@ class EngramStore:
             composed_from=composed_from,
         )
 
-        return Engram(
+        return ConceptVersion(
             concept_id=concept_id, version=new_version, name=name,
             memory_type=memory_type, groundedness=groundedness_at_bump,
             anchor_tx=tx_hash, created_at=self._clock(),
@@ -502,7 +502,7 @@ class EngramStore:
                 n += 1
             except Exception as e:
                 logger.warning(
-                    "[EngramStore] recompute_groundedness_batch row failed: "
+                    "[ConceptStore] recompute_groundedness_batch row failed: "
                     "%r: %s", r, e,
                 )
         return n
@@ -544,7 +544,7 @@ class EngramStore:
         concepts: list[dict] = []
         try:
             qr = self._graph._conn.execute(
-                "MATCH (c:Engram) "
+                "MATCH (c:Concept) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                 "c.groundedness, c.anchor_tx, c.created_at"
             )
@@ -561,7 +561,7 @@ class EngramStore:
                 })
         except Exception as e:
             logger.warning(
-                "[EngramStore] export_snapshot: concept fetch failed: %s", e,
+                "[ConceptStore] export_snapshot: concept fetch failed: %s", e,
             )
 
         concepts.sort(key=lambda r: (r["concept_id"], r["version"]))
@@ -572,7 +572,7 @@ class EngramStore:
                             ("COMPOSED_INTO", edges_into)):
             try:
                 qr = self._graph._conn.execute(
-                    f"MATCH (a:Engram)-[:{rel}]->(b:Engram) "
+                    f"MATCH (a:Concept)-[:{rel}]->(b:Concept) "
                     f"RETURN a.concept_id, a.version, b.concept_id, b.version"
                 )
                 while qr.has_next():
@@ -583,7 +583,7 @@ class EngramStore:
                     ])
             except Exception as e:
                 logger.debug(
-                    "[EngramStore] export_snapshot: %s edge fetch failed: %s",
+                    "[ConceptStore] export_snapshot: %s edge fetch failed: %s",
                     rel, e,
                 )
 
@@ -607,7 +607,7 @@ class EngramStore:
             os.replace(tmp_path, snapshot_path)
         except Exception as e:
             logger.warning(
-                "[EngramStore] export_snapshot atomic write failed: %s", e,
+                "[ConceptStore] export_snapshot atomic write failed: %s", e,
             )
             try:
                 os.unlink(tmp_path)
@@ -659,8 +659,8 @@ class EngramStore:
             declarative.append(own_anchor)
         try:
             qr = self._graph._conn.execute(
-                "MATCH (a:Engram {concept_id: $cid, version: $v})"
-                "-[:COMPOSED_FROM]->(b:Engram) "
+                "MATCH (a:Concept {concept_id: $cid, version: $v})"
+                "-[:COMPOSED_FROM]->(b:Concept) "
                 "RETURN b.memory_type, b.anchor_tx",
                 {"cid": concept_id, "v": resolved_version},
             )
@@ -678,7 +678,7 @@ class EngramStore:
                 # 'meta' parents are not one of the four spine strands — skip.
         except Exception as e:
             logger.debug(
-                "[EngramStore] read_spine_strands: COMPOSED_FROM read failed "
+                "[ConceptStore] read_spine_strands: COMPOSED_FROM read failed "
                 "for %s:%s: %s", concept_id, resolved_version, e)
         return {
             "declarative_anchors": declarative,
@@ -710,16 +710,16 @@ class EngramStore:
             )
             if not (ok_from or ok_into):
                 logger.debug(
-                    "[EngramStore] composition edge %s v%d ↔ %s v%d skipped"
+                    "[ConceptStore] composition edge %s v%d ↔ %s v%d skipped"
                     " (likely missing endpoint)",
                     from_concept_id, from_version, parent_id, parent_ver,
                 )
 
 
 __all__ = (
-    "EngramStore",
-    "Engram",
-    "EngramSpine",
+    "ConceptStore",
+    "ConceptVersion",
+    "ConceptSpine",
     "ParentVersionMissing",
     "WriterFailure",
     "compute_groundedness",

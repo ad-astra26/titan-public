@@ -12,7 +12,7 @@ namespace. Per the 2026-05-20 design conversation and arch §3.2 + INV-1:
 
 This module is the thin bridge that:
 
-1. Registers a spine concept_id when EngramStore materializes it (P4.B).
+1. Registers a spine concept_id when ConceptStore materializes it (P4.B).
    Registration writes to `data/synthesis_spine_concepts.json` (atomic
    tmp+rename) — a small registry distinct from CGN's vocabulary, so
    neither namespace pollutes the other.
@@ -24,7 +24,7 @@ P4 ships the **interface**; the deep CGN integration lands incrementally
 per the "interface-complete, implementation-incremental" §3.3 discipline.
 
 Soft-fail semantics: any persistence error logs WARN but never raises so
-EngramStore.create_concept can still anchor its TX (the spine row is a
+ConceptStore.create_concept can still anchor its TX (the spine row is a
 derived index, not the canonical record — INV-2).
 """
 from __future__ import annotations
@@ -201,7 +201,7 @@ class CGNRegistrationBridge:
         note="phase4_stub")`. The inner-outer bridge phase deepens this
         into a real CGN.meaning_of() / ensure_grounded() call cycle.
 
-        Caller (EngramStore.recompute_groundedness via P4.G consolidation)
+        Caller (ConceptStore.recompute_groundedness via P4.G consolidation)
         treats None as "no felt strand yet" → felt_coverage=0.0 in the
         groundedness formula (§P4.E). Same numeric result as P4's stub,
         but the structural seam is in place for the bridge phase.
