@@ -249,7 +249,7 @@ def on_writer(method: Callable) -> Callable:
     @functools.wraps(method)
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         # Prefer `self._db_writer` when the store already uses `self._writer`
-        # for something else (HypothesisForkStore / ConceptStore hold the
+        # for something else (HypothesisForkStore / EngramStore hold the
         # bus-only OuterMemoryWriter on `self._writer`); else `self._writer`
         # IS the SynthesisWriter (ActivationStore, buffer/skill/vector stores).
         w = getattr(self, "_db_writer", None) or self._writer

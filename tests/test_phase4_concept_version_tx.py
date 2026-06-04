@@ -12,8 +12,8 @@ against PLAN §P4.D + arch §10.
   same hash; mutated content → different hash).
 - composed_from cap respected (large list trimmed on TX, full list still
   passed by caller).
-- ConceptStore + real OuterMemoryWriter integration (INV-14 parity:
-  ConceptStore's FakeWriter-shape vs real writer produce a TX of the
+- EngramStore + real OuterMemoryWriter integration (INV-14 parity:
+  EngramStore's FakeWriter-shape vs real writer produce a TX of the
   expected shape — proves the §P4.B mock contract matches reality).
 """
 from __future__ import annotations
@@ -237,23 +237,23 @@ def test_composed_from_cap_respected_on_tx(writer):
     }
 
 
-# ── ConceptStore integration ────────────────────────────────────────
+# ── EngramStore integration ────────────────────────────────────────
 
 
-def test_concept_store_with_real_writer_end_to_end():
-    """INV-14 parity: ConceptStore + real OuterMemoryWriter produces the
+def test_engram_store_with_real_writer_end_to_end():
+    """INV-14 parity: EngramStore + real OuterMemoryWriter produces the
     expected TX on the queue + the expected Kuzu row. Proves the P4.B
     FakeWriter mock contract matches the real writer."""
     import os
     import tempfile
     from titan_hcl.core.direct_memory import TitanKnowledgeGraph
-    from titan_hcl.synthesis.concept_store import ConceptStore
+    from titan_hcl.synthesis.engram_store import EngramStore
 
     with tempfile.TemporaryDirectory() as tmp:
         g = TitanKnowledgeGraph(os.path.join(tmp, "p4d_e2e.kuzu"))
         q = queue.Queue()
         w = OuterMemoryWriter(send_queue=q, src="synthesis_worker_e2e_test")
-        store = ConceptStore(g, w, clock=lambda: 12345.6)
+        store = EngramStore(g, w, clock=lambda: 12345.6)
 
         cv = store.create_concept(
             "linux_terminal", "Linux terminal",

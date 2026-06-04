@@ -37,7 +37,7 @@ from titan_hcl.synthesis.composite_score import (
     composite_score,
     make_kuzu_spreading_lookup,
 )
-from titan_hcl.synthesis.concept_store import ConceptStore
+from titan_hcl.synthesis.engram_store import EngramStore
 from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter
 
 
@@ -160,7 +160,7 @@ def graph_with_spine():
         import queue
         q = queue.Queue()
         w = OuterMemoryWriter(send_queue=q, src="test_spreading")
-        store = ConceptStore(g, w, clock=lambda: 1000.0)
+        store = EngramStore(g, w, clock=lambda: 1000.0)
         store.create_concept("unix_shell", "Unix shell", memory_type="declarative")
         store.create_concept(
             "linux_terminal", "Linux terminal", memory_type="declarative",

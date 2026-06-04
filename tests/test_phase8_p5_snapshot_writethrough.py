@@ -41,7 +41,7 @@ def _make_kuzu_graph():
     return g
 
 
-def _make_concept_store():
+def _make_engram_store():
     cs = MagicMock()
     cs.create_concept = MagicMock(return_value=MagicMock(
         anchor_tx="cv_anchor", version=1, name="x",
@@ -66,7 +66,7 @@ def store_with_writethrough(tmp_path):
     s = HypothesisForkStore(
         duckdb_conn=conn,
         kuzu_graph=_make_kuzu_graph(),
-        concept_store=_make_concept_store(),
+        engram_store=_make_engram_store(),
         outer_memory_writer=_make_writer(),
         activation_store=_make_activation_store(),
         snapshot_path=str(snap),
@@ -81,7 +81,7 @@ def store_no_writethrough(tmp_path):
     return HypothesisForkStore(
         duckdb_conn=conn,
         kuzu_graph=_make_kuzu_graph(),
-        concept_store=_make_concept_store(),
+        engram_store=_make_engram_store(),
         outer_memory_writer=_make_writer(),
         activation_store=_make_activation_store(),
         # snapshot_path=None (default) — no write-through
@@ -154,7 +154,7 @@ def test_snapshot_export_exception_is_swallowed(tmp_path, monkeypatch):
     store = HypothesisForkStore(
         duckdb_conn=conn,
         kuzu_graph=_make_kuzu_graph(),
-        concept_store=_make_concept_store(),
+        engram_store=_make_engram_store(),
         outer_memory_writer=_make_writer(),
         activation_store=_make_activation_store(),
         snapshot_path=str(tmp_path / "forks_snapshot.json"),
