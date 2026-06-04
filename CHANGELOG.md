@@ -56,6 +56,34 @@ _(curate as you go; lifted into the next versioned section at release time)_
 
 ---
 
+## v0.0.7 — 2026-06-04 (pre-release)
+
+_Critical boot fix for fresh installs. `v0.0.6` defaults a new Titan's id to
+`titan`, but the Rust kernel accepted only the maintainer fleet's `T1`/`T2`/`T3`
+— so a brand-new sovereign install **could not boot** (`--titan-id titan` →
+kernel exit 2, `INVALIDARGUMENT`). The kernel now accepts any path-safe id.
+Proven on a from-scratch devnet box: a Titan born from nothing booted, all
+subsystems came up, and it **chatted** end-to-end via the TC² console._
+
+### Fixed
+
+- **A fresh install now boots.** Every Rust daemon's `--titan-id` accepted only
+  `T1`/`T2`/`T3` (the maintainer's own fleet), so a new Titan installed with the
+  default id `titan` exited immediately. The kernel and all daemons now accept a
+  **free-form, path-safe id** (`[A-Za-z0-9_-]`, 1–32 chars) via a single shared
+  validator. Per-Titan isolation (shared-memory namespace, bus socket, identity)
+  is unchanged, and the bus authkey handshake is unaffected (it derives from the
+  Titan's keypair, not its id).
+- **Release workflow now marks each cut a pre-release** (the `v0.0.x` line is an
+  alpha) instead of surfacing it as a stable "Latest" release.
+
+### SPEC
+
+- §13 per-binary CLI contract — `--titan-id` relaxed from a closed `T1|T2|T3`
+  enum to a validated free-form id (SPEC v1.84.0 · D-SPEC-150).
+
+---
+
 ## v0.0.6 — 2026-06-04 (pre-release)
 
 _Production sovereign birth. `setup_titan install` now performs a Titan's full

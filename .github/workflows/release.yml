@@ -127,6 +127,10 @@ jobs:
           tag_name: ${{ steps.tag.outputs.name }}
           name: ${{ steps.tag.outputs.name }}
           body_path: ${{ steps.notes.outputs.notes }}
+          # The public line is a pre-release alpha (v0.0.x) — mark every cut a
+          # pre-release so GitHub doesn't surface it as "Latest stable". (Was
+          # defaulting to a full release; v0.0.6 had to be PATCHed by hand.)
+          prerelease: true
           fail_on_unmatched_files: true
           files: |
             release-staging/titan-inner-body-rs
