@@ -716,12 +716,12 @@ class TitanKnowledgeGraph:
 
     def spine_update_groundedness(
         self, concept_id: str, version: int, new_groundedness: float,
-        *, axis_felt: Optional[float] = None,
+        *, axes: Optional[dict] = None,
     ) -> bool:
-        """UPDATE one Engram row's derived-metric columns (`groundedness`, and
-        optionally `axis_felt`). Allowed by INV-3 because these are *derived
-        metric columns*, not the row's identity / version / lineage — they can
-        be recomputed at any time without violating version immutability.
+        """UPDATE one Engram row's derived-metric columns: `groundedness` always,
+        and (when `axes` is given) the 4 raw axes `axis_used/verified/felt/fluent`
+        (§7.D — keys `used/verified/felt/fluent`). Allowed by INV-3 because these
+        are *derived metric columns*, not the row's identity / version / lineage.
         Returns True on update, False if the row is missing."""
         pk = self._spine_pk(concept_id, version)
         try:
@@ -731,9 +731,15 @@ class TitanKnowledgeGraph:
                 return False
             set_clause = "SET c.groundedness = $g"
             params = {"pk": pk, "g": float(new_groundedness)}
-            if axis_felt is not None:
-                set_clause += ", c.axis_felt = $af"
-                params["af"] = float(axis_felt)
+            if axes is not None:
+                for col, key in (("axis_used", "used"),
+                                 ("axis_verified", "verified"),
+                                 ("axis_felt", "felt"),
+                                 ("axis_fluent", "fluent")):
+                    if key in axes and axes[key] is not None:
+                        ph = "ax_" + key
+                        set_clause += f", c.{col} = ${ph}"
+                        params[ph] = float(axes[key])
             self._conn.execute(
                 f"MATCH (c:Engram {{pk: $pk}}) {set_clause}", params,
             )
@@ -744,6 +750,33 @@ class TitanKnowledgeGraph:
                 concept_id, version, e,
             )
             return False
+
+    def spine_read_engram_axes(self) -> list[dict]:
+        """Read every Engram's 4 raw grounding axes + the current `groundedness`
+        for the §7.D population percentile-blend recompute (groundedness is the
+        backfill source for pre-D Engrams whose `axis_used` is still 0). Returns
+        [{concept_id, version, used, verified, felt, fluent, groundedness}].
+        Soft-fail → []."""
+        out: list[dict] = []
+        try:
+            qr = self._conn.execute(
+                "MATCH (c:Engram) RETURN c.concept_id, c.version, c.axis_used, "
+                "c.axis_verified, c.axis_felt, c.axis_fluent, c.groundedness"
+            )
+            while qr.has_next():
+                row = qr.get_next()
+                out.append({
+                    "concept_id": row[0],
+                    "version": int(row[1]),
+                    "used": float(row[2]) if row[2] is not None else 0.0,
+                    "verified": float(row[3]) if row[3] is not None else 0.0,
+                    "felt": float(row[4]) if row[4] is not None else 0.0,
+                    "fluent": float(row[5]) if row[5] is not None else 0.0,
+                    "groundedness": float(row[6]) if row[6] is not None else 0.0,
+                })
+        except Exception as e:
+            logger.warning("[KnowledgeGraph] spine_read_engram_axes failed: %s", e)
+        return out
 
     def spine_add_composition_edge(
         self,

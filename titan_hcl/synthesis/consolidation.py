@@ -347,6 +347,18 @@ class ConsolidationPass:
             if not applied:
                 result.rejected_clusters += 1
 
+        # Step 4.5 — §7.D dream-boundary population recompute: percentile-blend
+        # the grounding scalar across ALL Engrams so groundedness DISCRIMINATES
+        # (replaces the old saturate-at-50 per-Engram scalar). Only when the
+        # population changed this pass.
+        if result.concepts_created or result.concepts_bumped:
+            try:
+                self._store.recompute_population_groundedness()
+            except Exception as e:
+                logger.warning(
+                    "[ConsolidationPass] population groundedness recompute "
+                    "failed: %s", e)
+
         # Step 5 — anchor the pass-summary TX.
         result.finished_at = self._clock()
         result.duration_ms = (result.finished_at - started_at) * 1000.0

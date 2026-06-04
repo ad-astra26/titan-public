@@ -185,6 +185,126 @@ def compute_groundedness(
     return raw
 
 
+# ── Phase D — decomposed axes + population-percentile reduction (§7.D) ────────
+# BRAIN §3.4 anti-collapse: store the 4 grounding axes ABSOLUTE/independent; the
+# recall-ranking scalar is a derived percentile-normalized blend recomputed across
+# the live population at the dream boundary (guaranteed discrimination, no magic
+# saturation constant). At launch only `used` varies (verified/felt sparse,
+# fluent=0); the variance-gated blend lets `used`'s percentile spread drive the
+# scalar across [0,1], with the other axes enriching forward.
+
+_AXIS_NAMES = ("used", "verified", "felt", "fluent")
+
+
+@dataclass
+class _BlendParams:
+    """[synthesis.engram.grounding] — percentile-blend weights + NARS horizon.
+    Weights lean on `used` at launch (the live signal); variance-gating means a
+    flat axis is excluded + the remaining weights renormalize, so the spread is
+    always driven by whatever actually varies."""
+
+    w_used: float = 0.40
+    w_verified: float = 0.25
+    w_felt: float = 0.20
+    w_fluent: float = 0.15
+    nars_k: float = 1.0
+
+
+def _load_blend_params_from_toml() -> _BlendParams:
+    """Best-effort load of `[synthesis.engram.grounding]`; in-code defaults on any error."""
+    try:
+        try:
+            import tomllib  # 3.11+
+        except ImportError:
+            import tomli as tomllib  # type: ignore
+        import os
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "titan_params.toml"), "rb") as f:
+            data = tomllib.load(f)
+        sub = data.get("synthesis", {}).get("engram", {}).get("grounding", {})
+        return _BlendParams(
+            w_used=float(sub.get("w_used", 0.40)),
+            w_verified=float(sub.get("w_verified", 0.25)),
+            w_felt=float(sub.get("w_felt", 0.20)),
+            w_fluent=float(sub.get("w_fluent", 0.15)),
+            nars_k=float(sub.get("nars_k", 1.0)),
+        )
+    except Exception:
+        return _BlendParams()
+
+
+def compute_axes(
+    *,
+    provisional: float = 0.0,
+    oracle_evidence: int = 0,
+    felt_coverage: float = 0.0,
+    fluent: float = 0.0,
+    nars_k: float = 1.0,
+) -> dict[str, float]:
+    """The 4 grounding axes stored on the Engram (§6.2.3 / §7.D, option-1 v1):
+      used     = the **provisional grounding blend** (`compute_groundedness`) — the
+                 consistent, stable rank base across the WHOLE population (pre-D
+                 Engrams are backfilled from their stored `groundedness`, same
+                 scale, no magic constant). The pure log1p-B_i decomposition
+                 graduates with the §7.E learned reduction.
+      verified = NARS c = n/(n+k), n = oracle scored_by evidence count
+      felt     = felt_coverage (§7.C; [0,1])
+      fluent   = recall-citation rate ([0,1]; 0 at launch — attribution deferred)
+    The recall scalar is the population percentile-blend of these (reduce step)."""
+    n = max(0, int(oracle_evidence))
+    return {
+        "used": float(provisional),
+        "verified": (n / (n + nars_k)) if (n + nars_k) > 0 else 0.0,
+        "felt": max(0.0, min(1.0, float(felt_coverage))),
+        "fluent": max(0.0, min(1.0, float(fluent))),
+    }
+
+
+def _percentile_ranks(values: list[float]) -> list[float]:
+    """Empirical-CDF percentile rank ∈ (0,1] for each value (fraction ≤ v). A
+    constant population maps every value to 1.0 (no discrimination — the caller
+    variance-gates flat axes out of the blend)."""
+    import bisect
+    n = len(values)
+    if n == 0:
+        return []
+    srt = sorted(values)
+    return [bisect.bisect_right(srt, v) / n for v in values]
+
+
+def reduce_population_to_scalars(
+    axes_rows: list[dict], params: _BlendParams | None = None,
+) -> dict[str, float]:
+    """Map [{"key", used, verified, felt, fluent}] → {key: groundedness scalar}.
+    Percentile-normalize EACH axis across the population, then blend ONLY the axes
+    that actually vary (variance > 1e-9), renormalizing their weights — so the
+    scalar's spread is driven by whatever signal exists (at launch: `used` alone →
+    full [0,1]). All-flat population → all 0.0 (nothing to discriminate on)."""
+    p = params or _BlendParams()
+    if not axes_rows:
+        return {}
+    weights = {"used": p.w_used, "verified": p.w_verified,
+               "felt": p.w_felt, "fluent": p.w_fluent}
+    pct: dict[str, list[float]] = {}
+    active: list[str] = []
+    for ax in _AXIS_NAMES:
+        vals = [float(r.get(ax, 0.0) or 0.0) for r in axes_rows]
+        pct[ax] = _percentile_ranks(vals)
+        if (max(vals) - min(vals)) > 1e-9:
+            active.append(ax)
+    if not active:
+        # No axis varies (single Engram, or a population not yet carrying axis
+        # data) → percentile can't discriminate. Return {} so the caller KEEPS
+        # each Engram's provisional scalar rather than zeroing it.
+        return {}
+    wsum = sum(weights[ax] for ax in active) or 1.0
+    out: dict[str, float] = {}
+    for i, r in enumerate(axes_rows):
+        s = sum((weights[ax] / wsum) * pct[ax][i] for ax in active)
+        out[r["key"]] = max(0.0, min(1.0, s))
+    return out
+
+
 # ── EngramStore ────────────────────────────────────────────────────
 
 
@@ -211,6 +331,7 @@ class EngramStore:
         # inject none → InlineWriter runs ops inline.
         self._db_writer = resolve_writer(db_writer)
         self._params = groundedness_params or _GroundednessParams()
+        self._blend = _load_blend_params_from_toml()  # §7.D percentile-blend params
         self._clock = clock
 
     # ── Public surface ────────────────────────────────────────
@@ -463,9 +584,13 @@ class EngramStore:
         distinct_contexts: int = 0,
         procedural_links: int = 0,
         felt_coverage: float = 0.0,
+        oracle_evidence: int = 0,
     ) -> float:
-        """Compute + persist groundedness for a single (concept_id, version).
-        Returns the new value (0.0 if the row is missing)."""
+        """Store the provisional grounding blend + the 4 axes (§7.D, option-1) for
+        this (concept_id, version). `axis_used` = the provisional blend (the stable
+        rank base); the scalar is refined to the population percentile-blend by
+        `recompute_population_groundedness` at the dream boundary (this provisional
+        keeps recall sane between passes). Returns the provisional (0.0 if missing)."""
         new_value = compute_groundedness(
             episodic_encounters=episodic_encounters,
             distinct_contexts=distinct_contexts,
@@ -473,15 +598,64 @@ class EngramStore:
             felt_coverage=felt_coverage,
             params=self._params,
         )
-        # Store the felt axis absolute (§7.C) alongside the derived scalar —
-        # axis_felt is independently visible on /v6/synthesis/concepts and is
-        # what Phase D's compute_axes/reduction consumes.
+        axes = compute_axes(
+            provisional=new_value,  # the consistent, stable rank base (§7.D option-1)
+            oracle_evidence=oracle_evidence,
+            felt_coverage=felt_coverage,
+            fluent=0.0,  # no per-Engram citation attribution yet (§7.D / deferred)
+            nars_k=self._blend.nars_k,
+        )
         updated = self._graph.spine_update_groundedness(
-            concept_id, version, new_value, axis_felt=felt_coverage,
+            concept_id, version, new_value, axes=axes,
         )
         if not updated:
             return 0.0
         return new_value
+
+    @on_writer
+    def recompute_population_groundedness(self) -> int:
+        """Dream-boundary pass (§7.D, option-1): read EVERY Engram's axes, percentile-
+        normalize the population (variance-gated blend) → write the `groundedness`
+        scalar back. `axis_used` is the consistent rank base (the provisional blend);
+        pre-D Engrams whose `axis_used` is still 0 are BACKFILLED once from their
+        stored `groundedness` (same scale) so the WHOLE population discriminates from
+        the first pass. This is what makes groundedness DISCRIMINATE (vs the old
+        saturate-at-50 scalar). Returns rows updated."""
+        try:
+            rows = self._graph.spine_read_engram_axes()
+        except Exception as e:
+            logger.warning("[EngramStore] recompute_population: read axes failed: %s", e)
+            return 0
+        if not rows:
+            return 0
+        for r in rows:
+            r["key"] = (r["concept_id"], int(r["version"]))
+            # One-time backfill: a pre-D Engram has axis_used==0 but a real
+            # provisional `groundedness` — seed axis_used from it (same scale) so
+            # the population shares one rank base. Marked for persistence below.
+            if (r.get("used") or 0.0) <= 0.0 and (r.get("groundedness") or 0.0) > 0.0:
+                r["used"] = float(r["groundedness"])
+                r["_backfill_used"] = True
+        scalars = reduce_population_to_scalars(rows, self._blend)
+        n = 0
+        for r in rows:
+            sc = scalars.get(r["key"])
+            if sc is None:
+                continue
+            # Persist the backfilled axis_used alongside the new scalar (one write).
+            axes = {"used": r["used"]} if r.get("_backfill_used") else None
+            try:
+                if self._graph.spine_update_groundedness(
+                        r["concept_id"], int(r["version"]), float(sc), axes=axes):
+                    n += 1
+            except Exception as e:
+                logger.warning(
+                    "[EngramStore] recompute_population: update %s v%s failed: %s",
+                    r["concept_id"], r["version"], e)
+        logger.info(
+            "[EngramStore] population groundedness recomputed: %d/%d Engrams "
+            "(percentile-blend, §7.D)", n, len(rows))
+        return n
 
     @on_writer
     def recompute_groundedness_batch(
@@ -549,7 +723,8 @@ class EngramStore:
             qr = self._graph._conn.execute(
                 "MATCH (c:Engram) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
-                "c.groundedness, c.anchor_tx, c.created_at, c.axis_felt"
+                "c.groundedness, c.anchor_tx, c.created_at, c.axis_used, "
+                "c.axis_verified, c.axis_felt, c.axis_fluent"
             )
             while qr.has_next():
                 row = qr.get_next()
@@ -561,7 +736,11 @@ class EngramStore:
                     "groundedness": float(row[4]),
                     "anchor_tx": row[5],
                     "created_at": float(row[6]),
-                    "axis_felt": float(row[7]) if row[7] is not None else 0.0,
+                    # The 4 decomposed grounding axes (§7.D), visible on the API.
+                    "axis_used": float(row[7]) if row[7] is not None else 0.0,
+                    "axis_verified": float(row[8]) if row[8] is not None else 0.0,
+                    "axis_felt": float(row[9]) if row[9] is not None else 0.0,
+                    "axis_fluent": float(row[10]) if row[10] is not None else 0.0,
                 })
         except Exception as e:
             logger.warning(
