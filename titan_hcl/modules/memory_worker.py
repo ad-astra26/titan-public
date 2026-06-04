@@ -1591,6 +1591,7 @@ def _handle_mempool_add(msg: dict, ctx: WorkerContext) -> None:
     user_prompt = payload.get("user_prompt", "")
     agent_response = payload.get("agent_response", "")
     user_identifier = payload.get("user_identifier", "Anonymous")
+    neuromod_context = payload.get("neuromod_context")  # felt-at-lived-time (§7.C)
     if not user_prompt and not agent_response:
         logger.debug("[MemoryWorker] MEMORY_MEMPOOL_ADD ignored (empty)")
         return
@@ -1601,6 +1602,7 @@ def _handle_mempool_add(msg: dict, ctx: WorkerContext) -> None:
                 ctx.memory.add_to_mempool(
                     user_prompt, agent_response,
                     user_identifier=user_identifier,
+                    neuromod_context=neuromod_context,
                 )
             )
         logger.info(
