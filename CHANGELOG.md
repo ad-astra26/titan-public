@@ -56,6 +56,50 @@ _(curate as you go; lifted into the next versioned section at release time)_
 
 ---
 
+## v0.0.6 — 2026-06-04 (pre-release)
+
+_Production sovereign birth. `setup_titan install` now performs a Titan's full
+on-chain genesis — proven live: a devnet Titan was born from nothing, booted,
+grew, and **chatted** end-to-end (Ollama Cloud, OVG-signed). The cognitive engine
+also gained its **synthesis spine** — a Titan's thoughts now consolidate into a
+canonical, recallable memory._
+
+### Added
+
+- **Production genesis ceremony — `install --mode {devnet,mainnet}` performs a
+  full sovereign birth**, not just a Shamir-split keypair:
+  - soul keypair → Shamir 2-of-3 (Maker **Shard-1**, on-chain **Shard-3**) →
+    **funding pause** (no on-chain write until the wallet is funded) → Shard-3
+    anchor → **ZK-Vault** PDA → **GenesisNFT** mint → a distinct **`genesis_tx`**
+    identity memo → bootable identity.
+  - a birth ALWAYS generates a fresh keypair (never imports) so the Maker
+    receives a real Shard-1 (INV-GEN-BIRTH).
+  - the install wizard collects the Titan's **name**, the **Maker pubkey**, and
+    the **prime directives** (Maker-supplied, via `$EDITOR`); every internal
+    setting (Solana network + RPC) is written from the chosen mode.
+  - the install asks before starting the Titan, brings up the **TC² console**,
+    and verifies the chat backend.
+- **Synthesis spine (cognitive)** — a Titan's thoughts consolidate into a
+  canonical, recallable memory (synthesis Phases A–F): real-thought
+  consolidation, spine-backed thought recall, and a sovereignty meter that
+  reseeds from the synthesis store and survives restart.
+
+### Fixed
+
+- **Genesis art** no longer crashes on a base58 pubkey seed (it was parsed as
+  hex).
+- **Fresh installs default the Titan id to `titan`** (was `T1`).
+- **Network config is written per the chosen mode** — a devnet Titan no longer
+  boots with mainnet config.
+
+### SPEC
+
+- Genesis ceremony production mechanic — `ARCHITECTURE_mainnet_birth_resurrection`
+  §B1.5 · `RFP_genesis_ceremony_production` (gates G1–G8 proven live on devnet).
+- Synthesis engine spine — Phases A–F shipped.
+
+---
+
 ## v0.0.4 — 2026-05-29 (pre-release)
 
 _Out-of-box Observatory fix. `v0.0.3` shipped the Observatory bundle but its
