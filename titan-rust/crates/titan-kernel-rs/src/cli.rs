@@ -1,7 +1,8 @@
 //! cli — `clap`-derived CLI per SPEC §13 (per-binary CLI contract).
 //!
 //! Mandatory flags every Rust binary accepts (SPEC §13):
-//! - `--titan-id <T1|T2|T3>`
+//! - `--titan-id <id>`  (free-form, path-safe `[A-Za-z0-9_-]`; fleet uses
+//!   `T1`/`T2`/`T3`, a sovereign user's Titan picks its own, e.g. `titan`)
 //! - `--shm-dir <path>`
 //! - `--bus-socket <path>`
 //! - `--log-level <debug|info|warn|error>`
@@ -43,29 +44,6 @@ impl LogLevel {
     }
 }
 
-/// Titan ID — restricted to canonical T1/T2/T3 set per SPEC §1 glossary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-#[clap(rename_all = "UPPERCASE")]
-pub enum TitanIdArg {
-    /// T1 (origin).
-    T1,
-    /// T2 (mid-cluster).
-    T2,
-    /// T3 (T3 cluster).
-    T3,
-}
-
-impl TitanIdArg {
-    /// Canonical short form (`"T1"`, etc.).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TitanIdArg::T1 => "T1",
-            TitanIdArg::T2 => "T2",
-            TitanIdArg::T3 => "T3",
-        }
-    }
-}
-
 /// Top-level CLI per SPEC §13.
 ///
 /// `--version` prints the cargo crate version. The kernel emits a richer
@@ -79,10 +57,15 @@ impl TitanIdArg {
     version,
 )]
 pub struct Cli {
-    /// Titan ID (T1/T2/T3). Required either via this flag OR
-    /// `TITAN_KERNEL_TITAN_ID` env.
-    #[arg(long, env = "TITAN_KERNEL_TITAN_ID", value_enum)]
-    pub titan_id: TitanIdArg,
+    /// Titan ID — the fleet's `T1`/`T2`/`T3` or a sovereign user's own id
+    /// (the installer defaults to `titan`). 1–32 of `[A-Za-z0-9_-]`. Required
+    /// either via this flag OR the `TITAN_KERNEL_TITAN_ID` env.
+    #[arg(
+        long,
+        env = "TITAN_KERNEL_TITAN_ID",
+        value_parser = titan_core::identity::validate_titan_id
+    )]
+    pub titan_id: String,
 
     /// Override `TITAN_KERNEL_SHM_DIR` (default: `/dev/shm/titan_<id>/`).
     #[arg(long, env = "TITAN_KERNEL_SHM_DIR")]
@@ -149,8 +132,24 @@ mod tests {
     #[test]
     fn parses_minimum_required_args() {
         let cli = Cli::try_parse_from(["titan-kernel-rs", "--titan-id", "T1"]).unwrap();
-        assert_eq!(cli.titan_id, TitanIdArg::T1);
+        assert_eq!(cli.titan_id, "T1");
         assert_eq!(cli.log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn parses_sovereign_titan_id() {
+        // A sovereign user's Titan id (the installer default) must parse —
+        // this is the case the closed T1/T2/T3 enum rejected (kernel exit 2).
+        let cli = Cli::try_parse_from(["titan-kernel-rs", "--titan-id", "titan"]).unwrap();
+        assert_eq!(cli.titan_id, "titan");
+        assert_eq!(
+            cli.effective_shm_dir(),
+            PathBuf::from("/dev/shm/titan_titan/")
+        );
+        assert_eq!(
+            cli.effective_bus_socket(),
+            PathBuf::from("/tmp/titan_bus_titan.sock")
+        );
     }
 
     #[test]
@@ -169,7 +168,7 @@ mod tests {
             "/tmp/data",
         ])
         .unwrap();
-        assert_eq!(cli.titan_id, TitanIdArg::T2);
+        assert_eq!(cli.titan_id, "T2");
         assert_eq!(cli.shm_dir, Some(PathBuf::from("/tmp/test_shm")));
         assert_eq!(cli.bus_socket, Some(PathBuf::from("/tmp/test_bus.sock")));
         assert_eq!(cli.log_level, LogLevel::Debug);
@@ -178,8 +177,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_titan_id() {
-        let result = Cli::try_parse_from(["titan-kernel-rs", "--titan-id", "T9"]);
-        assert!(result.is_err());
+        // Path-unsafe / empty ids are rejected by the shared value_parser.
+        // (NB: "T9" is now a VALID free-form id — the old closed-enum
+        // rejection of it was the fleet-ism this fix removes.)
+        for bad in &["bad/id", "has space", "a.b", ""] {
+            let result = Cli::try_parse_from(["titan-kernel-rs", "--titan-id", bad]);
+            assert!(result.is_err(), "expected {bad:?} to be rejected");
+        }
     }
 
     #[test]
