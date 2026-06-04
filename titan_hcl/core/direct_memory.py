@@ -370,19 +370,26 @@ class TitanKnowledgeGraph:
                 "[KnowledgeGraph] X-voice Person migration skipped: %s", exc
             )
 
-        # Phase 4 — synthesis-engine Concept-spine schema (§6.1 / §10).
-        # 4 node tables + 5 rel tables, additive + idempotent. Empty
-        # Production/ActionChain/HypothesisFork ship in P4 so consumers
-        # can issue Cypher without a schema-missing branch; population
-        # lands in P5/P8.
+        # Phase 4/B — synthesis-engine Engram-spine schema (§6.1 / §6.2 / §10).
+        # Engram (renamed from Concept, RFP §7.B) + the 4 spine rel tables +
+        # COMPILED_FROM, additive + idempotent. `migrate_concept_to_engram`
+        # runs FIRST so an existing `Concept`-schema graph is copy-migrated to
+        # `Engram` (+ the new axis/domain_hint columns) BEFORE the bootstrap
+        # presence-checks; on a fresh or already-migrated graph it is a guarded
+        # no-op. Single-threaded here at graph-open (INV-Syn-7/28 — no writer
+        # thread live yet). Empty Production/ActionChain/HypothesisFork ship so
+        # consumers can issue Cypher without a schema-missing branch.
         try:
             from titan_hcl.synthesis.kuzu_spine_schema import (
                 bootstrap_spine_schema,
+                migrate_concept_to_engram,
             )
+            migrate_concept_to_engram(self)
             bootstrap_spine_schema(self)
         except Exception as exc:
             logger.warning(
-                "[KnowledgeGraph] synthesis spine bootstrap skipped: %s", exc
+                "[KnowledgeGraph] synthesis spine bootstrap/migration skipped: %s",
+                exc,
             )
 
         # Relationship tables — we use a generic rel table per node-type pair
@@ -631,7 +638,7 @@ class TitanKnowledgeGraph:
         pk = self._spine_pk(concept_id, version)
         try:
             self._conn.execute(
-                "CREATE (c:Concept {pk: $pk, concept_id: $cid, version: $ver, "
+                "CREATE (c:Engram {pk: $pk, concept_id: $cid, version: $ver, "
                 "name: $name, memory_type: $mt, groundedness: $g, "
                 "anchor_tx: $atx, created_at: $ts})",
                 {"pk": pk, "cid": concept_id, "ver": int(version),
@@ -660,7 +667,7 @@ class TitanKnowledgeGraph:
         pk = self._spine_pk(concept_id, version)
         try:
             qr = self._conn.execute(
-                "MATCH (c:Concept {pk: $pk}) "
+                "MATCH (c:Engram {pk: $pk}) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                 "c.groundedness, c.anchor_tx, c.created_at",
                 {"pk": pk},
@@ -686,7 +693,7 @@ class TitanKnowledgeGraph:
         and by spine recall (P4.H) to pick the latest spine root."""
         try:
             qr = self._conn.execute(
-                "MATCH (c:Concept {concept_id: $cid}) "
+                "MATCH (c:Engram {concept_id: $cid}) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                 "c.groundedness, c.anchor_tx, c.created_at "
                 "ORDER BY c.version DESC LIMIT 1",
@@ -722,7 +729,7 @@ class TitanKnowledgeGraph:
             if self.spine_get_concept_version(concept_id, version) is None:
                 return False
             self._conn.execute(
-                "MATCH (c:Concept {pk: $pk}) SET c.groundedness = $g",
+                "MATCH (c:Engram {pk: $pk}) SET c.groundedness = $g",
                 {"pk": pk, "g": float(new_groundedness)},
             )
             return True
@@ -769,7 +776,7 @@ class TitanKnowledgeGraph:
         to_pk = self._spine_pk(to_concept_id, to_version)
         try:
             self._conn.execute(
-                f"MATCH (a:Concept {{pk: $apk}}), (b:Concept {{pk: $bpk}}) "
+                f"MATCH (a:Engram {{pk: $apk}}), (b:Engram {{pk: $bpk}}) "
                 f"CREATE (a)-[:{rel}]->(b)",
                 {"apk": from_pk, "bpk": to_pk},
             )
@@ -790,7 +797,7 @@ class TitanKnowledgeGraph:
         """Total Concept rows across all (concept_id, version) tuples.
         Used by the fleet E2E test P4.kuzu-spine-active check (§P4.J)."""
         try:
-            qr = self._conn.execute("MATCH (c:Concept) RETURN COUNT(c)")
+            qr = self._conn.execute("MATCH (c:Engram) RETURN COUNT(c)")
             if qr.has_next():
                 return int(qr.get_next()[0])
         except Exception as e:
@@ -840,7 +847,7 @@ class TitanKnowledgeGraph:
         for rel in ("COMPOSED_FROM", "COMPOSED_INTO"):
             try:
                 qr = self._conn.execute(
-                    f"MATCH (a:Concept {{pk: $apk}})-[:{rel}]->(b:Concept) "
+                    f"MATCH (a:Engram {{pk: $apk}})-[:{rel}]->(b:Engram) "
                     f"RETURN b.concept_id, b.version LIMIT $lim",
                     {"apk": anchor_pk, "lim": int(limit)},
                 )
@@ -873,14 +880,14 @@ class TitanKnowledgeGraph:
         try:
             if memory_type is not None:
                 qr = self._conn.execute(
-                    "MATCH (c:Concept) WHERE c.memory_type = $mt "
+                    "MATCH (c:Engram) WHERE c.memory_type = $mt "
                     "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                     "c.groundedness, c.anchor_tx, c.created_at",
                     {"mt": memory_type},
                 )
             else:
                 qr = self._conn.execute(
-                    "MATCH (c:Concept) "
+                    "MATCH (c:Engram) "
                     "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                     "c.groundedness, c.anchor_tx, c.created_at"
                 )
@@ -1036,7 +1043,7 @@ class TitanKnowledgeGraph:
         try:
             self._conn.execute(
                 "MATCH (f:HypothesisFork {fork_id: $fid}), "
-                "(c:Concept {pk: $cpk}) "
+                "(c:Engram {pk: $cpk}) "
                 "CREATE (f)-[:EXPLORES]->(c)",
                 {"fid": fork_id, "cpk": concept_pk},
             )
@@ -1110,7 +1117,7 @@ class TitanKnowledgeGraph:
         repair-fork graduation to resolve the parent concept."""
         try:
             qr = self._conn.execute(
-                "MATCH (f:HypothesisFork {fork_id: $fid})-[:EXPLORES]->(c:Concept) "
+                "MATCH (f:HypothesisFork {fork_id: $fid})-[:EXPLORES]->(c:Engram) "
                 "RETURN c.concept_id, c.version",
                 {"fid": fork_id},
             )
