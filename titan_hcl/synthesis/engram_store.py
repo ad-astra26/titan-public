@@ -37,7 +37,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional, Protocol
+from typing import Any, Callable, Iterable, Optional, Protocol
 
 from titan_hcl.synthesis.writer import on_writer, resolve_writer
 
@@ -602,7 +602,8 @@ class EngramStore:
             provisional=new_value,  # the consistent, stable rank base (§7.D option-1)
             oracle_evidence=oracle_evidence,
             felt_coverage=felt_coverage,
-            fluent=0.0,  # no per-Engram citation attribution yet (§7.D / deferred)
+            fluent=0.0,  # §7.E.0: fresh-version seed; the LIVE recall-citation rate
+                         # is injected at the dream population recompute (fluent_lookup)
             nars_k=self._blend.nars_k,
         )
         updated = self._graph.spine_update_groundedness(
@@ -613,14 +614,23 @@ class EngramStore:
         return new_value
 
     @on_writer
-    def recompute_population_groundedness(self) -> int:
+    def recompute_population_groundedness(
+        self,
+        fluent_lookup: Optional[Callable[[str, int], Optional[float]]] = None,
+        axes_sink: Optional[Callable[[list[dict]], None]] = None,
+    ) -> int:
         """Dream-boundary pass (§7.D, option-1): read EVERY Engram's axes, percentile-
         normalize the population (variance-gated blend) → write the `groundedness`
         scalar back. `axis_used` is the consistent rank base (the provisional blend);
         pre-D Engrams whose `axis_used` is still 0 are BACKFILLED once from their
         stored `groundedness` (same scale) so the WHOLE population discriminates from
         the first pass. This is what makes groundedness DISCRIMINATE (vs the old
-        saturate-at-50 scalar). Returns rows updated."""
+        saturate-at-50 scalar). Returns rows updated.
+
+        §7.E.0: `fluent_lookup(concept_id, version) → float|None` injects the LIVE
+        recall-citation rate over the stored `axis_fluent` so the 4th axis varies and
+        enters the blend; `axes_sink(rows)` receives the final per-Engram axes for the
+        recall-event snapshot cache. Both optional/soft — None = §7.D behaviour."""
         try:
             rows = self._graph.spine_read_engram_axes()
         except Exception as e:
@@ -630,6 +640,15 @@ class EngramStore:
             return 0
         for r in rows:
             r["key"] = (r["concept_id"], int(r["version"]))
+            # §7.E.0 — override the stored (stale) fluent with the live citation rate.
+            if fluent_lookup is not None:
+                try:
+                    fl = fluent_lookup(r["concept_id"], int(r["version"]))
+                except Exception:
+                    fl = None
+                if fl is not None:
+                    r["fluent"] = float(fl)
+                    r["_fluent_updated"] = True
             # One-time backfill: a pre-D Engram has axis_used==0 but a real
             # provisional `groundedness` — seed axis_used from it (same scale) so
             # the population shares one rank base. Marked for persistence below.
@@ -642,19 +661,38 @@ class EngramStore:
             sc = scalars.get(r["key"])
             if sc is None:
                 continue
-            # Persist the backfilled axis_used alongside the new scalar (one write).
-            axes = {"used": r["used"]} if r.get("_backfill_used") else None
+            # Persist the backfilled axis_used + live fluent alongside the new
+            # scalar (one write per row).
+            axes: dict = {}
+            if r.get("_backfill_used"):
+                axes["used"] = r["used"]
+            if r.get("_fluent_updated"):
+                axes["fluent"] = r["fluent"]
             try:
                 if self._graph.spine_update_groundedness(
-                        r["concept_id"], int(r["version"]), float(sc), axes=axes):
+                        r["concept_id"], int(r["version"]), float(sc),
+                        axes=(axes or None)):
                     n += 1
             except Exception as e:
                 logger.warning(
                     "[EngramStore] recompute_population: update %s v%s failed: %s",
                     r["concept_id"], r["version"], e)
+        # §7.E.0 — denormalize the fresh axes for the recall-event snapshot cache.
+        if axes_sink is not None:
+            try:
+                axes_sink([
+                    {"concept_id": r["concept_id"], "version": int(r["version"]),
+                     "used": float(r.get("used") or 0.0),
+                     "verified": float(r.get("verified") or 0.0),
+                     "felt": float(r.get("felt") or 0.0),
+                     "fluent": float(r.get("fluent") or 0.0)}
+                    for r in rows])
+            except Exception as e:
+                logger.debug("[EngramStore] axes_sink soft-fail: %s", e)
         logger.info(
             "[EngramStore] population groundedness recomputed: %d/%d Engrams "
-            "(percentile-blend, §7.D)", n, len(rows))
+            "(percentile-blend, §7.D%s)", n, len(rows),
+            "; fluent live" if fluent_lookup is not None else "")
         return n
 
     @on_writer

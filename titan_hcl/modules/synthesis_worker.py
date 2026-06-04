@@ -818,6 +818,18 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     status_writer = SynthStatusWriter(titan_id)
     registry = PlugRegistry()
 
+    # §7.E.0 — per-Engram citation attribution: the membership reverse-index +
+    # the live `fluent` axis feed + §7.E's `(axes_at_recall, cited?)` reward log.
+    # Shares ActivationStore's ONE guarded conn (store._conn) + the sole writer
+    # (G21 / INV-Syn-28). Soft: a schema-DDL failure disables attribution for the
+    # session; synthesis is otherwise unaffected. In scope from here for the
+    # ConsolidationPass injection AND the KNOWLEDGE_MOMENT handler below.
+    from titan_hcl.synthesis.recall_attribution import RecallAttribution
+    recall_attribution: Optional[RecallAttribution] = RecallAttribution(
+        store._conn, db_writer)
+    if not recall_attribution.ensure_schema():
+        recall_attribution = None
+
     # Phase 2 D-P2-4 standing-bundle store — sole writer of
     # data/synthesis.duckdb / association_bundles. CONN-2 FOLD (AUDIT §5.2):
     # shares ActivationStore's ONE guarded connection (store._conn) rather than
@@ -1166,7 +1178,21 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # a dream creates new concepts. Idempotent + cheap (bounded Engram count);
         # ongoing re-ranking happens at each dream boundary (ConsolidationPass.run).
         try:
-            migrated = engram_store.recompute_population_groundedness()
+            # §7.E.0 — restore the live `fluent` axis from persisted citation
+            # counters on boot (counts survive restarts in synthesis.duckdb), so
+            # fluent discriminates day-1 just like axis_used does.
+            _boot_fluent_lookup = None
+            _boot_axes_sink = None
+            if recall_attribution is not None:
+                try:
+                    _bfm = recall_attribution.fluent_map()
+                    _boot_fluent_lookup = (
+                        lambda cid, ver, _m=_bfm: _m.get((str(cid), int(ver))))
+                    _boot_axes_sink = recall_attribution.update_axes_cache
+                except Exception:
+                    pass
+            migrated = engram_store.recompute_population_groundedness(
+                fluent_lookup=_boot_fluent_lookup, axes_sink=_boot_axes_sink)
             logger.info(
                 "[synthesis_worker] boot population groundedness recompute: "
                 "%d Engrams percentile-blended (§7.D)", migrated)
@@ -1302,6 +1328,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             cosine_fn=_np_cosine,
             window_hours=_window_hours,
             min_cluster_size=_min_cluster,
+            recall_attribution=recall_attribution,  # §7.E.0 membership + fluent feed
         )
         logger.info(
             "[synthesis_worker] ConsolidationPass ready — DREAM_STATE_CHANGED "
@@ -2396,19 +2423,30 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 # signal emitted post-LLM by agno. `needed` = the turn required
                 # knowledge (≥1 recall surfaced OR a tool call); `satisfied` =
                 # answered by ≥1 cited recall. One moment per turn, not per item.
-                if sovereignty_meter is None:
-                    continue
                 _km_ts = payload.get("ts")
                 if not isinstance(_km_ts, (int, float)):
                     _km_ts = time.time()
-                try:
-                    if payload.get("needed"):
-                        sovereignty_meter.record_knowledge_moment(float(_km_ts))
-                    if payload.get("satisfied"):
-                        sovereignty_meter.record_recall_satisfied(
-                            kind="cited_recall", ts=float(_km_ts))
-                except Exception:
-                    pass
+                if sovereignty_meter is not None:
+                    try:
+                        if payload.get("needed"):
+                            sovereignty_meter.record_knowledge_moment(float(_km_ts))
+                        if payload.get("satisfied"):
+                            sovereignty_meter.record_recall_satisfied(
+                                kind="cited_recall", ts=float(_km_ts))
+                    except Exception:
+                        pass
+                # §7.E.0 — per-Engram citation attribution (OFF the chat hot path):
+                # resolve the surfaced + cited tx_hash sets → their latest Engram(s)
+                # and record recall-citation (feeds the live `fluent` axis + §7.E's
+                # `(axes_at_recall, cited?)` reward). Independent of the meter; soft.
+                if recall_attribution is not None:
+                    try:
+                        recall_attribution.record_recall(
+                            payload.get("surfaced_tx") or [],
+                            payload.get("cited_tx") or [],
+                            float(_km_ts))
+                    except Exception:
+                        pass
                 continue
 
             if msg_type == TOOL_CALL_VERDICT_RECORD:

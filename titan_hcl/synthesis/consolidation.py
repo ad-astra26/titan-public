@@ -225,9 +225,13 @@ class ConsolidationPass:
         max_concepts_per_pass: int = 10,
         llm_calls_max: int = 20,
         source: str = "synthesis_worker",
+        recall_attribution: Optional[Any] = None,
     ):
         self._store = engram_store
         self._bridge = cgn_bridge
+        # §7.E.0 — per-Engram citation attribution (membership write + the live
+        # `fluent` axis feed at the dream recompute). Optional/soft — None disables.
+        self._attribution = recall_attribution
         self._writer = outer_memory_writer
         self._mine = mine_recent_txs_fn
         self._propose = llm_propose_fn
@@ -353,7 +357,22 @@ class ConsolidationPass:
         # population changed this pass.
         if result.concepts_created or result.concepts_bumped:
             try:
-                self._store.recompute_population_groundedness()
+                # §7.E.0 — feed the LIVE recall-citation rate into the `fluent` axis
+                # + cache the fresh axes for the recall-event snapshots. Soft: a
+                # missing/failed attribution falls back to pure §7.D behaviour.
+                fluent_lookup = None
+                axes_sink = None
+                if self._attribution is not None:
+                    try:
+                        _fmap = self._attribution.fluent_map()
+                        fluent_lookup = (
+                            lambda cid, ver, _m=_fmap: _m.get((str(cid), int(ver))))
+                        axes_sink = self._attribution.update_axes_cache
+                    except Exception as _fa_err:
+                        logger.debug(
+                            "[ConsolidationPass] fluent feed unavailable: %s", _fa_err)
+                self._store.recompute_population_groundedness(
+                    fluent_lookup=fluent_lookup, axes_sink=axes_sink)
             except Exception as e:
                 logger.warning(
                     "[ConsolidationPass] population groundedness recompute "
@@ -491,6 +510,11 @@ class ConsolidationPass:
                     if _parse_felt(getattr(m, "felt", None))),
                 len(cluster.members))
 
+        # §7.E.0 — persist the member tx_hash → Engram reverse-index (the
+        # citation-attribution resolver source). Soft; never blocks the pass.
+        if self._attribution is not None:
+            self._attribution.record_membership(cv.concept_id, cv.version, evidence)
+
         result.concepts_created.append((cv.concept_id, cv.version))
         return True
 
@@ -536,6 +560,11 @@ class ConsolidationPass:
                 sum(1 for m in cluster.members
                     if _parse_felt(getattr(m, "felt", None))),
                 len(cluster.members))
+
+        # §7.E.0 — persist the member tx_hash → Engram reverse-index for the new
+        # version (latest-version-only credit resolves to it). Soft.
+        if self._attribution is not None:
+            self._attribution.record_membership(cv.concept_id, cv.version, evidence)
 
         result.concepts_bumped.append((cv.concept_id, cv.version))
         return True
