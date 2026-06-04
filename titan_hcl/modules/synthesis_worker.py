@@ -623,7 +623,7 @@ def _recompute_loop(store: "ActivationStore",
             bundles_exported = bundle_store.export_snapshot(bundle_snapshot_path)
             # Phase 4 FU-1 — spine snapshot for cross-process api reads.
             # Holder pattern: synthesis_worker_main sets the exporter to
-            # ConceptStore.export_snapshot AFTER kuzu_graph_obj is wired;
+            # EngramStore.export_snapshot AFTER kuzu_graph_obj is wired;
             # default no-op until that completes.
             try:
                 spine_exporter_holder["fn"]()
@@ -858,7 +858,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # See the "Liveness BEFORE the heavy init" block near the top of boot.)
 
     # Phase 4 FU-1 — spine exporter holder (late-bound). Default is a
-    # no-op so the recompute loop fires safely before the ConceptStore is
+    # no-op so the recompute loop fires safely before the EngramStore is
     # ready. The consolidation wiring below sets the real exporter.
     spine_exporter_holder: dict = {"fn": lambda: None}
     # Phase 5 §P5.I — forks exporter + activation updater holders
@@ -1114,16 +1114,16 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # the proposer returns all-reject (pass still mines + anchors summary
     # TXs for audit; spine writes simply don't happen until provider lands).
     consolidation_pass: Optional[Any] = None
-    # Phase 4 FU-1 — the ConceptStore instance is hoisted into the outer
-    # scope so the recompute loop can call concept_store.export_snapshot()
+    # Phase 4 FU-1 — the EngramStore instance is hoisted into the outer
+    # scope so the recompute loop can call engram_store.export_snapshot()
     # each 60s tick regardless of whether ConsolidationPass construction
     # succeeded. Stays None if kuzu_graph_obj is unavailable.
-    concept_store: Optional[Any] = None
+    engram_store: Optional[Any] = None
     last_dream_pass_started_ts: float = 0.0
     consolidation_thread_lock = threading.Lock()
     try:
         from titan_hcl.synthesis.cgn_bridge import CGNRegistrationBridge
-        from titan_hcl.synthesis.concept_store import ConceptStore
+        from titan_hcl.synthesis.engram_store import EngramStore
         from titan_hcl.synthesis.consolidation import (
             ConsolidationPass, LLMProposal,
         )
@@ -1150,20 +1150,20 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         cgn_bridge = CGNRegistrationBridge(
             registry_path=os.path.join("data", "synthesis_spine_concepts.json"),
         )
-        concept_store = ConceptStore(kuzu_graph, writer, db_writer=db_writer)
+        engram_store = EngramStore(kuzu_graph, writer, db_writer=db_writer)
 
         # Phase 4 FU-1 — wire the spine_exporter so the recompute loop's
         # next 60s tick starts writing data/spine_snapshot.json. The api
         # process reads this JSON (NOT Kuzu directly — Kuzu 0.11 holds
         # the exclusive lock even for read_only=True opens).
         spine_exporter_holder["fn"] = (
-            lambda: concept_store.export_snapshot(spine_snapshot_path)
+            lambda: engram_store.export_snapshot(spine_snapshot_path)
         )
         # Initial export so the snapshot is non-empty + present before
         # the first 60s tick (api process gets data immediately on first
         # poll after worker boot).
         try:
-            initial_n = concept_store.export_snapshot(spine_snapshot_path)
+            initial_n = engram_store.export_snapshot(spine_snapshot_path)
             logger.info(
                 "[synthesis_worker] initial spine snapshot exported "
                 "(%d concept rows) → %s",
@@ -1279,7 +1279,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 return 0.0
 
         consolidation_pass = ConsolidationPass(
-            concept_store=concept_store,
+            engram_store=engram_store,
             cgn_bridge=cgn_bridge,
             outer_memory_writer=writer,
             mine_recent_txs_fn=_mine_with_embeddings,
@@ -1304,7 +1304,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         )
 
     # ── Phase 5 §P5.A–P5.H — HypothesisForkStore + ForkGC wiring ────────
-    # Constructed AFTER ConceptStore / OuterMemoryWriter are wired so it
+    # Constructed AFTER EngramStore / OuterMemoryWriter are wired so it
     # can reuse them for graduation paths (INV-10 / INV-Syn-11). Soft-fail
     # if any dependency is missing: forks become a no-op for the session,
     # synthesis_worker keeps running.
@@ -1312,10 +1312,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     fork_gc: Optional[Any] = None
     try:
         if (kuzu_graph_obj is None
-                or concept_store is None
+                or engram_store is None
                 or 'writer' not in locals()):
             raise RuntimeError(
-                "missing dependency: kuzu_graph / concept_store / writer "
+                "missing dependency: kuzu_graph / engram_store / writer "
                 "not wired — hypothesis-fork lifecycle disabled this session"
             )
         from titan_hcl.synthesis.hypothesis_fork_store import (
@@ -1327,7 +1327,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             writer=db_writer,           # single-writer-thread (Option C)
             duckdb_conn=store._conn,    # same DuckDB conn as ActivationStore
             kuzu_graph=kuzu_graph_obj,
-            concept_store=concept_store,
+            engram_store=engram_store,
             outer_memory_writer=writer,
             activation_store=store,      # ActivationStore from above
             # P8.X (D-SPEC-PHASE8 fold-in): write-through snapshot path so
@@ -1548,20 +1548,20 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             privacy_domains=zk_privacy_domains(config or {}),
         )
 
-        # CGN meaning oracle — concept_reader bound to ConceptStore;
+        # CGN meaning oracle — concept_reader bound to EngramStore;
         # cgn_grounder reserved for the bus-RPC follow-up (returns None
         # for now → degraded grounding per the P6.H defensive contract).
         def _concept_reader(concept_id: str, version: int):
-            # G3 (AUDIT §5.3): ConceptStore.read_spine_strands now exists (the
+            # G3 (AUDIT §5.3): EngramStore.read_spine_strands now exists (the
             # getattr probe used to silently return None → meaning_of empty
             # fleet-wide). Call it directly; it runs on the writer thread
             # (@on_writer) and returns the four Timechain-anchor strands, or
             # None for a missing concept. Soft-fail so a Kuzu hiccup on this
             # dream-orchestrator path never crash-loops the worker.
-            if concept_store is None:
+            if engram_store is None:
                 return None
             try:
-                return concept_store.read_spine_strands(concept_id, version)
+                return engram_store.read_spine_strands(concept_id, version)
             except Exception:
                 logger.exception("[synthesis_worker] concept_reader failed")
                 return None

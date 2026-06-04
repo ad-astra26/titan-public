@@ -11,7 +11,7 @@ api process does NOT open the Kuzu file directly because Kuzu 0.11's
 the active synthesis_worker writer — same lock-conflict that motivated
 the JSON-snapshot pattern for DuckDB in Phase 1.
 
-Snapshot schema (see `ConceptStore.export_snapshot`):
+Snapshot schema (see `EngramStore.export_snapshot`):
     {
       "version": 1,
       "exported_at": <wall-clock seconds>,

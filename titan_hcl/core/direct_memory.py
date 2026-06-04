@@ -603,10 +603,10 @@ class TitanKnowledgeGraph:
 
     # ─── Phase 4 — synthesis-engine Concept-spine helpers (§6.1 / §10) ───
     #
-    # Low-level Cypher wrappers consumed by `titan_hcl/synthesis/concept_store.py`
+    # Low-level Cypher wrappers consumed by `titan_hcl/synthesis/engram_store.py`
     # (the sole writer per INV-Syn-3 extended). High-level invariants
     # (INV-3 no parent mutation, INV-4 single canonical write path, INV-10
-    # parent must exist) live in ConceptStore; these helpers are intentionally
+    # parent must exist) live in EngramStore; these helpers are intentionally
     # primitive so they're also safe for read-only consumers (BridgeRecall +
     # observatory endpoints).
 
@@ -682,7 +682,7 @@ class TitanKnowledgeGraph:
 
     def spine_get_latest_concept(self, concept_id: str) -> dict | None:
         """Return the highest-version row for concept_id, or None if no
-        version exists. Used by ConceptStore.bump_version() to compute v+1
+        version exists. Used by EngramStore.bump_version() to compute v+1
         and by spine recall (P4.H) to pick the latest spine root."""
         try:
             qr = self._conn.execute(

@@ -24,20 +24,20 @@ import pytest
 
 from titan_hcl.core.direct_memory import TitanKnowledgeGraph
 from titan_hcl.synthesis.cgn_bridge import CGNRegistrationBridge
-from titan_hcl.synthesis.concept_store import ConceptStore
+from titan_hcl.synthesis.engram_store import EngramStore
 from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter
 from titan_hcl.synthesis.recall import EngineRecall, RecallResult
 
 
 @pytest.fixture()
 def env_with_spine():
-    """Real Kuzu graph + ConceptStore + a few materialized spine concepts."""
+    """Real Kuzu graph + EngramStore + a few materialized spine concepts."""
     with tempfile.TemporaryDirectory() as tmp:
         g = TitanKnowledgeGraph(os.path.join(tmp, "p4h.kuzu"))
         q = queue.Queue()
         w = OuterMemoryWriter(send_queue=q, src="recall_test")
         bridge = CGNRegistrationBridge(os.path.join(tmp, "spine.json"))
-        store = ConceptStore(g, w, clock=lambda: 1000.0)
+        store = EngramStore(g, w, clock=lambda: 1000.0)
 
         # 3 spine concepts with varying groundedness.
         bridge.register_spine_concept("linux_terminal", "Linux terminal")
