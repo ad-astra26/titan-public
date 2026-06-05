@@ -453,6 +453,41 @@ def _estimate_threat_level(message: str, features: dict) -> float:
 # Pre-hooks (run before LLM inference)
 # ---------------------------------------------------------------------------
 
+def _capture_pre_chat_felt(plugin) -> dict:
+    """Capture the felt-at-lived-time neuromod snapshot for THIS turn (§7.C /
+    RFP_synthesis_engram_grounding) and store it on ``plugin._pre_chat_neuromods``.
+
+    Source = ``ShmReaderBank.read_neuromod()`` — the authoritative live neuromod SHM
+    slot (``{modulator: {"level": float}}``). It is NOT sourced from the agno
+    coordinator: the coordinator's ``neuromodulators`` is **empty in the agno PreHook
+    path** (it relies on an SHM fallback only some api endpoints apply), so the prior
+    coordinator-sourced snapshot resolved ``{}`` on every turn → every promoted chat
+    thought carried NULL felt → ``axis_felt`` was 0 fleet-wide, and the synthesis
+    felt-bridge / CGN-felt ``frame_dependent`` path (which consumes this lived felt via
+    ``agg_felt``) was inert. Captured for EVERY chat regardless of tier — the lived felt
+    is ground truth, not a prompt-enrichment artifact. Soft-fail → ``{}``.
+    """
+    snap: dict = {}
+    try:
+        bank = getattr(plugin, "_shm_reader_bank", None)
+        if bank is None:
+            from titan_hcl.api.shm_reader_bank import ShmReaderBank
+            bank = ShmReaderBank()
+            plugin._shm_reader_bank = bank
+        nm = bank.read_neuromod()
+        mods = (nm or {}).get("modulators", {}) or {}
+        snap = {
+            name: (m.get("level", 0.5) if isinstance(m, dict) else float(m))
+            for name, m in mods.items()
+            if isinstance(m, (dict, int, float)) and not isinstance(m, bool)
+        }
+    except Exception as _felt_err:  # noqa: BLE001 — felt is best-effort, never blocks chat
+        logger.debug("[pre_hook] felt-at-lived-time SHM snapshot failed: %s", _felt_err)
+        snap = {}
+    plugin._pre_chat_neuromods = snap
+    return snap
+
+
 def create_pre_hook(plugin):
     """
     Factory: creates the Titan pre-inference hook bound to a TitanHCL instance.
@@ -1106,6 +1141,12 @@ def create_pre_hook(plugin):
         }
         _v5_active = bool(active_features & _v5_features)
 
+        # Felt-at-lived-time (§7.C) — capture the pre-chat neuromod snapshot the turn
+        # is lived under, BEFORE the V5 gate, so it runs for EVERY chat (felt is ground
+        # truth regardless of the prompt-enrichment tier). Sourced from SHM, not the
+        # coordinator (which is empty in this path — see _capture_pre_chat_felt).
+        _capture_pre_chat_felt(plugin)
+
         class _SkipV5Block(Exception):
             """Sentinel used to short-circuit V5 enrichment when no feature
             consumer is active. Caught by the existing outer except below."""
@@ -1123,15 +1164,9 @@ def create_pre_hook(plugin):
 
             _v5 = await asyncio.to_thread(_fetch_coordinator)
 
-            # Save pre-chat neuromod snapshot for CGN social consumer reward
-            try:
-                _pre_mods = _v5.get("neuromodulators", {}).get("modulators", {})
-                plugin._pre_chat_neuromods = {
-                    nm: md.get("level", 0.5) if isinstance(md, dict) else 0.5
-                    for nm, md in _pre_mods.items()
-                }
-            except Exception:
-                plugin._pre_chat_neuromods = {}
+            # (pre-chat neuromod snapshot for felt-at-lived-time + CGN social reward is
+            # now captured from SHM before this block via _capture_pre_chat_felt — the
+            # coordinator's neuromodulators is empty in this PreHook path.)
 
             # [10] Neurochemical state — felt_state feature (ζ.1)
             try:
