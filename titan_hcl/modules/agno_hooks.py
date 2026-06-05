@@ -482,10 +482,8 @@ def _capture_pre_chat_felt(plugin) -> dict:
             for name, m in mods.items()
             if isinstance(m, (dict, int, float)) and not isinstance(m, bool)
         }
-        logger.info("[FELT-DIAG] bank=%s nm_none=%s mods=%d snap=%d",
-                    type(bank).__name__, nm is None, len(mods), len(snap))
     except Exception as _felt_err:  # noqa: BLE001 — felt is best-effort, never blocks chat
-        logger.info("[FELT-DIAG] EXC %s: %s", type(_felt_err).__name__, _felt_err)
+        logger.debug("[pre_hook] felt-at-lived-time SHM snapshot failed: %s", _felt_err)
         snap = {}
     plugin._pre_chat_neuromods = snap
     return snap
