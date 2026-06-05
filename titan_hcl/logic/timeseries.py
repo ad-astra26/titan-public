@@ -1,7 +1,10 @@
 """
 Unified Time-Series Store for Titan Observatory.
 
-Single SQLite table storing ~37 metrics every 5 minutes with 30-day retention.
+Single SQLite table storing ~45 metrics every 5 minutes. Retention = data time-machine:
+keep-all (10yr floor) with a 15GB size-ceiling guard that prunes oldest only if exceeded
+(~decades away at the observed ~0.4 MB/day). Was 30-day retention — changed 2026-06-04 to
+make this the long-term substrate for higher-system metrics (pi-cluster, sovereignty, …).
 Auto-downsamples to hourly averages for queries > 48h.
 
 Usage:
@@ -19,7 +22,8 @@ import threading
 
 logger = logging.getLogger("titan.timeseries")
 
-_RETENTION_DAYS = 30
+_RETENTION_DAYS = 3650            # ~10yr — effectively keep-all (data time-machine); size-capped below
+_MAX_DB_BYTES = 15 * 1024 ** 3    # 15GB hard ceiling (~decades at ~0.4MB/day); prune oldest only if exceeded
 _DOWNSAMPLE_THRESHOLD_HOURS = 48
 _RECORD_INTERVAL = 300  # 5 minutes
 
@@ -176,16 +180,33 @@ class TimeseriesStore:
         return result
 
     def cleanup(self):
-        """Remove data older than retention period."""
+        """Data time-machine retention (2026-06-04): keep ALL data up to a 10yr floor,
+        and prune oldest ONLY if the db exceeds the size ceiling (decades away at ~0.4MB/day).
+        Replaces the old 30-day delete — this db is now the long-term substrate."""
+        import os as _os
         cutoff = int(time.time()) - (_RETENTION_DAYS * 86400)
         with self._lock:
             conn = sqlite3.connect(self._db_path, timeout=10)
             try:
-                cursor = conn.execute("DELETE FROM metrics WHERE ts < ?", (cutoff,))
-                deleted = cursor.rowcount
+                # 1) 10yr time-floor — effectively never deletes (keep-all)
+                deleted = conn.execute("DELETE FROM metrics WHERE ts < ?", (cutoff,)).rowcount
                 conn.commit()
+                # 2) size-ceiling guard — only fires near tens-of-GB; prunes oldest 10% back under
+                try:
+                    if _os.path.getsize(self._db_path) > _MAX_DB_BYTES:
+                        row = conn.execute("SELECT MIN(ts), MAX(ts) FROM metrics").fetchone()
+                        if row and row[0] is not None and row[1] is not None and row[1] > row[0]:
+                            prune_before = row[0] + int((row[1] - row[0]) * 0.10)
+                            n = conn.execute("DELETE FROM metrics WHERE ts < ?", (prune_before,)).rowcount
+                            conn.commit()
+                            conn.execute("VACUUM")
+                            deleted += n
+                            logger.warning("[Timeseries] DB > %d bytes — pruned oldest 10%% (%d rows)",
+                                           _MAX_DB_BYTES, n)
+                except Exception as _e:
+                    logger.warning("[Timeseries] size-guard check failed: %s", _e)
                 if deleted > 0:
-                    logger.info("[Timeseries] Cleaned up %d old rows (cutoff=%d)", deleted, cutoff)
+                    logger.info("[Timeseries] Retention cleanup removed %d rows", deleted)
             finally:
                 conn.close()
 
@@ -272,12 +293,25 @@ def collect_snapshot(state_refs: dict) -> dict[str, float]:
             if comp:
                 metrics[f"expression.{cname.lower()}_fires"] = float(getattr(comp, "fire_count", 0))
 
-    # ── Pi heartbeat ──
+    # ── Pi heartbeat ──  (route through get_stats() — the canonical accessor.
+    #   Note: the old getattr(pi,"cluster_count") read the PRIVATE attr name and
+    #   silently recorded 0; get_stats() exposes the real values + the full set.)
     pi = state_refs.get("pi_monitor")
     if pi:
-        metrics["pi.heartbeat_ratio"] = float(getattr(pi, "heartbeat_ratio", 0))
-        metrics["pi.cluster_count"] = float(getattr(pi, "cluster_count", 0))
-        metrics["pi.dev_age"] = float(getattr(pi, "developmental_age", 0))
+        try:
+            ps = pi.get_stats() if hasattr(pi, "get_stats") else {}
+        except Exception:
+            ps = {}
+        metrics["pi.heartbeat_ratio"] = float(ps.get("heartbeat_ratio", getattr(pi, "heartbeat_ratio", 0)) or 0)
+        metrics["pi.cluster_count"] = float(ps.get("cluster_count", 0) or 0)
+        metrics["pi.dev_age"] = float(ps.get("developmental_age", getattr(pi, "developmental_age", 0)) or 0)
+        # NEW 2026-06-04 — the ≈π "value" + the streak/total raw signals (were live-only):
+        metrics["pi.avg_cluster_size"] = float(ps.get("avg_cluster_size", getattr(pi, "avg_cluster_size", 0)) or 0)
+        metrics["pi.pi_streak"] = float(ps.get("current_pi_streak", 0) or 0)
+        metrics["pi.zero_streak"] = float(ps.get("current_zero_streak", 0) or 0)
+        metrics["pi.total_pi_epochs"] = float(ps.get("total_pi_epochs", 0) or 0)
+        metrics["pi.total_epochs"] = float(ps.get("total_epochs_observed", 0) or 0)
+        metrics["pi.in_cluster"] = 1.0 if ps.get("in_cluster") else 0.0
 
     # ── Epoch ──
     if coordinator:
