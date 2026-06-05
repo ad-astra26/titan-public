@@ -1075,6 +1075,18 @@ def create_pre_hook(plugin):
                 logger.info(
                     "[PreHook] B3 synthesis recall ran: %d raw results in %.0fms",
                     len(_results or []), _recall_latency_ms)
+                # D5-probe (RFP_synthesis_decision_authority P0): emit per-result
+                # cosine so the known-vs-unknown discrimination that GATES P2 is
+                # readable from the journal. Self-guarding comprehension (getattr
+                # default + `or 0.0`) — no try/except needed, never breaks chat.
+                # Down-payment on P2's `[PreHook] decision →` instrumentation.
+                _d5_cos = sorted(
+                    (round(float(getattr(_r, "cosine", 0.0) or 0.0), 4)
+                     for _r in (_results or [])),
+                    reverse=True)
+                logger.info(
+                    "[PreHook] B3 recall cosine[D5] top=%s prompt=%r",
+                    _d5_cos, (prompt_text or "")[:64])
                 try:
                     _s1 = _ev.get_stats() if _ev is not None else {}
                     plugin._last_retrieval_sample = {
