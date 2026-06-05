@@ -18,6 +18,7 @@ must NEVER affect synthesis correctness or the chat path (INV-Syn-17).
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -52,6 +53,10 @@ class FeltBridge:
         # writes arrive on the bus recv-loop thread while reads run on the dream
         # (consolidation) worker thread.
         self._grounded: set[str] = set()
+        # CGN-felt RFP Phase B — label → per-concept felt centroid (parsed dict),
+        # carried on CGN_CONCEPT_GROUNDED. The fast in-mem read for the dream-pass
+        # frame_dependent comparison (G18 — never an RPC). Lock-shared with _grounded.
+        self._grounded_felt: dict[str, dict] = {}
         self._grounded_lock = threading.Lock()
 
     # ── Schema ──────────────────────────────────────────────────────────
@@ -71,10 +76,18 @@ class FeltBridge:
                     " PRIMARY KEY (engram_id, version, object_label))")
                 # Phase 2 — durable CGN grounded-Object set (event-sourced from
                 # CGN_CONCEPT_GROUNDED; G18 — never an RPC into cgn_worker).
+                # CGN-felt RFP Phase B — `felt_json` carries the per-concept felt
+                # centroid (CGN→synthesis read-down) so the producer can do a true
+                # felt-vector frame_dependent comparison (else label-only).
                 self._conn.execute(
                     "CREATE TABLE IF NOT EXISTS cgn_grounded_objects ("
                     " object_label VARCHAR PRIMARY KEY,"
-                    " first_seen_ts DOUBLE DEFAULT 0)")
+                    " first_seen_ts DOUBLE DEFAULT 0,"
+                    " felt_json VARCHAR DEFAULT '')")
+                # Migrate tables created before the felt column (idempotent).
+                self._conn.execute(
+                    "ALTER TABLE cgn_grounded_objects "
+                    "ADD COLUMN IF NOT EXISTS felt_json VARCHAR DEFAULT ''")
                 # Phase 3 — the propose-only felt-teaching candidate queue. A §3.4
                 # BRAIN Object record (felt-seeded, low-c, lineage→source Engram,
                 # frames→domain_hint). `hv` is deferred (BRAIN-not-built); this is the
@@ -150,34 +163,70 @@ class FeltBridge:
 
     # ── Phase 2 — event-sourced CGN grounded-set (G18) ──────────────────
     def _load_grounded(self) -> None:
-        """Boot-seed the in-memory grounded-set from the durable table (so it
-        survives restart; G18 — no RPC into CGN). Soft-fail → empty set."""
+        """Boot-seed the in-memory grounded-set AND the felt-centroid mirror from the
+        durable table (so both survive restart; G18 — no RPC into CGN). The felt mirror
+        boot-seed is what makes Phase-B's `grounded_felt` durable (G2). Soft-fail →
+        empty mirrors."""
         try:
             rows = self._writer.submit_sync(lambda: self._conn.execute(
-                "SELECT object_label FROM cgn_grounded_objects").fetchall())
+                "SELECT object_label, felt_json FROM cgn_grounded_objects").fetchall())
+            grounded: set[str] = set()
+            felt: dict[str, dict] = {}
+            for r in (rows or []):
+                lbl = str(r[0]) if r[0] else ""
+                if not lbl:
+                    continue
+                grounded.add(lbl)
+                fj = r[1] if len(r) > 1 else None
+                if fj:
+                    try:
+                        d = json.loads(fj)
+                        if isinstance(d, dict) and d:
+                            felt[lbl] = d
+                    except Exception:  # noqa: BLE001 — a corrupt centroid never blocks grounding
+                        pass
             with self._grounded_lock:
-                self._grounded = {str(r[0]) for r in (rows or []) if r[0]}
+                self._grounded = grounded
+                self._grounded_felt = felt
         except Exception as e:  # noqa: BLE001
             logger.debug("[FeltBridge] grounded-set boot-load soft-fail: %s", e)
 
     def record_grounded(
-        self, object_label: str, ts: Optional[float] = None,
+        self, object_label: str, felt_centroid: Optional[dict] = None,
+        ts: Optional[float] = None,
     ) -> None:
         """Absorb a `CGN_CONCEPT_GROUNDED` event into the durable grounded-set + the
         fast in-memory mirror (RFP §7.2). This is the ONLY way the set grows — it is
         **event-sourced**, never a sync RPC into cgn_worker (G18). Normalized to the
-        shared key space; idempotent; fire-and-forget; soft-fail."""
+        shared key space; idempotent; fire-and-forget; soft-fail.
+
+        CGN-felt RFP Phase B — `felt_centroid` (the per-concept felt centroid carried
+        on the event) is stored in `felt_json` + the in-mem `label→dict` mirror so the
+        producer can do a true felt-vector frame_dependent comparison. `None`/empty →
+        label-only (backward-compatible with pre-felt emitters); a non-empty centroid
+        refreshes any existing one."""
         lbl = normalize_label(object_label)
         if not lbl:
             return
+        felt = felt_centroid if isinstance(felt_centroid, dict) and felt_centroid else None
+        felt_json = json.dumps(felt, sort_keys=True) if felt else ""
         with self._grounded_lock:
             self._grounded.add(lbl)
+            if felt:
+                self._grounded_felt[lbl] = dict(felt)
         t = float(ts) if ts is not None else time.time()
         try:
             def _write() -> None:
-                self._conn.execute(
-                    "INSERT INTO cgn_grounded_objects (object_label, first_seen_ts) "
-                    "VALUES (?, ?) ON CONFLICT DO NOTHING", [lbl, t])
+                if felt_json:
+                    self._conn.execute(
+                        "INSERT INTO cgn_grounded_objects "
+                        "(object_label, first_seen_ts, felt_json) VALUES (?, ?, ?) "
+                        "ON CONFLICT (object_label) DO UPDATE SET "
+                        "felt_json = excluded.felt_json", [lbl, t, felt_json])
+                else:
+                    self._conn.execute(
+                        "INSERT INTO cgn_grounded_objects (object_label, first_seen_ts) "
+                        "VALUES (?, ?) ON CONFLICT DO NOTHING", [lbl, t])
             self._writer.submit(_write)
         except Exception as e:  # noqa: BLE001
             logger.debug("[FeltBridge] record_grounded soft-fail: %s", e)
@@ -193,6 +242,19 @@ class FeltBridge:
             return False
         with self._grounded_lock:
             return lbl in self._grounded
+
+    def grounded_felt(self, label: str) -> Optional[dict]:
+        """The per-concept felt centroid CGN grounded this Object under, or `None` if
+        the Object is ungrounded OR matured before the felt-centroid channel existed
+        (backward-compat). Reads the in-memory event-sourced mirror ONLY — no sync RPC
+        (G18). Used by the producer (`_queue_felt_gaps`) for the true felt-vector
+        frame_dependent comparison (CGN-felt RFP Phase C). Normalized key space."""
+        lbl = normalize_label(label)
+        if not lbl:
+            return None
+        with self._grounded_lock:
+            fc = self._grounded_felt.get(lbl)
+            return dict(fc) if fc else None
 
     # ── Phase 3 — propose-only candidate queue (INV-Syn-ENG-4) ──────────
     def queue_candidate(

@@ -874,11 +874,16 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     # in record_outcome; we drain + publish to cognitive_worker.
                     try:
                         for _mat in cgn.pop_matured_concepts():
+                            # CGN-felt RFP Phase B — carry the per-concept felt centroid
+                            # (G18 read-down) so synthesis can do a true felt-vector
+                            # frame_dependent comparison. {} when no felt accumulated yet.
                             _send_msg(send_queue, bus.CGN_CONCEPT_GROUNDED, name,
                                       "cognitive_worker", {
                                           "concept_id": _mat["concept_id"],
                                           "consumers": _mat["consumers"],
                                           "first_consumer": _mat["first_consumer"],
+                                          "felt_centroid": cgn.concept_felt_centroid(
+                                              _mat["concept_id"]),
                                       })
                             logger.info(
                                 "[CGN] CGN_CONCEPT_GROUNDED — concept=%s consumers=%s "

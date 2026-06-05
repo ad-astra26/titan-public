@@ -2473,14 +2473,18 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             if msg_type == CGN_CONCEPT_GROUNDED:
                 # Inner↔Outer Felt-Teaching Bridge §7.2 — event-sourced CGN
                 # grounded-set. cgn_worker emits this when a concept matures across
-                # ≥2 consumers (cgn_worker.py:851; payload {concept_id, consumers,
-                # first_consumer}). We absorb the concept_id (the Object label) into
-                # FeltBridge's durable grounded-set so the next dream no longer flags
-                # it as a felt-gap. G18: fire-and-forget event consumption — NEVER a
-                # sync RPC into cgn_worker. Soft.
+                # ≥2 consumers (cgn_worker.py:877; payload {concept_id, consumers,
+                # first_consumer, felt_centroid}). We absorb the concept_id (the Object
+                # label) into FeltBridge's durable grounded-set so the next dream no
+                # longer flags it as a felt-gap. CGN-felt RFP Phase B — also absorb the
+                # felt_centroid (G18 read-down) so the producer can do a true
+                # felt-vector frame_dependent comparison. G18: fire-and-forget event
+                # consumption — NEVER a sync RPC into cgn_worker. Soft.
                 if felt_bridge is not None:
                     try:
-                        felt_bridge.record_grounded(payload.get("concept_id"))
+                        felt_bridge.record_grounded(
+                            payload.get("concept_id"),
+                            felt_centroid=payload.get("felt_centroid"))
                     except Exception:
                         pass
                 continue
