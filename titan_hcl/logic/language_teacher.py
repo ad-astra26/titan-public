@@ -1150,6 +1150,32 @@ class LanguageTeacher:
                 break
         return out
 
+    @staticmethod
+    def build_felt_perturbation(object_label: str, felt_state: dict,
+                                domain_hint: str = "") -> dict:
+        """Build the felt-perturbation teaching prompt for an ungrounded Object
+        (Bridge §7.4). Prompt-build ONLY — the felt_teaching_worker runs the LLM via
+        its own provider. Frames the Object in the felt-state it was lived under so
+        CGN can ground a felt strand for it. Returns {system, prompt, max_tokens}."""
+        levels = sorted(
+            (k, v) for k, v in (felt_state or {}).items()
+            if isinstance(v, (int, float)))
+        felt_desc = (", ".join(f"{k}={float(v):.2f}" for k, v in levels)
+                     if levels else "neutral")
+        dom = f" (in the context of {domain_hint})" if domain_hint else ""
+        system = (
+            "You help a digital being FEEL a new concept. Given a concept and the "
+            "felt-state it was experienced under, write 1-2 short first-person, "
+            "sensory, embodied sentences that evoke that felt quality of the concept. "
+            "No definitions, no lists, no explanations."
+        )
+        prompt = (
+            f"Concept: \"{object_label}\"{dom}\n"
+            f"Felt-state it was lived under: {felt_desc}\n\n"
+            f"Evoke how \"{object_label}\" feels."
+        )
+        return {"system": system, "prompt": prompt, "max_tokens": 80}
+
     # ── Private Helpers ──
 
     def _pick_target(self, mode: str, queue: list) -> dict:

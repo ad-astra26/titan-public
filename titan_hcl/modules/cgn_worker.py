@@ -468,6 +468,28 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         ))
         logger.info("[CGNWorker] Pre-registered 'social' consumer (A5 cross-Titan symmetry)")
 
+    # ── Pre-register "felt_teaching" consumer ──
+    # Inner↔Outer Felt-Teaching Bridge §7.4 (RFP_inner_outer_felt_teaching_bridge):
+    # the felt_teaching_worker feeds outer→inner felt-grounding evidence as a FULL
+    # CGN consumer (value_net + IQL participant) — but propose-only (record_outcome
+    # only; never writes a grounding). Pre-registered here as the safety net so its
+    # CGN_TRANSITION sends are not silently dropped (BUG-CGN-SILENT-UNREGISTERED-
+    # CONSUMER); the worker also sends CGN_REGISTER at init.
+    if "felt_teaching" not in cgn._consumers:
+        cgn.register_consumer(CGNConsumerConfig(
+            name="felt_teaching",
+            feature_dims=30,
+            action_dims=8,
+            action_names=["reinforce", "explore", "differentiate",
+                          "consolidate", "associate", "dissociate",
+                          "deepen", "stabilize"],
+            reward_source="felt_grounding_evidence",
+            max_buffer_size=500,
+            consolidation_priority=2,
+        ))
+        logger.info("[CGNWorker] Pre-registered 'felt_teaching' consumer "
+                    "(Inner↔Outer Felt-Teaching Bridge §7.4)")
+
     # ── Audit: disk consumers vs code-authoritative manifest (A5 — 2026-04-21) ──
     # After all static pre-registrations complete, cross-check: any consumer
     # loaded from cgn_state.pt that isn't in CODE_AUTHORITATIVE_CONSUMERS
