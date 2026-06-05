@@ -733,7 +733,7 @@ class EngramStore:
         """Atomic JSON export of the full spine state for cross-process
         readers. Mirrors the standing_store + activation_snapshot pattern:
         synthesis_worker is the sole writer (G21); cross-process consumers
-        (api process for `/v6/synthesis/concepts/*`) read this JSON
+        (api process for `/v6/synthesis/engrams/*`) read this JSON
         snapshot — the same Kuzu file CANNOT be opened read-only against
         an active RW writer in Kuzu 0.11 (read_only=True still acquires
         the exclusive lock), so the snapshot pattern is the canonical

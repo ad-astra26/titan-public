@@ -908,7 +908,7 @@ class TitanKnowledgeGraph:
         memory_type: str | None = None,
     ) -> list[dict]:
         """Paginated list of concepts (latest version per concept_id), ordered
-        by groundedness DESC. Backs the Observatory /v6/synthesis/concepts
+        by groundedness DESC. Backs the Observatory /v6/synthesis/engrams
         endpoint (§P4.I).
 
         Kuzu's Cypher dialect doesn't provide MAX+GROUP BY in 0.11, so we

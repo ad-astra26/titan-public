@@ -987,7 +987,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # rejection (same class of cross-process conflict the Phase 1 lesson
     # 1 solved for DuckDB by giving synthesis_worker its own .duckdb).
     # Cross-process readers open this file with read_only=True (api
-    # process for /v6/synthesis/concepts/* — Kuzu 0.11 supports
+    # process for /v6/synthesis/engrams/* — Kuzu 0.11 supports
     # concurrent read-only opens against an active writer).
     kuzu_graph_obj: Optional[Any] = None
     try:

@@ -211,7 +211,7 @@ def test_composition_edges_round_trip(graph):
 
 def test_list_concepts_returns_latest_per_id_ordered_by_groundedness(graph):
     """spine_list_concepts collapses to latest version per concept_id and
-    sorts by groundedness DESC — used by the Observatory /v6/synthesis/concepts
+    sorts by groundedness DESC — used by the Observatory /v6/synthesis/engrams
     endpoint and the groundedness heatmap."""
     graph.spine_create_concept_node(
         concept_id="a_concept", version=1, name="A v1",
