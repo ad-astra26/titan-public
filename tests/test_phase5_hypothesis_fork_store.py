@@ -10,7 +10,7 @@ Covers `titan_hcl/synthesis/hypothesis_fork_store.py` against PLAN
 - record_exploration_tx: persisted to durable table, replayed on restart
 - on_fork_read: increments use_count, touches activation, auto-grad at 3
 - graduate_oracle: verdict='true' gate; verdict-not-true raises;
-  emits concept-version TX via writer; reuses EngramStore (INV-10/11);
+  emits concept-version TX via writer; reuses ConceptStore (INV-10/11);
   status='graduated' + anchor_tx persisted
 - graduate_used: requires use_count>=3; auto-trigger on threshold crossing
 - abandon: writes tombstone TX with exploration_root Merkle (INV-Syn-9);
@@ -20,7 +20,7 @@ Covers `titan_hcl/synthesis/hypothesis_fork_store.py` against PLAN
 - export_snapshot: atomic JSON, includes all rows + summary
 - purge_durable_state: drops Kuzu node + durable exploration log
 
-Real EngramStore + real Kuzu graph; FakeWriter for OuterMemoryWriter
+Real ConceptStore + real Kuzu graph; FakeWriter for OuterMemoryWriter
 (spies on TX emissions); in-memory DuckDB for synthesis.duckdb-like store.
 
 Uses a fake ActivationStore (record_access spy) — the real one belongs to
@@ -37,7 +37,7 @@ import duckdb
 import pytest
 
 from titan_hcl.core.direct_memory import TitanKnowledgeGraph
-from titan_hcl.synthesis.engram_store import EngramStore
+from titan_hcl.synthesis.concept_store import ConceptStore
 from titan_hcl.synthesis.hypothesis_fork_store import (
     DEFAULT_ACTIVATION_FLOOR,
     DEFAULT_WINDOW_SEC,
@@ -79,7 +79,7 @@ class _TombstoneCall:
 
 class FakeOuterMemoryWriter:
     """Spies on graduation + tombstone calls. Also fulfils the writer
-    protocol that EngramStore needs (write_concept_version returns a tx)."""
+    protocol that ConceptStore needs (write_concept_version returns a tx)."""
 
     def __init__(self):
         self.grad_calls: list[_GradWriterCall] = []
@@ -87,7 +87,7 @@ class FakeOuterMemoryWriter:
         self._counter = 0
         self.bare_version_writes: list[dict] = []
 
-    # EngramStore-facing
+    # ConceptStore-facing
     def write_concept_version(self, **kwargs) -> str:
         self.bare_version_writes.append(kwargs)
         self._counter += 1
@@ -158,14 +158,14 @@ def activation():
 
 
 @pytest.fixture()
-def engram_store(graph, writer):
-    """Real EngramStore — the graduation paths go through this for end-
+def concept_store(graph, writer):
+    """Real ConceptStore — the graduation paths go through this for end-
     to-end INV-10 reuse."""
-    return EngramStore(graph, writer, clock=lambda: 1000.0)
+    return ConceptStore(graph, writer, clock=lambda: 1000.0)
 
 
 @pytest.fixture()
-def store(duck, graph, engram_store, writer, activation):
+def store(duck, graph, concept_store, writer, activation):
     """Hypothesis-fork store under test.
 
     Clock starts at 10_000_000.0 (~116 days post-epoch) so the default
@@ -179,7 +179,7 @@ def store(duck, graph, engram_store, writer, activation):
     s = HypothesisForkStore(
         duckdb_conn=duck,
         kuzu_graph=graph,
-        engram_store=engram_store,
+        concept_store=concept_store,
         outer_memory_writer=writer,
         activation_store=activation,
         clock=clock,
@@ -230,9 +230,9 @@ def test_create_fork_repair_requires_existing_parent(store, graph):
         )
 
 
-def test_create_fork_repair_writes_explores_edge(store, graph, engram_store):
+def test_create_fork_repair_writes_explores_edge(store, graph, concept_store):
     # Materialize a parent concept first.
-    parent = engram_store.create_concept(
+    parent = concept_store.create_concept(
         concept_id="metaplex_nft_minting", name="Metaplex NFT minting",
         memory_type="procedural",
     )
@@ -391,11 +391,11 @@ def test_graduate_oracle_netnew_writes_concept_version_with_proof(
 
 
 def test_graduate_oracle_repair_reuses_bump_version(
-    store, graph, engram_store, writer,
+    store, graph, concept_store, writer,
 ):
     """INV-10 / INV-Syn-11: repair-fork graduation produces v(n+1)
     insert-only, parent v(n) byte-identical."""
-    parent = engram_store.create_concept(
+    parent = concept_store.create_concept(
         concept_id="metaplex", name="Metaplex", memory_type="procedural",
     )
     parent_row_v1 = graph.spine_get_concept_version("metaplex", 1)
@@ -605,13 +605,13 @@ def test_purge_durable_state_drops_kuzu_and_log(store, graph, duck):
 
 
 def test_durable_log_rehydrates_on_store_recreation(
-    duck, graph, engram_store, writer, activation,
+    duck, graph, concept_store, writer, activation,
 ):
     """A worker restart re-instantiates HypothesisForkStore against the
     same DuckDB connection; the durable exploration log must be visible
     so a later abandonment can still compute the correct Merkle root."""
     s1 = HypothesisForkStore(
-        duckdb_conn=duck, kuzu_graph=graph, engram_store=engram_store,
+        duckdb_conn=duck, kuzu_graph=graph, concept_store=concept_store,
         outer_memory_writer=writer, activation_store=activation,
         clock=lambda: 1000.0,
     )
@@ -621,7 +621,7 @@ def test_durable_log_rehydrates_on_store_recreation(
 
     # "Restart": new instance, same DuckDB connection.
     s2 = HypothesisForkStore(
-        duckdb_conn=duck, kuzu_graph=graph, engram_store=engram_store,
+        duckdb_conn=duck, kuzu_graph=graph, concept_store=concept_store,
         outer_memory_writer=writer, activation_store=activation,
         clock=lambda: 1000.0,
     )

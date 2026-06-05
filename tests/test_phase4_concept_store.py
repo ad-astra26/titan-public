@@ -1,6 +1,6 @@
-"""Phase 4 — EngramStore tests (P4.B).
+"""Phase 4 — ConceptStore tests (P4.B).
 
-Covers `titan_hcl/synthesis/engram_store.py` against PLAN §P4.B + the
+Covers `titan_hcl/synthesis/concept_store.py` against PLAN §P4.B + the
 INV-3 / INV-4 / INV-10 invariants:
 
 - create_concept anchors a TX + inserts the Kuzu row + maintains composition edges
@@ -27,9 +27,9 @@ from typing import Optional
 import pytest
 
 from titan_hcl.core.direct_memory import TitanKnowledgeGraph
-from titan_hcl.synthesis.engram_store import (
-    EngramStore,
-    Engram,
+from titan_hcl.synthesis.concept_store import (
+    ConceptStore,
+    ConceptVersion,
     ParentVersionMissing,
     WriterFailure,
     _GroundednessParams,
@@ -93,7 +93,7 @@ def graph():
 
 @pytest.fixture()
 def store(graph):
-    return EngramStore(graph, FakeWriter(), clock=lambda: 1000.0)
+    return ConceptStore(graph, FakeWriter(), clock=lambda: 1000.0)
 
 
 # ── Groundedness formula ────────────────────────────────────────────
@@ -159,7 +159,7 @@ def test_create_concept_anchors_tx_inserts_row(graph, store):
         name="Metaplex NFT minting",
         memory_type="procedural",
     )
-    assert isinstance(cv, Engram)
+    assert isinstance(cv, ConceptVersion)
     assert cv.version == 1
     assert cv.anchor_tx.startswith("tx_metaplex_nft_minting_v1_")
 
@@ -178,7 +178,7 @@ def test_create_concept_rejects_invalid_memory_type(store):
 def test_create_concept_writer_failure_aborts_kuzu_insert(graph):
     """INV-4: if writer raises, the Kuzu row must NOT exist."""
     failing_writer = FakeWriter(raise_on_call=RuntimeError("chain down"))
-    s = EngramStore(graph, failing_writer, clock=lambda: 1000.0)
+    s = ConceptStore(graph, failing_writer, clock=lambda: 1000.0)
     with pytest.raises(WriterFailure):
         s.create_concept("orphan", "Orphan", memory_type="declarative")
     # The Kuzu row must NOT have been inserted.
@@ -251,7 +251,7 @@ def test_bump_version_passes_parent_tx_to_writer(graph):
     """The writer must receive the v(n-1) anchor_tx as parent_version_tx so
     the chain links the version-bump TX back to its predecessor."""
     writer = FakeWriter()
-    s = EngramStore(graph, writer, clock=lambda: 1000.0)
+    s = ConceptStore(graph, writer, clock=lambda: 1000.0)
     s.create_concept("solana_rpc", "Solana RPC", memory_type="procedural")
     s.bump_version("solana_rpc")
     assert len(writer.calls) == 2
@@ -342,7 +342,7 @@ def test_recompute_groundedness_batch_handles_partial_failures(graph, store):
 
 
 def test_export_snapshot_writes_atomic_json(graph, store):
-    """FU-1: EngramStore.export_snapshot writes a valid JSON snapshot
+    """FU-1: ConceptStore.export_snapshot writes a valid JSON snapshot
     with the documented schema (version + exported_at + concepts +
     composition_edges)."""
     import json
@@ -397,9 +397,9 @@ def test_export_snapshot_empty_spine_returns_zero(graph, store):
 
 
 def test_writer_called_once_per_create_or_bump(graph):
-    """Sanity: exactly one outer_memory_writer call per EngramStore op."""
+    """Sanity: exactly one outer_memory_writer call per ConceptStore op."""
     writer = FakeWriter()
-    s = EngramStore(graph, writer, clock=lambda: 1000.0)
+    s = ConceptStore(graph, writer, clock=lambda: 1000.0)
     s.create_concept("c1", "C1", memory_type="declarative")
     s.create_concept("c2", "C2", memory_type="procedural")
     s.bump_version("c1")

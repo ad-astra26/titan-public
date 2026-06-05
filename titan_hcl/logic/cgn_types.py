@@ -16,7 +16,6 @@ See: titan-docs/rFP_chat_streaming_safety_first_ovg_async.md §9.1 Chunk α.
 """
 
 import logging
-import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -24,88 +23,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 logger = logging.getLogger("titan.cgn_types")
-
-
-# ── CGN-felt RFP: shared neuromod-felt helpers (torch-free) ──────────────────
-# Imported by BOTH cgn.py (Phase A — materialize the per-concept felt centroid)
-# and synthesis/consolidation.py (Phase C — compare lived felt vs the centroid),
-# so the canonical key-space + EMA + distance live in ONE place and cannot drift.
-# consolidation cannot import torch-heavy cgn.py, which is why these live here.
-
-# Default EMA recency weight for the per-concept felt centroid (config-tunable).
-FELT_EMA_ALPHA: float = 0.3
-# Default frame-divergence threshold — RMS felt_distance ABOVE this = a new felt
-# frame (frame_dependent), not redundant grounding (config-tunable, RFP §5).
-FELT_FRAME_DIVERGENCE: float = 0.15
-# The neuromod homeostatic centre (neutral setpoint); a key missing on one side
-# compares as neutral rather than 0 (matches cgn._build_state_vector default 0.5).
-_NEUROMOD_NEUTRAL: float = 0.5
-# felt-dict keys that are metadata, NOT neuromod levels (matches consolidation.py).
-_FELT_META_KEYS = frozenset({"emotion", "emotion_confidence", "dream_cycle", "ts"})
-
-
-def normalize_neuromods(felt: Dict[str, Any]) -> Dict[str, float]:
-    """Canonicalize a felt/neuromod dict to ONE comparable key-space (RFP §1.2).
-
-    CGN reads ``DA / 5-HT|5HT / NE / GABA / ACh`` while the lived ``neuromod_context``
-    uses ``DA / 5HT / NE / ACh / Endorphin / GABA`` (and may nest ``{level, setpoint}``).
-    This collapses ``"5-HT" → "5HT"``, flattens a nested ``{"level": x}`` to ``x``,
-    drops metadata keys, and keeps every remaining numeric neuromod level. It does NOT
-    fabricate missing keys (no neutral floor — emergence over a hardcode). Non-dict /
-    empty → ``{}``.
-    """
-    if not isinstance(felt, dict):
-        return {}
-    out: Dict[str, float] = {}
-    for k, v in felt.items():
-        if k in _FELT_META_KEYS:
-            continue
-        if isinstance(v, dict):
-            v = v.get("level")
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            continue
-        out["5HT" if k == "5-HT" else k] = float(v)
-    return out
-
-
-def felt_ema(prev: Optional[Dict[str, float]], new: Dict[str, float],
-             alpha: float = FELT_EMA_ALPHA) -> Dict[str, float]:
-    """Per-key exponential moving average of a felt centroid (RFP §1.2 MATERIALIZE).
-
-    First observation → a copy of ``new``; thereafter ``α·new + (1-α)·prev`` for each
-    key in ``new``, preserving any prior-only keys. ``new`` is assumed already
-    normalized (caller passes ``normalize_neuromods(...)``). Bounded — no growth.
-    """
-    if not new:
-        return dict(prev or {})
-    if not prev:
-        return dict(new)
-    out = dict(prev)
-    for k, v in new.items():
-        base = prev.get(k)
-        out[k] = float(v) if base is None else float(alpha * v + (1.0 - alpha) * base)
-    return out
-
-
-def felt_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
-    """Normalized felt divergence ∈ [0,1] between two felt-states (RFP §1.2 / §5).
-
-    Both sides are canonicalized via :func:`normalize_neuromods`; the distance is the
-    RMS per-key gap over the UNION of present keys, a missing key counting as the
-    neutral setpoint (0.5). RMS — not cosine: felt vectors sit near 0.5 with all-positive
-    components, so cosine is ≈1 for any pair and blind to the magnitude difference that
-    *defines* a felt frame. Empty either side → 0.0 (absence of signal is not a conflict).
-    """
-    ca = normalize_neuromods(a)
-    cb = normalize_neuromods(b)
-    if not ca or not cb:
-        return 0.0
-    keys = set(ca) | set(cb)
-    sq = 0.0
-    for k in keys:
-        d = ca.get(k, _NEUROMOD_NEUTRAL) - cb.get(k, _NEUROMOD_NEUTRAL)
-        sq += d * d
-    return min(1.0, math.sqrt(sq / len(keys)))
 
 # ── Data Classes ────────────────────────��───────────────────────────────────
 

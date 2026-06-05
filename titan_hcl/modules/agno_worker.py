@@ -601,13 +601,6 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                 "needed": bool(_items),
                 "satisfied": bool(_cited),
                 "ts": _now,
-                # §7.E.0 — per-Engram citation attribution: the surfaced + cited
-                # tx_hash sets (item_id = tx_hash, the tx-spine recall key) so
-                # synthesis_worker can resolve each → its Engram(s) and record
-                # recall-citation OFF the chat hot path. INV-Syn-17 soft.
-                "surfaced_tx": [_it.item_id for _it in _items],
-                "cited_tx": [_it.item_id for _it in _items
-                             if _it.item_id in _cited],
             })
     except Exception as _cu_err:
         logger.debug(

@@ -2400,12 +2400,6 @@ BACKUP_TRIGGER_MANUAL = "BACKUP_TRIGGER_MANUAL"
 # Bus protocol — supervision transfer
 BUS_HANDOFF_ACK = "BUS_HANDOFF_ACK"
 
-# Inner↔Outer Felt-Teaching Bridge (RFP_inner_outer_felt_teaching_bridge §7.3)
-# synthesis_worker → felt_teaching_worker: a decomposed Engram Object has no CGN
-# felt-grounding (a gap) → a propose-only teaching candidate. Payload:
-# {object_label, felt_state, source_engram, source_version, domain_hint}.
-ENGRAM_FELT_CANDIDATE = "ENGRAM_FELT_CANDIDATE"
-
 # CGN protocol
 CGN_CONCEPT_GROUNDED  = "CGN_CONCEPT_GROUNDED"  # cgn → cognitive_worker: a concept matured across ≥2 consumers (Phase B Level-B trigger, RFP_cgn_enhancements §9.2)
 CGN_CROSS_INSIGHT     = "CGN_CROSS_INSIGHT"

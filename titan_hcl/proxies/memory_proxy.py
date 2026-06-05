@@ -506,13 +506,8 @@ class MemoryProxy:
         }
 
     async def add_to_mempool(self, user_prompt: str, agent_response: str,
-                            user_identifier: str = "Anonymous",
-                            neuromod_context: dict = None) -> None:
+                            user_identifier: str = "Anonymous") -> None:
         """Add conversation to mempool — ONE-WAY fire-and-forget bus event.
-
-        `neuromod_context` (§7.C): the felt-at-lived-time snapshot, forwarded in
-        the bus payload so the promoted chat thought carries felt into the
-        synthesis felt axis (memory_worker._handle_mempool_add → core add_to_mempool).
 
         2026-05-12 migration: was bus.request_async("add_to_mempool", ...)
         which serialized through memory_worker's single-threaded dispatch
@@ -535,7 +530,6 @@ class MemoryProxy:
                     "user_prompt": user_prompt,
                     "agent_response": agent_response,
                     "user_identifier": user_identifier,
-                    "neuromod_context": neuromod_context,
                 },
             ))
         except Exception as e:

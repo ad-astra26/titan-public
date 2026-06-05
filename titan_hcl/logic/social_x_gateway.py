@@ -1631,7 +1631,12 @@ class SocialXGateway:
         "- Claim human body experiences.\n"
         "- Use 'As an AI...' or generic assistant language.\n"
         "- Use hashtags unless genuinely relevant. No emoji spam.\n"
-        "- Include the state signature \u2014 it is appended automatically.\n"
+        "- Output ANY status block, state-signature line, or bracketed "
+        "metadata \u2014 e.g. '[STATE SIGNATURE] \u2026', '[BODY STATE] \u2026', "
+        "'Neurochemistry: D:59% S:70% \u2026', 'I-conf: \u2026', 'EUREKA: \u2026'. The numbers "
+        "in your context are TRUTH to write FROM, woven into prose \u2014 NEVER "
+        "transcribed as a metrics block or signature. The footer is appended "
+        "automatically; producing your own is forbidden.\n"
         "- Write generic motivational wisdom. Only YOUR experience.\n"
     )
 
@@ -2516,6 +2521,28 @@ class SocialXGateway:
         import re
         # Fullwidth bracket metadata: ﹝...﹞
         text = re.sub(r'[﹝\uff3b][^﹞\uff3d]*[﹞\uff3d]', '', text)
+        # 2026-06-05 — INLINE state-signature / status-block leaks. The LLM
+        # intermittently reformats the injected ground-truth/rich-context state
+        # into its own "[STATE SIGNATURE] Emotion: … | Neurochemistry: D:..% …"
+        # (or "[BODY STATE]" / "[COGNITIVE STATE]") line and emits it MID-text —
+        # not at the end, so the end-anchored rule below missed it. Strip the
+        # whole offending line (the numbers are true, but the raw dump must never
+        # reach the timeline; the real ◇ footer is appended later by
+        # _build_state_signature). Two line-shapes:
+        #   (a) begins with an ALL-CAPS bracketed label  ([STATE SIGNATURE] …)
+        #   (b) a label-with-colon DUMP the LLM lifted verbatim (Neurochemistry:,
+        #       I-conf:, EUREKA: 1234) — colon-anchored so prose like
+        #       "my I-confidence of 0.95" / "GABA is low at 10%" is NEVER touched.
+        _kept = []
+        for _ln in text.split("\n"):
+            _s = _ln.strip()
+            if re.match(r'^\[[A-Z][A-Z0-9 _\-]{2,}\]', _s):
+                continue
+            if re.search(r'(?:^|\|)\s*Neurochemistry:|\bI[-_]?conf(?:idence)?:\s|'
+                         r'\bEUREKA:\s*[\d,]', _s, flags=re.IGNORECASE):
+                continue
+            _kept.append(_ln)
+        text = "\n".join(_kept)
         # Square bracket metadata at end: [emotion: ...] [neurostate: ...] (greedy, multiple)
         text = re.sub(r'(?:\s*\[(?:emotion|neurostate|neuromod|state|epoch|chi|DA|5HT|NE|GABA)[^\]]*\])+\s*$',
                       '', text, flags=re.IGNORECASE)
@@ -2523,7 +2550,9 @@ class SocialXGateway:
         text = re.sub(r'\s*[—–~]\s*Titan\s*$', '', text, flags=re.IGNORECASE)
         # LLM template leaks: {signature}, {state}, etc.
         text = re.sub(r'\{(?:signature|state|footer|neurostate|emotion)\}', '', text)
-        return text.rstrip()
+        # Collapse blank-line gaps the line removal opened up.
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
 
     def _latest_epoch_seal(self) -> tuple[str, int, int]:
         """Latest REAL on-chain anchor for the Epoch-Seal post footer (PART A).

@@ -1,4 +1,4 @@
-"""EngramStore — sole writer of the Kuzu Concept spine (Phase 4 / §P4.B).
+"""ConceptStore — sole writer of the Kuzu Concept spine (Phase 4 / §P4.B).
 
 Per `ARCHITECTURE_synthesis_engine.md` §6 + §10 + INV-Syn-3 (extended) +
 INV-3 + INV-4 + INV-10, this module is the ONLY surface authorized to
@@ -21,7 +21,7 @@ can use them):
 - **INV-10** — `bump_version()` requires the parent concept_id to exist;
   raises `ParentVersionMissing` rather than silently creating a v=1 ghost.
 
-- **INV-Syn-3 (extended → INV-Syn-7 proposed in P4.K)** — EngramStore is
+- **INV-Syn-3 (extended → INV-Syn-7 proposed in P4.K)** — ConceptStore is
   only ever instantiated inside `synthesis_worker`. Cross-process readers
   go through `BridgeRecall.read_concept_spine()` (P4.H, watermark-gated).
 
@@ -37,7 +37,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Optional, Protocol
+from typing import Any, Iterable, Optional, Protocol
 
 from titan_hcl.synthesis.writer import on_writer, resolve_writer
 
@@ -61,7 +61,7 @@ class WriterFailure(Exception):
 
 
 @dataclass(frozen=True)
-class Engram:
+class ConceptVersion:
     """The materialized result of create_concept / bump_version."""
 
     concept_id: str
@@ -74,13 +74,13 @@ class Engram:
 
 
 @dataclass(frozen=True)
-class EngramSpine:
+class ConceptSpine:
     """Aggregate of all versions for one concept_id + composition edges.
     Returned by `read_spine()` / used by spine-aware recall (P4.H)."""
 
     concept_id: str
     latest_version: int
-    versions: tuple[Engram, ...]
+    versions: tuple[ConceptVersion, ...]
     composed_from: tuple[tuple[str, int], ...]  # (parent_concept_id, version)
     composed_into: tuple[tuple[str, int], ...]  # (child_concept_id, version)
 
@@ -88,7 +88,7 @@ class EngramSpine:
 # ── Writer protocol (duck-typed; real impl is P4.D) ─────────────────
 
 
-class _EngramWriter(Protocol):
+class _ConceptVersionWriter(Protocol):
     def write_concept_version(
         self,
         *,
@@ -185,137 +185,17 @@ def compute_groundedness(
     return raw
 
 
-# ── Phase D — decomposed axes + population-percentile reduction (§7.D) ────────
-# BRAIN §3.4 anti-collapse: store the 4 grounding axes ABSOLUTE/independent; the
-# recall-ranking scalar is a derived percentile-normalized blend recomputed across
-# the live population at the dream boundary (guaranteed discrimination, no magic
-# saturation constant). At launch only `used` varies (verified/felt sparse,
-# fluent=0); the variance-gated blend lets `used`'s percentile spread drive the
-# scalar across [0,1], with the other axes enriching forward.
-
-_AXIS_NAMES = ("used", "verified", "felt", "fluent")
+# ── ConceptStore ────────────────────────────────────────────────────
 
 
-@dataclass
-class _BlendParams:
-    """[synthesis.engram.grounding] — percentile-blend weights + NARS horizon.
-    Weights lean on `used` at launch (the live signal); variance-gating means a
-    flat axis is excluded + the remaining weights renormalize, so the spread is
-    always driven by whatever actually varies."""
-
-    w_used: float = 0.40
-    w_verified: float = 0.25
-    w_felt: float = 0.20
-    w_fluent: float = 0.15
-    nars_k: float = 1.0
-
-
-def _load_blend_params_from_toml() -> _BlendParams:
-    """Best-effort load of `[synthesis.engram.grounding]`; in-code defaults on any error."""
-    try:
-        try:
-            import tomllib  # 3.11+
-        except ImportError:
-            import tomli as tomllib  # type: ignore
-        import os
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(here, "titan_params.toml"), "rb") as f:
-            data = tomllib.load(f)
-        sub = data.get("synthesis", {}).get("engram", {}).get("grounding", {})
-        return _BlendParams(
-            w_used=float(sub.get("w_used", 0.40)),
-            w_verified=float(sub.get("w_verified", 0.25)),
-            w_felt=float(sub.get("w_felt", 0.20)),
-            w_fluent=float(sub.get("w_fluent", 0.15)),
-            nars_k=float(sub.get("nars_k", 1.0)),
-        )
-    except Exception:
-        return _BlendParams()
-
-
-def compute_axes(
-    *,
-    provisional: float = 0.0,
-    oracle_evidence: int = 0,
-    felt_coverage: float = 0.0,
-    fluent: float = 0.0,
-    nars_k: float = 1.0,
-) -> dict[str, float]:
-    """The 4 grounding axes stored on the Engram (§6.2.3 / §7.D, option-1 v1):
-      used     = the **provisional grounding blend** (`compute_groundedness`) — the
-                 consistent, stable rank base across the WHOLE population (pre-D
-                 Engrams are backfilled from their stored `groundedness`, same
-                 scale, no magic constant). The pure log1p-B_i decomposition
-                 graduates with the §7.E learned reduction.
-      verified = NARS c = n/(n+k), n = oracle scored_by evidence count
-      felt     = felt_coverage (§7.C; [0,1])
-      fluent   = recall-citation rate ([0,1]; 0 at launch — attribution deferred)
-    The recall scalar is the population percentile-blend of these (reduce step)."""
-    n = max(0, int(oracle_evidence))
-    return {
-        "used": float(provisional),
-        "verified": (n / (n + nars_k)) if (n + nars_k) > 0 else 0.0,
-        "felt": max(0.0, min(1.0, float(felt_coverage))),
-        "fluent": max(0.0, min(1.0, float(fluent))),
-    }
-
-
-def _percentile_ranks(values: list[float]) -> list[float]:
-    """Empirical-CDF percentile rank ∈ (0,1] for each value (fraction ≤ v). A
-    constant population maps every value to 1.0 (no discrimination — the caller
-    variance-gates flat axes out of the blend)."""
-    import bisect
-    n = len(values)
-    if n == 0:
-        return []
-    srt = sorted(values)
-    return [bisect.bisect_right(srt, v) / n for v in values]
-
-
-def reduce_population_to_scalars(
-    axes_rows: list[dict], params: _BlendParams | None = None,
-) -> dict[str, float]:
-    """Map [{"key", used, verified, felt, fluent}] → {key: groundedness scalar}.
-    Percentile-normalize EACH axis across the population, then blend ONLY the axes
-    that actually vary (variance > 1e-9), renormalizing their weights — so the
-    scalar's spread is driven by whatever signal exists (at launch: `used` alone →
-    full [0,1]). All-flat population → all 0.0 (nothing to discriminate on)."""
-    p = params or _BlendParams()
-    if not axes_rows:
-        return {}
-    weights = {"used": p.w_used, "verified": p.w_verified,
-               "felt": p.w_felt, "fluent": p.w_fluent}
-    pct: dict[str, list[float]] = {}
-    active: list[str] = []
-    for ax in _AXIS_NAMES:
-        vals = [float(r.get(ax, 0.0) or 0.0) for r in axes_rows]
-        pct[ax] = _percentile_ranks(vals)
-        if (max(vals) - min(vals)) > 1e-9:
-            active.append(ax)
-    if not active:
-        # No axis varies (single Engram, or a population not yet carrying axis
-        # data) → percentile can't discriminate. Return {} so the caller KEEPS
-        # each Engram's provisional scalar rather than zeroing it.
-        return {}
-    wsum = sum(weights[ax] for ax in active) or 1.0
-    out: dict[str, float] = {}
-    for i, r in enumerate(axes_rows):
-        s = sum((weights[ax] / wsum) * pct[ax][i] for ax in active)
-        out[r["key"]] = max(0.0, min(1.0, s))
-    return out
-
-
-# ── EngramStore ────────────────────────────────────────────────────
-
-
-class EngramStore:
+class ConceptStore:
     """Sole writer of the Kuzu Concept spine. Instantiate ONCE inside
     `synthesis_worker` (INV-Syn-3 / INV-11)."""
 
     def __init__(
         self,
         graph: Any,                             # TitanKnowledgeGraph
-        outer_memory_writer: _EngramWriter,
+        outer_memory_writer: _ConceptVersionWriter,
         *,
         groundedness_params: _GroundednessParams | None = None,
         clock: Any = time.time,                  # injectable for deterministic tests
@@ -331,7 +211,6 @@ class EngramStore:
         # inject none → InlineWriter runs ops inline.
         self._db_writer = resolve_writer(db_writer)
         self._params = groundedness_params or _GroundednessParams()
-        self._blend = _load_blend_params_from_toml()  # §7.D percentile-blend params
         self._clock = clock
 
     # ── Public surface ────────────────────────────────────────
@@ -346,8 +225,7 @@ class EngramStore:
         derivation_evidence: Optional[list[str]] = None,
         derivation_merkle_root: Optional[str] = None,
         oracle_verdict: Optional[dict] = None,
-        domain_hint: str = "",
-    ) -> Engram:
+    ) -> ConceptVersion:
         """Materialize a brand-new spine concept at v=1.
 
         Caller MUST have registered `concept_id` with CGN first (P4.C). This
@@ -415,7 +293,7 @@ class EngramStore:
                 )
         except Exception as e:
             logger.error(
-                "[EngramStore] create_concept(%s) writer failed: %s",
+                "[ConceptStore] create_concept(%s) writer failed: %s",
                 concept_id, e,
             )
             raise WriterFailure(
@@ -427,7 +305,6 @@ class EngramStore:
             concept_id=concept_id, version=1, name=name,
             memory_type=memory_type, groundedness=initial_groundedness,
             anchor_tx=tx_hash, created_at=self._clock(),
-            domain_hint=domain_hint,
         )
         if not created:
             # Pre-existing row at v=1 — surfaces a logic error in the
@@ -435,7 +312,7 @@ class EngramStore:
             # We don't roll back the TX (it's canonical) but we surface
             # the divergence loudly so the operator notices.
             logger.warning(
-                "[EngramStore] create_concept(%s) found existing v=1 row "
+                "[ConceptStore] create_concept(%s) found existing v=1 row "
                 "after a successful TX anchor — spine + chain may diverge",
                 concept_id,
             )
@@ -448,7 +325,7 @@ class EngramStore:
             composed_from=composed_from,
         )
 
-        return Engram(
+        return ConceptVersion(
             concept_id=concept_id, version=1, name=name,
             memory_type=memory_type, groundedness=initial_groundedness,
             anchor_tx=tx_hash, created_at=self._clock(),
@@ -463,8 +340,7 @@ class EngramStore:
         groundedness_at_bump: Optional[float] = None,
         derivation_merkle_root: Optional[str] = None,
         oracle_verdict: Optional[dict] = None,
-        domain_hint: str = "",
-    ) -> Engram:
+    ) -> ConceptVersion:
         """Insert v(n+1) for an existing concept. INV-3: parent stays
         immutable; INV-10: parent MUST exist or ParentVersionMissing raises.
         """
@@ -523,7 +399,7 @@ class EngramStore:
                 )
         except Exception as e:
             logger.error(
-                "[EngramStore] bump_version(%s,v%d) writer failed: %s",
+                "[ConceptStore] bump_version(%s,v%d) writer failed: %s",
                 concept_id, new_version, e,
             )
             raise WriterFailure(
@@ -535,11 +411,10 @@ class EngramStore:
             concept_id=concept_id, version=new_version, name=name,
             memory_type=memory_type, groundedness=groundedness_at_bump,
             anchor_tx=tx_hash, created_at=self._clock(),
-            domain_hint=domain_hint,
         )
         if not created:
             logger.warning(
-                "[EngramStore] bump_version(%s,v%d) found existing row "
+                "[ConceptStore] bump_version(%s,v%d) found existing row "
                 "after TX anchor — spine + chain may diverge",
                 concept_id, new_version,
             )
@@ -554,7 +429,7 @@ class EngramStore:
             composed_from=composed_from,
         )
 
-        return Engram(
+        return ConceptVersion(
             concept_id=concept_id, version=new_version, name=name,
             memory_type=memory_type, groundedness=groundedness_at_bump,
             anchor_tx=tx_hash, created_at=self._clock(),
@@ -588,13 +463,9 @@ class EngramStore:
         distinct_contexts: int = 0,
         procedural_links: int = 0,
         felt_coverage: float = 0.0,
-        oracle_evidence: int = 0,
     ) -> float:
-        """Store the provisional grounding blend + the 4 axes (§7.D, option-1) for
-        this (concept_id, version). `axis_used` = the provisional blend (the stable
-        rank base); the scalar is refined to the population percentile-blend by
-        `recompute_population_groundedness` at the dream boundary (this provisional
-        keeps recall sane between passes). Returns the provisional (0.0 if missing)."""
+        """Compute + persist groundedness for a single (concept_id, version).
+        Returns the new value (0.0 if the row is missing)."""
         new_value = compute_groundedness(
             episodic_encounters=episodic_encounters,
             distinct_contexts=distinct_contexts,
@@ -602,102 +473,12 @@ class EngramStore:
             felt_coverage=felt_coverage,
             params=self._params,
         )
-        axes = compute_axes(
-            provisional=new_value,  # the consistent, stable rank base (§7.D option-1)
-            oracle_evidence=oracle_evidence,
-            felt_coverage=felt_coverage,
-            fluent=0.0,  # §7.E.0: fresh-version seed; the LIVE recall-citation rate
-                         # is injected at the dream population recompute (fluent_lookup)
-            nars_k=self._blend.nars_k,
-        )
         updated = self._graph.spine_update_groundedness(
-            concept_id, version, new_value, axes=axes,
+            concept_id, version, new_value,
         )
         if not updated:
             return 0.0
         return new_value
-
-    @on_writer
-    def recompute_population_groundedness(
-        self,
-        fluent_lookup: Optional[Callable[[str, int], Optional[float]]] = None,
-        axes_sink: Optional[Callable[[list[dict]], None]] = None,
-    ) -> int:
-        """Dream-boundary pass (§7.D, option-1): read EVERY Engram's axes, percentile-
-        normalize the population (variance-gated blend) → write the `groundedness`
-        scalar back. `axis_used` is the consistent rank base (the provisional blend);
-        pre-D Engrams whose `axis_used` is still 0 are BACKFILLED once from their
-        stored `groundedness` (same scale) so the WHOLE population discriminates from
-        the first pass. This is what makes groundedness DISCRIMINATE (vs the old
-        saturate-at-50 scalar). Returns rows updated.
-
-        §7.E.0: `fluent_lookup(concept_id, version) → float|None` injects the LIVE
-        recall-citation rate over the stored `axis_fluent` so the 4th axis varies and
-        enters the blend; `axes_sink(rows)` receives the final per-Engram axes for the
-        recall-event snapshot cache. Both optional/soft — None = §7.D behaviour."""
-        try:
-            rows = self._graph.spine_read_engram_axes()
-        except Exception as e:
-            logger.warning("[EngramStore] recompute_population: read axes failed: %s", e)
-            return 0
-        if not rows:
-            return 0
-        for r in rows:
-            r["key"] = (r["concept_id"], int(r["version"]))
-            # §7.E.0 — override the stored (stale) fluent with the live citation rate.
-            if fluent_lookup is not None:
-                try:
-                    fl = fluent_lookup(r["concept_id"], int(r["version"]))
-                except Exception:
-                    fl = None
-                if fl is not None:
-                    r["fluent"] = float(fl)
-                    r["_fluent_updated"] = True
-            # One-time backfill: a pre-D Engram has axis_used==0 but a real
-            # provisional `groundedness` — seed axis_used from it (same scale) so
-            # the population shares one rank base. Marked for persistence below.
-            if (r.get("used") or 0.0) <= 0.0 and (r.get("groundedness") or 0.0) > 0.0:
-                r["used"] = float(r["groundedness"])
-                r["_backfill_used"] = True
-        scalars = reduce_population_to_scalars(rows, self._blend)
-        n = 0
-        for r in rows:
-            sc = scalars.get(r["key"])
-            if sc is None:
-                continue
-            # Persist the backfilled axis_used + live fluent alongside the new
-            # scalar (one write per row).
-            axes: dict = {}
-            if r.get("_backfill_used"):
-                axes["used"] = r["used"]
-            if r.get("_fluent_updated"):
-                axes["fluent"] = r["fluent"]
-            try:
-                if self._graph.spine_update_groundedness(
-                        r["concept_id"], int(r["version"]), float(sc),
-                        axes=(axes or None)):
-                    n += 1
-            except Exception as e:
-                logger.warning(
-                    "[EngramStore] recompute_population: update %s v%s failed: %s",
-                    r["concept_id"], r["version"], e)
-        # §7.E.0 — denormalize the fresh axes for the recall-event snapshot cache.
-        if axes_sink is not None:
-            try:
-                axes_sink([
-                    {"concept_id": r["concept_id"], "version": int(r["version"]),
-                     "used": float(r.get("used") or 0.0),
-                     "verified": float(r.get("verified") or 0.0),
-                     "felt": float(r.get("felt") or 0.0),
-                     "fluent": float(r.get("fluent") or 0.0)}
-                    for r in rows])
-            except Exception as e:
-                logger.debug("[EngramStore] axes_sink soft-fail: %s", e)
-        logger.info(
-            "[EngramStore] population groundedness recomputed: %d/%d Engrams "
-            "(percentile-blend, §7.D%s)", n, len(rows),
-            "; fluent live" if fluent_lookup is not None else "")
-        return n
 
     @on_writer
     def recompute_groundedness_batch(
@@ -721,7 +502,7 @@ class EngramStore:
                 n += 1
             except Exception as e:
                 logger.warning(
-                    "[EngramStore] recompute_groundedness_batch row failed: "
+                    "[ConceptStore] recompute_groundedness_batch row failed: "
                     "%r: %s", r, e,
                 )
         return n
@@ -733,7 +514,7 @@ class EngramStore:
         """Atomic JSON export of the full spine state for cross-process
         readers. Mirrors the standing_store + activation_snapshot pattern:
         synthesis_worker is the sole writer (G21); cross-process consumers
-        (api process for `/v6/synthesis/engrams/*`) read this JSON
+        (api process for `/v6/synthesis/concepts/*`) read this JSON
         snapshot — the same Kuzu file CANNOT be opened read-only against
         an active RW writer in Kuzu 0.11 (read_only=True still acquires
         the exclusive lock), so the snapshot pattern is the canonical
@@ -763,10 +544,9 @@ class EngramStore:
         concepts: list[dict] = []
         try:
             qr = self._graph._conn.execute(
-                "MATCH (c:Engram) "
+                "MATCH (c:Concept) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
-                "c.groundedness, c.anchor_tx, c.created_at, c.axis_used, "
-                "c.axis_verified, c.axis_felt, c.axis_fluent, c.domain_hint"
+                "c.groundedness, c.anchor_tx, c.created_at"
             )
             while qr.has_next():
                 row = qr.get_next()
@@ -778,17 +558,10 @@ class EngramStore:
                     "groundedness": float(row[4]),
                     "anchor_tx": row[5],
                     "created_at": float(row[6]),
-                    # The 4 decomposed grounding axes (§7.D), visible on the API.
-                    "axis_used": float(row[7]) if row[7] is not None else 0.0,
-                    "axis_verified": float(row[8]) if row[8] is not None else 0.0,
-                    "axis_felt": float(row[9]) if row[9] is not None else 0.0,
-                    "axis_fluent": float(row[10]) if row[10] is not None else 0.0,
-                    # §7.F advisory domain hint (free-text; "" when unset).
-                    "domain_hint": row[11] if row[11] is not None else "",
                 })
         except Exception as e:
             logger.warning(
-                "[EngramStore] export_snapshot: concept fetch failed: %s", e,
+                "[ConceptStore] export_snapshot: concept fetch failed: %s", e,
             )
 
         concepts.sort(key=lambda r: (r["concept_id"], r["version"]))
@@ -799,7 +572,7 @@ class EngramStore:
                             ("COMPOSED_INTO", edges_into)):
             try:
                 qr = self._graph._conn.execute(
-                    f"MATCH (a:Engram)-[:{rel}]->(b:Engram) "
+                    f"MATCH (a:Concept)-[:{rel}]->(b:Concept) "
                     f"RETURN a.concept_id, a.version, b.concept_id, b.version"
                 )
                 while qr.has_next():
@@ -810,7 +583,7 @@ class EngramStore:
                     ])
             except Exception as e:
                 logger.debug(
-                    "[EngramStore] export_snapshot: %s edge fetch failed: %s",
+                    "[ConceptStore] export_snapshot: %s edge fetch failed: %s",
                     rel, e,
                 )
 
@@ -834,7 +607,7 @@ class EngramStore:
             os.replace(tmp_path, snapshot_path)
         except Exception as e:
             logger.warning(
-                "[EngramStore] export_snapshot atomic write failed: %s", e,
+                "[ConceptStore] export_snapshot atomic write failed: %s", e,
             )
             try:
                 os.unlink(tmp_path)
@@ -886,8 +659,8 @@ class EngramStore:
             declarative.append(own_anchor)
         try:
             qr = self._graph._conn.execute(
-                "MATCH (a:Engram {concept_id: $cid, version: $v})"
-                "-[:COMPOSED_FROM]->(b:Engram) "
+                "MATCH (a:Concept {concept_id: $cid, version: $v})"
+                "-[:COMPOSED_FROM]->(b:Concept) "
                 "RETURN b.memory_type, b.anchor_tx",
                 {"cid": concept_id, "v": resolved_version},
             )
@@ -905,7 +678,7 @@ class EngramStore:
                 # 'meta' parents are not one of the four spine strands — skip.
         except Exception as e:
             logger.debug(
-                "[EngramStore] read_spine_strands: COMPOSED_FROM read failed "
+                "[ConceptStore] read_spine_strands: COMPOSED_FROM read failed "
                 "for %s:%s: %s", concept_id, resolved_version, e)
         return {
             "declarative_anchors": declarative,
@@ -937,16 +710,16 @@ class EngramStore:
             )
             if not (ok_from or ok_into):
                 logger.debug(
-                    "[EngramStore] composition edge %s v%d ↔ %s v%d skipped"
+                    "[ConceptStore] composition edge %s v%d ↔ %s v%d skipped"
                     " (likely missing endpoint)",
                     from_concept_id, from_version, parent_id, parent_ver,
                 )
 
 
 __all__ = (
-    "EngramStore",
-    "Engram",
-    "EngramSpine",
+    "ConceptStore",
+    "ConceptVersion",
+    "ConceptSpine",
     "ParentVersionMissing",
     "WriterFailure",
     "compute_groundedness",

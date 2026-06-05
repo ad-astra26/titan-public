@@ -125,30 +125,6 @@ _RECALL_MOD_SCALE = {
 }
 
 
-def _can_afford_research(plugin) -> bool:
-    """EEL Pillar 0 §7.0b.2 part 4 — the metabolic research gate.
-
-    Reuses the EXISTING per-tier `research` feature (core/metabolism.py
-    TIER_FEATURES: True for THRIVING/HEALTHY/CONSERVING, False for
-    SURVIVAL/EMERGENCY/HIBERNATION), read via the metabolism SHM reader
-    (`MetabolismShmReader.can_use_feature`, sub-ms, no bus/RPC — G18-safe).
-    Fails OPEN (research allowed) when metabolism is unwired/cold so a read
-    hiccup never makes Titan refuse to look something up."""
-    metab = getattr(plugin, "metabolism", None)
-    if metab is None:
-        return True
-    try:
-        cuf = getattr(metab, "can_use_feature", None)
-        if callable(cuf):
-            return bool(cuf("research"))
-        # Fallback: read the SHM-cached tier + dispatch against TIER_FEATURES.
-        from titan_hcl.core.metabolism import TIER_FEATURES
-        tier = metab.get_metabolic_tier()
-        return bool(TIER_FEATURES.get(tier, {}).get("research", True))
-    except Exception:
-        return True
-
-
 def _compute_recall_perturbation(memories: list, current_time: float) -> dict:
     """Compute aggregate neuromod nudge from recalled memories' felt snapshots.
 
@@ -476,42 +452,6 @@ def _estimate_threat_level(message: str, features: dict) -> float:
 # ---------------------------------------------------------------------------
 # Pre-hooks (run before LLM inference)
 # ---------------------------------------------------------------------------
-
-def _capture_pre_chat_felt(plugin) -> dict:
-    """Capture the felt-at-lived-time neuromod snapshot for THIS turn (§7.C /
-    RFP_synthesis_engram_grounding) and store it on ``plugin._pre_chat_neuromods``.
-
-    Source = ``ShmReaderBank.read_neuromod()`` — the authoritative live neuromod SHM
-    slot (``{modulator: {"level": float}}``). It is NOT sourced from the agno
-    coordinator: the coordinator's ``neuromodulators`` is **empty in the agno PreHook
-    path** (it relies on an SHM fallback only some api endpoints apply), so the prior
-    coordinator-sourced snapshot resolved ``{}`` on every turn → every promoted chat
-    thought carried NULL felt → ``axis_felt`` was 0 fleet-wide, and the synthesis
-    felt-bridge / CGN-felt ``frame_dependent`` path (which consumes this lived felt via
-    ``agg_felt``) was inert. Captured for EVERY chat regardless of tier — the lived felt
-    is ground truth, not a prompt-enrichment artifact. Soft-fail → ``{}``.
-    """
-    snap: dict = {}
-    try:
-        # NEVER assign plugin._shm_reader_bank — it is a read-only @property
-        # (agno_worker_plugin). Use it if present, else build a throwaway bank.
-        bank = getattr(plugin, "_shm_reader_bank", None)
-        if bank is None:
-            from titan_hcl.api.shm_reader_bank import ShmReaderBank
-            bank = ShmReaderBank()
-        nm = bank.read_neuromod()
-        mods = (nm or {}).get("modulators", {}) or {}
-        snap = {
-            name: (m.get("level", 0.5) if isinstance(m, dict) else float(m))
-            for name, m in mods.items()
-            if isinstance(m, (dict, int, float)) and not isinstance(m, bool)
-        }
-    except Exception as _felt_err:  # noqa: BLE001 — felt is best-effort, never blocks chat
-        logger.debug("[pre_hook] felt-at-lived-time SHM snapshot failed: %s", _felt_err)
-        snap = {}
-    plugin._pre_chat_neuromods = snap
-    return snap
-
 
 def create_pre_hook(plugin):
     """
@@ -952,74 +892,14 @@ def create_pre_hook(plugin):
         # RL gatekeeper only trains on reasoning interactions (Maker 2026-05-18).
         mode, adv, text = "direct", 0.5, ""
         plugin._last_observation_vector = None
-        plugin._last_router_decision = None
-        # EEL Pillar 0 §7.0b.2 — the grounded router runs on any tier carrying the
-        # `grounded_router` feature (reasoning/casual/personal) OR the legacy
-        # `gatekeeper_state` (reasoning). The OR keeps reasoning routing alive even
-        # on a box whose config hasn't added `grounded_router` yet (no dark-out on
-        # a code-only deploy). Greeting carries neither → stays "direct".
-        _reasoning_tier = "gatekeeper_state" in active_features
-        _router_active = (
-            (_reasoning_tier or "grounded_router" in active_features)
-            and plugin.gatekeeper is not None
-            and hasattr(plugin.gatekeeper, "decide_execution_mode_from_prompt")
-        )
-        if _router_active:
-            obs_vec = None
-            # The torch encode RPC is EXPENSIVE → reasoning-tier-only (cost + the
-            # IQL training scope, §7.0b.2 part 3). On casual/personal the cheap
-            # grounded readout below decides with no torch work. Its q−v `mode` is
-            # the reasoning-tier safety fallback; the grounded router overrides it.
-            if _reasoning_tier:
-                try:
-                    mode, adv, text, obs_vec = await plugin.gatekeeper.decide_execution_mode_from_prompt(
-                        prompt_text)
-                    plugin._last_observation_vector = obs_vec
-                except Exception as _gk_err:
-                    logger.warning("[PreHook] decide_from_prompt failed: %s", _gk_err)
-            # ── grounded execution-mode router (all routed tiers) ──────────────
-            # Decide from Titan's ACTUAL cognitive state (recall + task type),
-            # reusing signals already on the spine (INV-EEL-1). engram/skill come
-            # online in fast-follows; the router degrades gracefully. The IQL
-            # advantage is PASSIVE (recorded, never gates in 0a/0b — 0c activates).
+        if ("gatekeeper_state" in active_features and plugin.gatekeeper is not None
+                and hasattr(plugin.gatekeeper, "decide_execution_mode_from_prompt")):
             try:
-                from titan_hcl.logic.sage.grounded_router import (
-                    GroundedReadout, grounded_route, load_router_thresholds,
-                    is_informational_query, recall_score_from_memories)
-                from titan_hcl.synthesis.tool_intent import detect_tool_intent
-                _thr = getattr(plugin, "_grounded_router_thresholds", None)
-                if _thr is None:
-                    _thr = load_router_thresholds()
-                    plugin._grounded_router_thresholds = _thr
-                try:
-                    _requires_tool = bool(detect_tool_intent(prompt_text).requires_tool)
-                except Exception:
-                    _requires_tool = False
-                _readout = GroundedReadout(
-                    recall_score=recall_score_from_memories(relevant_memories),
-                    engram_ground=0.0,         # fast-follow (recall-only for now)
-                    skill_utility=None,        # B1 (skill-lane dormant until then)
-                    requires_tool=_requires_tool,
-                    is_informational=is_informational_query(prompt_text),
-                    can_afford_research=_can_afford_research(plugin),  # §7.0b.2 part 4
-                )
-                _decision = grounded_route(
-                    _readout, _thr,
-                    iql_advantage=(adv if _reasoning_tier else None))
-                mode = _decision.mode  # grounded router is the decision
-                plugin._last_router_decision = _decision
-                logger.info(
-                    "[PreHook] grounded router → %s (lane=%s tier=%s; recall=%.2f "
-                    "tool=%s info=%s afford_research=%s) — %s",
-                    _decision.mode, _decision.lane,
-                    getattr(plugin, "_current_chat_tier", "?"),
-                    _readout.recall_score, _requires_tool,
-                    _readout.is_informational, _readout.can_afford_research,
-                    _decision.reason)
-            except Exception as _gr_err:
-                logger.warning(
-                    "[PreHook] grounded router failed (keeping mode '%s'): %s",
-                    mode, _gr_err)
+                mode, adv, text, obs_vec = await plugin.gatekeeper.decide_execution_mode_from_prompt(
+                    prompt_text)
+                plugin._last_observation_vector = obs_vec
+            except Exception as _gk_err:
+                logger.warning("[PreHook] decide_from_prompt failed: %s", _gk_err)
         plugin._last_execution_mode = mode
 
         _ph_stage("after_gatekeeper_hostside")
@@ -1183,12 +1063,6 @@ def create_pre_hook(plugin):
         }
         _v5_active = bool(active_features & _v5_features)
 
-        # Felt-at-lived-time (§7.C) — capture the pre-chat neuromod snapshot the turn
-        # is lived under, BEFORE the V5 gate, so it runs for EVERY chat (felt is ground
-        # truth regardless of the prompt-enrichment tier). Sourced from SHM, not the
-        # coordinator (which is empty in this path — see _capture_pre_chat_felt).
-        _capture_pre_chat_felt(plugin)
-
         class _SkipV5Block(Exception):
             """Sentinel used to short-circuit V5 enrichment when no feature
             consumer is active. Caught by the existing outer except below."""
@@ -1206,9 +1080,15 @@ def create_pre_hook(plugin):
 
             _v5 = await asyncio.to_thread(_fetch_coordinator)
 
-            # (pre-chat neuromod snapshot for felt-at-lived-time + CGN social reward is
-            # now captured from SHM before this block via _capture_pre_chat_felt — the
-            # coordinator's neuromodulators is empty in this PreHook path.)
+            # Save pre-chat neuromod snapshot for CGN social consumer reward
+            try:
+                _pre_mods = _v5.get("neuromodulators", {}).get("modulators", {})
+                plugin._pre_chat_neuromods = {
+                    nm: md.get("level", 0.5) if isinstance(md, dict) else 0.5
+                    for nm, md in _pre_mods.items()
+                }
+            except Exception:
+                plugin._pre_chat_neuromods = {}
 
             # [10] Neurochemical state — felt_state feature (ζ.1)
             try:
@@ -2434,33 +2314,21 @@ def create_post_hook(plugin):
         # returns immediately; memory persistence completes in background.
         # Task exceptions logged via the done_callback. agno_worker.py
         # awaits all background tasks at SHUTDOWN to avoid orphans.
-        # Felt-at-lived-time (§7.C — RFP_synthesis_engram_grounding): capture the
-        # neuromod levels the turn was lived under so the promoted chat thought
-        # carries felt into the synthesis felt axis. `_pre_chat_neuromods` is the
-        # {name: level} snapshot taken in the PreHook (set at the V5 fetch, ~:1086);
-        # copy it so a later turn's mutation can't alias this thought's felt. Empty
-        # → None (graceful; no felt for this thought).
-        _felt_snapshot = dict(getattr(plugin, "_pre_chat_neuromods", {}) or {})
-        _felt_snapshot = _felt_snapshot or None
-
-        async def _log_to_mempool_bg(user_prompt_v, response_text_v, user_id_v,
-                                     neuromod_context_v=None):
+        async def _log_to_mempool_bg(user_prompt_v, response_text_v, user_id_v):
             try:
                 await plugin.memory.add_to_mempool(
                     user_prompt_v, response_text_v,
-                    user_identifier=user_id_v,
-                    neuromod_context=neuromod_context_v)
+                    user_identifier=user_id_v)
                 logger.info(
-                    "[PostHook][bg] Memory logged: user=%s prompt=%s... (%d chars, "
-                    "felt=%s)", user_id_v, user_prompt_v[:40], len(response_text_v),
-                    bool(neuromod_context_v))
+                    "[PostHook][bg] Memory logged: user=%s prompt=%s... (%d chars)",
+                    user_id_v, user_prompt_v[:40], len(response_text_v))
             except Exception as e:
                 logger.warning(
                     "[PostHook][bg] Memory logging failed: %s", e)
 
         try:
             asyncio.create_task(_log_to_mempool_bg(
-                user_prompt, response_text, user_id, _felt_snapshot))
+                user_prompt, response_text, user_id))
         except Exception as e:
             # asyncio.create_task can only fail if there's no running loop;
             # the post_hook is invoked from agent.arun's loop so this is

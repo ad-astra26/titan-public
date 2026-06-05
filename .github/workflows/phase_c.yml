@@ -1,21 +1,20 @@
 # Phase C SPEC + Rust gates.
 #
 # Per PLAN_microkernel_phase_c_s2_kernel.md §15.5 + SPEC §20.7-§20.8.
-# This is the MAINTAINER's internal conformance + Rust gate. It is NOT run
-# automatically — the active dev gate is the pre-commit hook
-# (scripts/precommit_all_checks.sh). On the PUBLIC mirror it cannot pass: the
-# `phase-c-spec` job needs the internal SPEC ground-truth
-# (titan-docs/specs/SPEC_titan_architecture_constants.toml), which is
-# deliberately NOT published. Triggering it on every public push therefore
-# red-X'd every commit for a check that structurally cannot succeed there. So
-# it is now MANUAL-ONLY (`workflow_dispatch`); the public repo's automatic CI is
-# release.yml (musl binary builds on a `v*` tag). Re-enable push/PR triggers
-# only on a repo that ships the SPEC ground-truth.
+# This workflow ships in C-S2 as a stub. The repo currently relies on
+# the pre-commit hook (scripts/precommit_all_checks.sh) as the active
+# gate. When CI is enabled (GitHub Actions on this repo or upstream),
+# this file already encodes the canonical checks.
 
 name: phase-c
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
   rust-gates:

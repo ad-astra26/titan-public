@@ -17,7 +17,7 @@ Invariants enforced HERE:
   canonical record is the chain TX).
 
 - **INV-10** — a repair fork NEVER mutates its parent concept. Reuses
-  `EngramStore.bump_version()` insert-only contract (Phase 4 hard test).
+  `ConceptStore.bump_version()` insert-only contract (Phase 4 hard test).
 
 - **INV-Syn-3** — synthesis_worker is the sole writer to `synthesis.duckdb`.
   HypothesisForkStore is only ever instantiated inside that process.
@@ -44,7 +44,7 @@ Constructor dependencies (all duck-typed — tests inject fakes):
   "same lock"; the writer thread IS the serializer (Option C, AUDIT 2026-06-02).
 - `kuzu_graph`: `TitanKnowledgeGraph` with the Phase 5 fork-helper methods
   (`fork_create_node`, `fork_update_status`, ...).
-- `engram_store`: `EngramStore` instance for graduation-path concept writes
+- `concept_store`: `ConceptStore` instance for graduation-path concept writes
   (reuses Phase 4's create_concept / bump_version — INV-10 enforced there).
 - `outer_memory_writer`: `OuterMemoryWriter` for tombstone + graduation TXs.
 - `activation_store`: `ActivationStore` (synthesis_worker.py) for the
@@ -61,7 +61,7 @@ Public API surface (see `PLAN_synthesis_engine_Phase5.md §P5.A`):
   - `find_below_floor(floor, window_sec)` → list[fork_id]
   - `get_fork(fork_id)` → HypothesisFork | None
   - `list_active()` → list[HypothesisFork]
-  - `export_snapshot(path)` → int (atomic JSON, mirrors EngramStore.export_snapshot)
+  - `export_snapshot(path)` → int (atomic JSON, mirrors ConceptStore.export_snapshot)
   - `pending_gc_targets()` → list[fork_id] (graduated/abandoned awaiting cascade sweep)
 
 `fork_class="hypothesis"` is encoded on the chain TX *metadata* (the
@@ -141,7 +141,7 @@ class _ActivationStoreLike(Protocol):
     def record_access(self, item_id: str, ts: float) -> None: ...
 
 
-class _EngramStoreLike(Protocol):
+class _ConceptStoreLike(Protocol):
     def create_concept(
         self, concept_id: str, name: str, memory_type: str,
         composed_from: Optional[list[tuple[str, int]]] = None,
@@ -179,7 +179,7 @@ def _make_fork_id(intent: str, ts: float, root_anchor: Optional[str]) -> str:
     """sha256(intent || ts || root_anchor or '')[:16] — 64-bit space, collision
     probability negligible at fleet scale, opaque to outside observers
     (intent + ts not directly reversible). The 16-hex (8-byte) length matches
-    the convention used by Phase-4 EngramStore for concept_id collisions."""
+    the convention used by Phase-4 ConceptStore for concept_id collisions."""
     seed = f"{intent}|{ts:.6f}|{root_anchor or ''}".encode()
     return hashlib.sha256(seed).hexdigest()[:16]
 
@@ -195,7 +195,7 @@ class HypothesisForkStore:
         *,
         duckdb_conn: Any,                    # open DuckDB connection (synthesis.duckdb)
         kuzu_graph: Any,                     # TitanKnowledgeGraph
-        engram_store: _EngramStoreLike,
+        concept_store: _ConceptStoreLike,
         outer_memory_writer: _OuterMemoryWriterLike,
         activation_store: _ActivationStoreLike,
         activation_floor: float = DEFAULT_ACTIVATION_FLOOR,
@@ -213,7 +213,7 @@ class HypothesisForkStore:
     ):
         self._db = duckdb_conn
         self._graph = kuzu_graph
-        self._concepts = engram_store
+        self._concepts = concept_store
         self._writer = outer_memory_writer
         # Single-writer-thread (Option C): the DuckDB + Kuzu handles are touched
         # only on the one SynthesisWriter thread (the @on_writer methods below),
@@ -470,8 +470,8 @@ class HypothesisForkStore:
 
         Side effects:
           - Computes Merkle root over the fork's exploration TXs.
-          - Repair fork: calls EngramStore.bump_version (INV-10, INV-Syn-11).
-          - Net-new fork: calls EngramStore.create_concept (caller must
+          - Repair fork: calls ConceptStore.bump_version (INV-10, INV-Syn-11).
+          - Net-new fork: calls ConceptStore.create_concept (caller must
             supply `concept_name`; raises ValueError if missing).
           - Calls OuterMemoryWriter.write_concept_version_with_proof
             (anchors concept-version TX + OracleVerdict TX on chain).
@@ -928,7 +928,7 @@ class HypothesisForkStore:
             )
 
         if is_repair:
-            # Reuse Phase 4 EngramStore.bump_version — INV-10 enforced by
+            # Reuse Phase 4 ConceptStore.bump_version — INV-10 enforced by
             # the existing hard test (`test_bump_version_inserts_new_row_"
             # "without_mutating_parent`).
             parent_id = fork.parent_concept_id
@@ -941,7 +941,7 @@ class HypothesisForkStore:
 
             # Use bump_version directly — it handles the OuterMemoryWriter
             # call internally via the standard Phase 4 path, returning a
-            # Engram whose anchor_tx is the canonical write hash.
+            # ConceptVersion whose anchor_tx is the canonical write hash.
             new_cv = self._concepts.bump_version(
                 parent_id,
                 composed_from=[],

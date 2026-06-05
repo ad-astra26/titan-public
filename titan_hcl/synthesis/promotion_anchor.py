@@ -65,11 +65,7 @@ def build_promotion_tx(node: dict, *, now: float) -> tuple[dict, str]:
         "coherence": 0.5,
         "tags": ["memory_node", "promoted", "persistent", mem_type],
         "db_ref": f"memory_nodes:{node_id}",
-        # Felt-at-lived-time (§7.C). NOT a tx_hash input (hash = {t,s,e,g,c,a,ts},
-        # timechain_v2.py compute_hash) → additive chain-envelope provenance, zero
-        # determinism/idempotency impact.
-        "neuromods": (node.get("neuromod_context")
-                      if isinstance(node.get("neuromod_context"), dict) else {}),
+        "neuromods": {},
         "chi_available": 0.5,
         "attention": 0.5,
         "i_confidence": 0.5,

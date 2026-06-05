@@ -66,7 +66,6 @@ def compute_life_force_inputs(
     topology_snap: Optional[dict[str, Any]] = None,
     expression_state_reader: Any = None,
     vocab_db_path: str = "data/inner_memory.db",
-    sol_balance: Optional[float] = None,
 ) -> dict[str, Any]:
     """Aggregate the 16 LifeForceEngine.evaluate inputs into a single dict.
 
@@ -175,11 +174,7 @@ def compute_life_force_inputs(
         expression_fire_rate = 0.0
 
     # ── Body inputs (6) ────────────────────────────────────────────────
-    # sol_balance — REAL cached SOL (network_state.bin balance_sol, passed by
-    # the caller) replacing the 13.0 stub (BUG-LIFEFORCE-INPUT-STUBS 2026-06-05).
-    # Falls back to the stub ONLY on cold-boot before the first balance fetch.
-    sol_balance = (
-        float(sol_balance) if sol_balance is not None else _STUB_SOL_BALANCE)
+    sol_balance = _STUB_SOL_BALANCE          # follow-up rFP target
     anchor_freshness = _STUB_ANCHOR_FRESHNESS  # follow-up rFP target
 
     hormonal_vitality = 0.5

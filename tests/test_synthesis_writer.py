@@ -147,7 +147,7 @@ def test_on_writer_decorator_routes_and_is_reentrant(writer):
 
 def test_on_writer_prefers_db_writer_attr(writer):
     """When a store already uses self._writer for something else, the decorator
-    falls back to self._db_writer (HypothesisForkStore / EngramStore case)."""
+    falls back to self._db_writer (HypothesisForkStore / ConceptStore case)."""
     class Store:
         def __init__(self, w):
             self._writer = object()       # NOT a writer (e.g. OuterMemoryWriter)

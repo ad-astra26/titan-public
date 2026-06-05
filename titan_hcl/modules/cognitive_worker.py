@@ -3549,17 +3549,6 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
             from titan_hcl.logic.life_force_inputs_builder import (
                 compute_life_force_inputs,
             )
-            # sol_balance — real cached SOL from network_state.bin (kernel
-            # balance-publisher loop; cheap G18 SHM read), replacing the 13.0
-            # stub (BUG-LIFEFORCE-INPUT-STUBS, 2026-06-05).
-            _lf_sol = None
-            try:
-                _lf_bank = state_refs.get("_shm_reader_bank")
-                _lf_ns = _lf_bank.read_network_state() if _lf_bank is not None else None
-                if _lf_ns:
-                    _lf_sol = _lf_ns.get("balance_sol")
-            except Exception:
-                _lf_sol = None
             _lf_inputs = compute_life_force_inputs(
                 coordinator=coordinator,
                 pi_monitor=pi_monitor,
@@ -3568,7 +3557,6 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                 consciousness=consciousness,
                 topology_snap=topology_snap,
                 expression_state_reader=state_refs.get("expression_state_reader"),
-                sol_balance=_lf_sol,
             )
             _lf_inputs_publisher.publish(_lf_inputs)
         except Exception as _err:
@@ -5070,23 +5058,12 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                 _ts_pi = state_refs.get("pi_monitor")
                 if _ts_pi is not None:
                     try:
-                        # get_stats() is the canonical accessor. The old
-                        # getattr(pi,"cluster_count") read a PRIVATE attr and
-                        # silently logged 0 — fixed + expanded 2026-06-04.
-                        _ps = _ts_pi.get_stats() if hasattr(_ts_pi, "get_stats") else {}
                         _ts_metrics["pi.heartbeat_ratio"] = float(
-                            _ps.get("heartbeat_ratio", getattr(_ts_pi, "heartbeat_ratio", 0.0)) or 0.0)
-                        _ts_metrics["pi.cluster_count"] = float(_ps.get("cluster_count", 0) or 0)
+                            getattr(_ts_pi, "heartbeat_ratio", 0.0) or 0.0)
+                        _ts_metrics["pi.cluster_count"] = float(
+                            getattr(_ts_pi, "cluster_count", 0) or 0)
                         _ts_metrics["pi.dev_age"] = float(
-                            _ps.get("developmental_age", getattr(_ts_pi, "developmental_age", 0)) or 0)
-                        # NEW — the ≈π "value" + streak/total raw signals:
-                        _ts_metrics["pi.avg_cluster_size"] = float(
-                            _ps.get("avg_cluster_size", getattr(_ts_pi, "avg_cluster_size", 0)) or 0)
-                        _ts_metrics["pi.pi_streak"] = float(_ps.get("current_pi_streak", 0) or 0)
-                        _ts_metrics["pi.zero_streak"] = float(_ps.get("current_zero_streak", 0) or 0)
-                        _ts_metrics["pi.total_pi_epochs"] = float(_ps.get("total_pi_epochs", 0) or 0)
-                        _ts_metrics["pi.total_epochs"] = float(_ps.get("total_epochs_observed", 0) or 0)
-                        _ts_metrics["pi.in_cluster"] = 1.0 if _ps.get("in_cluster") else 0.0
+                            getattr(_ts_pi, "developmental_age", 0) or 0)
                     except Exception:
                         pass
                 _ts_reas = state_refs.get("reasoning_engine")
@@ -5114,64 +5091,6 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                         if _ts_hrm is not None:
                             _ts_metrics["ns.maturity"] = float(
                                 getattr(_ts_hrm, "maturity", 0.0) or 0.0)
-                    except Exception:
-                        pass
-                # ── Higher-system + inner-layer gauges (2026-06-05) — read the
-                # canonical SHM state slots via the reader bank (G18; never
-                # hand-rolled offsets). Gated by should_record (5-min) → zero
-                # per-epoch cost; each guarded so a missing slot never breaks the
-                # tick. Curated to REAL publishers ONLY — the life_force INPUT
-                # stubs (sovereignty_index, sol_balance) are deliberately excluded.
-                _ts_bank = state_refs.get("_shm_reader_bank")
-                if _ts_bank is not None:
-                    def _ts_put(_name, _d, _key):
-                        try:
-                            _v = (_d or {}).get(_key)
-                            if isinstance(_v, bool):
-                                _ts_metrics[_name] = 1.0 if _v else 0.0
-                            elif isinstance(_v, (int, float)):
-                                _ts_metrics[_name] = float(_v)
-                        except Exception:
-                            pass
-                    try:
-                        _m = _ts_bank.read_memory_state()
-                        _ts_put("memory.mempool", _m, "mempool_size")
-                        _ts_put("memory.persistent", _m, "persistent_count")
-                        _ts_put("memory.learning_velocity", _m, "learning_velocity")
-                        _ts_put("memory.kg_nodes", _m, "kg_node_count")
-                    except Exception:
-                        pass
-                    try:
-                        _ts_put("sovereignty.ratio", _ts_bank.read_expression_state(), "sovereignty_ratio")
-                    except Exception:
-                        pass
-                    try:
-                        _mb = _ts_bank.read_metabolism_state()
-                        _ts_put("metabolic.balance_pct", _mb, "balance_pct")
-                        _ts_put("metabolic.social_gravity", _mb, "social_gravity_score")
-                    except Exception:
-                        pass
-                    try:
-                        _bd = _ts_bank.read_body_state()
-                        _ts_put("metabolic.sol_balance", _bd, "sol_balance")
-                        _ts_put("body.health", _bd, "body_health")
-                    except Exception:
-                        pass
-                    try:
-                        _ts_put("life_force.total", _ts_bank.read_life_force_state(), "total")
-                    except Exception:
-                        pass
-                    try:
-                        _cg = _ts_bank.read_cgn_engine_state()
-                        _ts_put("cgn.groundings", _cg, "total_groundings")
-                        _ts_put("cgn.avg_reward", _cg, "avg_reward")
-                        _ts_put("cgn.consolidations", _cg, "consolidations")
-                    except Exception:
-                        pass
-                    try:
-                        _lg = _ts_bank.read_language_state()
-                        _ts_put("vocab.total", _lg, "vocab_total")
-                        _ts_put("vocab.producible", _lg, "vocab_producible")
                     except Exception:
                         pass
                 # `chi.total` alias — IDepthTab queries the dotted name; the

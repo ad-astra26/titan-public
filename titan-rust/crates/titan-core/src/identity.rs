@@ -29,70 +29,47 @@
 use std::path::Path;
 use zeroize::Zeroizing;
 
-/// Maximum titan-id length. The id is interpolated into `/dev/shm/titan_<id>/`
-/// and the bus/kernel socket paths, so it must stay short + path-safe.
-pub const MAX_TITAN_ID_LEN: usize = 32;
-
-/// Titan instance identifier — a validated free-form id. The Maker's fleet
-/// uses `T1`/`T2`/`T3`; a sovereign user's Titan picks its own (the public
-/// installer defaults to `titan`). This is deliberately NOT a closed enum:
-/// hardcoding T1/T2/T3 was a fleet-ism that blocked every Titan not named
-/// after the fleet from booting (kernel exited `INVALIDARGUMENT` on
-/// `--titan-id titan`). Per SPEC §1 glossary `titan-id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TitanId(String);
-
-/// Validate a titan-id: non-empty, ≤ [`MAX_TITAN_ID_LEN`], and only
-/// `[A-Za-z0-9_-]` (path-safe — the id names SHM dirs + UNIX sockets).
-/// Returns the trimmed id verbatim on success.
-///
-/// Shared by [`TitanId::parse`] and the `clap` `value_parser` on every
-/// binary's `--titan-id` flag, so the kernel and a spawned worker can never
-/// disagree on what a legal id is. `IdentityError` impls `std::error::Error`,
-/// so this doubles as a clap value-parser function.
-pub fn validate_titan_id(s: &str) -> Result<String, IdentityError> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(IdentityError::UnknownTitanId(
-            "titan-id is empty".to_string(),
-        ));
-    }
-    if s.len() > MAX_TITAN_ID_LEN {
-        return Err(IdentityError::UnknownTitanId(format!(
-            "titan-id {s:?} exceeds {MAX_TITAN_ID_LEN} chars ({} given)",
-            s.len()
-        )));
-    }
-    if !s
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(IdentityError::UnknownTitanId(format!(
-            "titan-id {s:?} has illegal chars (allowed: A-Z a-z 0-9 _ -)"
-        )));
-    }
-    Ok(s.to_string())
+/// Titan instance identifier. Constrained to the canonical set per SPEC §1
+/// glossary `titan-id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitanId {
+    /// Titan 1 (origin instance).
+    T1,
+    /// Titan 2 (mid-cluster).
+    T2,
+    /// Titan 3 (T3 cluster).
+    T3,
 }
 
 impl TitanId {
-    /// The id as stored (e.g. `"T1"`, `"titan"`).
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// Returns the canonical lowercase form (e.g. `"T1"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TitanId::T1 => "T1",
+            TitanId::T2 => "T2",
+            TitanId::T3 => "T3",
+        }
     }
 
-    /// Legacy namespaced form (`"titan_<id>"`). Retained for callers that
-    /// still expect it; the bus authkey **no longer** derives from it — the
-    /// HKDF info is the constant `b"titan-bus"` (per
-    /// `rFP_phase_c_bus_authkey_contract_fix.md`), and per-Titan isolation
-    /// comes from the identity keypair, not this string.
-    pub fn as_namespace(&self) -> String {
-        format!("titan_{}", self.0)
+    /// Returns the namespaced form used as HKDF info per `bus_authkey.py`
+    /// (e.g. `"titan_T1"`).
+    pub fn as_namespace(&self) -> &'static str {
+        match self {
+            TitanId::T1 => "titan_T1",
+            TitanId::T2 => "titan_T2",
+            TitanId::T3 => "titan_T3",
+        }
     }
 
-    /// Parse + validate a titan-id from a string. Accepts any path-safe id —
-    /// the fleet's `T1`/`T2`/`T3` and a sovereign user's own (`titan`, …).
+    /// Parse from a string. Accepts both bare (`"T1"`) and namespaced
+    /// (`"titan_T1"`) forms.
     pub fn parse(s: &str) -> Result<Self, IdentityError> {
-        validate_titan_id(s).map(TitanId)
+        match s {
+            "T1" | "titan_T1" => Ok(TitanId::T1),
+            "T2" | "titan_T2" => Ok(TitanId::T2),
+            "T3" | "titan_T3" => Ok(TitanId::T3),
+            other => Err(IdentityError::UnknownTitanId(other.to_string())),
+        }
     }
 }
 
@@ -148,9 +125,8 @@ pub enum IdentityError {
     #[error("public_key does not derive from secret_seed")]
     PublicKeyMismatch,
 
-    /// `titan_id` field is missing, empty, too long, or has illegal chars
-    /// (must be 1–32 of `[A-Za-z0-9_-]`).
-    #[error("invalid titan_id: {0}")]
+    /// `titan_id` field is missing or unknown (not T1/T2/T3).
+    #[error("unknown or missing titan_id: {0}")]
     UnknownTitanId(String),
 
     /// Identity file marked corrupted (G16(8) — never auto-restore).
@@ -161,8 +137,7 @@ pub enum IdentityError {
 /// Loaded Titan identity. Holds the Ed25519 keypair + titan_id with zeroize
 /// guarantees on the secret material.
 pub struct Identity {
-    /// Titan instance identifier (the fleet's `T1`/`T2`/`T3`, or a sovereign
-    /// user's own id such as `titan`).
+    /// Titan instance identifier (T1/T2/T3).
     pub titan_id: TitanId,
     /// Ed25519 public key (verifying key) — safe to expose.
     pub verifying_key: ed25519_dalek::VerifyingKey,
@@ -387,48 +362,24 @@ mod tests {
 
     #[test]
     fn titan_id_parse() {
-        // Fleet ids and a sovereign user's own id all parse verbatim.
-        assert_eq!(TitanId::parse("T1").unwrap().as_str(), "T1");
-        assert_eq!(TitanId::parse("titan").unwrap().as_str(), "titan");
-        assert_eq!(
-            TitanId::parse("titan-research_2").unwrap().as_str(),
-            "titan-research_2"
-        );
-        // Genuinely invalid ids are rejected (path-unsafe / empty / too long).
+        assert_eq!(TitanId::parse("T1").unwrap(), TitanId::T1);
+        assert_eq!(TitanId::parse("titan_T2").unwrap(), TitanId::T2);
         assert!(matches!(
-            TitanId::parse(""),
-            Err(IdentityError::UnknownTitanId(_))
-        ));
-        assert!(matches!(
-            TitanId::parse("bad/id"),
-            Err(IdentityError::UnknownTitanId(_))
-        ));
-        assert!(matches!(
-            TitanId::parse("has space"),
-            Err(IdentityError::UnknownTitanId(_))
-        ));
-        assert!(matches!(
-            TitanId::parse("a.b"),
-            Err(IdentityError::UnknownTitanId(_))
-        ));
-        assert!(matches!(
-            TitanId::parse(&"x".repeat(MAX_TITAN_ID_LEN + 1)),
+            TitanId::parse("T9"),
             Err(IdentityError::UnknownTitanId(_))
         ));
     }
 
     #[test]
     fn titan_id_namespace() {
-        assert_eq!(TitanId::parse("T1").unwrap().as_namespace(), "titan_T1");
-        assert_eq!(
-            TitanId::parse("titan").unwrap().as_namespace(),
-            "titan_titan"
-        );
+        assert_eq!(TitanId::T1.as_namespace(), "titan_T1");
+        assert_eq!(TitanId::T2.as_namespace(), "titan_T2");
+        assert_eq!(TitanId::T3.as_namespace(), "titan_T3");
     }
 
     #[test]
     fn titan_id_str() {
-        assert_eq!(TitanId::parse("T1").unwrap().as_str(), "T1");
+        assert_eq!(TitanId::T1.as_str(), "T1");
     }
 
     #[test]
@@ -457,7 +408,7 @@ mod tests {
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let identity = Identity::load_from_disk(tmp.path()).unwrap();
-        assert_eq!(identity.titan_id.as_str(), "T1");
+        assert_eq!(identity.titan_id, TitanId::T1);
     }
 
     #[test]
@@ -511,17 +462,7 @@ mod tests {
     fn byte_array_format_loads_with_titan_id_hint() {
         let (tmp, _seed) = write_byte_array_keypair();
         let identity = Identity::load_from_disk_with_hint(tmp.path(), Some("T3")).unwrap();
-        assert_eq!(identity.titan_id.as_str(), "T3");
-    }
-
-    #[test]
-    fn byte_array_format_loads_with_sovereign_titan_id() {
-        // A sovereign user's Titan (id = "titan") boots from the Solana
-        // byte-array keypair — the exact path that exit-2'd before the
-        // free-form fix.
-        let (tmp, _seed) = write_byte_array_keypair();
-        let identity = Identity::load_from_disk_with_hint(tmp.path(), Some("titan")).unwrap();
-        assert_eq!(identity.titan_id.as_str(), "titan");
+        assert_eq!(identity.titan_id, TitanId::T3);
     }
 
     #[test]
@@ -538,10 +479,8 @@ mod tests {
 
     #[test]
     fn byte_array_format_with_invalid_titan_id_hint_errors() {
-        // "bad/id" has a path-unsafe char → rejected (note: "T9" is now a
-        // VALID free-form id, so the invalid case must be genuinely illegal).
         let (tmp, _seed) = write_byte_array_keypair();
-        let result = Identity::load_from_disk_with_hint(tmp.path(), Some("bad/id"));
+        let result = Identity::load_from_disk_with_hint(tmp.path(), Some("T9"));
         assert!(matches!(result, Err(IdentityError::UnknownTitanId(_))));
     }
 
@@ -624,7 +563,7 @@ mod tests {
 
         // Hint says T1 but file says T2 — file wins for struct format.
         let identity = Identity::load_from_disk_with_hint(tmp.path(), Some("T1")).unwrap();
-        assert_eq!(identity.titan_id.as_str(), "T2");
+        assert_eq!(identity.titan_id, TitanId::T2);
     }
 
     #[test]

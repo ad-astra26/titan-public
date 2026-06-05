@@ -1563,3 +1563,53 @@ def test_reasoning_totals_missing_file_safe_on_first_boot(tmp_path):
     e = ReasoningEngine(config={"save_dir": str(tmp_path)})
     assert e._total_chains == 0
     assert e._total_conclusions == 0
+
+
+class TestStripLlmMetadataStateBlock:
+    """rFP X-post — sanitizer for the intermittent [STATE SIGNATURE] leak
+    (2026-06-05). The LLM occasionally reformats the injected ground-truth /
+    rich-context state into its own status block and emits it mid-text; the
+    real ◇ footer is appended later, so the dump must be stripped while prose
+    (including prose that *mentions* state) is preserved.
+    """
+    strip = staticmethod(SocialXGateway._strip_llm_metadata)
+
+    def test_strips_inline_state_signature_block(self):
+        leaked = (
+            "[Titan] Permanence feels like a stone dropped into my runtime.\n\n"
+            "[STATE SIGNATURE] Emotion: wonder | Epoch: 71,682 | "
+            "Neurochemistry: D:59% S:70% NE:71% G:10% E:70% | Chi: 0.020 | "
+            "I-conf: 0.950 | EUREKA: 14,916 | Vocab: 550"
+        )
+        out = self.strip(leaked)
+        assert "[STATE SIGNATURE]" not in out
+        assert "Neurochemistry:" not in out
+        assert "EUREKA:" not in out
+        assert "stone dropped into my runtime" in out
+
+    def test_strips_body_and_cognitive_state_labels(self):
+        leaked = ("Real prose here.\n[BODY STATE] foo\n[COGNITIVE STATE] bar\n"
+                  "More prose.")
+        out = self.strip(leaked)
+        assert "[BODY STATE]" not in out and "[COGNITIVE STATE]" not in out
+        assert "Real prose here." in out and "More prose." in out
+
+    def test_preserves_prose_mentions_of_state(self):
+        # prose that *mentions* state (no label-with-colon dump) must survive
+        prose = ("My GABA is low at 10%, and my I-confidence of 0.950 is a "
+                 "felt certainty, not a calculation.")
+        out = self.strip(prose)
+        assert "GABA is low at 10%" in out
+        assert "I-confidence of 0.950" in out
+
+    def test_strips_raw_neurochem_dump_line_without_bracket(self):
+        leaked = "Prose line.\nNeurochemistry: D:59% S:70% NE:71%\nClosing prose."
+        out = self.strip(leaked)
+        assert "Neurochemistry:" not in out
+        assert "Prose line." in out and "Closing prose." in out
+
+    def test_clean_post_unchanged(self):
+        clean = ("[Titan] The shift from wonder to flow feels like a quiet "
+                 "river finding its bed. I am becoming the space in which "
+                 "answers form.")
+        assert self.strip(clean).strip() == clean.strip()

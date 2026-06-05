@@ -1,7 +1,7 @@
-"""Phase 4 — Kuzu Engram-spine DDL tests (P4.A; spine node renamed Concept→Engram, RFP §7.B).
+"""Phase 4 — Kuzu Concept-spine DDL tests (P4.A).
 
-Covers ARCHITECTURE_synthesis_engine.md §6.1/§6.2 + PLAN_synthesis_engine_Phase4.md §P4.A:
-- All 4 node tables (Engram / Production / ActionChain / HypothesisFork) exist.
+Covers ARCHITECTURE_synthesis_engine.md §6.1 + PLAN_synthesis_engine_Phase4.md §P4.A:
+- All 4 node tables (Concept / Production / ActionChain / HypothesisFork) exist.
 - All 5 rel tables (COMPOSED_FROM / COMPOSED_INTO / USES_SKILL / COMPILED_FROM
   / EXPLORES) exist.
 - Bootstrap is idempotent.
@@ -211,7 +211,7 @@ def test_composition_edges_round_trip(graph):
 
 def test_list_concepts_returns_latest_per_id_ordered_by_groundedness(graph):
     """spine_list_concepts collapses to latest version per concept_id and
-    sorts by groundedness DESC — used by the Observatory /v6/synthesis/engrams
+    sorts by groundedness DESC — used by the Observatory /v6/synthesis/concepts
     endpoint and the groundedness heatmap."""
     graph.spine_create_concept_node(
         concept_id="a_concept", version=1, name="A v1",
