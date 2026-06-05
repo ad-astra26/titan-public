@@ -66,6 +66,8 @@ from titan_hcl.synthesis.engram_store import (
 )
 from titan_hcl.synthesis.cgn_bridge import CGNRegistrationBridge
 from titan_hcl.synthesis.outer_memory_writer import OuterMemoryEvent, OuterMemoryWriter
+# CGN-felt RFP — the shared, torch-free neuromod helpers (one source with cgn.py).
+from titan_hcl.logic.cgn_types import FELT_FRAME_DIVERGENCE, felt_distance
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +271,7 @@ class ConsolidationPass:
         decompose_fn: Optional[Callable[[str, str], list[str]]] = None,
         felt_bridge: Optional[Any] = None,
         emit_candidate_fn: Optional[Callable[[dict], None]] = None,
+        frame_divergence: float = FELT_FRAME_DIVERGENCE,
     ):
         self._store = engram_store
         self._bridge = cgn_bridge
@@ -299,6 +302,9 @@ class ConsolidationPass:
         self._cap_concepts = max_concepts_per_pass
         self._cap_llm = llm_calls_max
         self._source = source
+        # CGN-felt RFP §1.2 UPGRADE — RMS felt_distance above this between a cluster's
+        # lived felt and a grounded Object's centroid = a new felt frame (config-tunable).
+        self._frame_divergence = frame_divergence
 
     # ── Public API ──────────────────────────────────────────
 
@@ -673,23 +679,31 @@ class ConsolidationPass:
         only, ZERO CGN writes (INV-Syn-ENG-4). The bus event fires ONCE per candidate
         (only on a fresh queue), not every dream.
 
-        NOTE (mismatch / frame_dependent): a grounded-but-conflicting felt is NOT
-        detectable here — the event-sourced grounded-set is label-only
-        (CGN_CONCEPT_GROUNDED carries no felt-state) and fetching CGN's felt would
-        violate G18. So a grounded Object is skipped; `frame_dependent` is left to the
-        consumer (which interacts with CGN) / a later refinement. The schema supports
-        the status value for forward-compat."""
+        frame_dependent (CGN-felt RFP §1.2 UPGRADE): a grounded Object is no longer
+        blindly skipped. The grounded-set now carries CGN's per-concept felt centroid
+        (event-sourced on CGN_CONCEPT_GROUNDED — G18, no RPC), so we compare the
+        cluster's lived felt against it: divergent (> frame_divergence) → queue a
+        `frame_dependent` candidate (a NEW felt frame for an existing concept, F⊗C
+        scoped to domain_hint); aligned — or no centroid yet (pre-felt grounding) →
+        skip (genuinely redundant). Still propose-only (INV-Syn-ENG-4 — zero CGN writes)."""
         lived_felt = agg_felt(cluster.members)
         felt_json = json.dumps(lived_felt, sort_keys=True) if lived_felt else "{}"
         domain_hint = getattr(proposal, "domain_hint", "") or ""
         for obj in objects:
+            status = "candidate"
+            provenance = "engram_felt_gap"
             if self._felt_bridge.is_object_grounded(obj):
-                continue  # grounded → no candidate (mismatch detection deferred)
+                gc = self._felt_bridge.grounded_felt(obj)
+                if gc and felt_distance(lived_felt, gc) > self._frame_divergence:
+                    status = "frame_dependent"        # divergent felt → a new frame
+                    provenance = "engram_felt_frame"
+                else:
+                    continue  # grounded + aligned / no centroid yet → redundant, skip
             newly = self._felt_bridge.queue_candidate(
                 object_label=obj, felt_state_json=felt_json, c=PROBATION_C,
                 source_engram=cv.concept_id, source_version=cv.version,
-                provenance="engram_felt_gap", domain_hint=domain_hint,
-                status="candidate")
+                provenance=provenance, domain_hint=domain_hint,
+                status=status)
             if newly and self._emit_candidate is not None:
                 self._emit_candidate({
                     "object_label": obj,
@@ -697,6 +711,7 @@ class ConsolidationPass:
                     "source_engram": cv.concept_id,
                     "source_version": cv.version,
                     "domain_hint": domain_hint,
+                    "status": status,
                 })
 
     # ── Internal — anchor pass TX ──────────────────────────

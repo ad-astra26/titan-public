@@ -123,9 +123,10 @@ def test_gap_queues_and_emits(bridge):
     # Payload shape + felt seeded from agg_felt(members).
     e0 = emitted[0]
     assert set(e0) == {"object_label", "felt_state", "source_engram",
-                       "source_version", "domain_hint"}
+                       "source_version", "domain_hint", "status"}
     assert e0["source_engram"] == "glacier_x" and e0["source_version"] == 2
     assert e0["domain_hint"] == "biology"
+    assert e0["status"] == "candidate"  # ungrounded → fresh candidate (CGN-felt Phase C)
     assert e0["felt_state"] == agg_felt(_cluster().members)
 
 
@@ -139,11 +140,12 @@ def test_felt_state_json_persisted(bridge):
 
 
 def test_grounded_object_skipped_no_candidate(bridge):
-    # A grounded Object is skipped (no candidate, no emit) — and this is where a
-    # mismatch→frame_dependent WOULD be detected, but cannot be (label-only
-    # grounded-set; deferred). Proves grounded → no synthesis write for it.
+    # A grounded Object with NO stored felt centroid (label-only grounding) is
+    # skip-safe: the producer has nothing to compare, so it skips (no candidate,
+    # no emit). The divergent→frame_dependent case (grounded WITH a centroid) is
+    # covered in test_felt_bridge_frame_dependent_conflict (CGN-felt RFP Phase C).
     fb, conn = bridge
-    fb.record_grounded("glacier")  # now grounded
+    fb.record_grounded("glacier")  # grounded, label-only (no centroid)
     emitted = []
     cp = _make_pass(fb, emit=emitted.append)
     cp._maybe_decompose(_cv(), _proposal(), _cluster())
