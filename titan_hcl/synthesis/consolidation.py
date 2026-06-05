@@ -133,6 +133,41 @@ def felt_coverage_from_members(members: list) -> float:
     return coverage * mean_magnitude
 
 
+def agg_felt(members: list) -> dict:
+    """Representative lived felt-state for a cluster — the mean of each numeric
+    neuromod level across the members that carried felt (metadata keys excluded).
+    This is the felt-state the Engram's thoughts were lived under, seeded into the
+    felt candidates (RFP_inner_outer_felt_teaching_bridge §1.2). Felt lives on the
+    members (`TxCandidate.felt`), NOT on the Engram node. Felt-less cluster → {}."""
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for m in (members or []):
+        felt = _parse_felt(getattr(m, "felt", None))
+        for k, v in felt.items():
+            if k in _FELT_META_KEYS or not isinstance(v, (int, float)):
+                continue
+            sums[k] = sums.get(k, 0.0) + float(v)
+            counts[k] = counts.get(k, 0) + 1
+    return {k: sums[k] / counts[k] for k in sums if counts[k] > 0}
+
+
+def _decompose_sample_from_members(
+    members: list, max_samples: int = 5, max_chars: int = 240,
+) -> str:
+    """A bounded sample of the cluster's REAL thought content — the signal the
+    decompose LLM names the Engram's constituent Objects from (mirrors
+    consolidation_defaults._build_cluster_prompt's content sample)."""
+    samples = []
+    for m in (members or [])[:max_samples]:
+        text = (getattr(m, "content_summary", "") or "").strip().replace("\n", " ")
+        if not text:
+            continue
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip() + "…"
+        samples.append(f"- {text}")
+    return "\n".join(samples)
+
+
 # ── DTOs ────────────────────────────────────────────────────────────
 
 
@@ -227,12 +262,19 @@ class ConsolidationPass:
         llm_calls_max: int = 20,
         source: str = "synthesis_worker",
         recall_attribution: Optional[Any] = None,
+        decompose_fn: Optional[Callable[[str, str], list[str]]] = None,
+        felt_bridge: Optional[Any] = None,
     ):
         self._store = engram_store
         self._bridge = cgn_bridge
         # §7.E.0 — per-Engram citation attribution (membership write + the live
         # `fluent` axis feed at the dream recompute). Optional/soft — None disables.
         self._attribution = recall_attribution
+        # Inner↔Outer Felt-Teaching Bridge §7.1 — Engram(Idea)→Object decompose +
+        # cache (off the hot path). Optional/soft — either None disables the bridge
+        # (synthesis otherwise unaffected). `decompose_fn(name, sample) -> list[str]`.
+        self._decompose = decompose_fn
+        self._felt_bridge = felt_bridge
         self._writer = outer_memory_writer
         self._mine = mine_recent_txs_fn
         self._propose = llm_propose_fn
@@ -517,6 +559,10 @@ class ConsolidationPass:
         if self._attribution is not None:
             self._attribution.record_membership(cv.concept_id, cv.version, evidence)
 
+        # Bridge §7.1 — decompose Engram(Idea)→Objects + cache (off the hot path).
+        # Phase 1 populates the cache; Phase 3 reads it for gap detection.
+        self._maybe_decompose(cv, proposal, cluster)
+
         result.concepts_created.append((cv.concept_id, cv.version))
         return True
 
@@ -569,8 +615,40 @@ class ConsolidationPass:
         if self._attribution is not None:
             self._attribution.record_membership(cv.concept_id, cv.version, evidence)
 
+        # Bridge §7.1 — decompose Engram(Idea)→Objects + cache (off the hot path).
+        # Phase 1 populates the cache; Phase 3 reads it for gap detection.
+        self._maybe_decompose(cv, proposal, cluster)
+
         result.concepts_bumped.append((cv.concept_id, cv.version))
         return True
+
+    # ── Internal — felt-teaching bridge (§7.1 decompose) ───
+
+    def _maybe_decompose(
+        self, cv: Any, proposal: LLMProposal, cluster: Cluster,
+    ) -> Optional[list[str]]:
+        """Bridge §7.1 (OFF the hot path) — decompose the Engram(Idea) into its
+        constituent Object labels + cache them by (concept_id, version) so a
+        re-touched Engram never re-calls the LLM. Returns the labels (cached or
+        freshly decomposed) for Phase-3 gap detection; None when the bridge is
+        disabled or decompose failed. Soft — never blocks the pass."""
+        if self._felt_bridge is None or self._decompose is None:
+            return None
+        try:
+            cached = self._felt_bridge.get_cached_objects(
+                cv.concept_id, cv.version)
+            if cached is not None:
+                return cached
+            name = proposal.proposed_name or proposal.concept_id or cv.concept_id
+            sample = _decompose_sample_from_members(cluster.members)
+            objects = self._decompose(name, sample) or []
+            if objects:
+                self._felt_bridge.cache_objects(
+                    cv.concept_id, cv.version, objects)
+            return objects
+        except Exception as e:  # noqa: BLE001 — soft per INV-Syn-17
+            logger.debug("[ConsolidationPass] decompose soft-fail: %s", e)
+            return None
 
     # ── Internal — anchor pass TX ──────────────────────────
 

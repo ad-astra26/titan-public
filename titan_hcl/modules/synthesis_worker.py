@@ -66,6 +66,7 @@ import msgpack
 
 from titan_hcl import bus
 from titan_hcl.bus import (
+    CGN_CONCEPT_GROUNDED,
     DREAM_STATE_CHANGED,
     KERNEL_EPOCH_TICK,
     KNOWLEDGE_MOMENT,
@@ -830,6 +831,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     if not recall_attribution.ensure_schema():
         recall_attribution = None
 
+    # Inner↔Outer Felt-Teaching Bridge (RFP_inner_outer_felt_teaching_bridge) —
+    # shares ActivationStore's ONE guarded conn (store._conn) + the sole writer
+    # (db_writer), like recall_attribution. Owns the §7.1 decompose cache
+    # (engram_objects) + the §7.2 event-sourced CGN grounded-set
+    # (cgn_grounded_objects). In scope from here for the ConsolidationPass injection
+    # AND the CGN_CONCEPT_GROUNDED handler below. Soft → None (synthesis unaffected).
+    from titan_hcl.synthesis.felt_bridge import FeltBridge
+    felt_bridge: Optional[FeltBridge] = FeltBridge(store._conn, db_writer)
+    if not felt_bridge.ensure_schema():
+        felt_bridge = None
+
     # Phase 2 D-P2-4 standing-bundle store — sole writer of
     # data/synthesis.duckdb / association_bundles. CONN-2 FOLD (AUDIT §5.2):
     # shares ActivationStore's ONE guarded connection (store._conn) rather than
@@ -1141,6 +1153,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         )
         from titan_hcl.synthesis.consolidation_defaults import (
             default_mine_recent_thoughts, make_default_llm_propose,
+            make_default_decompose,
         )
         # Reuse the kuzu_graph_obj constructed above for EngineRecall.
         # Soft-fail if it's missing: the worker keeps running with
@@ -1224,6 +1237,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # proposer so the pass still runs (mines TXs + anchors summary
         # for audit), just produces no spine writes.
         propose_fn = None
+        decompose_fn = None  # Bridge §7.1 — Engram→Object decompose (same provider)
         inference_cfg = (config or {}).get("inference", {}) or {}
         try:
             from titan_hcl.inference import get_provider as _get_provider
@@ -1231,6 +1245,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             if api_key:
                 provider = _get_provider("ollama_cloud", inference_cfg)
                 propose_fn = make_default_llm_propose(provider)
+                decompose_fn = make_default_decompose(provider)  # Bridge §7.1
                 model = inference_cfg.get(
                     "ollama_cloud_model", "") or "default"
                 logger.info(
@@ -1329,6 +1344,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             window_hours=_window_hours,
             min_cluster_size=_min_cluster,
             recall_attribution=recall_attribution,  # §7.E.0 membership + fluent feed
+            decompose_fn=decompose_fn,              # Bridge §7.1 Engram→Object decompose
+            felt_bridge=felt_bridge,                # Bridge §7.1/§7.2 tables
         )
         logger.info(
             "[synthesis_worker] ConsolidationPass ready — DREAM_STATE_CHANGED "
@@ -2445,6 +2462,21 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             payload.get("surfaced_tx") or [],
                             payload.get("cited_tx") or [],
                             float(_km_ts))
+                    except Exception:
+                        pass
+                continue
+
+            if msg_type == CGN_CONCEPT_GROUNDED:
+                # Inner↔Outer Felt-Teaching Bridge §7.2 — event-sourced CGN
+                # grounded-set. cgn_worker emits this when a concept matures across
+                # ≥2 consumers (cgn_worker.py:851; payload {concept_id, consumers,
+                # first_consumer}). We absorb the concept_id (the Object label) into
+                # FeltBridge's durable grounded-set so the next dream no longer flags
+                # it as a felt-gap. G18: fire-and-forget event consumption — NEVER a
+                # sync RPC into cgn_worker. Soft.
+                if felt_bridge is not None:
+                    try:
+                        felt_bridge.record_grounded(payload.get("concept_id"))
                     except Exception:
                         pass
                 continue

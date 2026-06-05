@@ -1333,6 +1333,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # sole consumer (INV-Syn-24 Tier-2 override via UserFeedbackOverride).
             _bus_constants.SKILL_REPAIR_FORK_SPAWNED,
             _bus_constants.USER_FEEDBACK_SIGNAL,
+            # Inner↔Outer Felt-Teaching Bridge §7.2 — event-sourced CGN grounded-set.
+            # Emitted by cgn_worker (to=cognitive_worker) when a concept matures across
+            # ≥2 consumers; synthesis_worker subscribes too (broadcast pub/sub) to feed
+            # FeltBridge.record_grounded → is_object_grounded (G18, no RPC into CGN).
+            _bus_constants.CGN_CONCEPT_GROUNDED,
             _bus_constants.KERNEL_EPOCH_TICK,
             _bus_constants.MODULE_SHUTDOWN,
         ],

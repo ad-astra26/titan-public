@@ -271,9 +271,48 @@ def make_default_llm_propose(provider: Any) -> Any:
     return _propose
 
 
+# ── Default decompose (Inner↔Outer Felt-Teaching Bridge §7.1) ──────
+
+
+def make_default_decompose(provider: Any, *, max_objects: int = 8) -> Any:
+    """Bind a provider into a sync `decompose_fn(name, sample_content) -> list[str]`
+    that decomposes an Engram(Idea) into its constituent Object labels
+    (RFP_inner_outer_felt_teaching_bridge §7.1). Mirrors `make_default_llm_propose`:
+    `LanguageTeacher` builds the prompt + parses (it never invokes the LLM itself);
+    this bridges the provider via `asyncio.run` (synthesis_worker's bus loop is
+    thread-based, no surrounding event loop).
+
+    Provider failure / parse error → `[]` (FeltBridge does NOT cache an empty result
+    → it retries next touch; a transient failure must never be frozen as "no
+    Objects"). Never raises."""
+    from titan_hcl.logic.language_teacher import LanguageTeacher
+
+    def _decompose(name: str, sample_content: str = "") -> list[str]:
+        spec = LanguageTeacher.build_decompose_prompt(
+            name, sample_content, max_objects=max_objects)
+        try:
+            text = asyncio.run(provider.complete(
+                prompt=spec["prompt"],
+                system=spec["system"],
+                temperature=0.2,
+                max_tokens=spec.get("max_tokens", 200),
+                timeout=45.0,
+            ))
+        except Exception as e:
+            logger.warning(
+                "[consolidation_defaults] decompose provider failed: %s", e)
+            return []
+
+        return LanguageTeacher.parse_decompose_objects(
+            text or "", max_objects=max_objects)
+
+    return _decompose
+
+
 __all__ = (
     "default_mine_recent_thoughts",
     "make_default_llm_propose",
+    "make_default_decompose",
     "_parse_llm_response",
     "_build_cluster_prompt",
 )
