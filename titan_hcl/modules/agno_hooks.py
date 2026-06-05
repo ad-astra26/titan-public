@@ -469,11 +469,12 @@ def _capture_pre_chat_felt(plugin) -> dict:
     """
     snap: dict = {}
     try:
+        # NEVER assign plugin._shm_reader_bank — it is a read-only @property
+        # (agno_worker_plugin). Use it if present, else build a throwaway bank.
         bank = getattr(plugin, "_shm_reader_bank", None)
         if bank is None:
             from titan_hcl.api.shm_reader_bank import ShmReaderBank
             bank = ShmReaderBank()
-            plugin._shm_reader_bank = bank
         nm = bank.read_neuromod()
         mods = (nm or {}).get("modulators", {}) or {}
         snap = {
@@ -481,8 +482,10 @@ def _capture_pre_chat_felt(plugin) -> dict:
             for name, m in mods.items()
             if isinstance(m, (dict, int, float)) and not isinstance(m, bool)
         }
+        logger.info("[FELT-DIAG] bank=%s nm_none=%s mods=%d snap=%d",
+                    type(bank).__name__, nm is None, len(mods), len(snap))
     except Exception as _felt_err:  # noqa: BLE001 — felt is best-effort, never blocks chat
-        logger.debug("[pre_hook] felt-at-lived-time SHM snapshot failed: %s", _felt_err)
+        logger.info("[FELT-DIAG] EXC %s: %s", type(_felt_err).__name__, _felt_err)
         snap = {}
     plugin._pre_chat_neuromods = snap
     return snap
