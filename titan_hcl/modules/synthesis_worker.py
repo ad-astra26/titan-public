@@ -688,12 +688,13 @@ def _recompute_loop(store: "ActivationStore",
                 "duration_ms": duration_ms,
             })
             pass_count += 1
-            if pass_count % 60 == 1:    # ~hourly summary
+            if pass_count <= 2 or pass_count % 60 == 1:    # ~hourly summary (+first 2 for RSS probe)
                 logger.info(
                     "[synthesis_worker] recompute pass #%d — items=%d "
                     "touched=%d bundles=%d duration=%dms errors=%d",
                     pass_count, items, n_touched, bundles_exported,
                     duration_ms, error_count)
+                _dbg_rss("recompute#%d" % pass_count, snapshot=True)
         except Exception as exc:
             error_count += 1
             logger.warning(
@@ -707,6 +708,35 @@ def _recompute_loop(store: "ActivationStore",
 
 
 @with_error_envelope(module_name="synthesis", subsystem="entry", severity=_phase11_sev.FATAL)
+def _dbg_rss(label: str, snapshot: bool = False) -> None:
+    """TEMP RSS-spike probe (T2 synthesis investigation 2026-06-05). Logs VmRSS at a
+    boot step; snapshot=True also dumps the tracemalloc top allocators (what is eating
+    the heap). Remove once T2's synthesis RSS bloat is root-caused."""
+    try:
+        rss = -1
+        with open("/proc/self/status") as _f:
+            for _l in _f:
+                if _l.startswith("VmRSS"):
+                    rss = int(_l.split()[1]) // 1024
+                    break
+        msg = "[RSS-PROBE] %s rss=%dMB" % (label, rss)
+        if snapshot:
+            try:
+                import tracemalloc as _tm
+                if _tm.is_tracing():
+                    top = _tm.take_snapshot().statistics("lineno")[:12]
+                    msg += " | TOP=" + "; ".join(
+                        "%s:%d=%.0fMB" % (
+                            _s.traceback[0].filename.split("/")[-1],
+                            _s.traceback[0].lineno, _s.size / 1e6)
+                        for _s in top)
+            except Exception:
+                pass
+        logger.info(msg)
+    except Exception:
+        pass
+
+
 def synthesis_worker_main(recv_queue, send_queue, name: str,
                           config: dict) -> None:
     """L2 module entry — Guardian supervised.
@@ -723,6 +753,15 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
     global _WORKER_READY
     _WORKER_READY = False
+
+    # TEMP (T2 synthesis RSS-spike investigation 2026-06-05) — trace boot RSS + allocs.
+    try:
+        import tracemalloc as _tm
+        if not _tm.is_tracing():
+            _tm.start()
+    except Exception:
+        pass
+    _dbg_rss("boot:start")
 
     from titan_hcl.core.state_registry import resolve_titan_id
 
@@ -1051,6 +1090,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             "attached" if index_db_conn else "missing",
             "tx_hash_store" if synth_vector_store is not None else "none",
             "attached" if kuzu_graph_obj is not None else "missing")
+        _dbg_rss("after_enginerecall")
 
         # Operator-closure Phase A2 — wire the incremental tx-index builder onto
         # the recompute-loop holder. Each 60s tick indexes new conversation/
@@ -1210,6 +1250,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             logger.info(
                 "[synthesis_worker] boot population groundedness recompute: "
                 "%d Engrams percentile-blended (§7.D)", migrated)
+            _dbg_rss("after_pop_recompute", snapshot=True)
         except Exception as _pop_err:
             logger.warning(
                 "[synthesis_worker] boot population recompute failed: %s", _pop_err)
