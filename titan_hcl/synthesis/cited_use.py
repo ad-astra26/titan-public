@@ -35,12 +35,19 @@ class SurfacedItem:
     Assembled by the agno caller from the `retrieval` buffer rows (P7) + the
     VCB-built context for the turn. `item_id` is the stable activation key
     already used by the P1 emit (`mem:<id>` / `tx:<hash>`).
+
+    `source` (RFP_synthesis_decision_authority P3) tags which substrate
+    delivered the item — one of {"recall" (synthesis tx-hash spine), "vcb"
+    (VCB inner-titan state), "memory" (legacy memory.query)}. It is the input
+    to the sovereignty `V` term (vcb_inner_cited / total_substrate_cited). Empty
+    string = unknown/untagged (back-compat; counts toward the denominator only).
     """
 
     item_id: str
     title: str = ""
     content_snippet: str = ""
     concept_ids: list[str] = field(default_factory=list)
+    source: str = ""
 
 
 # Token splitter: words of letters/digits/underscore. Used for the substring
