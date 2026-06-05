@@ -721,11 +721,35 @@ def _dbg_rss(label: str, snapshot: bool = False) -> None:
                     break
         msg = "[RSS-PROBE] %s rss=%dMB" % (label, rss)
         if snapshot:
+            # NATIVE breakdown via smaps (tracemalloc is blind to C allocs:
+            # FAISS / kuzu / gguf / duckdb) — anon heap + top file-backed mappings.
+            try:
+                maps: dict = {}
+                anon = 0
+                cur = None
+                with open("/proc/self/smaps") as _sf:
+                    for _ln in _sf:
+                        if (len(_ln) > 12 and _ln[0] not in " \t"
+                                and "-" in _ln[:18]):
+                            _p = _ln.split()
+                            cur = _p[5] if len(_p) >= 6 else None
+                        elif _ln.startswith("Rss:"):
+                            _kb = int(_ln.split()[1])
+                            if cur:
+                                maps[cur] = maps.get(cur, 0) + _kb
+                            else:
+                                anon += _kb
+                _topm = sorted(maps.items(), key=lambda x: -x[1])[:8]
+                msg += " | NATIVE anon=%dMB " % (anon // 1024) + "; ".join(
+                    "%s=%dMB" % (_k.split("/")[-1], _v // 1024)
+                    for _k, _v in _topm if _v > 5000)
+            except Exception:
+                pass
             try:
                 import tracemalloc as _tm
                 if _tm.is_tracing():
-                    top = _tm.take_snapshot().statistics("lineno")[:12]
-                    msg += " | TOP=" + "; ".join(
+                    top = _tm.take_snapshot().statistics("lineno")[:6]
+                    msg += " | PY=" + "; ".join(
                         "%s:%d=%.0fMB" % (
                             _s.traceback[0].filename.split("/")[-1],
                             _s.traceback[0].lineno, _s.size / 1e6)
@@ -1090,7 +1114,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             "attached" if index_db_conn else "missing",
             "tx_hash_store" if synth_vector_store is not None else "none",
             "attached" if kuzu_graph_obj is not None else "missing")
-        _dbg_rss("after_enginerecall")
+        _dbg_rss("after_enginerecall", snapshot=True)
 
         # Operator-closure Phase A2 — wire the incremental tx-index builder onto
         # the recompute-loop holder. Each 60s tick indexes new conversation/
