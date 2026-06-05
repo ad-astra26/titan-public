@@ -1,6 +1,6 @@
-"""Phase 4 — Observatory /v6/synthesis/concepts/* handler tests (§P4.I + FU-1).
+"""Phase 4 — Observatory /v6/synthesis/engrams/* handler tests (§P4.I + FU-1).
 
-Covers `titan_hcl/api/synthesis_concept_handlers.py`:
+Covers `titan_hcl/api/synthesis_engram_handlers.py`:
 - list endpoint: pagination, memory_type filter, ordering by groundedness DESC
 - get-one endpoint: returns all versions + composition edges
 - heatmap endpoint: 4x10 grid bucketed by (memory_type, groundedness decile)
@@ -8,7 +8,7 @@ Covers `titan_hcl/api/synthesis_concept_handlers.py`:
 
 FU-1 swapped the read source from direct Kuzu to data/spine_snapshot.json
 (written by synthesis_worker each 60s tick). Tests build the spine via
-ConceptStore in a tmp dir, call concept_store.export_snapshot() to write
+EngramStore in a tmp dir, call engram_store.export_snapshot() to write
 the JSON, then close the Kuzu writer and exercise the handlers (which read
 the JSON only — no Kuzu open).
 """
@@ -20,9 +20,9 @@ import tempfile
 
 import pytest
 
-from titan_hcl.api import synthesis_concept_handlers as handlers
+from titan_hcl.api import synthesis_engram_handlers as handlers
 from titan_hcl.core.direct_memory import TitanKnowledgeGraph
-from titan_hcl.synthesis.concept_store import ConceptStore
+from titan_hcl.synthesis.engram_store import EngramStore
 from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter
 
 
@@ -39,7 +39,7 @@ def seeded_kuzu(monkeypatch):
         g = TitanKnowledgeGraph(kuzu_path)
         q = queue.Queue()
         w = OuterMemoryWriter(send_queue=q, src="api_test")
-        store = ConceptStore(g, w, clock=lambda: 1000.0)
+        store = EngramStore(g, w, clock=lambda: 1000.0)
 
         store.create_concept("linux_terminal", "Linux terminal",
                              memory_type="declarative")
@@ -76,45 +76,45 @@ def seeded_kuzu(monkeypatch):
 
 
 def test_list_returns_all_concepts_ordered_by_groundedness(seeded_kuzu):
-    resp = handlers.get_synthesis_concepts(limit=20)
+    resp = handlers.get_synthesis_engrams(limit=20)
     assert resp["ok"] is True
     assert resp["total"] == 4
-    concepts = resp["concepts"]
+    concepts = resp["engrams"]
     # Ordered groundedness DESC.
     scores = [c["groundedness"] for c in concepts]
     assert scores == sorted(scores, reverse=True)
 
 
 def test_list_memory_type_filter(seeded_kuzu):
-    resp = handlers.get_synthesis_concepts(memory_type="declarative")
+    resp = handlers.get_synthesis_engrams(memory_type="declarative")
     assert resp["ok"] is True
     # declarative: linux_terminal v=2, linux_basics v=1
     assert resp["total"] == 2
-    for c in resp["concepts"]:
+    for c in resp["engrams"]:
         assert c["memory_type"] == "declarative"
 
 
 def test_list_pagination(seeded_kuzu):
-    resp1 = handlers.get_synthesis_concepts(limit=2, offset=0)
-    resp2 = handlers.get_synthesis_concepts(limit=2, offset=2)
+    resp1 = handlers.get_synthesis_engrams(limit=2, offset=0)
+    resp2 = handlers.get_synthesis_engrams(limit=2, offset=2)
     assert resp1["total"] == 4 and resp2["total"] == 4
-    ids1 = {c["concept_id"] for c in resp1["concepts"]}
-    ids2 = {c["concept_id"] for c in resp2["concepts"]}
+    ids1 = {c["engram_id"] for c in resp1["engrams"]}
+    ids2 = {c["engram_id"] for c in resp2["engrams"]}
     assert not (ids1 & ids2)  # disjoint pages
 
 
 def test_list_clamps_excessive_limit(seeded_kuzu):
     """limit=99999 must not blow up; clamped to 500 page cap."""
-    resp = handlers.get_synthesis_concepts(limit=99999)
+    resp = handlers.get_synthesis_engrams(limit=99999)
     assert resp["ok"] is True
-    assert len(resp["concepts"]) <= 500
+    assert len(resp["engrams"]) <= 500
 
 
 # ── Get-one endpoint ───────────────────────────────────────────────
 
 
 def test_get_one_returns_all_versions(seeded_kuzu):
-    resp = handlers.get_synthesis_concept("linux_terminal")
+    resp = handlers.get_synthesis_engram("linux_terminal")
     assert resp["ok"] is True
     assert resp["exists"] is True
     versions = resp["versions"]
@@ -127,34 +127,34 @@ def test_get_one_returns_all_versions(seeded_kuzu):
 
 def test_get_one_returns_composition_edges(seeded_kuzu):
     """linux_basics v1 has COMPOSED_FROM → linux_terminal v1."""
-    resp = handlers.get_synthesis_concept("linux_basics")
+    resp = handlers.get_synthesis_engram("linux_basics")
     assert resp["ok"] is True
     assert resp["exists"] is True
     composed_from = resp["composed_from"]
     assert any(
-        e["concept_id"] == "linux_terminal" and e["version"] == 1
+        e["engram_id"] == "linux_terminal" and e["version"] == 1
         for e in composed_from
     )
 
 
 def test_get_one_missing_concept_returns_empty_versions(seeded_kuzu):
-    resp = handlers.get_synthesis_concept("never_existed")
+    resp = handlers.get_synthesis_engram("never_existed")
     assert resp["ok"] is True
     assert resp["exists"] is False
     assert resp["versions"] == []
 
 
 def test_get_one_empty_concept_id_rejected(seeded_kuzu):
-    resp = handlers.get_synthesis_concept("")
+    resp = handlers.get_synthesis_engram("")
     assert resp["ok"] is False
-    assert "empty_concept_id" in resp.get("error", "")
+    assert "empty_engram_id" in resp.get("error", "")
 
 
 # ── Heatmap endpoint ───────────────────────────────────────────────
 
 
 def test_heatmap_buckets_by_memory_type_and_decile(seeded_kuzu):
-    resp = handlers.get_synthesis_concepts_heatmap()
+    resp = handlers.get_synthesis_engrams_heatmap()
     assert resp["ok"] is True
     heatmap = resp["heatmap"]
     # 4 memory types × 10 deciles.
@@ -172,7 +172,7 @@ def test_heatmap_solana_rpc_lands_in_mid_decile(seeded_kuzu):
     """solana_rpc has the highest groundedness in the seed set
     (epi=50 + proc=10 → g ≈ 0.54 with default weights). Lands in the
     procedural row's decile 5+."""
-    resp = handlers.get_synthesis_concepts_heatmap()
+    resp = handlers.get_synthesis_engrams_heatmap()
     proc_row = resp["heatmap"]["procedural"]
     # At least one procedural concept in decile 5+ (solana_rpc).
     assert sum(proc_row[5:]) >= 1
@@ -187,17 +187,17 @@ def test_missing_snapshot_returns_empty_response(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setenv("TITAN_DATA_DIR", tmp)
         handlers._reset_cache_for_tests()
-        resp = handlers.get_synthesis_concepts()
+        resp = handlers.get_synthesis_engrams()
         assert resp["ok"] is True
-        assert resp["concepts"] == []
+        assert resp["engrams"] == []
         assert resp.get("snapshot") == "missing"
 
-        resp2 = handlers.get_synthesis_concept("anything")
+        resp2 = handlers.get_synthesis_engram("anything")
         assert resp2["ok"] is True
         assert resp2["versions"] == []
         assert resp2.get("snapshot") == "missing"
 
-        resp3 = handlers.get_synthesis_concepts_heatmap()
+        resp3 = handlers.get_synthesis_engrams_heatmap()
         assert resp3["ok"] is True
         assert resp3.get("snapshot") == "missing"
         # Empty heatmap = all zeros.
@@ -230,11 +230,11 @@ def test_stale_snapshot_returns_data_with_stale_flag(monkeypatch):
         old = time.time() - (handlers.SNAPSHOT_STALENESS_SECONDS + 60)
         os.utime(snap_path, (old, old))
 
-        resp = handlers.get_synthesis_concepts()
+        resp = handlers.get_synthesis_engrams()
         assert resp["ok"] is True
         assert resp["snapshot"] == "stale"
         # Data still returned (UI can choose to render with a warning).
-        assert len(resp["concepts"]) == 1
+        assert len(resp["engrams"]) == 1
 
 
 def test_corrupt_snapshot_returns_empty_response(monkeypatch):
@@ -248,7 +248,7 @@ def test_corrupt_snapshot_returns_empty_response(monkeypatch):
         snap_path = os.path.join(tmp, "spine_snapshot.json")
         with open(snap_path, "w") as f:
             f.write("{not valid json")
-        resp = handlers.get_synthesis_concepts()
+        resp = handlers.get_synthesis_engrams()
         assert resp["ok"] is True
-        assert resp["concepts"] == []
+        assert resp["engrams"] == []
         assert resp["snapshot"] == "corrupt"

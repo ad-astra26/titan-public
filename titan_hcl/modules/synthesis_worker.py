@@ -52,6 +52,7 @@ The recompute loop is a no-op until `MEMORY_RETRIEVAL_USED` events arrive
 """
 from __future__ import annotations
 
+import faulthandler
 import json
 import logging
 import os
@@ -66,7 +67,9 @@ import msgpack
 
 from titan_hcl import bus
 from titan_hcl.bus import (
+    CGN_CONCEPT_GROUNDED,
     DREAM_STATE_CHANGED,
+    ENGRAM_FELT_CANDIDATE,
     KERNEL_EPOCH_TICK,
     KNOWLEDGE_MOMENT,
     MAINTAIN_BUNDLE,
@@ -99,11 +102,14 @@ from titan_hcl.synthesis.standing_store import (
 from titan_hcl.synthesis.recall import EngineRecall
 from titan_hcl.synthesis.writer import (
     SynthesisWriter,
+    BOOT_SYNC_TIMEOUT_S,
     guard_conn,
     resolve_writer,
 )
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
+from titan_hcl.errors import ModuleError, ModuleErrorCode
+from titan_hcl.bus import publish_module_error
 
 # Process-local EngineRecall singleton (PLAN §2D). Constructed during
 # synthesis_worker_main boot; exposed via get_engine_recall() so future
@@ -142,6 +148,25 @@ _WORKER_READY: bool = False
 
 
 HEARTBEAT_INTERVAL_S = 30.0
+# Freeze-watchdog deadline (2026-06-05 heartbeat-timeout hunt). The heartbeat
+# thread re-arms a faulthandler all-thread stack dump every beat; if the process
+# freezes (a thread holds the GIL or blocks a lock) and the heartbeat loop cannot
+# re-arm within this many seconds, faulthandler dumps EVERY thread's stack to
+# stderr → the journal, naming the exact frozen op. Sized < the 60s guardian
+# heartbeat_timeout so the dump lands BEFORE the kill, and > HEARTBEAT_INTERVAL_S
+# so a healthy beat always cancels+re-arms it (no dump in steady state).
+HB_FREEZE_DUMP_S = 50.0
+# Recompute-pass duration above which we log a WARNING regardless of pass count
+# (a single slow pass on the recompute thread is a prime heartbeat-freeze suspect).
+RECOMPUTE_SLOW_WARN_MS = 10_000
+# Bounded boot-alive window (root-cause fix 2026-06-04): the heartbeat thread
+# emits the SHM heartbeat DURING boot (not just after _WORKER_READY) up to this
+# many seconds, so a slow boot under a respawn cascade reports ALIVE instead of
+# being false-detected as CRASHED (shm_pid_dead). Generous enough to ride out a
+# cascade; bounded so a GENUINELY stuck boot still stops heartbeating and gets
+# restarted (no hidden hang). State stays starting/booted; readiness stays
+# probe-gated (SPEC §11.I.2 / §11.I.7).
+BOOT_HEARTBEAT_GRACE_S = 300.0
 RECOMPUTE_INTERVAL_S = 60.0          # arch §5.2 60s recompute cadence
 SYNTH_STATUS_SLOT_NAME = "synth_status"     # /dev/shm/titan_<id>/synth_status.bin
 SYNTH_STATUS_PAYLOAD_BYTES = 24             # struct '<ddII'
@@ -155,6 +180,13 @@ SYNTH_STATUS_PAYLOAD_BYTES = 24             # struct '<ddII'
 # same synth_status.bin watermark for freshness. Snapshot atomic via
 # write-tmp + os.replace.
 ACTIVATION_SNAPSHOT_NAME = "activation_snapshot.json"
+
+# WAL-hygiene (bugfix 2026-06-05) — checkpoint the synthesis_spine Kuzu graph
+# whenever its un-checkpointed `.wal` crosses this size, so its replay-on-open
+# cost stays small. Kept low: a Guardian-supervised module is killed (never
+# cleanly closed), so the only thing that ever clears the WAL is an explicit
+# checkpoint. (T2 2026-06-05: a 632 KB WAL already replayed to +420 MB.)
+_KUZU_WAL_CHECKPOINT_MB = 4.0
 
 # Phase 4 FU-1 — concept-spine cross-process read surface. synthesis_worker
 # exports the full Kuzu spine state to JSON each 60s recompute pass; the api
@@ -311,15 +343,20 @@ class ActivationStore:
         # cross-process readers use atomic JSON snapshots, never this handle.)
         self._writer = resolve_writer(writer)
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        # BOOT_SYNC_TIMEOUT_S (not the 30s steady-state default): this is the
+        # boot-CRITICAL connect+schema+load. Under a respawn cascade the writer
+        # thread can be CPU-starved, so it gets room to complete instead of a
+        # TimeoutError crash on init (root-cause fix 2026-06-04 — T1 mainnet).
         self._conn = guard_conn(
             self._writer,
-            self._writer.submit_sync(lambda: duckdb.connect(db_path)))
+            self._writer.submit_sync(
+                lambda: duckdb.connect(db_path), timeout=BOOT_SYNC_TIMEOUT_S))
         # Cache resumes ACT-R activation across restarts. Schema + resume-load
         # run on the writer thread (boot is single-threaded, so they complete
         # before any other thread submits an op).
         self._cache: dict[str, ActivationState] = {}
-        self._writer.submit_sync(self._init_schema)
-        self._writer.submit_sync(self._load_existing)
+        self._writer.submit_sync(self._init_schema, timeout=BOOT_SYNC_TIMEOUT_S)
+        self._writer.submit_sync(self._load_existing, timeout=BOOT_SYNC_TIMEOUT_S)
 
     def _init_schema(self) -> None:
         # CREATE TABLE IF NOT EXISTS is idempotent across restarts. Mirrors the
@@ -498,7 +535,8 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
 
 def _heartbeat_loop(send_queue, name: str,
                     stop_event: threading.Event,
-                    state_writer: Optional[Any] = None) -> None:
+                    state_writer: Optional[Any] = None,
+                    boot_deadline: Optional[float] = None) -> None:
     """Daemon thread — MODULE_HEARTBEAT every 30s.
 
     Phase 11 §11.I.5 (Chunk 11N): also publishes
@@ -510,28 +548,83 @@ def _heartbeat_loop(send_queue, name: str,
     """
     _hb_last = time.monotonic()
     while not stop_event.is_set():
+        # Freeze-watchdog (2026-06-05): re-arm a faulthandler all-thread stack
+        # dump at the TOP of every beat. A healthy next beat (≤30s) cancels +
+        # re-arms it; if THIS process freezes (a thread holds the GIL, or
+        # heartbeat() blocks on _write_lock) the loop cannot re-arm within
+        # HB_FREEZE_DUMP_S → faulthandler dumps EVERY thread's stack to stderr
+        # → the journal, naming the exact frozen op BEFORE the 60s guardian kill.
+        try:
+            faulthandler.cancel_dump_traceback_later()
+            faulthandler.dump_traceback_later(HB_FREEZE_DUMP_S, repeat=False)
+        except Exception:  # never let the watchdog break the heartbeat
+            pass
         _hb_gap = time.monotonic() - _hb_last
         _hb_last = time.monotonic()
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
-        if state_writer is not None and _WORKER_READY:
-            try:
-                state_writer.heartbeat()
-                # TRACE (RFP §7.D flap hunt): a large gap = the heartbeat thread
-                # was starved (GIL held by a bulk op on another thread) → SHM slot
-                # goes stale → guardian shm_pid_dead. Surfaces starvation directly.
-                if _hb_gap > HEARTBEAT_INTERVAL_S * 1.5:
+        if state_writer is not None:
+            # Emit the SHM heartbeat once READY (steady state) OR during boot
+            # while still within the boot-grace window (root-cause fix
+            # 2026-06-04). A slow boot under a respawn cascade then reports
+            # ALIVE (state stays starting/booted — heartbeat() preserves state;
+            # readiness stays probe-gated) instead of being false-detected as
+            # CRASHED via a stale slot and killed mid-init. Past the boot
+            # deadline a still-not-ready worker stops heartbeating → a genuinely
+            # stuck boot is caught by EMPTY/CRASHED supervision (no hidden hang).
+            _booting_ok = (boot_deadline is not None
+                           and time.monotonic() < boot_deadline)
+            if _WORKER_READY or _booting_ok:
+                _hb_w0 = time.monotonic()
+                try:
+                    state_writer.heartbeat()
+                except Exception as _hb_err:
+                    # NEVER silent (directive_error_visibility / SPEC §11.I.4):
+                    # a failed SHM heartbeat write is exactly how the slot goes
+                    # stale → guardian heartbeat_timeout. Surface it in the journal
+                    # AND on the MODULE_ERROR cascade (WARN = informational, no
+                    # restart impact) so the next freeze names its own cause.
                     logger.warning(
-                        "[synthesis_worker] HB STARVED — gap=%.1fs (expected ~%.1fs)"
-                        " — heartbeat thread blocked by a GIL-holding bulk op; SHM"
-                        " slot went stale", _hb_gap, HEARTBEAT_INTERVAL_S)
-            except Exception:  # noqa: BLE001
-                pass
-        elif state_writer is not None:
-            logger.warning(
-                "[synthesis_worker] HB SUPPRESSED — _WORKER_READY=False (probe "
-                "handshake not complete %.0fs into life) — SHM slot stays stale",
-                _hb_gap)
+                        "[synthesis_worker] HB WRITE FAILED — state_writer."
+                        "heartbeat() raised %r — SHM slot will go stale → "
+                        "guardian heartbeat_timeout", _hb_err, exc_info=True)
+                    try:
+                        publish_module_error(send_queue, ModuleError(
+                            module_name=name, subsystem="heartbeat",
+                            error_code=ModuleErrorCode.SHM_WRITE_FAILED,
+                            severity=_phase11_sev.WARN,
+                            message="synthesis SHM heartbeat write failed",
+                            detail=repr(_hb_err)))
+                    except Exception as _casc_err:
+                        logger.debug(
+                            "[synthesis_worker] HB error cascade publish failed: "
+                            "%s", _casc_err)
+                else:
+                    # A large GAP since the last beat = this thread was starved
+                    # (GIL held by a bulk op on another thread). A large WRITE
+                    # duration = heartbeat() blocked on ModuleStateWriter._write_lock
+                    # (a slow concurrent publish). Either → SHM slot stale →
+                    # guardian heartbeat_timeout. Log BOTH so a near-miss is visible
+                    # even when faulthandler's harder threshold didn't trip.
+                    _hb_write_ms = (time.monotonic() - _hb_w0) * 1000.0
+                    if _WORKER_READY and (_hb_gap > HEARTBEAT_INTERVAL_S * 1.5
+                                          or _hb_write_ms > 2000.0):
+                        logger.warning(
+                            "[synthesis_worker] HB SLOW — gap=%.1fs write=%.0fms "
+                            "(expected gap ~%.1fs, write <100ms) — heartbeat path "
+                            "delayed; SHM slot at risk of staleness",
+                            _hb_gap, _hb_write_ms, HEARTBEAT_INTERVAL_S)
+            else:
+                logger.warning(
+                    "[synthesis_worker] HB SUPPRESSED — not READY + past boot "
+                    "grace (%.0fs into life) — SHM slot stale, guardian will "
+                    "restart a genuinely stuck boot", _hb_gap)
         stop_event.wait(HEARTBEAT_INTERVAL_S)
+    # Loop exiting (shutdown) — disarm the freeze-watchdog so a clean stop
+    # never trips a spurious dump.
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
 
 
 def _tx_index_loop(tx_index_holder: dict, stop_event: threading.Event,
@@ -562,6 +655,7 @@ def _recompute_loop(store: "ActivationStore",
                     oracle_exporter_holder: dict,
                     metrics_exporter_holder: dict,
                     tx_index_holder: dict,
+                    kuzu_checkpoint_holder: dict,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
@@ -596,7 +690,7 @@ def _recompute_loop(store: "ActivationStore",
             bundles_exported = bundle_store.export_snapshot(bundle_snapshot_path)
             # Phase 4 FU-1 — spine snapshot for cross-process api reads.
             # Holder pattern: synthesis_worker_main sets the exporter to
-            # ConceptStore.export_snapshot AFTER kuzu_graph_obj is wired;
+            # EngramStore.export_snapshot AFTER kuzu_graph_obj is wired;
             # default no-op until that completes.
             try:
                 spine_exporter_holder["fn"]()
@@ -640,6 +734,17 @@ def _recompute_loop(store: "ActivationStore",
                     "[synthesis_worker] metrics_exporter call failed: %s",
                     _met_exp_err,
                 )
+            # WAL-hygiene (bugfix 2026-06-05) — bound the Kuzu spine WAL so its
+            # replay-on-open cost can never grow into the OOM-loop danger zone.
+            # No-op until wired (kuzu_graph_obj open) + only checkpoints past the
+            # size threshold / every ~30 passes (self-throttled inside the tick).
+            try:
+                kuzu_checkpoint_holder["fn"]()
+            except Exception as _kck_err:
+                logger.debug(
+                    "[synthesis_worker] kuzu_checkpoint call failed: %s",
+                    _kck_err,
+                )
             # G13 (AUDIT §5.3): the tx-index FAISS build (embed + add, bounded)
             # runs on its OWN `synthesis-tx-index` daemon thread now — NOT
             # inline here — so a slow embed (the embedder lazy-load is seconds)
@@ -665,6 +770,16 @@ def _recompute_loop(store: "ActivationStore",
                     "touched=%d bundles=%d duration=%dms errors=%d",
                     pass_count, items, n_touched, bundles_exported,
                     duration_ms, error_count)
+            # Heartbeat-freeze hunt (2026-06-05): a single slow recompute pass on
+            # this thread is a prime suspect for starving the 30s heartbeat. Warn
+            # on ANY pass over the threshold (independent of the hourly summary) so
+            # a creeping recompute names itself well before it hits 60s.
+            if duration_ms > RECOMPUTE_SLOW_WARN_MS:
+                logger.warning(
+                    "[synthesis_worker] recompute pass #%d SLOW — duration=%dms "
+                    "(items=%d touched=%d) — a pass approaching 60s will starve "
+                    "the heartbeat → guardian heartbeat_timeout",
+                    pass_count, duration_ms, items, n_touched)
         except Exception as exc:
             error_count += 1
             logger.warning(
@@ -677,7 +792,6 @@ def _recompute_loop(store: "ActivationStore",
         stop_event.wait(remaining)
 
 
-@with_error_envelope(module_name="synthesis", subsystem="entry", severity=_phase11_sev.FATAL)
 def synthesis_worker_main(recv_queue, send_queue, name: str,
                           config: dict) -> None:
     """L2 module entry — Guardian supervised.
@@ -740,6 +854,26 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             "[synthesis_worker] Phase 11 ModuleStateWriter init failed "
             "(continuing on legacy path): %s", _sw_err)
 
+    # ── Liveness BEFORE the heavy init (root-cause fix 2026-06-04) ──────────
+    # Start the heartbeat thread NOW — before the boot-critical duckdb.connect +
+    # schema/load below — and let it emit the SHM heartbeat DURING boot (bounded
+    # by BOOT_HEARTBEAT_GRACE_S). Previously the hb thread started AFTER the
+    # connect, and the SHM heartbeat was suppressed until _WORKER_READY (end of
+    # boot), so a slow boot under a respawn cascade (box CPU/I/O starved) emitted
+    # no SHM heartbeat → guardian false-detected the alive-but-still-booting
+    # worker as CRASHED (shm_pid_dead) and killed it mid-init. State stays
+    # starting/booted (heartbeat() preserves state); readiness is still
+    # probe-gated (state→running only via the recv-loop probe, post-_WORKER_READY),
+    # so nothing routes work early. SPEC-aligned: §11.I.2 (state machine
+    # unchanged) + §11.I.7 (staleness-supervision is a RUNNING-state concern).
+    stop_event = threading.Event()
+    _boot_hb_deadline = time.monotonic() + BOOT_HEARTBEAT_GRACE_S
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(send_queue, name, stop_event, _state_writer, _boot_hb_deadline),
+        daemon=True, name=f"synthesis-hb-{name}")
+    hb_thread.start()
+
     # DuckDB path — synthesis_worker owns its OWN file (not titan_memory.duckdb)
     # per G21 / INV-Syn-3 to avoid the cross-worker R/W lock conflict
     # (DuckDB v0.8+ rejects two R/W connections to one file across
@@ -770,6 +904,29 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     store = ActivationStore(db_path, writer=db_writer)
     status_writer = SynthStatusWriter(titan_id)
     registry = PlugRegistry()
+
+    # §7.E.0 — per-Engram citation attribution: the membership reverse-index +
+    # the live `fluent` axis feed + §7.E's `(axes_at_recall, cited?)` reward log.
+    # Shares ActivationStore's ONE guarded conn (store._conn) + the sole writer
+    # (G21 / INV-Syn-28). Soft: a schema-DDL failure disables attribution for the
+    # session; synthesis is otherwise unaffected. In scope from here for the
+    # ConsolidationPass injection AND the KNOWLEDGE_MOMENT handler below.
+    from titan_hcl.synthesis.recall_attribution import RecallAttribution
+    recall_attribution: Optional[RecallAttribution] = RecallAttribution(
+        store._conn, db_writer)
+    if not recall_attribution.ensure_schema():
+        recall_attribution = None
+
+    # Inner↔Outer Felt-Teaching Bridge (RFP_inner_outer_felt_teaching_bridge) —
+    # shares ActivationStore's ONE guarded conn (store._conn) + the sole writer
+    # (db_writer), like recall_attribution. Owns the §7.1 decompose cache
+    # (engram_objects) + the §7.2 event-sourced CGN grounded-set
+    # (cgn_grounded_objects). In scope from here for the ConsolidationPass injection
+    # AND the CGN_CONCEPT_GROUNDED handler below. Soft → None (synthesis unaffected).
+    from titan_hcl.synthesis.felt_bridge import FeltBridge
+    felt_bridge: Optional[FeltBridge] = FeltBridge(store._conn, db_writer)
+    if not felt_bridge.ensure_schema():
+        felt_bridge = None
 
     # Phase 2 D-P2-4 standing-bundle store — sole writer of
     # data/synthesis.duckdb / association_bundles. CONN-2 FOLD (AUDIT §5.2):
@@ -806,17 +963,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # doesn't contend with activation recompute.
     cache_lock = threading.Lock()
 
-    stop_event = threading.Event()
-    # Phase 11 §11.I.5 — pass state_writer so heartbeat thread mirrors
-    # MODULE_HEARTBEAT to the SHM slot once _WORKER_READY flips True.
-    hb_thread = threading.Thread(
-        target=_heartbeat_loop,
-        args=(send_queue, name, stop_event, _state_writer),
-        daemon=True, name=f"synthesis-hb-{name}")
-    hb_thread.start()
+    # (stop_event + the heartbeat thread are now started EARLIER — before the
+    # heavy duckdb init above — so liveness covers the boot-critical connect.
+    # See the "Liveness BEFORE the heavy init" block near the top of boot.)
 
     # Phase 4 FU-1 — spine exporter holder (late-bound). Default is a
-    # no-op so the recompute loop fires safely before the ConceptStore is
+    # no-op so the recompute loop fires safely before the EngramStore is
     # ready. The consolidation wiring below sets the real exporter.
     spine_exporter_holder: dict = {"fn": lambda: None}
     # Phase 5 §P5.I — forks exporter + activation updater holders
@@ -835,6 +987,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # (late-bound; set once the SynthesisVectorStore + TxIndexBuilder are wired
     # below). Default no-op so the recompute loop fires safely before wiring.
     tx_index_holder: dict = {"fn": lambda: None}
+    # WAL-hygiene (bugfix 2026-06-05) — periodic Kuzu spine checkpoint holder
+    # (late-bound; set after the spine graph opens). Bounds the synthesis_spine
+    # WAL so its replay-on-open can never grow into the OOM-loop danger zone.
+    kuzu_checkpoint_holder: dict = {"fn": lambda: None}
 
     # Operator-closure Phase A — ONE shared embedder for the whole worker (the
     # tx_hash FAISS store, EngineRecall's query embed, the consolidation cosine
@@ -897,7 +1053,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
               bundle_snapshot_path, spine_exporter_holder,
               fork_exporter_holder, fork_activation_updater_holder,
               oracle_exporter_holder, metrics_exporter_holder,
-              tx_index_holder,
+              tx_index_holder, kuzu_checkpoint_holder,
               send_queue, name,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
@@ -920,7 +1076,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # rejection (same class of cross-process conflict the Phase 1 lesson
     # 1 solved for DuckDB by giving synthesis_worker its own .duckdb).
     # Cross-process readers open this file with read_only=True (api
-    # process for /v6/synthesis/concepts/* — Kuzu 0.11 supports
+    # process for /v6/synthesis/engrams/* — Kuzu 0.11 supports
     # concurrent read-only opens against an active writer).
     kuzu_graph_obj: Optional[Any] = None
     try:
@@ -928,12 +1084,49 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         kuzu_graph_obj = TitanKnowledgeGraph(
             os.path.join(os.path.dirname(db_path) or ".", "synthesis_spine.kuzu"),
         )
+        # WAL hygiene (bugfix 2026-06-05) — a Guardian-supervised module is
+        # KILLED, never cleanly closed, so the Kuzu WAL only ever GROWS across
+        # boots and is replayed in full on every open. Once that replay cost
+        # crosses synthesis's RSS cap the module OOM-loops *before* it can ever
+        # checkpoint → dirty WAL forever (T2 2026-06-05: 632 KB WAL → +420 MB
+        # per boot → DISABLED). Checkpoint once at boot to clear the prior
+        # session's + the schema-DDL WAL immediately, then bound it periodically
+        # in the recompute loop (see kuzu_checkpoint_holder below).
+        _boot_wal = kuzu_graph_obj.wal_size_mb()
+        if kuzu_graph_obj.checkpoint():
+            logger.info(
+                "[synthesis_worker] Kuzu spine boot checkpoint — WAL %.1fMB → cleared",
+                _boot_wal)
     except Exception as exc:
         logger.warning(
             "[synthesis_worker] Kuzu spine graph open failed: %s — spine "
             "recall + consolidation will degrade to no-op",
             exc,
         )
+
+    # Bound the spine WAL during a long-running session: each recompute tick,
+    # checkpoint when the WAL crosses a low threshold OR every ~30 passes, so it
+    # can never accumulate back to the OOM-loop danger zone. Default no-op until
+    # wired here (kuzu_graph_obj may be None on open failure). G21 sole-writer
+    # (INV-Syn-7) — safe to checkpoint from the recompute thread.
+    if kuzu_graph_obj is not None:
+        _kuzu_ckpt_state = {"pass": 0}
+
+        def _kuzu_checkpoint_tick() -> None:
+            try:
+                _kuzu_ckpt_state["pass"] += 1
+                wal_mb = kuzu_graph_obj.wal_size_mb()
+                if wal_mb >= _KUZU_WAL_CHECKPOINT_MB or _kuzu_ckpt_state["pass"] % 30 == 0:
+                    if kuzu_graph_obj.checkpoint() and wal_mb >= 1.0:
+                        logger.info(
+                            "[synthesis_worker] Kuzu spine checkpoint — WAL "
+                            "%.1fMB → cleared (pass=%d)",
+                            wal_mb, _kuzu_ckpt_state["pass"])
+            except Exception as _ck_err:
+                logger.debug(
+                    "[synthesis_worker] Kuzu checkpoint tick failed: %s", _ck_err)
+
+        kuzu_checkpoint_holder["fn"] = _kuzu_checkpoint_tick
 
     # Phase 2 D-P2-1 EngineRecall — contract-driven recall coordinator.
     # Lazy-open a read-only sqlite handle on data/timechain/index.db so
@@ -1072,21 +1265,22 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # the proposer returns all-reject (pass still mines + anchors summary
     # TXs for audit; spine writes simply don't happen until provider lands).
     consolidation_pass: Optional[Any] = None
-    # Phase 4 FU-1 — the ConceptStore instance is hoisted into the outer
-    # scope so the recompute loop can call concept_store.export_snapshot()
+    # Phase 4 FU-1 — the EngramStore instance is hoisted into the outer
+    # scope so the recompute loop can call engram_store.export_snapshot()
     # each 60s tick regardless of whether ConsolidationPass construction
     # succeeded. Stays None if kuzu_graph_obj is unavailable.
-    concept_store: Optional[Any] = None
+    engram_store: Optional[Any] = None
     last_dream_pass_started_ts: float = 0.0
     consolidation_thread_lock = threading.Lock()
     try:
         from titan_hcl.synthesis.cgn_bridge import CGNRegistrationBridge
-        from titan_hcl.synthesis.concept_store import ConceptStore
+        from titan_hcl.synthesis.engram_store import EngramStore
         from titan_hcl.synthesis.consolidation import (
             ConsolidationPass, LLMProposal,
         )
         from titan_hcl.synthesis.consolidation_defaults import (
             default_mine_recent_thoughts, make_default_llm_propose,
+            make_default_decompose,
         )
         # Reuse the kuzu_graph_obj constructed above for EngineRecall.
         # Soft-fail if it's missing: the worker keeps running with
@@ -1108,20 +1302,49 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         cgn_bridge = CGNRegistrationBridge(
             registry_path=os.path.join("data", "synthesis_spine_concepts.json"),
         )
-        concept_store = ConceptStore(kuzu_graph, writer, db_writer=db_writer)
+        engram_store = EngramStore(kuzu_graph, writer, db_writer=db_writer)
 
         # Phase 4 FU-1 — wire the spine_exporter so the recompute loop's
         # next 60s tick starts writing data/spine_snapshot.json. The api
         # process reads this JSON (NOT Kuzu directly — Kuzu 0.11 holds
         # the exclusive lock even for read_only=True opens).
         spine_exporter_holder["fn"] = (
-            lambda: concept_store.export_snapshot(spine_snapshot_path)
+            lambda: engram_store.export_snapshot(spine_snapshot_path)
         )
+        # Phase D (§7.D) — one-time boot recompute of the population grounding
+        # scalar. This MIGRATES the existing population onto the percentile-blend
+        # (backfilling axis_used from the stored provisional for pre-D Engrams) so
+        # groundedness discriminates immediately on deploy — independent of whether
+        # a dream creates new concepts. Idempotent + cheap (bounded Engram count);
+        # ongoing re-ranking happens at each dream boundary (ConsolidationPass.run).
+        try:
+            # §7.E.0 — restore the live `fluent` axis from persisted citation
+            # counters on boot (counts survive restarts in synthesis.duckdb), so
+            # fluent discriminates day-1 just like axis_used does.
+            _boot_fluent_lookup = None
+            _boot_axes_sink = None
+            if recall_attribution is not None:
+                try:
+                    _bfm = recall_attribution.fluent_map()
+                    _boot_fluent_lookup = (
+                        lambda cid, ver, _m=_bfm: _m.get((str(cid), int(ver))))
+                    _boot_axes_sink = recall_attribution.update_axes_cache
+                except Exception:
+                    pass
+            migrated = engram_store.recompute_population_groundedness(
+                fluent_lookup=_boot_fluent_lookup, axes_sink=_boot_axes_sink)
+            logger.info(
+                "[synthesis_worker] boot population groundedness recompute: "
+                "%d Engrams percentile-blended (§7.D)", migrated)
+        except Exception as _pop_err:
+            logger.warning(
+                "[synthesis_worker] boot population recompute failed: %s", _pop_err)
+
         # Initial export so the snapshot is non-empty + present before
         # the first 60s tick (api process gets data immediately on first
         # poll after worker boot).
         try:
-            initial_n = concept_store.export_snapshot(spine_snapshot_path)
+            initial_n = engram_store.export_snapshot(spine_snapshot_path)
             logger.info(
                 "[synthesis_worker] initial spine snapshot exported "
                 "(%d concept rows) → %s",
@@ -1141,6 +1364,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # proposer so the pass still runs (mines TXs + anchors summary
         # for audit), just produces no spine writes.
         propose_fn = None
+        decompose_fn = None  # Bridge §7.1 — Engram→Object decompose (same provider)
         inference_cfg = (config or {}).get("inference", {}) or {}
         try:
             from titan_hcl.inference import get_provider as _get_provider
@@ -1148,6 +1372,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             if api_key:
                 provider = _get_provider("ollama_cloud", inference_cfg)
                 propose_fn = make_default_llm_propose(provider)
+                decompose_fn = make_default_decompose(provider)  # Bridge §7.1
                 model = inference_cfg.get(
                     "ollama_cloud_model", "") or "default"
                 logger.info(
@@ -1237,7 +1462,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 return 0.0
 
         consolidation_pass = ConsolidationPass(
-            concept_store=concept_store,
+            engram_store=engram_store,
             cgn_bridge=cgn_bridge,
             outer_memory_writer=writer,
             mine_recent_txs_fn=_mine_with_embeddings,
@@ -1245,6 +1470,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             cosine_fn=_np_cosine,
             window_hours=_window_hours,
             min_cluster_size=_min_cluster,
+            recall_attribution=recall_attribution,  # §7.E.0 membership + fluent feed
+            decompose_fn=decompose_fn,              # Bridge §7.1 Engram→Object decompose
+            felt_bridge=felt_bridge,                # Bridge §7.1/§7.2 tables
+            emit_candidate_fn=(                     # Bridge §7.3 handoff → felt_teaching
+                lambda _p: _send(send_queue, ENGRAM_FELT_CANDIDATE, name,
+                                 "felt_teaching_worker", _p)),
         )
         logger.info(
             "[synthesis_worker] ConsolidationPass ready — DREAM_STATE_CHANGED "
@@ -1262,7 +1493,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         )
 
     # ── Phase 5 §P5.A–P5.H — HypothesisForkStore + ForkGC wiring ────────
-    # Constructed AFTER ConceptStore / OuterMemoryWriter are wired so it
+    # Constructed AFTER EngramStore / OuterMemoryWriter are wired so it
     # can reuse them for graduation paths (INV-10 / INV-Syn-11). Soft-fail
     # if any dependency is missing: forks become a no-op for the session,
     # synthesis_worker keeps running.
@@ -1270,10 +1501,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     fork_gc: Optional[Any] = None
     try:
         if (kuzu_graph_obj is None
-                or concept_store is None
+                or engram_store is None
                 or 'writer' not in locals()):
             raise RuntimeError(
-                "missing dependency: kuzu_graph / concept_store / writer "
+                "missing dependency: kuzu_graph / engram_store / writer "
                 "not wired — hypothesis-fork lifecycle disabled this session"
             )
         from titan_hcl.synthesis.hypothesis_fork_store import (
@@ -1285,7 +1516,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             writer=db_writer,           # single-writer-thread (Option C)
             duckdb_conn=store._conn,    # same DuckDB conn as ActivationStore
             kuzu_graph=kuzu_graph_obj,
-            concept_store=concept_store,
+            engram_store=engram_store,
             outer_memory_writer=writer,
             activation_store=store,      # ActivationStore from above
             # P8.X (D-SPEC-PHASE8 fold-in): write-through snapshot path so
@@ -1506,20 +1737,20 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             privacy_domains=zk_privacy_domains(config or {}),
         )
 
-        # CGN meaning oracle — concept_reader bound to ConceptStore;
+        # CGN meaning oracle — concept_reader bound to EngramStore;
         # cgn_grounder reserved for the bus-RPC follow-up (returns None
         # for now → degraded grounding per the P6.H defensive contract).
         def _concept_reader(concept_id: str, version: int):
-            # G3 (AUDIT §5.3): ConceptStore.read_spine_strands now exists (the
+            # G3 (AUDIT §5.3): EngramStore.read_spine_strands now exists (the
             # getattr probe used to silently return None → meaning_of empty
             # fleet-wide). Call it directly; it runs on the writer thread
             # (@on_writer) and returns the four Timechain-anchor strands, or
             # None for a missing concept. Soft-fail so a Kuzu hiccup on this
             # dream-orchestrator path never crash-loops the worker.
-            if concept_store is None:
+            if engram_store is None:
                 return None
             try:
-                return concept_store.read_spine_strands(concept_id, version)
+                return engram_store.read_spine_strands(concept_id, version)
             except Exception:
                 logger.exception("[synthesis_worker] concept_reader failed")
                 return None
@@ -2339,19 +2570,49 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 # signal emitted post-LLM by agno. `needed` = the turn required
                 # knowledge (≥1 recall surfaced OR a tool call); `satisfied` =
                 # answered by ≥1 cited recall. One moment per turn, not per item.
-                if sovereignty_meter is None:
-                    continue
                 _km_ts = payload.get("ts")
                 if not isinstance(_km_ts, (int, float)):
                     _km_ts = time.time()
-                try:
-                    if payload.get("needed"):
-                        sovereignty_meter.record_knowledge_moment(float(_km_ts))
-                    if payload.get("satisfied"):
-                        sovereignty_meter.record_recall_satisfied(
-                            kind="cited_recall", ts=float(_km_ts))
-                except Exception:
-                    pass
+                if sovereignty_meter is not None:
+                    try:
+                        if payload.get("needed"):
+                            sovereignty_meter.record_knowledge_moment(float(_km_ts))
+                        if payload.get("satisfied"):
+                            sovereignty_meter.record_recall_satisfied(
+                                kind="cited_recall", ts=float(_km_ts))
+                    except Exception:
+                        pass
+                # §7.E.0 — per-Engram citation attribution (OFF the chat hot path):
+                # resolve the surfaced + cited tx_hash sets → their latest Engram(s)
+                # and record recall-citation (feeds the live `fluent` axis + §7.E's
+                # `(axes_at_recall, cited?)` reward). Independent of the meter; soft.
+                if recall_attribution is not None:
+                    try:
+                        recall_attribution.record_recall(
+                            payload.get("surfaced_tx") or [],
+                            payload.get("cited_tx") or [],
+                            float(_km_ts))
+                    except Exception:
+                        pass
+                continue
+
+            if msg_type == CGN_CONCEPT_GROUNDED:
+                # Inner↔Outer Felt-Teaching Bridge §7.2 — event-sourced CGN
+                # grounded-set. cgn_worker emits this when a concept matures across
+                # ≥2 consumers (cgn_worker.py:877; payload {concept_id, consumers,
+                # first_consumer, felt_centroid}). We absorb the concept_id (the Object
+                # label) into FeltBridge's durable grounded-set so the next dream no
+                # longer flags it as a felt-gap. CGN-felt RFP Phase B — also absorb the
+                # felt_centroid (G18 read-down) so the producer can do a true
+                # felt-vector frame_dependent comparison. G18: fire-and-forget event
+                # consumption — NEVER a sync RPC into cgn_worker. Soft.
+                if felt_bridge is not None:
+                    try:
+                        felt_bridge.record_grounded(
+                            payload.get("concept_id"),
+                            felt_centroid=payload.get("felt_centroid"))
+                    except Exception:
+                        pass
                 continue
 
             if msg_type == TOOL_CALL_VERDICT_RECORD:

@@ -40,6 +40,19 @@ logger = logging.getLogger(__name__)
 # caller thread). A blocked submit_sync beyond this is a real bug, not slowness.
 DEFAULT_SYNC_TIMEOUT_S = 30.0
 
+# Boot-only timeout for the heavy, boot-CRITICAL native ops (the one
+# ``duckdb.connect`` that opens data/synthesis.duckdb + its schema/load).
+# Root cause (2026-06-04, T1 mainnet): when synthesis RESPAWNS during a
+# boot-grace cascade (dozens of modules restarting at once → box-wide CPU/I/O
+# starvation), the writer thread cannot be scheduled to run the connect within
+# the steady-state 30s → ``TimeoutError`` → the worker crashes on init and
+# synthesis is silently non-functional (process up, init dead). Boot is exactly
+# when the box is most contended, so the boot connect must tolerate transient
+# congestion. Generous (3×) + the guardian respawn loop is the retry mechanism
+# (a fresh process each time → no double-connect). Steady-state submit_sync stays
+# 30s so chat-path blockages still surface fast as the real bugs they are.
+BOOT_SYNC_TIMEOUT_S = 90.0
+
 # Sentinel enqueued by close() to stop the drain loop after all prior ops run.
 _STOP = object()
 
@@ -236,7 +249,7 @@ def on_writer(method: Callable) -> Callable:
     @functools.wraps(method)
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         # Prefer `self._db_writer` when the store already uses `self._writer`
-        # for something else (HypothesisForkStore / ConceptStore hold the
+        # for something else (HypothesisForkStore / EngramStore hold the
         # bus-only OuterMemoryWriter on `self._writer`); else `self._writer`
         # IS the SynthesisWriter (ActivationStore, buffer/skill/vector stores).
         w = getattr(self, "_db_writer", None) or self._writer

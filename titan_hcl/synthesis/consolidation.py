@@ -27,7 +27,7 @@ This module owns the orchestration logic of one consolidation pass:
        - `reject`: no coherent concept; skip the cluster.
   4. Apply each accepted proposal:
        * Register the concept_id with CGN (P4.C).
-       * Create / bump via ConceptStore (P4.B) — which anchors the
+       * Create / bump via EngramStore (P4.B) — which anchors the
          canonical concept-version TX via OuterMemoryWriter (P4.D) AND
          maintains COMPOSED_FROM / COMPOSED_INTO edges to the cluster's
          contributing concept_ids.
@@ -52,21 +52,126 @@ construction — production synthesis_worker wires the real implementations
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional
 
-from titan_hcl.synthesis.concept_store import (
-    ConceptStore,
+from titan_hcl.synthesis.engram_store import (
+    EngramStore,
     ParentVersionMissing,
     WriterFailure,
 )
 from titan_hcl.synthesis.cgn_bridge import CGNRegistrationBridge
 from titan_hcl.synthesis.outer_memory_writer import OuterMemoryEvent, OuterMemoryWriter
+# CGN-felt RFP — the shared, torch-free neuromod helpers (one source with cgn.py).
+from titan_hcl.logic.cgn_types import FELT_FRAME_DIVERGENCE, felt_distance
 
 logger = logging.getLogger(__name__)
+
+
+# ── Felt-at-lived-time coverage (RFP_synthesis_engram_grounding §7.C / §6.2 Q2) ──
+
+# The neuromod homeostatic centre — `Neuromodulator.initial_setpoint`
+# (titan_hcl/logic/neuromodulator.py:115; bounded [0.3,0.7]). The live per-modulator
+# dynamic setpoint is not available cross-process at consolidation, so the felt
+# intensity is measured as deviation from this canonical centre (not a magic
+# number — the documented setpoint default). Sanity-checked vs emotional_intensity.
+_NEUROMOD_SETPOINT_CENTRE = 0.5
+# felt-dict keys that are metadata, NOT neuromod levels (see cognitive_worker:2563).
+_FELT_META_KEYS = frozenset({"emotion", "emotion_confidence", "dream_cycle", "ts"})
+
+# Inner↔Outer Felt-Teaching Bridge §1.3 — a fresh felt candidate's confidence `c`
+# starts low (probationary; CGN's value_net refines it over exposure, BRAIN-INV-4).
+PROBATION_C = 0.05
+
+
+def _parse_felt(felt: Any) -> dict:
+    """Coerce a felt value (sidecar JSON string | dict | None) → dict. Soft-fail → {}."""
+    if not felt:
+        return {}
+    if isinstance(felt, dict):
+        return felt
+    if isinstance(felt, str):
+        try:
+            d = json.loads(felt)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _felt_magnitude(felt: dict) -> float:
+    """Normalized felt intensity ∈ [0,1] = ‖levels − setpoint_centre‖ / max_dev over
+    the numeric neuromod levels (metadata excluded). Key-agnostic (robust to
+    5HT/5-HT naming). Empty / level-less felt → 0.0."""
+    levels = [
+        float(v) for k, v in felt.items()
+        if k not in _FELT_META_KEYS and isinstance(v, (int, float))
+    ]
+    if not levels:
+        return 0.0
+    dev = math.sqrt(sum((x - _NEUROMOD_SETPOINT_CENTRE) ** 2 for x in levels))
+    max_dev = math.sqrt(len(levels)) * _NEUROMOD_SETPOINT_CENTRE  # each |x-0.5| ≤ 0.5
+    if max_dev <= 0.0:
+        return 0.0
+    return min(1.0, dev / max_dev)
+
+
+def felt_coverage_from_members(members: list) -> float:
+    """felt_coverage = (members_with_felt / total) × mean_magnitude  (§6.2 Q2:
+    consistency × intensity). ∈ [0,1]. Members carry `.felt` (sidecar JSON)."""
+    if not members:
+        return 0.0
+    mags = []
+    for m in members:
+        felt = _parse_felt(getattr(m, "felt", None))
+        if felt:
+            mag = _felt_magnitude(felt)
+            if mag > 0.0:
+                mags.append(mag)
+    if not mags:
+        return 0.0
+    coverage = len(mags) / len(members)
+    mean_magnitude = sum(mags) / len(mags)
+    return coverage * mean_magnitude
+
+
+def agg_felt(members: list) -> dict:
+    """Representative lived felt-state for a cluster — the mean of each numeric
+    neuromod level across the members that carried felt (metadata keys excluded).
+    This is the felt-state the Engram's thoughts were lived under, seeded into the
+    felt candidates (RFP_inner_outer_felt_teaching_bridge §1.2). Felt lives on the
+    members (`TxCandidate.felt`), NOT on the Engram node. Felt-less cluster → {}."""
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for m in (members or []):
+        felt = _parse_felt(getattr(m, "felt", None))
+        for k, v in felt.items():
+            if k in _FELT_META_KEYS or not isinstance(v, (int, float)):
+                continue
+            sums[k] = sums.get(k, 0.0) + float(v)
+            counts[k] = counts.get(k, 0) + 1
+    return {k: sums[k] / counts[k] for k in sums if counts[k] > 0}
+
+
+def _decompose_sample_from_members(
+    members: list, max_samples: int = 5, max_chars: int = 240,
+) -> str:
+    """A bounded sample of the cluster's REAL thought content — the signal the
+    decompose LLM names the Engram's constituent Objects from (mirrors
+    consolidation_defaults._build_cluster_prompt's content sample)."""
+    samples = []
+    for m in (members or [])[:max_samples]:
+        text = (getattr(m, "content_summary", "") or "").strip().replace("\n", " ")
+        if not text:
+            continue
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip() + "…"
+        samples.append(f"- {text}")
+    return "\n".join(samples)
 
 
 # ── DTOs ────────────────────────────────────────────────────────────
@@ -81,6 +186,7 @@ class TxCandidate:
     tags: tuple[str, ...]
     embedding: Optional[tuple[float, ...]]  # None → tag-only clustering
     content_summary: str = ""
+    felt: Optional[str] = None  # felt-at-lived-time JSON (neuromod_context); §7.C
 
 
 @dataclass
@@ -101,6 +207,7 @@ class LLMProposal:
     memory_type: Optional[str] = None  # declarative|procedural|episodic|meta
     base_concept_refs: tuple[tuple[str, int], ...] = ()
     reason: str = ""
+    domain_hint: str = ""  # §7.F — advisory free-text domain (mutable; never gates)
 
 
 @dataclass
@@ -140,7 +247,7 @@ class ConsolidationPass:
 
     def __init__(
         self,
-        concept_store: ConceptStore,
+        engram_store: EngramStore,
         cgn_bridge: CGNRegistrationBridge,
         outer_memory_writer: OuterMemoryWriter,
         mine_recent_txs_fn: Callable[..., list[TxCandidate]],
@@ -160,9 +267,27 @@ class ConsolidationPass:
         max_concepts_per_pass: int = 10,
         llm_calls_max: int = 20,
         source: str = "synthesis_worker",
+        recall_attribution: Optional[Any] = None,
+        decompose_fn: Optional[Callable[[str, str], list[str]]] = None,
+        felt_bridge: Optional[Any] = None,
+        emit_candidate_fn: Optional[Callable[[dict], None]] = None,
+        frame_divergence: float = FELT_FRAME_DIVERGENCE,
     ):
-        self._store = concept_store
+        self._store = engram_store
         self._bridge = cgn_bridge
+        # §7.E.0 — per-Engram citation attribution (membership write + the live
+        # `fluent` axis feed at the dream recompute). Optional/soft — None disables.
+        self._attribution = recall_attribution
+        # Inner↔Outer Felt-Teaching Bridge §7.1 — Engram(Idea)→Object decompose +
+        # cache (off the hot path). Optional/soft — either None disables the bridge
+        # (synthesis otherwise unaffected). `decompose_fn(name, sample) -> list[str]`.
+        self._decompose = decompose_fn
+        self._felt_bridge = felt_bridge
+        # Bridge §7.3 — the bus handoff to felt_teaching_worker. `emit_candidate_fn(
+        # payload: dict)` (synthesis_worker binds it to _send(...ENGRAM_FELT_CANDIDATE
+        # ...)). None → the durable engram_felt_candidates row is still written (audit/
+        # retry), just no live event.
+        self._emit_candidate = emit_candidate_fn
         self._writer = outer_memory_writer
         self._mine = mine_recent_txs_fn
         self._propose = llm_propose_fn
@@ -177,6 +302,9 @@ class ConsolidationPass:
         self._cap_concepts = max_concepts_per_pass
         self._cap_llm = llm_calls_max
         self._source = source
+        # CGN-felt RFP §1.2 UPGRADE — RMS felt_distance above this between a cluster's
+        # lived felt and a grounded Object's centroid = a new felt frame (config-tunable).
+        self._frame_divergence = frame_divergence
 
     # ── Public API ──────────────────────────────────────────
 
@@ -282,6 +410,33 @@ class ConsolidationPass:
             if not applied:
                 result.rejected_clusters += 1
 
+        # Step 4.5 — §7.D dream-boundary population recompute: percentile-blend
+        # the grounding scalar across ALL Engrams so groundedness DISCRIMINATES
+        # (replaces the old saturate-at-50 per-Engram scalar). Only when the
+        # population changed this pass.
+        if result.concepts_created or result.concepts_bumped:
+            try:
+                # §7.E.0 — feed the LIVE recall-citation rate into the `fluent` axis
+                # + cache the fresh axes for the recall-event snapshots. Soft: a
+                # missing/failed attribution falls back to pure §7.D behaviour.
+                fluent_lookup = None
+                axes_sink = None
+                if self._attribution is not None:
+                    try:
+                        _fmap = self._attribution.fluent_map()
+                        fluent_lookup = (
+                            lambda cid, ver, _m=_fmap: _m.get((str(cid), int(ver))))
+                        axes_sink = self._attribution.update_axes_cache
+                    except Exception as _fa_err:
+                        logger.debug(
+                            "[ConsolidationPass] fluent feed unavailable: %s", _fa_err)
+                self._store.recompute_population_groundedness(
+                    fluent_lookup=fluent_lookup, axes_sink=axes_sink)
+            except Exception as e:
+                logger.warning(
+                    "[ConsolidationPass] population groundedness recompute "
+                    "failed: %s", e)
+
         # Step 5 — anchor the pass-summary TX.
         result.finished_at = self._clock()
         result.duration_ms = (result.finished_at - started_at) * 1000.0
@@ -377,7 +532,7 @@ class ConsolidationPass:
             seed_consumer="synthesis_engine",
         )
 
-        # 2. Create via ConceptStore (anchors the TX via OuterMemoryWriter +
+        # 2. Create via EngramStore (anchors the TX via OuterMemoryWriter +
         #    inserts the Kuzu row + maintains composition edges).
         evidence = [m.tx_hash for m in cluster.members]
         try:
@@ -387,6 +542,7 @@ class ConsolidationPass:
                 memory_type=memory_type,
                 composed_from=list(proposal.base_concept_refs),
                 derivation_evidence=evidence,
+                domain_hint=proposal.domain_hint,  # §7.F advisory
             )
         except (WriterFailure, ValueError) as e:
             logger.warning(
@@ -395,14 +551,33 @@ class ConsolidationPass:
             )
             return False
 
-        # 3. Recompute groundedness from cluster stats.
+        # 3. Recompute groundedness + store the felt axis (§7.C). felt_coverage
+        #    feeds the legacy scalar (w_f=0 → no scalar change yet) AND is stored
+        #    to Engram.axis_felt so it's independently visible (Phase D consumes it).
+        felt_coverage = felt_coverage_from_members(cluster.members)
         self._store.recompute_groundedness(
             cv.concept_id, cv.version,
             episodic_encounters=len(cluster.members),
             distinct_contexts=len(cluster.centroid_tags),
             procedural_links=len(proposal.base_concept_refs),
-            felt_coverage=0.0,
+            felt_coverage=felt_coverage,
         )
+        if felt_coverage > 0.0:
+            logger.info(
+                "[ConsolidationPass] Engram %s v%d axis_felt=%.4f (%d/%d members "
+                "felt-laden)", cv.concept_id, cv.version, felt_coverage,
+                sum(1 for m in cluster.members
+                    if _parse_felt(getattr(m, "felt", None))),
+                len(cluster.members))
+
+        # §7.E.0 — persist the member tx_hash → Engram reverse-index (the
+        # citation-attribution resolver source). Soft; never blocks the pass.
+        if self._attribution is not None:
+            self._attribution.record_membership(cv.concept_id, cv.version, evidence)
+
+        # Bridge §7.1 — decompose Engram(Idea)→Objects + cache (off the hot path).
+        # Phase 1 populates the cache; Phase 3 reads it for gap detection.
+        self._maybe_decompose(cv, proposal, cluster)
 
         result.concepts_created.append((cv.concept_id, cv.version))
         return True
@@ -426,6 +601,7 @@ class ConsolidationPass:
                 concept_id=proposal.concept_id,
                 composed_from=list(proposal.base_concept_refs),
                 derivation_evidence=evidence,
+                domain_hint=proposal.domain_hint,  # §7.F advisory
             )
         except (ParentVersionMissing, WriterFailure) as e:
             logger.warning(
@@ -434,16 +610,109 @@ class ConsolidationPass:
             )
             return False
 
+        felt_coverage = felt_coverage_from_members(cluster.members)
         self._store.recompute_groundedness(
             cv.concept_id, cv.version,
             episodic_encounters=len(cluster.members),
             distinct_contexts=len(cluster.centroid_tags),
             procedural_links=len(proposal.base_concept_refs),
-            felt_coverage=0.0,
+            felt_coverage=felt_coverage,
         )
+        if felt_coverage > 0.0:
+            logger.info(
+                "[ConsolidationPass] Engram %s v%d axis_felt=%.4f (bump; %d/%d "
+                "members felt-laden)", cv.concept_id, cv.version, felt_coverage,
+                sum(1 for m in cluster.members
+                    if _parse_felt(getattr(m, "felt", None))),
+                len(cluster.members))
+
+        # §7.E.0 — persist the member tx_hash → Engram reverse-index for the new
+        # version (latest-version-only credit resolves to it). Soft.
+        if self._attribution is not None:
+            self._attribution.record_membership(cv.concept_id, cv.version, evidence)
+
+        # Bridge §7.1 — decompose Engram(Idea)→Objects + cache (off the hot path).
+        # Phase 1 populates the cache; Phase 3 reads it for gap detection.
+        self._maybe_decompose(cv, proposal, cluster)
 
         result.concepts_bumped.append((cv.concept_id, cv.version))
         return True
+
+    # ── Internal — felt-teaching bridge (§7.1 decompose) ───
+
+    def _maybe_decompose(
+        self, cv: Any, proposal: LLMProposal, cluster: Cluster,
+    ) -> Optional[list[str]]:
+        """Bridge §7.1 + §7.3 (OFF the hot path) — decompose the Engram(Idea) into its
+        constituent Object labels (cached by (concept_id, version) so a re-touched
+        Engram never re-calls the LLM), then queue a propose-only felt candidate for
+        every Object with NO CGN grounding (a gap). Returns the labels; None when the
+        bridge is disabled or decompose failed. Soft — never blocks the pass."""
+        if self._felt_bridge is None or self._decompose is None:
+            return None
+        try:
+            objects = self._felt_bridge.get_cached_objects(
+                cv.concept_id, cv.version)
+            if objects is None:
+                name = (proposal.proposed_name or proposal.concept_id
+                        or cv.concept_id)
+                sample = _decompose_sample_from_members(cluster.members)
+                objects = self._decompose(name, sample) or []
+                if objects:
+                    self._felt_bridge.cache_objects(
+                        cv.concept_id, cv.version, objects)
+            # Phase 3 — gap detection → propose-only candidate queue + bus handoff.
+            if objects:
+                self._queue_felt_gaps(cv, proposal, cluster, objects)
+            return objects
+        except Exception as e:  # noqa: BLE001 — soft per INV-Syn-17
+            logger.debug("[ConsolidationPass] decompose soft-fail: %s", e)
+            return None
+
+    def _queue_felt_gaps(
+        self, cv: Any, proposal: LLMProposal, cluster: Cluster,
+        objects: list[str],
+    ) -> None:
+        """For each decomposed Object with NO CGN felt-grounding (a gap), queue a
+        propose-only §3.4 candidate seeded with the cluster's lived felt + emit the
+        ENGRAM_FELT_CANDIDATE handoff (RFP §7.3). PROPOSE-ONLY — writes synthesis
+        only, ZERO CGN writes (INV-Syn-ENG-4). The bus event fires ONCE per candidate
+        (only on a fresh queue), not every dream.
+
+        frame_dependent (CGN-felt RFP §1.2 UPGRADE): a grounded Object is no longer
+        blindly skipped. The grounded-set now carries CGN's per-concept felt centroid
+        (event-sourced on CGN_CONCEPT_GROUNDED — G18, no RPC), so we compare the
+        cluster's lived felt against it: divergent (> frame_divergence) → queue a
+        `frame_dependent` candidate (a NEW felt frame for an existing concept, F⊗C
+        scoped to domain_hint); aligned — or no centroid yet (pre-felt grounding) →
+        skip (genuinely redundant). Still propose-only (INV-Syn-ENG-4 — zero CGN writes)."""
+        lived_felt = agg_felt(cluster.members)
+        felt_json = json.dumps(lived_felt, sort_keys=True) if lived_felt else "{}"
+        domain_hint = getattr(proposal, "domain_hint", "") or ""
+        for obj in objects:
+            status = "candidate"
+            provenance = "engram_felt_gap"
+            if self._felt_bridge.is_object_grounded(obj):
+                gc = self._felt_bridge.grounded_felt(obj)
+                if gc and felt_distance(lived_felt, gc) > self._frame_divergence:
+                    status = "frame_dependent"        # divergent felt → a new frame
+                    provenance = "engram_felt_frame"
+                else:
+                    continue  # grounded + aligned / no centroid yet → redundant, skip
+            newly = self._felt_bridge.queue_candidate(
+                object_label=obj, felt_state_json=felt_json, c=PROBATION_C,
+                source_engram=cv.concept_id, source_version=cv.version,
+                provenance=provenance, domain_hint=domain_hint,
+                status=status)
+            if newly and self._emit_candidate is not None:
+                self._emit_candidate({
+                    "object_label": obj,
+                    "felt_state": lived_felt,
+                    "source_engram": cv.concept_id,
+                    "source_version": cv.version,
+                    "domain_hint": domain_hint,
+                    "status": status,
+                })
 
     # ── Internal — anchor pass TX ──────────────────────────
 

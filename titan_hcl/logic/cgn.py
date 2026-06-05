@@ -51,6 +51,9 @@ from titan_hcl.logic.cgn_types import (  # noqa: F401  (re-export)
     CGNTransition,
     GeneralizedHypothesis,
     GeneralizedHAOVTracker,
+    FELT_EMA_ALPHA,
+    felt_ema,
+    normalize_neuromods,
 )
 
 logger = logging.getLogger("titan.cgn")
@@ -440,6 +443,17 @@ class ConceptGroundingNetwork:
                 if not isinstance(_seen, set):
                     _seen = set(_seen); _j["consumers_seen"] = _seen
                 _seen.add(consumer)
+                # CGN-felt RFP §1.2 MATERIALIZE — accumulate the per-concept felt
+                # centroid from the lived felt this outcome was grounded under. This
+                # is the ONLY felt that reaches the central (emitting) instance —
+                # record_outcome, never ground() (§1.4). EMA: bounded, recency-weighted.
+                # Currently fed by felt_teaching (it ships outcome_context.felt_state);
+                # forward-compatible as more consumers do. value_net/action-net untouched.
+                _felt = (outcome_context or {}).get("felt_state")
+                _norm = normalize_neuromods(_felt) if isinstance(_felt, dict) else {}
+                if _norm:
+                    _j["felt_centroid"] = felt_ema(
+                        _j.get("felt_centroid"), _norm, FELT_EMA_ALPHA)
                 if (len(_seen) >= self._concept_grounded_maturity_min
                         and concept_id not in self._matured_emitted):
                     self._matured_emitted.add(concept_id)
@@ -739,6 +753,20 @@ class ConceptGroundingNetwork:
         out = self._pending_matured
         self._pending_matured = []
         return out
+
+    def concept_felt_centroid(self, concept_id: str) -> dict:
+        """CGN-felt RFP §1.2 — the per-concept felt centroid (read-only accessor).
+
+        Returns the running-EMA neuromod-felt this concept has been grounded under
+        (canonical key-space), or ``{}`` if none has accumulated yet (probationary /
+        no felt-bearing outcome seen). cgn_worker attaches this to CGN_CONCEPT_GROUNDED
+        at maturation (the G18 read-down exposure channel). Never mutates state.
+        """
+        j = self._concept_journeys.get(concept_id)
+        if not j:
+            return {}
+        fc = j.get("felt_centroid")
+        return dict(fc) if isinstance(fc, dict) else {}
 
     # ── Cross-Domain Insights ─────────────────────────��─────────────────
 

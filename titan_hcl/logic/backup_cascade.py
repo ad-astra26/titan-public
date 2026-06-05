@@ -401,10 +401,21 @@ class BackupCascade:
                 "daily_cap": daily_cap,
             }
 
-        # Step 4 — query wallet (T1 mainnet runtime keypair)
+        # Step 4 — query wallet (T1 mainnet runtime keypair).
+        # Resolve the `solana` CLI by FULL PATH: the systemd-spawned worker has no
+        # solana bin dir on PATH, so a bare "solana" ⇒ FileNotFoundError ⇒ this
+        # wallet query failed ⇒ auto-fund SILENTLY SKIPPED ⇒ Irys never topped up
+        # ⇒ 402 Not enough balance ⇒ T1 Arweave ship FAILED (root cause 2026-06-04).
+        # shutil.which catches it when on PATH; fallback = the known install path.
+        _solana = shutil.which("solana") or next(
+            (p for p in (
+                os.path.expanduser(
+                    "~/.local/share/solana/install/active_release/bin/solana"),
+                "/home/youruser/.local/share/solana/install/active_release/bin/solana",
+            ) if os.path.exists(p)), "solana")
         try:
             wallet_out = subprocess.check_output(  # noqa: async-block — backup cascade runs via loop.run_until_complete on a dedicated sequential worker loop — no concurrent coroutines to starve, not the FastAPI loop
-                ["solana", "balance", "-k", keypair, "-u", "mainnet-beta"],
+                [_solana, "balance", "-k", keypair, "-u", "mainnet-beta"],
                 timeout=30,
             )
             # Format: "0.148356701 SOL"

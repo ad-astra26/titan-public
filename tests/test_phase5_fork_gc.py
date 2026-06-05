@@ -26,7 +26,7 @@ import duckdb
 import pytest
 
 from titan_hcl.core.direct_memory import TitanKnowledgeGraph
-from titan_hcl.synthesis.concept_store import ConceptStore
+from titan_hcl.synthesis.engram_store import EngramStore
 from titan_hcl.synthesis.fork_gc import (
     DEFAULT_MAX_NODES_PER_SWEEP,
     ForkGC,
@@ -103,14 +103,14 @@ def activation():
 
 
 @pytest.fixture()
-def concept_store(graph, writer):
-    return ConceptStore(graph, writer, clock=lambda: 10_000_000.0)
+def engram_store(graph, writer):
+    return EngramStore(graph, writer, clock=lambda: 10_000_000.0)
 
 
 @pytest.fixture()
-def store(duck, graph, concept_store, writer, activation):
+def store(duck, graph, engram_store, writer, activation):
     return HypothesisForkStore(
-        duckdb_conn=duck, kuzu_graph=graph, concept_store=concept_store,
+        duckdb_conn=duck, kuzu_graph=graph, engram_store=engram_store,
         outer_memory_writer=writer, activation_store=activation,
         clock=lambda: 10_000_000.0,
     )
@@ -421,9 +421,9 @@ def test_predicate_all_three_pass_prunes_node(
 
 
 def test_repair_fork_parent_concept_never_in_plan(
-    store, duck, graph, concept_store, activation,
+    store, duck, graph, engram_store, activation,
 ):
-    parent = concept_store.create_concept(
+    parent = engram_store.create_concept(
         concept_id="metaplex", name="Metaplex", memory_type="procedural",
     )
     fid = store.create_fork(

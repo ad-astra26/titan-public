@@ -1333,6 +1333,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # sole consumer (INV-Syn-24 Tier-2 override via UserFeedbackOverride).
             _bus_constants.SKILL_REPAIR_FORK_SPAWNED,
             _bus_constants.USER_FEEDBACK_SIGNAL,
+            # Inner↔Outer Felt-Teaching Bridge §7.2 — event-sourced CGN grounded-set.
+            # Emitted by cgn_worker (to=cognitive_worker) when a concept matures across
+            # ≥2 consumers; synthesis_worker subscribes too (broadcast pub/sub) to feed
+            # FeltBridge.record_grounded → is_object_grounded (G18, no RPC into CGN).
+            _bus_constants.CGN_CONCEPT_GROUNDED,
             _bus_constants.KERNEL_EPOCH_TICK,
             _bus_constants.MODULE_SHUTDOWN,
         ],
@@ -1345,6 +1350,33 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _mod_dep('timechain'),
             _mod_dep('memory'),
         ],
+    ))
+
+    # felt_teaching_worker — Inner↔Outer Felt-Teaching Bridge §7.4 consumer
+    # (RFP_inner_outer_felt_teaching_bridge). A lean L2 CGN consumer + IQL/value-net
+    # contributor (propose-only): consumes ENGRAM_FELT_CANDIDATE (synthesis Phase-3
+    # producer) → LanguageTeacher.build_felt_perturbation → CGNConsumerClient.
+    # record_outcome("felt_teaching", ...). Owns its OWN data/felt_teaching.duckdb
+    # (G21 — synthesis owns synthesis.duckdb exclusively). Subscribes CGN_CONCEPT_
+    # GROUNDED too (its grounded-view for frame_dependent + status=matured).
+    from titan_hcl.modules.felt_teaching_worker import felt_teaching_worker_main
+    guardian.register(ModuleSpec(
+        name="felt_teaching",
+        layer="L2",
+        entry_fn=felt_teaching_worker_main,
+        config=config,
+        rss_limit_mb=300,    # lean consumer; record_outcome-only (no SHM weight load)
+        autostart=True,
+        lazy=False,
+        heartbeat_timeout=120.0,  # a felt-perturbation LLM call can take ~30s
+        broadcast_topics=[
+            _bus_constants.ENGRAM_FELT_CANDIDATE,
+            _bus_constants.CGN_CONCEPT_GROUNDED,
+            _bus_constants.MODULE_SHUTDOWN,
+        ],
+        start_method="spawn" if _spawn_grad else "fork",
+        critical_data_writer=False,  # own store is rebuildable from the bus events
+        boot_priority="post_boot",
     ))
 
     # observatory_worker — extracted per RFP_phase_c_titan_hcl_cleanup

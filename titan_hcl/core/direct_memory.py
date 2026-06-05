@@ -370,19 +370,26 @@ class TitanKnowledgeGraph:
                 "[KnowledgeGraph] X-voice Person migration skipped: %s", exc
             )
 
-        # Phase 4 — synthesis-engine Concept-spine schema (§6.1 / §10).
-        # 4 node tables + 5 rel tables, additive + idempotent. Empty
-        # Production/ActionChain/HypothesisFork ship in P4 so consumers
-        # can issue Cypher without a schema-missing branch; population
-        # lands in P5/P8.
+        # Phase 4/B — synthesis-engine Engram-spine schema (§6.1 / §6.2 / §10).
+        # Engram (renamed from Concept, RFP §7.B) + the 4 spine rel tables +
+        # COMPILED_FROM, additive + idempotent. `migrate_concept_to_engram`
+        # runs FIRST so an existing `Concept`-schema graph is copy-migrated to
+        # `Engram` (+ the new axis/domain_hint columns) BEFORE the bootstrap
+        # presence-checks; on a fresh or already-migrated graph it is a guarded
+        # no-op. Single-threaded here at graph-open (INV-Syn-7/28 — no writer
+        # thread live yet). Empty Production/ActionChain/HypothesisFork ship so
+        # consumers can issue Cypher without a schema-missing branch.
         try:
             from titan_hcl.synthesis.kuzu_spine_schema import (
                 bootstrap_spine_schema,
+                migrate_concept_to_engram,
             )
+            migrate_concept_to_engram(self)
             bootstrap_spine_schema(self)
         except Exception as exc:
             logger.warning(
-                "[KnowledgeGraph] synthesis spine bootstrap skipped: %s", exc
+                "[KnowledgeGraph] synthesis spine bootstrap/migration skipped: %s",
+                exc,
             )
 
         # Relationship tables — we use a generic rel table per node-type pair
@@ -603,10 +610,10 @@ class TitanKnowledgeGraph:
 
     # ─── Phase 4 — synthesis-engine Concept-spine helpers (§6.1 / §10) ───
     #
-    # Low-level Cypher wrappers consumed by `titan_hcl/synthesis/concept_store.py`
+    # Low-level Cypher wrappers consumed by `titan_hcl/synthesis/engram_store.py`
     # (the sole writer per INV-Syn-3 extended). High-level invariants
     # (INV-3 no parent mutation, INV-4 single canonical write path, INV-10
-    # parent must exist) live in ConceptStore; these helpers are intentionally
+    # parent must exist) live in EngramStore; these helpers are intentionally
     # primitive so they're also safe for read-only consumers (BridgeRecall +
     # observatory endpoints).
 
@@ -621,9 +628,11 @@ class TitanKnowledgeGraph:
     def spine_create_concept_node(
         self, concept_id: str, version: int, name: str, memory_type: str,
         groundedness: float, anchor_tx: str, created_at: float,
+        domain_hint: str = "",
     ) -> bool:
         """INSERT one Concept row keyed by synthetic pk = `<id>:v<ver>` so the
         same concept_id can carry multiple versions (§10 versioning invariant).
+        `domain_hint` (§7.F) is an advisory free-text domain stored on the node.
 
         Returns True on insert, False if the row already exists (idempotent —
         safe to call on replay). Raises only on unexpected Cypher errors.
@@ -631,13 +640,13 @@ class TitanKnowledgeGraph:
         pk = self._spine_pk(concept_id, version)
         try:
             self._conn.execute(
-                "CREATE (c:Concept {pk: $pk, concept_id: $cid, version: $ver, "
+                "CREATE (c:Engram {pk: $pk, concept_id: $cid, version: $ver, "
                 "name: $name, memory_type: $mt, groundedness: $g, "
-                "anchor_tx: $atx, created_at: $ts})",
+                "anchor_tx: $atx, created_at: $ts, domain_hint: $dh})",
                 {"pk": pk, "cid": concept_id, "ver": int(version),
                  "name": name, "mt": memory_type,
                  "g": float(groundedness), "atx": anchor_tx,
-                 "ts": float(created_at)},
+                 "ts": float(created_at), "dh": str(domain_hint or "")},
             )
             return True
         except Exception as e:
@@ -660,7 +669,7 @@ class TitanKnowledgeGraph:
         pk = self._spine_pk(concept_id, version)
         try:
             qr = self._conn.execute(
-                "MATCH (c:Concept {pk: $pk}) "
+                "MATCH (c:Engram {pk: $pk}) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                 "c.groundedness, c.anchor_tx, c.created_at",
                 {"pk": pk},
@@ -682,11 +691,11 @@ class TitanKnowledgeGraph:
 
     def spine_get_latest_concept(self, concept_id: str) -> dict | None:
         """Return the highest-version row for concept_id, or None if no
-        version exists. Used by ConceptStore.bump_version() to compute v+1
+        version exists. Used by EngramStore.bump_version() to compute v+1
         and by spine recall (P4.H) to pick the latest spine root."""
         try:
             qr = self._conn.execute(
-                "MATCH (c:Concept {concept_id: $cid}) "
+                "MATCH (c:Engram {concept_id: $cid}) "
                 "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                 "c.groundedness, c.anchor_tx, c.created_at "
                 "ORDER BY c.version DESC LIMIT 1",
@@ -709,21 +718,32 @@ class TitanKnowledgeGraph:
 
     def spine_update_groundedness(
         self, concept_id: str, version: int, new_groundedness: float,
+        *, axes: Optional[dict] = None,
     ) -> bool:
-        """UPDATE one Concept row's groundedness column. Allowed by INV-3
-        because groundedness is a *derived metric column*, not the row's
-        identity / version / lineage — it can be recomputed at any time
-        without violating the immutability of the version itself. Returns
-        True on update, False if the row is missing."""
+        """UPDATE one Engram row's derived-metric columns: `groundedness` always,
+        and (when `axes` is given) the 4 raw axes `axis_used/verified/felt/fluent`
+        (§7.D — keys `used/verified/felt/fluent`). Allowed by INV-3 because these
+        are *derived metric columns*, not the row's identity / version / lineage.
+        Returns True on update, False if the row is missing."""
         pk = self._spine_pk(concept_id, version)
         try:
             # Verify row exists first (Kuzu MATCH+SET silently succeeds with
             # zero rows; we want a definite signal).
             if self.spine_get_concept_version(concept_id, version) is None:
                 return False
+            set_clause = "SET c.groundedness = $g"
+            params = {"pk": pk, "g": float(new_groundedness)}
+            if axes is not None:
+                for col, key in (("axis_used", "used"),
+                                 ("axis_verified", "verified"),
+                                 ("axis_felt", "felt"),
+                                 ("axis_fluent", "fluent")):
+                    if key in axes and axes[key] is not None:
+                        ph = "ax_" + key
+                        set_clause += f", c.{col} = ${ph}"
+                        params[ph] = float(axes[key])
             self._conn.execute(
-                "MATCH (c:Concept {pk: $pk}) SET c.groundedness = $g",
-                {"pk": pk, "g": float(new_groundedness)},
+                f"MATCH (c:Engram {{pk: $pk}}) {set_clause}", params,
             )
             return True
         except Exception as e:
@@ -732,6 +752,33 @@ class TitanKnowledgeGraph:
                 concept_id, version, e,
             )
             return False
+
+    def spine_read_engram_axes(self) -> list[dict]:
+        """Read every Engram's 4 raw grounding axes + the current `groundedness`
+        for the §7.D population percentile-blend recompute (groundedness is the
+        backfill source for pre-D Engrams whose `axis_used` is still 0). Returns
+        [{concept_id, version, used, verified, felt, fluent, groundedness}].
+        Soft-fail → []."""
+        out: list[dict] = []
+        try:
+            qr = self._conn.execute(
+                "MATCH (c:Engram) RETURN c.concept_id, c.version, c.axis_used, "
+                "c.axis_verified, c.axis_felt, c.axis_fluent, c.groundedness"
+            )
+            while qr.has_next():
+                row = qr.get_next()
+                out.append({
+                    "concept_id": row[0],
+                    "version": int(row[1]),
+                    "used": float(row[2]) if row[2] is not None else 0.0,
+                    "verified": float(row[3]) if row[3] is not None else 0.0,
+                    "felt": float(row[4]) if row[4] is not None else 0.0,
+                    "fluent": float(row[5]) if row[5] is not None else 0.0,
+                    "groundedness": float(row[6]) if row[6] is not None else 0.0,
+                })
+        except Exception as e:
+            logger.warning("[KnowledgeGraph] spine_read_engram_axes failed: %s", e)
+        return out
 
     def spine_add_composition_edge(
         self,
@@ -769,7 +816,7 @@ class TitanKnowledgeGraph:
         to_pk = self._spine_pk(to_concept_id, to_version)
         try:
             self._conn.execute(
-                f"MATCH (a:Concept {{pk: $apk}}), (b:Concept {{pk: $bpk}}) "
+                f"MATCH (a:Engram {{pk: $apk}}), (b:Engram {{pk: $bpk}}) "
                 f"CREATE (a)-[:{rel}]->(b)",
                 {"apk": from_pk, "bpk": to_pk},
             )
@@ -790,7 +837,7 @@ class TitanKnowledgeGraph:
         """Total Concept rows across all (concept_id, version) tuples.
         Used by the fleet E2E test P4.kuzu-spine-active check (§P4.J)."""
         try:
-            qr = self._conn.execute("MATCH (c:Concept) RETURN COUNT(c)")
+            qr = self._conn.execute("MATCH (c:Engram) RETURN COUNT(c)")
             if qr.has_next():
                 return int(qr.get_next()[0])
         except Exception as e:
@@ -840,7 +887,7 @@ class TitanKnowledgeGraph:
         for rel in ("COMPOSED_FROM", "COMPOSED_INTO"):
             try:
                 qr = self._conn.execute(
-                    f"MATCH (a:Concept {{pk: $apk}})-[:{rel}]->(b:Concept) "
+                    f"MATCH (a:Engram {{pk: $apk}})-[:{rel}]->(b:Engram) "
                     f"RETURN b.concept_id, b.version LIMIT $lim",
                     {"apk": anchor_pk, "lim": int(limit)},
                 )
@@ -861,7 +908,7 @@ class TitanKnowledgeGraph:
         memory_type: str | None = None,
     ) -> list[dict]:
         """Paginated list of concepts (latest version per concept_id), ordered
-        by groundedness DESC. Backs the Observatory /v6/synthesis/concepts
+        by groundedness DESC. Backs the Observatory /v6/synthesis/engrams
         endpoint (§P4.I).
 
         Kuzu's Cypher dialect doesn't provide MAX+GROUP BY in 0.11, so we
@@ -873,14 +920,14 @@ class TitanKnowledgeGraph:
         try:
             if memory_type is not None:
                 qr = self._conn.execute(
-                    "MATCH (c:Concept) WHERE c.memory_type = $mt "
+                    "MATCH (c:Engram) WHERE c.memory_type = $mt "
                     "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                     "c.groundedness, c.anchor_tx, c.created_at",
                     {"mt": memory_type},
                 )
             else:
                 qr = self._conn.execute(
-                    "MATCH (c:Concept) "
+                    "MATCH (c:Engram) "
                     "RETURN c.concept_id, c.version, c.name, c.memory_type, "
                     "c.groundedness, c.anchor_tx, c.created_at"
                 )
@@ -1036,7 +1083,7 @@ class TitanKnowledgeGraph:
         try:
             self._conn.execute(
                 "MATCH (f:HypothesisFork {fork_id: $fid}), "
-                "(c:Concept {pk: $cpk}) "
+                "(c:Engram {pk: $cpk}) "
                 "CREATE (f)-[:EXPLORES]->(c)",
                 {"fid": fork_id, "cpk": concept_pk},
             )
@@ -1110,7 +1157,7 @@ class TitanKnowledgeGraph:
         repair-fork graduation to resolve the parent concept."""
         try:
             qr = self._conn.execute(
-                "MATCH (f:HypothesisFork {fork_id: $fid})-[:EXPLORES]->(c:Concept) "
+                "MATCH (f:HypothesisFork {fork_id: $fid})-[:EXPLORES]->(c:Engram) "
                 "RETURN c.concept_id, c.version",
                 {"fid": fork_id},
             )
@@ -1125,6 +1172,36 @@ class TitanKnowledgeGraph:
                 fork_id, e,
             )
             return []
+
+    def checkpoint(self) -> bool:
+        """Force a Kuzu CHECKPOINT — merge the WAL into the main DB file and
+        truncate it.
+
+        A Guardian-supervised module is *killed*, never cleanly closed, so the
+        Kuzu WAL only ever GROWS across boots. Kuzu replays the entire WAL on
+        every open; once that replay cost crosses the module's RSS cap, the
+        module OOM-loops *before* it can checkpoint → the WAL stays dirty →
+        infinite loop. (T2 synthesis 2026-06-05: a 632 KB un-checkpointed
+        synthesis_spine WAL replayed to +420 MB on every boot → DISABLED;
+        one explicit CHECKPOINT cleared it to 0 B and dropped reopen to +3 MB.)
+        Callers checkpoint periodically to keep the WAL bounded. Single-writer
+        only (INV-Syn-7 — synthesis is the G21 sole writer of its spine)."""
+        try:
+            self._conn.execute("CHECKPOINT")
+            return True
+        except Exception as exc:
+            logger.warning("[KnowledgeGraph] CHECKPOINT failed: %s", exc)
+            return False
+
+    def wal_size_mb(self) -> float:
+        """Current `.wal` size in MB (0.0 if absent) — the un-checkpointed
+        backlog Kuzu must replay on next open. Used to gate periodic
+        checkpoints (see `checkpoint`)."""
+        try:
+            wal = self._db_path + ".wal"
+            return os.path.getsize(wal) / (1024.0 * 1024.0) if os.path.exists(wal) else 0.0
+        except Exception:
+            return 0.0
 
     def close(self):
         del self._conn

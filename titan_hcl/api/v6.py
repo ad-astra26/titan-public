@@ -418,14 +418,14 @@ _T = (
      None, None, (), ("maker_worker",), True, "/v4/maker/dialogue-history"),
 
     # ── synthesis — Phase 4 §P4.I (D-SPEC-128 forthcoming) ───────────────
-    # Concept-spine readouts. Source = data/knowledge_graph.kuzu (read-only
-    # cross-process open). Producer = synthesis_worker. No legacy /v4 path
-    # replaced (new in P4).
-    ("/v6/synthesis/concepts", "GET", "get_v6_synthesis_concepts", "synthesis", "readout",
+    # Engram-spine readouts (§7.G: concepts→engrams, no-shim). Source =
+    # data/spine_snapshot.json (synthesis_worker exports each 60s tick).
+    # Producer = synthesis_worker. No legacy /v4 path replaced (new in P4).
+    ("/v6/synthesis/engrams", "GET", "get_v6_synthesis_engrams", "synthesis", "readout",
      None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/concepts/heatmap", "GET", "get_v6_synthesis_concepts_heatmap",
+    ("/v6/synthesis/engrams/heatmap", "GET", "get_v6_synthesis_engrams_heatmap",
      "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/concepts/{concept_id}", "GET", "get_v6_synthesis_concept",
+    ("/v6/synthesis/engrams/{engram_id}", "GET", "get_v6_synthesis_engram",
      "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
 
     # ── synthesis — Phase 5 §P5.I (D-SPEC-PHASE5 forthcoming) ────────────

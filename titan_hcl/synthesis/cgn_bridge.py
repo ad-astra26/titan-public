@@ -12,8 +12,8 @@ namespace. Per the 2026-05-20 design conversation and arch §3.2 + INV-1:
 
 This module is the thin bridge that:
 
-1. Registers a spine concept_id when ConceptStore materializes it (P4.B).
-   Registration writes to `data/synthesis_spine_concepts.json` (atomic
+1. Registers a spine concept_id when EngramStore materializes it (P4.B).
+   Registration writes to `data/synthesis_engrams.json` (atomic
    tmp+rename) — a small registry distinct from CGN's vocabulary, so
    neither namespace pollutes the other.
 2. Provides `ensure_grounded()` — a stub in P4 that returns None. The
@@ -24,7 +24,7 @@ P4 ships the **interface**; the deep CGN integration lands incrementally
 per the "interface-complete, implementation-incremental" §3.3 discipline.
 
 Soft-fail semantics: any persistence error logs WARN but never raises so
-ConceptStore.create_concept can still anchor its TX (the spine row is a
+EngramStore.create_concept can still anchor its TX (the spine row is a
 derived index, not the canonical record — INV-2).
 """
 from __future__ import annotations
@@ -40,7 +40,9 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_REGISTRY_PATH = "data/synthesis_spine_concepts.json"
+DEFAULT_REGISTRY_PATH = "data/synthesis_engrams.json"
+# §7.G — the pre-rename registry filename; boot-migrated on first _load (rename).
+_LEGACY_REGISTRY_PATH = "data/synthesis_spine_concepts.json"
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,21 @@ class CGNRegistrationBridge:
         with self._lock:
             if self._loaded:
                 return
+            # §7.G boot-migrate: rename the legacy registry file once (no-shim).
+            # Legacy lives beside the configured registry (same dir), so this
+            # works for the default path AND test/shadow dirs.
+            _legacy = os.path.join(
+                os.path.dirname(self._registry_path) or ".",
+                os.path.basename(_LEGACY_REGISTRY_PATH))
+            if (not os.path.exists(self._registry_path)
+                    and _legacy != self._registry_path
+                    and os.path.exists(_legacy)):
+                try:
+                    os.rename(_legacy, self._registry_path)
+                    logger.info("[CGNBridge] migrated registry %s → %s (§7.G)",
+                                _legacy, self._registry_path)
+                except Exception as _mig_err:  # noqa: BLE001
+                    logger.warning("[CGNBridge] registry migrate failed: %s", _mig_err)
             try:
                 if os.path.exists(self._registry_path):
                     with open(self._registry_path, "r") as f:
@@ -201,7 +218,7 @@ class CGNRegistrationBridge:
         note="phase4_stub")`. The inner-outer bridge phase deepens this
         into a real CGN.meaning_of() / ensure_grounded() call cycle.
 
-        Caller (ConceptStore.recompute_groundedness via P4.G consolidation)
+        Caller (EngramStore.recompute_groundedness via P4.G consolidation)
         treats None as "no felt strand yet" → felt_coverage=0.0 in the
         groundedness formula (§P4.E). Same numeric result as P4's stub,
         but the structural seam is in place for the bridge phase.

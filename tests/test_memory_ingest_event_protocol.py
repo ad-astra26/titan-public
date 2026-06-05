@@ -382,3 +382,53 @@ def test_ingest_completion_registry_duplicate_rid_raises(stub_bus):
     reg.register("rid-dup")
     with pytest.raises(RuntimeError, match="already in-flight"):
         reg.register("rid-dup")
+
+
+# ── add_to_mempool felt plumbing (Phase C / RFP_synthesis_engram_grounding §7.C) ──
+# Regression guard for the proxy hop the offline tests originally missed (the
+# felt crux failed live on T3: MemoryProxy.add_to_mempool rejected neuromod_context).
+
+
+@pytest.mark.asyncio
+async def test_add_to_mempool_forwards_neuromod_context_in_payload(proxy, stub_bus):
+    felt = {"DA": 0.9, "NE": 0.8, "emotion": "wonder"}
+    await proxy.add_to_mempool("u", "a", user_identifier="x", neuromod_context=felt)
+    evts = [m for m in stub_bus.published if m.get("type") == bus.MEMORY_MEMPOOL_ADD]
+    assert len(evts) == 1
+    payload = evts[0]["payload"]
+    assert payload["user_prompt"] == "u"
+    assert payload["agent_response"] == "a"
+    assert payload["user_identifier"] == "x"
+    assert payload["neuromod_context"] == felt
+
+
+@pytest.mark.asyncio
+async def test_add_to_mempool_neuromod_context_defaults_none(proxy, stub_bus):
+    await proxy.add_to_mempool("u", "a")
+    evts = [m for m in stub_bus.published if m.get("type") == bus.MEMORY_MEMPOOL_ADD]
+    assert len(evts) == 1
+    assert evts[0]["payload"]["neuromod_context"] is None
+
+
+def test_handle_mempool_add_forwards_neuromod_context_to_core():
+    """memory_worker._handle_mempool_add forwards payload neuromod_context to core
+    add_to_mempool (the worker hop of the felt chain)."""
+    import threading
+    from types import SimpleNamespace
+    from titan_hcl.modules.memory_worker import _handle_mempool_add
+
+    captured: dict = {}
+
+    class _Mem:
+        async def add_to_mempool(self, user_prompt, agent_response,
+                                 user_identifier="Anonymous", neuromod_context=None):
+            captured.update(neuromod_context=neuromod_context, up=user_prompt)
+
+    ctx = SimpleNamespace(memory=_Mem(), write_lock=threading.Lock(),
+                          name="memory", send_queue=None)
+    felt = {"DA": 0.7}
+    _handle_mempool_add(
+        {"payload": {"user_prompt": "u", "agent_response": "a",
+                     "user_identifier": "x", "neuromod_context": felt}}, ctx)
+    assert captured["neuromod_context"] == felt
+    assert captured["up"] == "u"

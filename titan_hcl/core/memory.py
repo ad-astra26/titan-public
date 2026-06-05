@@ -777,12 +777,19 @@ class TieredMemoryGraph:
     # Mempool Operations (local-only, fast)
     # -------------------------------------------------------------------------
     async def add_to_mempool(
-        self, user_prompt: str, agent_response: str, user_identifier: str = "Anonymous"
+        self, user_prompt: str, agent_response: str, user_identifier: str = "Anonymous",
+        neuromod_context: dict = None,
     ) -> None:
         """
         Add a fresh node to the mempool with sigmoid decay tracking.
         If a semantically similar topic already exists in the mempool,
         reinforces the existing node instead of creating a duplicate.
+
+        `neuromod_context` (§7.C — RFP_synthesis_engram_grounding): the felt-state
+        snapshot (neuromod levels + emotion) the turn was lived under, stored on
+        the node so a promoted chat thought carries felt into the synthesis felt
+        axis (the crux fix — chat thoughts previously carried NO felt). Optional;
+        the reinforce path keeps the existing node's original lived felt.
         """
         now = time.time()
 
@@ -832,6 +839,7 @@ class TieredMemoryGraph:
             "mempool_reinforcements": 0,
             "mempool_weight": 1.0,
             "effective_weight": 1.0,
+            "neuromod_context": neuromod_context,  # felt-at-lived-time (§7.C)
         }
         self._node_store[node_id] = node
         self._next_id += 1

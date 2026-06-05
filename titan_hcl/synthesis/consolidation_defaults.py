@@ -106,6 +106,7 @@ def default_mine_recent_thoughts(
                 tags=(),  # sidecar carries none → cosine-primary clustering
                 embedding=None,  # filled from the conversation FAISS shard (D2)
                 content_summary=content,
+                felt=row.get("felt"),  # felt-at-lived-time JSON (§7.C)
             ))
     except Exception as e:
         logger.warning(
@@ -139,6 +140,8 @@ _LLM_SYSTEM_PROMPT = (
     "CONCEPT_ID: <id_with_underscores>\n"
     "NAME: <human-readable name, empty for reject>\n"
     "MEMORY_TYPE: declarative | procedural | episodic | meta\n"
+    "DOMAIN: <broad knowledge domain, e.g. biology | mathematics | music | "
+    "self; empty if unclear>\n"
     "REASON: <one short sentence>\n"
 )
 
@@ -190,7 +193,8 @@ def _parse_llm_response(text: str) -> LLMProposal:
             continue
         key, _, val = line.partition(":")
         key = key.strip().upper()
-        if key in ("ACTION", "CONCEPT_ID", "NAME", "MEMORY_TYPE", "REASON"):
+        if key in ("ACTION", "CONCEPT_ID", "NAME", "MEMORY_TYPE", "DOMAIN",
+                   "REASON"):
             fields[key] = val.strip()
 
     action_raw = fields.get("ACTION", "reject").lower()
@@ -217,6 +221,12 @@ def _parse_llm_response(text: str) -> LLMProposal:
     if memory_type not in ("declarative", "procedural", "episodic", "meta"):
         memory_type = "meta"
 
+    # §7.F — advisory domain_hint (free-text, normalized; "" if the LLM omitted
+    # it or returned the placeholder). Never gates behaviour; mutable.
+    domain_hint = fields.get("DOMAIN", "").strip().lower()
+    if domain_hint.startswith("<") or domain_hint in ("empty", "unclear", "none"):
+        domain_hint = ""
+
     return LLMProposal(
         action=action_raw,  # type: ignore[arg-type]
         concept_id=concept_id,
@@ -224,6 +234,7 @@ def _parse_llm_response(text: str) -> LLMProposal:
         memory_type=memory_type,
         base_concept_refs=(),
         reason=fields.get("REASON", ""),
+        domain_hint=domain_hint,
     )
 
 
@@ -260,9 +271,48 @@ def make_default_llm_propose(provider: Any) -> Any:
     return _propose
 
 
+# ── Default decompose (Inner↔Outer Felt-Teaching Bridge §7.1) ──────
+
+
+def make_default_decompose(provider: Any, *, max_objects: int = 8) -> Any:
+    """Bind a provider into a sync `decompose_fn(name, sample_content) -> list[str]`
+    that decomposes an Engram(Idea) into its constituent Object labels
+    (RFP_inner_outer_felt_teaching_bridge §7.1). Mirrors `make_default_llm_propose`:
+    `LanguageTeacher` builds the prompt + parses (it never invokes the LLM itself);
+    this bridges the provider via `asyncio.run` (synthesis_worker's bus loop is
+    thread-based, no surrounding event loop).
+
+    Provider failure / parse error → `[]` (FeltBridge does NOT cache an empty result
+    → it retries next touch; a transient failure must never be frozen as "no
+    Objects"). Never raises."""
+    from titan_hcl.logic.language_teacher import LanguageTeacher
+
+    def _decompose(name: str, sample_content: str = "") -> list[str]:
+        spec = LanguageTeacher.build_decompose_prompt(
+            name, sample_content, max_objects=max_objects)
+        try:
+            text = asyncio.run(provider.complete(
+                prompt=spec["prompt"],
+                system=spec["system"],
+                temperature=0.2,
+                max_tokens=spec.get("max_tokens", 200),
+                timeout=45.0,
+            ))
+        except Exception as e:
+            logger.warning(
+                "[consolidation_defaults] decompose provider failed: %s", e)
+            return []
+
+        return LanguageTeacher.parse_decompose_objects(
+            text or "", max_objects=max_objects)
+
+    return _decompose
+
+
 __all__ = (
     "default_mine_recent_thoughts",
     "make_default_llm_propose",
+    "make_default_decompose",
     "_parse_llm_response",
     "_build_cluster_prompt",
 )

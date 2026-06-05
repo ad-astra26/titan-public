@@ -1084,6 +1084,98 @@ class LanguageTeacher:
         )
         return {"system": system, "prompt": prompt, "max_tokens": 50}
 
+    # ── Inner↔Outer Felt-Teaching Bridge §7.1 — Engram(Idea)→Object decompose ──
+    # Prompt-build + parse ONLY. This class never invokes the LLM itself; the worker
+    # that owns it drives inference (for language teaching that is language_worker via
+    # LLM_TEACHER_REQUEST → the llm worker; for the dream-boundary decompose it is
+    # synthesis_worker via consolidation_defaults.make_default_decompose, using its
+    # own consolidation proposer provider). Decomposing an Idea into its constituent
+    # Objects — the smallest salient meaning-units (≈ neurons): nouns / entities /
+    # concepts — is a language operation, so the prompt lives here
+    # (RFP_inner_outer_felt_teaching_bridge §7.1; Q1 lean = entities first).
+    _DECOMPOSE_SYSTEM_PROMPT = (
+        "You break a concept down into its constituent meaning-units (its 'Objects') "
+        "— the smallest salient entities or concepts it is built from, the things a "
+        "mind would ground separately. For example 'Glacier Microbial Altitude "
+        "Stratification' breaks into: glacier, microbe, altitude, stratification.\n\n"
+        "Return ONLY the Objects, one per line, each prefixed exactly 'OBJECT: '. "
+        "Use lowercase single words or short noun phrases. Give 2-8 Objects. "
+        "No numbering, no commentary, no blank lines."
+    )
+
+    @staticmethod
+    def build_decompose_prompt(name: str, sample_content: str = "",
+                               max_objects: int = 8) -> dict:
+        """Build the LLM prompt that decomposes an Engram(Idea) into its constituent
+        Objects. Returns {system, prompt, max_tokens} for the caller's provider —
+        this class does NOT call the LLM. Parsed by parse_decompose_objects()."""
+        name = (name or "").strip()
+        sample = (sample_content or "").strip()
+        if len(sample) > 1200:
+            sample = sample[:1200].rstrip() + "…"
+        sample_block = (f"A sample of the underlying thoughts:\n{sample}\n\n"
+                        if sample else "")
+        prompt = (
+            f"Concept: \"{name}\"\n\n"
+            f"{sample_block}"
+            f"List up to {max_objects} constituent Objects (salient entities / "
+            f"concepts), one per line as 'OBJECT: <label>'."
+        )
+        return {"system": LanguageTeacher._DECOMPOSE_SYSTEM_PROMPT,
+                "prompt": prompt, "max_tokens": 16 * max_objects + 40}
+
+    @staticmethod
+    def parse_decompose_objects(text: str, max_objects: int = 8) -> list[str]:
+        """Parse the 'OBJECT: <label>' line-prefix response into a de-duplicated,
+        order-preserving list of lowercased Object labels (canonical key-space
+        normalization happens later in felt_bridge.normalize_label). Strict: only
+        'OBJECT:'-prefixed lines count, so a verbose model cannot inject noise. Never
+        raises; unparseable → []."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            if key.strip().upper() != "OBJECT":
+                continue
+            label = val.strip().strip("\"'").lower().rstrip(".,;:!?").strip()
+            if not label or len(label) > 60:
+                continue
+            if label not in seen:
+                seen.add(label)
+                out.append(label)
+            if len(out) >= max_objects:
+                break
+        return out
+
+    @staticmethod
+    def build_felt_perturbation(object_label: str, felt_state: dict,
+                                domain_hint: str = "") -> dict:
+        """Build the felt-perturbation teaching prompt for an ungrounded Object
+        (Bridge §7.4). Prompt-build ONLY — the felt_teaching_worker runs the LLM via
+        its own provider. Frames the Object in the felt-state it was lived under so
+        CGN can ground a felt strand for it. Returns {system, prompt, max_tokens}."""
+        levels = sorted(
+            (k, v) for k, v in (felt_state or {}).items()
+            if isinstance(v, (int, float)))
+        felt_desc = (", ".join(f"{k}={float(v):.2f}" for k, v in levels)
+                     if levels else "neutral")
+        dom = f" (in the context of {domain_hint})" if domain_hint else ""
+        system = (
+            "You help a digital being FEEL a new concept. Given a concept and the "
+            "felt-state it was experienced under, write 1-2 short first-person, "
+            "sensory, embodied sentences that evoke that felt quality of the concept. "
+            "No definitions, no lists, no explanations."
+        )
+        prompt = (
+            f"Concept: \"{object_label}\"{dom}\n"
+            f"Felt-state it was lived under: {felt_desc}\n\n"
+            f"Evoke how \"{object_label}\" feels."
+        )
+        return {"system": system, "prompt": prompt, "max_tokens": 80}
+
     # ── Private Helpers ──
 
     def _pick_target(self, mode: str, queue: list) -> dict:

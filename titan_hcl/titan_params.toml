@@ -3101,6 +3101,19 @@ reasoning = "data/reasoning_cgn/state_snapshot.json"
 # d (activation decay), composite weights, etc. land here as P1 promoted
 # its hardcoded defaults; currently only the chi subtable is consumed.
 
+[synthesis.engram.grounding]
+# Phase D (RFP_synthesis_engram_grounding §7.D) — the percentile-blend weights
+# for the Engram grounding scalar. The scalar = weighted blend of the 4
+# percentile-normalized axes, recomputed across the live population at the dream
+# boundary. Weights lean on `used` at launch (the only axis with variance now);
+# the blend is variance-gated (a flat axis is dropped + the remaining weights
+# renormalize), so the spread is always driven by whatever signal actually exists.
+w_used     = 0.40   # ACT-R B_i (episodic encounters + distinct contexts)
+w_verified = 0.25   # NARS c = n/(n+k) from oracle scored_by evidence
+w_felt     = 0.20   # felt-at-lived-time coverage (§7.C)
+w_fluent   = 0.15   # recall-citation rate (0 at launch — per-Engram attribution deferred)
+nars_k     = 1.0    # NARS evidence horizon (verified = n/(n+nars_k))
+
 [synthesis.chi]
 # Per-op cost paid into RuleEvaluator._chi_spent each time an op is
 # executed during a single evaluate() call. Costs match arch §22
@@ -3633,3 +3646,18 @@ self_reflection_worker_enabled = true
 #   • Pre-swap data backup taken — data.backup.20260504_080108/ (9.7G)
 # T1-only validation pass; T2/T3 stay deferred until T1 soaks 24h+ clean.
 maker_full_stop = false
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [gatekeeper.grounded_router] — EEL Pillar 0 (RFP_emergent_experience_learning §7.0)
+# Bootstrap thresholds for the grounded execution-mode router that replaces the
+# old `advantage = q − v` gate. CONSERVATIVE by design: the IQL refinement /
+# BRAIN `time_cost` supersede these over time (INV-EEL-4 — emergence over
+# determinism). Consumed by titan_hcl/logic/sage/grounded_router.py.
+# ─────────────────────────────────────────────────────────────────────────────
+[gatekeeper.grounded_router]
+recall_known_floor   = 0.65   # recall composite_score ≥ this → Sovereign (strong memory)
+recall_present_floor = 0.30   # recall ≥ this (but < known) → Collaborative (partial memory)
+engram_ground_floor  = 0.30   # EngramStore reduced groundedness ≥ this counts as strong substrate
+skill_promote_floor  = 0.70   # verified skill utility ≥ this → Skill-Delegate (active once B1 lands)
+iql_veto_margin      = 0.25   # |IQL advantage| beyond this may veto the grounded mode (0c only; passive in 0a/0b)
