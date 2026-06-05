@@ -892,14 +892,57 @@ def create_pre_hook(plugin):
         # RL gatekeeper only trains on reasoning interactions (Maker 2026-05-18).
         mode, adv, text = "direct", 0.5, ""
         plugin._last_observation_vector = None
+        plugin._last_router_decision = None
         if ("gatekeeper_state" in active_features and plugin.gatekeeper is not None
                 and hasattr(plugin.gatekeeper, "decide_execution_mode_from_prompt")):
             try:
+                # The recorder RPC still produces the advantage + 3072-d obs_vec
+                # (recorder/torch split preserved). Its q−v `mode` is the SAFETY
+                # FALLBACK only — the grounded router below normally overrides it.
                 mode, adv, text, obs_vec = await plugin.gatekeeper.decide_execution_mode_from_prompt(
                     prompt_text)
                 plugin._last_observation_vector = obs_vec
             except Exception as _gk_err:
                 logger.warning("[PreHook] decide_from_prompt failed: %s", _gk_err)
+            # ── EEL Pillar 0 §7.0 — grounded execution-mode router ──────────────
+            # Decide the mode from Titan's ACTUAL cognitive state (recall + task
+            # type), reusing signals already on the spine (INV-EEL-1) — not the
+            # stale q−v scalar. engram/skill/metabolic come online in fast-follows;
+            # the router degrades gracefully on their 0-defaults. The IQL advantage
+            # is carried PASSIVE in 0a/0b (recorded, never gates — 0c activates it).
+            try:
+                from titan_hcl.logic.sage.grounded_router import (
+                    GroundedReadout, grounded_route, load_router_thresholds,
+                    is_informational_query, recall_score_from_memories)
+                from titan_hcl.synthesis.tool_intent import detect_tool_intent
+                _thr = getattr(plugin, "_grounded_router_thresholds", None)
+                if _thr is None:
+                    _thr = load_router_thresholds()
+                    plugin._grounded_router_thresholds = _thr
+                try:
+                    _requires_tool = bool(detect_tool_intent(prompt_text).requires_tool)
+                except Exception:
+                    _requires_tool = False
+                _readout = GroundedReadout(
+                    recall_score=recall_score_from_memories(relevant_memories),
+                    engram_ground=0.0,         # 0b: deferred (recall-only) — fast-follow
+                    skill_utility=None,        # 0b: deferred to B1 (skill-lane dormant)
+                    requires_tool=_requires_tool,
+                    is_informational=is_informational_query(prompt_text),
+                    can_afford_research=True,  # 0b: deferred metabolic gate
+                )
+                _decision = grounded_route(_readout, _thr, iql_advantage=adv)
+                mode = _decision.mode  # override the q−v fallback
+                plugin._last_router_decision = _decision
+                logger.info(
+                    "[PreHook] grounded router → %s (lane=%s; recall=%.2f tool=%s "
+                    "info=%s iql_adv=%.3f) — %s",
+                    _decision.mode, _decision.lane, _readout.recall_score,
+                    _requires_tool, _readout.is_informational, adv, _decision.reason)
+            except Exception as _gr_err:
+                logger.warning(
+                    "[PreHook] grounded router failed (keeping q−v fallback mode "
+                    "'%s'): %s", mode, _gr_err)
         plugin._last_execution_mode = mode
 
         _ph_stage("after_gatekeeper_hostside")

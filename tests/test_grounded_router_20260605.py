@@ -14,6 +14,8 @@ from titan_hcl.logic.sage.grounded_router import (
     RouterDecision,
     grounded_route,
     load_router_thresholds,
+    is_informational_query,
+    recall_score_from_memories,
     MODE_SOVEREIGN,
     MODE_COLLABORATIVE,
     MODE_RESEARCH,
@@ -206,3 +208,56 @@ def test_mode_strings_match_existing_dispatch():
     assert MODE_COLLABORATIVE == "Collaborative"
     assert MODE_RESEARCH == "STATE_NEED_RESEARCH"
     assert MODE_SHADOW == "Shadow"
+
+
+# ── Readout helpers (0b): informational classifier + recall extraction ───────
+
+def test_is_informational_query_detects_realtime():
+    assert is_informational_query("what is the SOL price today")
+    assert is_informational_query("latest news on the launch")
+    assert is_informational_query("what's the current TVL of Jupiter?")
+
+
+def test_is_informational_query_false_for_creative():
+    assert not is_informational_query("write me a poem about the sea")
+    assert not is_informational_query("tell me about your day")
+    assert not is_informational_query("")
+
+
+def test_is_informational_query_is_case_insensitive():
+    assert is_informational_query("BREAKING: ANNOUNCEMENT")
+
+
+def test_recall_score_from_dict_memories():
+    mems = [{"effective_weight": 0.3}, {"effective_weight": 0.82}, {"effective_weight": 0.5}]
+    assert recall_score_from_memories(mems) == pytest.approx(0.82)
+
+
+def test_recall_score_empty_is_zero():
+    assert recall_score_from_memories([]) == 0.0
+    assert recall_score_from_memories(None) == 0.0
+
+
+def test_recall_score_falls_back_to_mempool_weight():
+    assert recall_score_from_memories([{"mempool_weight": 0.6}]) == pytest.approx(0.6)
+
+
+def test_recall_score_handles_missing_and_bad_weights():
+    # No weight key → 0 contribution; non-numeric → ignored; max wins.
+    mems = [{"no_weight": 1}, {"effective_weight": "bad"}, {"effective_weight": 0.4}]
+    assert recall_score_from_memories(mems) == pytest.approx(0.4)
+
+
+def test_recall_score_from_object_attr():
+    class _Rec:
+        effective_weight = 0.7
+    assert recall_score_from_memories([_Rec()]) == pytest.approx(0.7)
+
+
+def test_recall_extraction_feeds_router_to_research_when_empty():
+    # End-to-end: empty recall + informational → research (the EEL-G0 core).
+    ro = GroundedReadout(
+        recall_score=recall_score_from_memories([]),
+        is_informational=is_informational_query("what's the latest SOL price?"),
+    )
+    assert grounded_route(ro, T).mode == MODE_RESEARCH

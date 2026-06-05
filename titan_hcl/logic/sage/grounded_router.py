@@ -194,3 +194,61 @@ def load_router_thresholds() -> RouterThresholds:
         )
     except Exception:
         return RouterThresholds()
+
+
+# ── Readout assembly helpers (torch-free; importable agno-side) ───────────────
+# These let the agno PreHook (0b) build a GroundedReadout from signals already on
+# the spine without importing the torch-bearing gatekeeper module.
+
+# Single source for the informational classifier — extracted from
+# gatekeeper._is_informational_query (which lives in a torch-importing module) so
+# the agno-side router AND the recorder-side q−v path share ONE keyword set
+# (EEL §7.0 "expose _is_informational_query"; no duplication, no shim).
+_INFORMATIONAL_KEYWORDS = frozenset({
+    # Time-sensitive data
+    "latest", "current", "today", "right now", "recent", "news", "price",
+    "predict", "forecast",
+    # Market / financial signals
+    "market", "sol price", "bitcoin price", "eth price", "token price",
+    "trading", "apy", "yield", "tvl",
+    # Social pulse
+    "trending", "people saying", "sentiment", "what does", "what do people",
+    "community",
+    # Event-driven
+    "just happened", "breaking", "announcement", "launch", "update", "release",
+    "upgrade",
+})
+
+
+def is_informational_query(prompt: str) -> bool:
+    """True when the prompt needs real-world / real-time data that static memory
+    cannot answer reliably (→ the informational lane). Case-insensitive keyword
+    match; the single source for both the grounded router (agno-side) and
+    `gatekeeper._is_informational_query` (recorder-side q−v path)."""
+    if not prompt:
+        return False
+    lower = prompt.lower()
+    return any(kw in lower for kw in _INFORMATIONAL_KEYWORDS)
+
+
+def recall_score_from_memories(memories) -> float:
+    """Recall strength for the readout = the top weight of the memories ALREADY
+    recalled in the PreHook (reused, not re-computed — INV-EEL-1). 0.0 when
+    nothing was recalled, which is what opens the research branch. Covers both
+    recall paths: VCB records expose `effective_weight` (= chain confidence);
+    `memory.query` nodes expose `effective_weight` / `mempool_weight`."""
+    top = 0.0
+    for m in (memories or []):
+        if isinstance(m, dict):
+            w = m.get("effective_weight")
+            if w is None:
+                w = m.get("mempool_weight", m.get("weight"))
+        else:
+            w = getattr(m, "effective_weight", None)
+        try:
+            w = float(w) if w is not None else 0.0
+        except (TypeError, ValueError):
+            w = 0.0
+        if w > top:
+            top = w
+    return top

@@ -106,6 +106,12 @@ class SageGatekeeper:
         The check is case-insensitive and evaluates a curated set of keywords that
         strongly correlate with a need for live, external data.
 
+        EEL Pillar 0 §7.0: the keyword set was extracted to the torch-free
+        `logic/sage/grounded_router.is_informational_query` so the agno-side
+        grounded router and this recorder-side q−v path share ONE source (the
+        agno side cannot import this module — it carries torch). This method now
+        delegates; behaviour is unchanged.
+
         Args:
             prompt (str): The raw user prompt string.
 
@@ -113,22 +119,8 @@ class SageGatekeeper:
             bool: True if the prompt requires research; False if it can be handled
                   by the LLM from static memory alone.
         """
-        _INFORMATIONAL_KEYWORDS = {
-            # Time-sensitive data
-            "latest", "current", "today", "right now", "right now",
-            "recent", "news", "price", "predict", "forecast",
-            # Market / financial signals
-            "market", "sol price", "bitcoin price", "eth price",
-            "token price", "trading", "apy", "yield", "tvl",
-            # Social pulse
-            "trending", "people saying", "sentiment",
-            "what does", "what do people", "community",
-            # Event-driven
-            "just happened", "breaking", "announcement", "launch",
-            "update", "release", "upgrade",
-        }
-        lower = prompt.lower()
-        return any(kw in lower for kw in _INFORMATIONAL_KEYWORDS)
+        from titan_hcl.logic.sage.grounded_router import is_informational_query
+        return is_informational_query(prompt)
 
     def decide_execution_mode(
         self, state_tensor: torch.Tensor, raw_prompt: str = ""
