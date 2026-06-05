@@ -125,6 +125,30 @@ _RECALL_MOD_SCALE = {
 }
 
 
+def _can_afford_research(plugin) -> bool:
+    """EEL Pillar 0 §7.0b.2 part 4 — the metabolic research gate.
+
+    Reuses the EXISTING per-tier `research` feature (core/metabolism.py
+    TIER_FEATURES: True for THRIVING/HEALTHY/CONSERVING, False for
+    SURVIVAL/EMERGENCY/HIBERNATION), read via the metabolism SHM reader
+    (`MetabolismShmReader.can_use_feature`, sub-ms, no bus/RPC — G18-safe).
+    Fails OPEN (research allowed) when metabolism is unwired/cold so a read
+    hiccup never makes Titan refuse to look something up."""
+    metab = getattr(plugin, "metabolism", None)
+    if metab is None:
+        return True
+    try:
+        cuf = getattr(metab, "can_use_feature", None)
+        if callable(cuf):
+            return bool(cuf("research"))
+        # Fallback: read the SHM-cached tier + dispatch against TIER_FEATURES.
+        from titan_hcl.core.metabolism import TIER_FEATURES
+        tier = metab.get_metabolic_tier()
+        return bool(TIER_FEATURES.get(tier, {}).get("research", True))
+    except Exception:
+        return True
+
+
 def _compute_recall_perturbation(memories: list, current_time: float) -> dict:
     """Compute aggregate neuromod nudge from recalled memories' felt snapshots.
 
@@ -929,23 +953,35 @@ def create_pre_hook(plugin):
         mode, adv, text = "direct", 0.5, ""
         plugin._last_observation_vector = None
         plugin._last_router_decision = None
-        if ("gatekeeper_state" in active_features and plugin.gatekeeper is not None
-                and hasattr(plugin.gatekeeper, "decide_execution_mode_from_prompt")):
-            try:
-                # The recorder RPC still produces the advantage + 3072-d obs_vec
-                # (recorder/torch split preserved). Its q−v `mode` is the SAFETY
-                # FALLBACK only — the grounded router below normally overrides it.
-                mode, adv, text, obs_vec = await plugin.gatekeeper.decide_execution_mode_from_prompt(
-                    prompt_text)
-                plugin._last_observation_vector = obs_vec
-            except Exception as _gk_err:
-                logger.warning("[PreHook] decide_from_prompt failed: %s", _gk_err)
-            # ── EEL Pillar 0 §7.0 — grounded execution-mode router ──────────────
-            # Decide the mode from Titan's ACTUAL cognitive state (recall + task
-            # type), reusing signals already on the spine (INV-EEL-1) — not the
-            # stale q−v scalar. engram/skill/metabolic come online in fast-follows;
-            # the router degrades gracefully on their 0-defaults. The IQL advantage
-            # is carried PASSIVE in 0a/0b (recorded, never gates — 0c activates it).
+        # EEL Pillar 0 §7.0b.2 — the grounded router runs on any tier carrying the
+        # `grounded_router` feature (reasoning/casual/personal) OR the legacy
+        # `gatekeeper_state` (reasoning). The OR keeps reasoning routing alive even
+        # on a box whose config hasn't added `grounded_router` yet (no dark-out on
+        # a code-only deploy). Greeting carries neither → stays "direct".
+        _reasoning_tier = "gatekeeper_state" in active_features
+        _router_active = (
+            (_reasoning_tier or "grounded_router" in active_features)
+            and plugin.gatekeeper is not None
+            and hasattr(plugin.gatekeeper, "decide_execution_mode_from_prompt")
+        )
+        if _router_active:
+            obs_vec = None
+            # The torch encode RPC is EXPENSIVE → reasoning-tier-only (cost + the
+            # IQL training scope, §7.0b.2 part 3). On casual/personal the cheap
+            # grounded readout below decides with no torch work. Its q−v `mode` is
+            # the reasoning-tier safety fallback; the grounded router overrides it.
+            if _reasoning_tier:
+                try:
+                    mode, adv, text, obs_vec = await plugin.gatekeeper.decide_execution_mode_from_prompt(
+                        prompt_text)
+                    plugin._last_observation_vector = obs_vec
+                except Exception as _gk_err:
+                    logger.warning("[PreHook] decide_from_prompt failed: %s", _gk_err)
+            # ── grounded execution-mode router (all routed tiers) ──────────────
+            # Decide from Titan's ACTUAL cognitive state (recall + task type),
+            # reusing signals already on the spine (INV-EEL-1). engram/skill come
+            # online in fast-follows; the router degrades gracefully. The IQL
+            # advantage is PASSIVE (recorded, never gates in 0a/0b — 0c activates).
             try:
                 from titan_hcl.logic.sage.grounded_router import (
                     GroundedReadout, grounded_route, load_router_thresholds,
@@ -961,24 +997,29 @@ def create_pre_hook(plugin):
                     _requires_tool = False
                 _readout = GroundedReadout(
                     recall_score=recall_score_from_memories(relevant_memories),
-                    engram_ground=0.0,         # 0b: deferred (recall-only) — fast-follow
-                    skill_utility=None,        # 0b: deferred to B1 (skill-lane dormant)
+                    engram_ground=0.0,         # fast-follow (recall-only for now)
+                    skill_utility=None,        # B1 (skill-lane dormant until then)
                     requires_tool=_requires_tool,
                     is_informational=is_informational_query(prompt_text),
-                    can_afford_research=True,  # 0b: deferred metabolic gate
+                    can_afford_research=_can_afford_research(plugin),  # §7.0b.2 part 4
                 )
-                _decision = grounded_route(_readout, _thr, iql_advantage=adv)
-                mode = _decision.mode  # override the q−v fallback
+                _decision = grounded_route(
+                    _readout, _thr,
+                    iql_advantage=(adv if _reasoning_tier else None))
+                mode = _decision.mode  # grounded router is the decision
                 plugin._last_router_decision = _decision
                 logger.info(
-                    "[PreHook] grounded router → %s (lane=%s; recall=%.2f tool=%s "
-                    "info=%s iql_adv=%.3f) — %s",
-                    _decision.mode, _decision.lane, _readout.recall_score,
-                    _requires_tool, _readout.is_informational, adv, _decision.reason)
+                    "[PreHook] grounded router → %s (lane=%s tier=%s; recall=%.2f "
+                    "tool=%s info=%s afford_research=%s) — %s",
+                    _decision.mode, _decision.lane,
+                    getattr(plugin, "_current_chat_tier", "?"),
+                    _readout.recall_score, _requires_tool,
+                    _readout.is_informational, _readout.can_afford_research,
+                    _decision.reason)
             except Exception as _gr_err:
                 logger.warning(
-                    "[PreHook] grounded router failed (keeping q−v fallback mode "
-                    "'%s'): %s", mode, _gr_err)
+                    "[PreHook] grounded router failed (keeping mode '%s'): %s",
+                    mode, _gr_err)
         plugin._last_execution_mode = mode
 
         _ph_stage("after_gatekeeper_hostside")

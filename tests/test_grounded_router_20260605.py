@@ -210,6 +210,59 @@ def test_mode_strings_match_existing_dispatch():
     assert MODE_SHADOW == "Shadow"
 
 
+# ── §7.0b.2: broadened tier scope (router fires on casual/personal, not greeting) ─
+
+def _broadened_classifier():
+    """A ChatTierClassifier mirroring the broadened [[chat.tiers]] config:
+    grounded_router on reasoning/casual/personal; topic_memory on casual/personal;
+    greeting carries neither."""
+    from titan_hcl.modules.chat_tier_config import ChatTierClassifier
+    cfg = {"chat": {"default_tier": "casual", "tiers": [
+        {"name": "greeting", "detect": {"max_chars": 50, "regex_any": [r"\b(hi|hello|hey)\b"]},
+         "features": ["directives"]},
+        {"name": "personal", "detect": {"regex_any": [r"\b(my name is|remember me)\b"]},
+         "features": ["directives", "history", "grounded_router", "topic_memory"]},
+        {"name": "reasoning", "detect": {"regex_any": [r"\b(why|explain)\b"]},
+         "features": ["directives", "topic_memory", "gatekeeper_state", "grounded_router", "tools"]},
+        {"name": "casual", "detect": {"max_chars": 200},
+         "features": ["directives", "history", "grounded_router", "topic_memory"]},
+    ]}}
+    return ChatTierClassifier.from_config(cfg)
+
+
+def test_casual_informational_now_carries_grounded_router():
+    # The core fix: an everyday casual question (no why/explain) → casual tier →
+    # grounded_router present → the router runs (was: bypassed → mode=direct).
+    c = _broadened_classifier()
+    r = c.classify("what's the SOL price?")
+    assert r.tier.name == "casual"
+    assert "grounded_router" in r.active_features
+    assert "topic_memory" in r.active_features          # recall enabler → real recall_score
+
+
+def test_personal_carries_grounded_router():
+    c = _broadened_classifier()
+    r = c.classify("my name is Jirka")
+    assert r.tier.name == "personal"
+    assert "grounded_router" in r.active_features
+
+
+def test_reasoning_carries_both_gatekeeper_and_grounded_router():
+    c = _broadened_classifier()
+    r = c.classify("explain why the TVL changed")
+    assert r.tier.name == "reasoning"
+    assert "gatekeeper_state" in r.active_features      # → torch RPC (reasoning-only)
+    assert "grounded_router" in r.active_features
+
+
+def test_greeting_stays_router_free():
+    c = _broadened_classifier()
+    r = c.classify("hi there")
+    assert r.tier.name == "greeting"
+    assert "grounded_router" not in r.active_features
+    assert "gatekeeper_state" not in r.active_features
+
+
 # ── Readout helpers (0b): informational classifier + recall extraction ───────
 
 def test_is_informational_query_detects_realtime():
