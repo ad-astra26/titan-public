@@ -1173,6 +1173,36 @@ class TitanKnowledgeGraph:
             )
             return []
 
+    def checkpoint(self) -> bool:
+        """Force a Kuzu CHECKPOINT — merge the WAL into the main DB file and
+        truncate it.
+
+        A Guardian-supervised module is *killed*, never cleanly closed, so the
+        Kuzu WAL only ever GROWS across boots. Kuzu replays the entire WAL on
+        every open; once that replay cost crosses the module's RSS cap, the
+        module OOM-loops *before* it can checkpoint → the WAL stays dirty →
+        infinite loop. (T2 synthesis 2026-06-05: a 632 KB un-checkpointed
+        synthesis_spine WAL replayed to +420 MB on every boot → DISABLED;
+        one explicit CHECKPOINT cleared it to 0 B and dropped reopen to +3 MB.)
+        Callers checkpoint periodically to keep the WAL bounded. Single-writer
+        only (INV-Syn-7 — synthesis is the G21 sole writer of its spine)."""
+        try:
+            self._conn.execute("CHECKPOINT")
+            return True
+        except Exception as exc:
+            logger.warning("[KnowledgeGraph] CHECKPOINT failed: %s", exc)
+            return False
+
+    def wal_size_mb(self) -> float:
+        """Current `.wal` size in MB (0.0 if absent) — the un-checkpointed
+        backlog Kuzu must replay on next open. Used to gate periodic
+        checkpoints (see `checkpoint`)."""
+        try:
+            wal = self._db_path + ".wal"
+            return os.path.getsize(wal) / (1024.0 * 1024.0) if os.path.exists(wal) else 0.0
+        except Exception:
+            return 0.0
+
     def close(self):
         del self._conn
         del self._db

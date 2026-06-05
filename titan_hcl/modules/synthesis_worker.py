@@ -167,6 +167,13 @@ SYNTH_STATUS_PAYLOAD_BYTES = 24             # struct '<ddII'
 # write-tmp + os.replace.
 ACTIVATION_SNAPSHOT_NAME = "activation_snapshot.json"
 
+# WAL-hygiene (bugfix 2026-06-05) — checkpoint the synthesis_spine Kuzu graph
+# whenever its un-checkpointed `.wal` crosses this size, so its replay-on-open
+# cost stays small. Kept low: a Guardian-supervised module is killed (never
+# cleanly closed), so the only thing that ever clears the WAL is an explicit
+# checkpoint. (T2 2026-06-05: a 632 KB WAL already replayed to +420 MB.)
+_KUZU_WAL_CHECKPOINT_MB = 4.0
+
 # Phase 4 FU-1 — concept-spine cross-process read surface. synthesis_worker
 # exports the full Kuzu spine state to JSON each 60s recompute pass; the api
 # process reads this snapshot (NOT the Kuzu file directly) per the same
@@ -591,6 +598,7 @@ def _recompute_loop(store: "ActivationStore",
                     oracle_exporter_holder: dict,
                     metrics_exporter_holder: dict,
                     tx_index_holder: dict,
+                    kuzu_checkpoint_holder: dict,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
@@ -669,6 +677,17 @@ def _recompute_loop(store: "ActivationStore",
                     "[synthesis_worker] metrics_exporter call failed: %s",
                     _met_exp_err,
                 )
+            # WAL-hygiene (bugfix 2026-06-05) — bound the Kuzu spine WAL so its
+            # replay-on-open cost can never grow into the OOM-loop danger zone.
+            # No-op until wired (kuzu_graph_obj open) + only checkpoints past the
+            # size threshold / every ~30 passes (self-throttled inside the tick).
+            try:
+                kuzu_checkpoint_holder["fn"]()
+            except Exception as _kck_err:
+                logger.debug(
+                    "[synthesis_worker] kuzu_checkpoint call failed: %s",
+                    _kck_err,
+                )
             # G13 (AUDIT §5.3): the tx-index FAISS build (embed + add, bounded)
             # runs on its OWN `synthesis-tx-index` daemon thread now — NOT
             # inline here — so a slow embed (the embedder lazy-load is seconds)
@@ -688,13 +707,12 @@ def _recompute_loop(store: "ActivationStore",
                 "duration_ms": duration_ms,
             })
             pass_count += 1
-            if pass_count <= 2 or pass_count % 60 == 1:    # ~hourly summary (+first 2 for RSS probe)
+            if pass_count % 60 == 1:    # ~hourly summary
                 logger.info(
                     "[synthesis_worker] recompute pass #%d — items=%d "
                     "touched=%d bundles=%d duration=%dms errors=%d",
                     pass_count, items, n_touched, bundles_exported,
                     duration_ms, error_count)
-                _dbg_rss("recompute#%d" % pass_count, snapshot=True)
         except Exception as exc:
             error_count += 1
             logger.warning(
@@ -705,60 +723,6 @@ def _recompute_loop(store: "ActivationStore",
         slept = time.monotonic() - t0
         remaining = max(interval_s - slept, 0.1)
         stop_event.wait(remaining)
-
-
-@with_error_envelope(module_name="synthesis", subsystem="entry", severity=_phase11_sev.FATAL)
-def _dbg_rss(label: str, snapshot: bool = False) -> None:
-    """TEMP RSS-spike probe (T2 synthesis investigation 2026-06-05). Logs VmRSS at a
-    boot step; snapshot=True also dumps the tracemalloc top allocators (what is eating
-    the heap). Remove once T2's synthesis RSS bloat is root-caused."""
-    try:
-        rss = -1
-        with open("/proc/self/status") as _f:
-            for _l in _f:
-                if _l.startswith("VmRSS"):
-                    rss = int(_l.split()[1]) // 1024
-                    break
-        msg = "[RSS-PROBE] %s rss=%dMB" % (label, rss)
-        if snapshot:
-            # NATIVE breakdown via smaps (tracemalloc is blind to C allocs:
-            # FAISS / kuzu / gguf / duckdb) — anon heap + top file-backed mappings.
-            try:
-                maps: dict = {}
-                anon = 0
-                cur = None
-                with open("/proc/self/smaps") as _sf:
-                    for _ln in _sf:
-                        if (len(_ln) > 12 and _ln[0] not in " \t"
-                                and "-" in _ln[:18]):
-                            _p = _ln.split()
-                            cur = _p[5] if len(_p) >= 6 else None
-                        elif _ln.startswith("Rss:"):
-                            _kb = int(_ln.split()[1])
-                            if cur:
-                                maps[cur] = maps.get(cur, 0) + _kb
-                            else:
-                                anon += _kb
-                _topm = sorted(maps.items(), key=lambda x: -x[1])[:8]
-                msg += " | NATIVE anon=%dMB " % (anon // 1024) + "; ".join(
-                    "%s=%dMB" % (_k.split("/")[-1], _v // 1024)
-                    for _k, _v in _topm if _v > 5000)
-            except Exception:
-                pass
-            try:
-                import tracemalloc as _tm
-                if _tm.is_tracing():
-                    top = _tm.take_snapshot().statistics("lineno")[:6]
-                    msg += " | PY=" + "; ".join(
-                        "%s:%d=%.0fMB" % (
-                            _s.traceback[0].filename.split("/")[-1],
-                            _s.traceback[0].lineno, _s.size / 1e6)
-                        for _s in top)
-            except Exception:
-                pass
-        logger.info(msg)
-    except Exception:
-        pass
 
 
 def synthesis_worker_main(recv_queue, send_queue, name: str,
@@ -777,15 +741,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
     global _WORKER_READY
     _WORKER_READY = False
-
-    # TEMP (T2 synthesis RSS-spike investigation 2026-06-05) — trace boot RSS + allocs.
-    try:
-        import tracemalloc as _tm
-        if not _tm.is_tracing():
-            _tm.start()
-    except Exception:
-        pass
-    _dbg_rss("boot:start")
 
     from titan_hcl.core.state_registry import resolve_titan_id
 
@@ -882,7 +837,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     store = ActivationStore(db_path, writer=db_writer)
     status_writer = SynthStatusWriter(titan_id)
     registry = PlugRegistry()
-    _dbg_rss("after_activation_store", snapshot=True)
 
     # §7.E.0 — per-Engram citation attribution: the membership reverse-index +
     # the live `fluent` axis feed + §7.E's `(axes_at_recall, cited?)` reward log.
@@ -902,12 +856,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # (engram_objects) + the §7.2 event-sourced CGN grounded-set
     # (cgn_grounded_objects). In scope from here for the ConsolidationPass injection
     # AND the CGN_CONCEPT_GROUNDED handler below. Soft → None (synthesis unaffected).
-    _dbg_rss("after_recall_attribution", snapshot=True)
     from titan_hcl.synthesis.felt_bridge import FeltBridge
     felt_bridge: Optional[FeltBridge] = FeltBridge(store._conn, db_writer)
     if not felt_bridge.ensure_schema():
         felt_bridge = None
-    _dbg_rss("after_felt_bridge", snapshot=True)
 
     # Phase 2 D-P2-4 standing-bundle store — sole writer of
     # data/synthesis.duckdb / association_bundles. CONN-2 FOLD (AUDIT §5.2):
@@ -923,7 +875,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     bundle_store = StandingBundleStore(
         db_path, ring_size=ring_size, max_entities=max_entities,
         conn=store._conn, writer=db_writer)
-    _dbg_rss("after_bundle_store", snapshot=True)
 
     # Cross-process activation snapshot file — sits next to synthesis.duckdb
     # in the same data_dir. Readers consume via plain JSON read.
@@ -969,6 +920,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # (late-bound; set once the SynthesisVectorStore + TxIndexBuilder are wired
     # below). Default no-op so the recompute loop fires safely before wiring.
     tx_index_holder: dict = {"fn": lambda: None}
+    # WAL-hygiene (bugfix 2026-06-05) — periodic Kuzu spine checkpoint holder
+    # (late-bound; set after the spine graph opens). Bounds the synthesis_spine
+    # WAL so its replay-on-open can never grow into the OOM-loop danger zone.
+    kuzu_checkpoint_holder: dict = {"fn": lambda: None}
 
     # Operator-closure Phase A — ONE shared embedder for the whole worker (the
     # tx_hash FAISS store, EngineRecall's query embed, the consolidation cosine
@@ -1024,7 +979,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             "[synthesis_worker] tx_hash FAISS store wiring failed: %s — "
             "SEARCH stays cold (recall falls back to FORK_READ/CROSS_REF)", exc)
         synth_vector_store = None
-    _dbg_rss("after_faiss_store", snapshot=True)
 
     rc_thread = threading.Thread(
         target=_recompute_loop,
@@ -1032,7 +986,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
               bundle_snapshot_path, spine_exporter_holder,
               fork_exporter_holder, fork_activation_updater_holder,
               oracle_exporter_holder, metrics_exporter_holder,
-              tx_index_holder,
+              tx_index_holder, kuzu_checkpoint_holder,
               send_queue, name,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
@@ -1063,12 +1017,49 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         kuzu_graph_obj = TitanKnowledgeGraph(
             os.path.join(os.path.dirname(db_path) or ".", "synthesis_spine.kuzu"),
         )
+        # WAL hygiene (bugfix 2026-06-05) — a Guardian-supervised module is
+        # KILLED, never cleanly closed, so the Kuzu WAL only ever GROWS across
+        # boots and is replayed in full on every open. Once that replay cost
+        # crosses synthesis's RSS cap the module OOM-loops *before* it can ever
+        # checkpoint → dirty WAL forever (T2 2026-06-05: 632 KB WAL → +420 MB
+        # per boot → DISABLED). Checkpoint once at boot to clear the prior
+        # session's + the schema-DDL WAL immediately, then bound it periodically
+        # in the recompute loop (see kuzu_checkpoint_holder below).
+        _boot_wal = kuzu_graph_obj.wal_size_mb()
+        if kuzu_graph_obj.checkpoint():
+            logger.info(
+                "[synthesis_worker] Kuzu spine boot checkpoint — WAL %.1fMB → cleared",
+                _boot_wal)
     except Exception as exc:
         logger.warning(
             "[synthesis_worker] Kuzu spine graph open failed: %s — spine "
             "recall + consolidation will degrade to no-op",
             exc,
         )
+
+    # Bound the spine WAL during a long-running session: each recompute tick,
+    # checkpoint when the WAL crosses a low threshold OR every ~30 passes, so it
+    # can never accumulate back to the OOM-loop danger zone. Default no-op until
+    # wired here (kuzu_graph_obj may be None on open failure). G21 sole-writer
+    # (INV-Syn-7) — safe to checkpoint from the recompute thread.
+    if kuzu_graph_obj is not None:
+        _kuzu_ckpt_state = {"pass": 0}
+
+        def _kuzu_checkpoint_tick() -> None:
+            try:
+                _kuzu_ckpt_state["pass"] += 1
+                wal_mb = kuzu_graph_obj.wal_size_mb()
+                if wal_mb >= _KUZU_WAL_CHECKPOINT_MB or _kuzu_ckpt_state["pass"] % 30 == 0:
+                    if kuzu_graph_obj.checkpoint() and wal_mb >= 1.0:
+                        logger.info(
+                            "[synthesis_worker] Kuzu spine checkpoint — WAL "
+                            "%.1fMB → cleared (pass=%d)",
+                            wal_mb, _kuzu_ckpt_state["pass"])
+            except Exception as _ck_err:
+                logger.debug(
+                    "[synthesis_worker] Kuzu checkpoint tick failed: %s", _ck_err)
+
+        kuzu_checkpoint_holder["fn"] = _kuzu_checkpoint_tick
 
     # Phase 2 D-P2-1 EngineRecall — contract-driven recall coordinator.
     # Lazy-open a read-only sqlite handle on data/timechain/index.db so
@@ -1119,7 +1110,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             "attached" if index_db_conn else "missing",
             "tx_hash_store" if synth_vector_store is not None else "none",
             "attached" if kuzu_graph_obj is not None else "missing")
-        _dbg_rss("after_enginerecall", snapshot=True)
 
         # Operator-closure Phase A2 — wire the incremental tx-index builder onto
         # the recompute-loop holder. Each 60s tick indexes new conversation/
@@ -1279,7 +1269,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             logger.info(
                 "[synthesis_worker] boot population groundedness recompute: "
                 "%d Engrams percentile-blended (§7.D)", migrated)
-            _dbg_rss("after_pop_recompute", snapshot=True)
         except Exception as _pop_err:
             logger.warning(
                 "[synthesis_worker] boot population recompute failed: %s", _pop_err)
