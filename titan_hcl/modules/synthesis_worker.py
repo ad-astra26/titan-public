@@ -68,6 +68,7 @@ from titan_hcl import bus
 from titan_hcl.bus import (
     CGN_CONCEPT_GROUNDED,
     DREAM_STATE_CHANGED,
+    ENGRAM_FELT_CANDIDATE,
     KERNEL_EPOCH_TICK,
     KNOWLEDGE_MOMENT,
     MAINTAIN_BUNDLE,
@@ -1346,6 +1347,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             recall_attribution=recall_attribution,  # §7.E.0 membership + fluent feed
             decompose_fn=decompose_fn,              # Bridge §7.1 Engram→Object decompose
             felt_bridge=felt_bridge,                # Bridge §7.1/§7.2 tables
+            emit_candidate_fn=(                     # Bridge §7.3 handoff → felt_teaching
+                lambda _p: _send(send_queue, ENGRAM_FELT_CANDIDATE, name,
+                                 "felt_teaching_worker", _p)),
         )
         logger.info(
             "[synthesis_worker] ConsolidationPass ready — DREAM_STATE_CHANGED "

@@ -81,6 +81,10 @@ _NEUROMOD_SETPOINT_CENTRE = 0.5
 # felt-dict keys that are metadata, NOT neuromod levels (see cognitive_worker:2563).
 _FELT_META_KEYS = frozenset({"emotion", "emotion_confidence", "dream_cycle", "ts"})
 
+# Inner↔Outer Felt-Teaching Bridge §1.3 — a fresh felt candidate's confidence `c`
+# starts low (probationary; CGN's value_net refines it over exposure, BRAIN-INV-4).
+PROBATION_C = 0.05
+
 
 def _parse_felt(felt: Any) -> dict:
     """Coerce a felt value (sidecar JSON string | dict | None) → dict. Soft-fail → {}."""
@@ -264,6 +268,7 @@ class ConsolidationPass:
         recall_attribution: Optional[Any] = None,
         decompose_fn: Optional[Callable[[str, str], list[str]]] = None,
         felt_bridge: Optional[Any] = None,
+        emit_candidate_fn: Optional[Callable[[dict], None]] = None,
     ):
         self._store = engram_store
         self._bridge = cgn_bridge
@@ -275,6 +280,11 @@ class ConsolidationPass:
         # (synthesis otherwise unaffected). `decompose_fn(name, sample) -> list[str]`.
         self._decompose = decompose_fn
         self._felt_bridge = felt_bridge
+        # Bridge §7.3 — the bus handoff to felt_teaching_worker. `emit_candidate_fn(
+        # payload: dict)` (synthesis_worker binds it to _send(...ENGRAM_FELT_CANDIDATE
+        # ...)). None → the durable engram_felt_candidates row is still written (audit/
+        # retry), just no live event.
+        self._emit_candidate = emit_candidate_fn
         self._writer = outer_memory_writer
         self._mine = mine_recent_txs_fn
         self._propose = llm_propose_fn
@@ -627,28 +637,67 @@ class ConsolidationPass:
     def _maybe_decompose(
         self, cv: Any, proposal: LLMProposal, cluster: Cluster,
     ) -> Optional[list[str]]:
-        """Bridge §7.1 (OFF the hot path) — decompose the Engram(Idea) into its
-        constituent Object labels + cache them by (concept_id, version) so a
-        re-touched Engram never re-calls the LLM. Returns the labels (cached or
-        freshly decomposed) for Phase-3 gap detection; None when the bridge is
-        disabled or decompose failed. Soft — never blocks the pass."""
+        """Bridge §7.1 + §7.3 (OFF the hot path) — decompose the Engram(Idea) into its
+        constituent Object labels (cached by (concept_id, version) so a re-touched
+        Engram never re-calls the LLM), then queue a propose-only felt candidate for
+        every Object with NO CGN grounding (a gap). Returns the labels; None when the
+        bridge is disabled or decompose failed. Soft — never blocks the pass."""
         if self._felt_bridge is None or self._decompose is None:
             return None
         try:
-            cached = self._felt_bridge.get_cached_objects(
+            objects = self._felt_bridge.get_cached_objects(
                 cv.concept_id, cv.version)
-            if cached is not None:
-                return cached
-            name = proposal.proposed_name or proposal.concept_id or cv.concept_id
-            sample = _decompose_sample_from_members(cluster.members)
-            objects = self._decompose(name, sample) or []
+            if objects is None:
+                name = (proposal.proposed_name or proposal.concept_id
+                        or cv.concept_id)
+                sample = _decompose_sample_from_members(cluster.members)
+                objects = self._decompose(name, sample) or []
+                if objects:
+                    self._felt_bridge.cache_objects(
+                        cv.concept_id, cv.version, objects)
+            # Phase 3 — gap detection → propose-only candidate queue + bus handoff.
             if objects:
-                self._felt_bridge.cache_objects(
-                    cv.concept_id, cv.version, objects)
+                self._queue_felt_gaps(cv, proposal, cluster, objects)
             return objects
         except Exception as e:  # noqa: BLE001 — soft per INV-Syn-17
             logger.debug("[ConsolidationPass] decompose soft-fail: %s", e)
             return None
+
+    def _queue_felt_gaps(
+        self, cv: Any, proposal: LLMProposal, cluster: Cluster,
+        objects: list[str],
+    ) -> None:
+        """For each decomposed Object with NO CGN felt-grounding (a gap), queue a
+        propose-only §3.4 candidate seeded with the cluster's lived felt + emit the
+        ENGRAM_FELT_CANDIDATE handoff (RFP §7.3). PROPOSE-ONLY — writes synthesis
+        only, ZERO CGN writes (INV-Syn-ENG-4). The bus event fires ONCE per candidate
+        (only on a fresh queue), not every dream.
+
+        NOTE (mismatch / frame_dependent): a grounded-but-conflicting felt is NOT
+        detectable here — the event-sourced grounded-set is label-only
+        (CGN_CONCEPT_GROUNDED carries no felt-state) and fetching CGN's felt would
+        violate G18. So a grounded Object is skipped; `frame_dependent` is left to the
+        consumer (which interacts with CGN) / a later refinement. The schema supports
+        the status value for forward-compat."""
+        lived_felt = agg_felt(cluster.members)
+        felt_json = json.dumps(lived_felt, sort_keys=True) if lived_felt else "{}"
+        domain_hint = getattr(proposal, "domain_hint", "") or ""
+        for obj in objects:
+            if self._felt_bridge.is_object_grounded(obj):
+                continue  # grounded → no candidate (mismatch detection deferred)
+            newly = self._felt_bridge.queue_candidate(
+                object_label=obj, felt_state_json=felt_json, c=PROBATION_C,
+                source_engram=cv.concept_id, source_version=cv.version,
+                provenance="engram_felt_gap", domain_hint=domain_hint,
+                status="candidate")
+            if newly and self._emit_candidate is not None:
+                self._emit_candidate({
+                    "object_label": obj,
+                    "felt_state": lived_felt,
+                    "source_engram": cv.concept_id,
+                    "source_version": cv.version,
+                    "domain_hint": domain_hint,
+                })
 
     # ── Internal — anchor pass TX ──────────────────────────
 

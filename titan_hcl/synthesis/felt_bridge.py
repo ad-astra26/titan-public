@@ -75,6 +75,18 @@ class FeltBridge:
                     "CREATE TABLE IF NOT EXISTS cgn_grounded_objects ("
                     " object_label VARCHAR PRIMARY KEY,"
                     " first_seen_ts DOUBLE DEFAULT 0)")
+                # Phase 3 — the propose-only felt-teaching candidate queue. A §3.4
+                # BRAIN Object record (felt-seeded, low-c, lineage→source Engram,
+                # frames→domain_hint). `hv` is deferred (BRAIN-not-built); this is the
+                # durable audit/retry copy — the live handoff is the bus event.
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS engram_felt_candidates ("
+                    " object_label VARCHAR, felt_state_json VARCHAR,"
+                    " c DOUBLE, f DOUBLE DEFAULT 0, time_cost DOUBLE DEFAULT 0,"
+                    " source_engram VARCHAR, source_version INTEGER,"
+                    " provenance VARCHAR, domain_hint VARCHAR,"
+                    " frames_json VARCHAR DEFAULT '', ts DOUBLE, status VARCHAR,"
+                    " PRIMARY KEY (object_label, source_engram, source_version))")
             self._writer.submit_sync(_ddl)
             self._load_grounded()  # boot-seed the in-memory mirror (durability)
             return True
@@ -181,3 +193,49 @@ class FeltBridge:
             return False
         with self._grounded_lock:
             return lbl in self._grounded
+
+    # ── Phase 3 — propose-only candidate queue (INV-Syn-ENG-4) ──────────
+    def queue_candidate(
+        self,
+        *,
+        object_label: str,
+        felt_state_json: str,
+        c: float,
+        source_engram: str,
+        source_version: int,
+        provenance: str = "engram_felt_gap",
+        domain_hint: str = "",
+        frames_json: str = "",
+        status: str = "candidate",
+    ) -> bool:
+        """Queue a §3.4-Object-shaped felt candidate to `engram_felt_candidates`
+        (RFP §7.3). PROPOSE-ONLY — this writes to synthesis.duckdb ONLY, NEVER into
+        any CGN store (INV-Syn-ENG-4). Idempotent per (object_label, source_engram,
+        source_version). Returns **True iff a NEW row was inserted** (so the producer
+        emits the bus handoff once, not every dream). Soft-fail → False."""
+        lbl = normalize_label(object_label)
+        if not lbl or not source_engram:
+            return False
+        ts = time.time()
+        try:
+            def _ins() -> bool:
+                exists = self._conn.execute(
+                    "SELECT 1 FROM engram_felt_candidates WHERE object_label = ? "
+                    "AND source_engram = ? AND source_version = ?",
+                    [lbl, str(source_engram), int(source_version)]).fetchone()
+                if exists is not None:
+                    return False
+                self._conn.execute(
+                    "INSERT INTO engram_felt_candidates (object_label, "
+                    "felt_state_json, c, f, time_cost, source_engram, "
+                    "source_version, provenance, domain_hint, frames_json, ts, "
+                    "status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [lbl, str(felt_state_json or "{}"), float(c), 0.0, 0.0,
+                     str(source_engram), int(source_version), str(provenance),
+                     str(domain_hint or ""), str(frames_json or ""), ts,
+                     str(status)])
+                return True
+            return bool(self._writer.submit_sync(_ins))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[FeltBridge] queue_candidate soft-fail: %s", e)
+            return False
