@@ -71,6 +71,10 @@ CODE_AUTHORITATIVE_CONSUMERS = frozenset({
     "social",
     "knowledge",
     "meta",
+    # Inner↔Outer Felt-Teaching Bridge §7.4 — the felt_teaching_worker consumer
+    # (RFP_inner_outer_felt_teaching_bridge). Pre-registered below + self-registers
+    # via CGN_REGISTER; listed here so it is code-authoritative (no schema-drift warn).
+    "felt_teaching",
 })
 
 
