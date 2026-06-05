@@ -882,6 +882,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     store = ActivationStore(db_path, writer=db_writer)
     status_writer = SynthStatusWriter(titan_id)
     registry = PlugRegistry()
+    _dbg_rss("after_activation_store", snapshot=True)
 
     # §7.E.0 — per-Engram citation attribution: the membership reverse-index +
     # the live `fluent` axis feed + §7.E's `(axes_at_recall, cited?)` reward log.
@@ -901,10 +902,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # (engram_objects) + the §7.2 event-sourced CGN grounded-set
     # (cgn_grounded_objects). In scope from here for the ConsolidationPass injection
     # AND the CGN_CONCEPT_GROUNDED handler below. Soft → None (synthesis unaffected).
+    _dbg_rss("after_recall_attribution", snapshot=True)
     from titan_hcl.synthesis.felt_bridge import FeltBridge
     felt_bridge: Optional[FeltBridge] = FeltBridge(store._conn, db_writer)
     if not felt_bridge.ensure_schema():
         felt_bridge = None
+    _dbg_rss("after_felt_bridge", snapshot=True)
 
     # Phase 2 D-P2-4 standing-bundle store — sole writer of
     # data/synthesis.duckdb / association_bundles. CONN-2 FOLD (AUDIT §5.2):
@@ -920,6 +923,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     bundle_store = StandingBundleStore(
         db_path, ring_size=ring_size, max_entities=max_entities,
         conn=store._conn, writer=db_writer)
+    _dbg_rss("after_bundle_store", snapshot=True)
 
     # Cross-process activation snapshot file — sits next to synthesis.duckdb
     # in the same data_dir. Readers consume via plain JSON read.
@@ -1020,6 +1024,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             "[synthesis_worker] tx_hash FAISS store wiring failed: %s — "
             "SEARCH stays cold (recall falls back to FORK_READ/CROSS_REF)", exc)
         synth_vector_store = None
+    _dbg_rss("after_faiss_store", snapshot=True)
 
     rc_thread = threading.Thread(
         target=_recompute_loop,
