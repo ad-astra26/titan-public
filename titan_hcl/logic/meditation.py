@@ -585,7 +585,12 @@ class MeditationEpoch:
 
         batch_root = compute_batch_root(hashes)
         epoch_id = self._epoch_counter
-        sovereignty_bp = int(getattr(self, "_sovereignty_index", 0) * 100)
+        # P3 (Synthesis Decision Authority) — the ZK batch-compress commit
+        # carries the ONE sovereignty score S (basis points), read from the
+        # synthesis snapshot (G18). Was the vestigial `_sovereignty_index` (never
+        # set → always 0bp); now the same metric the meditation vault anchor uses.
+        from titan_hcl.synthesis.sovereignty_readout import rolling_sovereignty_bp
+        sovereignty_bp = rolling_sovereignty_bp()
 
         # Tier 1: Try full ZK compression with Photon proof
         if self._photon:
@@ -696,12 +701,14 @@ class MeditationEpoch:
                 # Fallback: hash the meditation state_root string
                 chained_root = hashlib.sha256(state_root.encode("utf-8")).digest()
 
-            # Step 3: Compute real sovereignty score
+            # Step 3: the ONE sovereignty score S (basis points), read from the
+            # synthesis snapshot (P3 re-source; was a composite of 3 sqlite reads
+            # + msl json).
             sovereignty_bp = self._compute_sovereignty_bp()
             _t3 = time.time()
             logger.info(
                 "[Meditation] [LAT] phase3_sovereignty_bp: %.3fs "
-                "(3 sqlite reads + msl json) | build_total=%.3fs",
+                "(rolling-S snapshot read) | build_total=%.3fs",
                 _t3 - _t2, _t3 - _t0,
             )
 
@@ -815,76 +822,21 @@ class MeditationEpoch:
         return getattr(self, '_cached_vault_root', None)
 
     def _compute_sovereignty_bp(self) -> int:
-        """Compute real sovereignty score in basis points (0-10000).
+        """The meditation's on-chain sovereignty anchor, in basis points (0-10000).
 
-        Weighted from:
-          I_confidence (0.30) + meta_reasoning_rate (0.20) +
-          vocab/500 (0.20) + dreams/2000 (0.15) + tc_blocks/100000 (0.15)
-        """
-        score = 0.0
+        P3 (RFP_synthesis_decision_authority): re-pointed to the ONE sovereignty
+        score `S = 0.7·E + 0.3·V` — the rolling per-reply metric read from the
+        synthesis snapshot (G18 file read, no recompute / no RPC) — replacing the
+        legacy composite (I_confidence + meta_reasoning + vocab + dreams +
+        tc_blocks), one of the 4 disagreeing scores this RFP collapses. The wire
+        is unchanged: still `int` basis points in [0,10000], so the ZK-vault
+        commit instruction (`build_vault_commit_instruction`, `:709`) is
+        byte-identical — only the value source changed. Never raises."""
         try:
-            # I-confidence from MSL
-            import json
-            msl_path = "data/msl/msl_identity.json"
-            if os.path.exists(msl_path):
-                with open(msl_path) as f:
-                    msl = json.load(f)
-                i_conf = msl.get("confidence", {}).get("confidence", 0.0)
-                score += min(1.0, i_conf) * 0.30
-
-            # Meta-reasoning commit rate
-            try:
-                import sqlite3
-                db = sqlite3.connect("data/consciousness.db")
-                # Count reasoning chains with commits in last 1000 epochs
-                row = db.execute(
-                    "SELECT COUNT(*) FROM consciousness_log ORDER BY epoch_id DESC LIMIT 1"
-                ).fetchone()
-                db.close()
-                # Use placeholder: meta_reasoning contributes 0.1 for now
-                score += 0.10  # TODO: wire real meta-reasoning rate
-            except Exception:
-                pass
-
-            # Vocabulary size / 500
-            try:
-                import sqlite3
-                # 2026-04-15: was missing timeout (default 0s → immediate lock failure)
-                # Bumped to 10s aligned with Layer 2 contention mitigation.
-                db = sqlite3.connect("data/inner_memory.db", timeout=10.0)
-                row = db.execute("SELECT COUNT(*) FROM vocabulary").fetchone()
-                db.close()
-                vocab = row[0] if row else 0
-                score += min(1.0, vocab / 500) * 0.20
-            except Exception:
-                pass
-
-            # Dream cycles / 2000
-            try:
-                import json
-                pi_path = "data/pi_heartbeat_state.json"
-                if os.path.exists(pi_path):
-                    with open(pi_path) as f:
-                        pi = json.load(f)
-                    dreams = pi.get("dream_count", pi.get("dreams_completed", 0))
-                    if not dreams:
-                        dreams = 0
-                    score += min(1.0, dreams / 2000) * 0.15
-            except Exception:
-                pass
-
-            # TimeChain blocks / 100000
-            try:
-                from titan_hcl.utils.db import safe_connect
-                db = safe_connect("data/timechain/index.db")
-                row = db.execute("SELECT COUNT(*) FROM block_index").fetchone()
-                db.close()
-                blocks = row[0] if row else 0
-                score += min(1.0, blocks / 100000) * 0.15
-            except Exception:
-                pass
-
+            from titan_hcl.synthesis.sovereignty_readout import (
+                rolling_sovereignty_bp,
+            )
+            return rolling_sovereignty_bp()
         except Exception as e:
-            logger.debug("[Meditation] Sovereignty computation error: %s", e)
-
-        return int(score * 10000)  # Convert to basis points
+            logger.debug("[Meditation] Sovereignty read error: %s", e)
+            return 0

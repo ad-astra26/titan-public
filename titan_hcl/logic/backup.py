@@ -597,13 +597,23 @@ class RebirthBackup:
         self._save_backup_state()
 
     async def _compute_sovereignty(self) -> float:
-        """Compute sovereignty index from available data."""
+        """The sovereignty index (0-100%) used for backup persistence + the
+        on-chain commit + the titan.md frontmatter milestone.
+
+        P3 (RFP_synthesis_decision_authority): re-pointed to the ONE sovereignty
+        score `S = 0.7·E + 0.3·V` (rolling, read from the synthesis snapshot —
+        G18 file read, no recompute / no RPC), returned on the 0-100 scale this
+        consumer expects (`S × 100`; the `:807` call then yields `S × 10000` bp).
+        Replaces the legacy `reflection.get_sovereignty_stats(None)` — which read
+        the IQL recorder buffer (passed `None` → always the 50.0 default) and is
+        retired with the offline-RL subsystem (P1). Never raises."""
         try:
-            from titan_hcl.logic.reflection import ReflectionLogic
-            reflection = ReflectionLogic(None)
-            return await reflection.get_sovereignty_stats(None)
+            from titan_hcl.synthesis.sovereignty_readout import (
+                read_rolling_sovereignty,
+            )
+            return read_rolling_sovereignty().get("s", 0.0) * 100.0
         except Exception:
-            return 50.0  # Default if computation unavailable
+            return 0.0
 
     # -------------------------------------------------------------------------
     # Boot Check
@@ -2053,7 +2063,13 @@ class RebirthBackup:
             vault_program_id = (cfg.get("network", {}) or {}).get("vault_program_id")
 
         try:
-            sovereignty_bp = int(float(getattr(self, "_last_sovereignty_idx", 0.0)) * 100)
+            # P3 (Synthesis Decision Authority) — the ONE sovereignty score S
+            # (basis points), read from the synthesis snapshot (G18). Was the
+            # vestigial `_last_sovereignty_idx` (never set → 0bp).
+            from titan_hcl.synthesis.sovereignty_readout import (
+                rolling_sovereignty_bp,
+            )
+            sovereignty_bp = rolling_sovereignty_bp()
         except Exception:
             sovereignty_bp = 0
 

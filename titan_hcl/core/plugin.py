@@ -1193,33 +1193,14 @@ class TitanHCL:
 
     def _read_rolling_sovereignty(self) -> dict:
         """Read the rolling sovereignty `{window, replies, s, e, v, trend}` from
-        the synthesis metrics snapshot (`data/synthesis_metrics_snapshot.json`,
-        INV-Syn-25 observation-only) — a cross-process FILE read, no recompute /
-        no RPC (G18). Prefers the 7d window (a stable "who I've been lately"),
-        falls back to 24h then all. Returns a zeroed dict when unavailable."""
-        import os
-        import json
-        zero = {"window": "7d", "replies": 0, "s": 0.0,
-                "e": 0.0, "v": 0.0, "trend": 0.0}
-        path = os.path.join("data", "synthesis_metrics_snapshot.json")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                snap = json.load(f)
-        except Exception:
-            return zero
-        windows = ((snap.get("sovereignty") or {}).get("windows") or {})
-        for w in ("7d", "24h", "all"):
-            win = windows.get(w)
-            if isinstance(win, dict) and int(win.get("replies", 0) or 0) > 0:
-                return {
-                    "window": w,
-                    "replies": int(win.get("replies", 0) or 0),
-                    "s": float(win.get("sovereignty", 0.0) or 0.0),
-                    "e": float(win.get("e", 0.0) or 0.0),
-                    "v": float(win.get("v", 0.0) or 0.0),
-                    "trend": float(win.get("trend") or 0.0),
-                }
-        return zero
+        the synthesis metrics snapshot — a cross-process FILE read, no recompute
+        / no RPC (G18). Delegates to the shared `synthesis.sovereignty_readout`
+        (the ONE read the chronicle / meditation-anchor / backup all share, so
+        the metric never drifts across consumers)."""
+        from titan_hcl.synthesis.sovereignty_readout import (
+            read_rolling_sovereignty,
+        )
+        return read_rolling_sovereignty()
 
     def _append_to_chronicle(self, sov: dict, med: dict) -> None:
         """Append one narrative meditation entry to `titan_chronicles.md`.
