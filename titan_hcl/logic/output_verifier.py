@@ -434,10 +434,9 @@ class OutputVerifier:
                         json.load(_cf).get("verified_count", 0) or 0)
             except Exception:
                 pass
-        # ExpressionTranslator.sovereignty_ratio analogue computed lazily
-        # via @property; kept as attribute for backward compat with
-        # output_verifier_worker's getattr() probes.
-        self.sovereignty_score: float = 0.0
+        # P3 (RFP_synthesis_decision_authority): the vestigial OVG
+        # `sovereignty_score` (always 0.0) is removed — sovereignty is now the
+        # ONE metric S (= 0.7E+0.3V), computed in synthesis and anchored per-tx.
 
         logger.info("[OVG] OutputVerifier ready (titan_id=%s, signing=%s, genesis=%s)",
                     titan_id, self._keypair is not None, bool(self._genesis_hash))

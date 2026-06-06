@@ -180,7 +180,9 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
                 send_queue.put({
                     "type": bus.OUTPUT_VERIFIER_STATS, "src": name, "dst": "all",
                     "payload": {
-                        "sovereignty_score": float(getattr(verifier, "sovereignty_score", 0.0) or 0.0),
+                        # P3 (RFP_synthesis_decision_authority): the vestigial OVG
+                        # `sovereignty_score` (always 0.0, no real consumer) is
+                        # removed — sovereignty is the ONE metric S, in synthesis.
                         "verified_count": int(getattr(verifier, "verified_count", 0) or 0),
                         "rejected_count": int(getattr(verifier, "rejected_count", 0) or 0),
                         # SPEC §23.8 D-SPEC-87 Phase 3.F wave 3a — feeds
