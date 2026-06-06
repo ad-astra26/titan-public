@@ -48,7 +48,6 @@ from titan_hcl.bus import (
     EPOCH_TICK,
     IMPULSE,
     OUTER_OBSERVATION,
-    SAGE_STATS,
     make_msg,
 )
 from titan_hcl.core.kernel import TitanKernel
@@ -263,17 +262,9 @@ class TitanHCL:
     def mood_engine(self):
         return self._proxies.get("mood_engine")
 
-    @property
-    def recorder(self):
-        return self._proxies.get("recorder")
-
-    @property
-    def gatekeeper(self):
-        return self._proxies.get("gatekeeper")
-
-    @property
-    def scholar(self):
-        return self._proxies.get("scholar")
+    # recorder / gatekeeper / scholar accessors RETIRED with the offline-RL
+    # subsystem (RFP_synthesis_decision_authority P1) — execution-mode routing is
+    # the grounded router; sovereignty is the ONE S.
 
     @property
     def consciousness(self):
@@ -326,7 +317,6 @@ class TitanHCL:
         `self.bus` and `self.guardian` work via compat @property delegates.
         """
         from titan_hcl.proxies.memory_proxy import MemoryProxy
-        from titan_hcl.proxies.rl_proxy import RLProxy
         from titan_hcl.proxies.llm_proxy import LLMProxy
         from titan_hcl.proxies.mind_proxy import MindProxy
         from titan_hcl.proxies.body_proxy import BodyProxy
@@ -342,7 +332,6 @@ class TitanHCL:
 
         # Lazy modules — start on first use
         self._proxies["memory"] = MemoryProxy(self.bus, self.guardian)
-        self._proxies["recorder"] = RLProxy(self.bus, self.guardian)
         self._proxies["llm"] = LLMProxy(self.bus, self.guardian)
 
         # Always-on modules — already started by Guardian
@@ -359,7 +348,6 @@ class TitanHCL:
 
         # V2-compatible aliases (so dashboard/agent code finds what it expects)
         self._proxies["mood_engine"] = self._proxies["mind"]  # mind proxy has get_mood_label()
-        self._proxies["gatekeeper"] = self._proxies["recorder"]     # recorder proxy has evaluate()
         # social_graph — dedicated proxy + dedicated subprocess per
         # rFP_titan_hcl_l2_separation_strategy §4.P + D-SPEC-50 (v1.7.1).
         # Replaces the legacy MindProxy alias rot that surfaced as
@@ -535,7 +523,6 @@ class TitanHCL:
             social = SocialManager(
                 metabolism_client=self._proxies.get("metabolism"),
                 mood_engine=self._proxies.get("mood_engine"),
-                recorder=None,
                 memory=self._proxies.get("memory"),
                 stealth_sage_config=sage_cfg,
                 social_graph=social_graph,
@@ -1442,44 +1429,9 @@ class TitanHCL:
                 logger.error("[TitanHCL] Agency loop error: %s", e)
                 await asyncio.sleep(5.0)
 
-    async def _rl_stats_loop(self) -> None:
-        """Drain RLProxy's `rl_proxy_stats` broadcast queue and route
-        SAGE_STATS payloads into the proxy's cache.
-
-        RLProxy.__init__ subscribes the queue (rl_proxy.py:67) but the
-        kernel-side drainer was never wired — the queue saturated under
-        every dst="all" broadcast and the producer-side overflow flooded
-        the brain log with `Queue full for 'rl_proxy_stats'` warnings
-        (~118/sec sustained, observed 2026-04-29 ~06:30 UTC).
-
-        Mirrors the AGENCY_STATS handler in `_agency_loop`. Drains
-        unconditionally — non-SAGE_STATS messages are discarded so the
-        queue cannot fill regardless of broadcast volume.
-        """
-        rl = self._proxies.get("recorder")
-        if rl is None or getattr(rl, "_stats_subscription", None) is None:
-            logger.info("[TitanHCL] RL stats loop skipped — no subscription")
-            return
-        queue = rl._stats_subscription
-        logger.info("[TitanHCL] RL stats loop started — draining rl_proxy_stats")
-        while True:
-            try:
-                msgs = self.bus.drain(queue, max_msgs=1000)
-                for msg in msgs:
-                    if msg.get("type") == SAGE_STATS:
-                        payload = msg.get("payload", {}) or {}
-                        try:
-                            rl.update_cached_stats(payload)
-                        except Exception as e:
-                            logger.warning(
-                                "[TitanHCL] RL update_cached_stats raised: %s", e
-                            )
-                # Tight cadence — broadcast volume can hit ~120 msg/sec at peak;
-                # drain at 2 Hz with batch-1000 keeps queue bounded at ~60 msgs.
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.warning("[TitanHCL] RL stats loop error: %s", e)
-                await asyncio.sleep(5.0)
+    # _rl_stats_loop RETIRED with the offline-RL subsystem
+    # (RFP_synthesis_decision_authority P1) — it drained RLProxy's
+    # `rl_proxy_stats`/SAGE_STATS broadcast queue; RLProxy is gone.
 
     # _sovereignty_loop RETIRED v1.8.3 §4.L (D-SPEC-57, 2026-05-15) —
     # SOVEREIGNTY_EPOCH consumption + tracker.record_epoch() + 100-message
@@ -2065,11 +2017,6 @@ class TitanHCL:
                 "[TitanHCL] [BOOT_TRACE] _agency_loop NOT scheduled — "
                 "self._agency is None (Agency boot failed or disabled)")
 
-        # RL stats drain — drains RLProxy's rl_proxy_stats subscription so
-        # SAGE_STATS payloads reach the proxy cache and the queue can't
-        # saturate under dst="all" broadcast volume. Mirrors AGENCY_STATS
-        # path; runs unconditionally because RLProxy is unconditional.
-        asyncio.get_event_loop().create_task(self._rl_stats_loop())
 
         # Chat bus bridge RETIRED in Phase C v1.17.0 (D-SPEC-72) — replaced
         # by agno_worker subprocess + agno_proxy.chat() per SPEC §9.B. The

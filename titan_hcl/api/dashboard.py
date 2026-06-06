@@ -2185,19 +2185,10 @@ def _build_health_snapshot_sync(plugin, kernel_proxy=None) -> dict:
         subsystems["metabolism"] = "ACTIVE" if titan_state.metabolism else "ABSENT"
         subsystems["studio"] = "ACTIVE" if getattr(plugin, "studio", None) else "ABSENT"
         subsystems["social"] = "ACTIVE" if titan_state.social else "ABSENT"
-        # Gatekeeper (SageGatekeeper) lives inside recorder_worker per SPEC
-        # §9.B — its availability == the recorder worker's supervised state
-        # (published in guardian_status above). Was hardcoded `bool(None)` →
-        # always ABSENT. Confirm via recorder_state.bin presence as a
-        # secondary signal when the guardian entry is missing.
-        _gk_state = subsystems.get("recorder")
-        if _gk_state is None:
-            try:
-                _rec = titan_state.spirit._shm.read_recorder_state()
-                _gk_state = "ACTIVE" if (_rec and isinstance(_rec, dict)) else "ABSENT"
-            except Exception:
-                _gk_state = "ABSENT"
-        subsystems["gatekeeper"] = _gk_state
+        # Gatekeeper RETIRED with the offline-RL subsystem
+        # (RFP_synthesis_decision_authority P1) — always ABSENT. Execution-mode
+        # routing is the grounded router; sovereignty is the ONE S.
+        subsystems["gatekeeper"] = "ABSENT"
     else:
         ollama_cloud = getattr(plugin, "_ollama_cloud", None)
         subsystems = {
@@ -2205,7 +2196,7 @@ def _build_health_snapshot_sync(plugin, kernel_proxy=None) -> dict:
             "metabolism": "ACTIVE" if titan_state.metabolism else "ABSENT",
             "soul": "ACTIVE" if titan_state.soul else "ABSENT",
             "guardian": "ACTIVE" if titan_state.guardian else "ABSENT",
-            "gatekeeper": "ACTIVE" if titan_state.gatekeeper else "ABSENT",
+            "gatekeeper": "ABSENT",  # RETIRED — offline-RL subsystem gone (P1)
             "studio": "ACTIVE" if getattr(plugin, "studio", None) else "ABSENT",
             "social": "ACTIVE" if titan_state.social else "ABSENT",
             "memory_backend": "ACTIVE" if (titan_state.memory and getattr(titan_state.memory, "_cognee_ready", False)) else "DEGRADED",
@@ -2228,7 +2219,7 @@ def _build_health_snapshot_sync(plugin, kernel_proxy=None) -> dict:
             cognee_ready = mem_status.get("cognee_ready", False) if mem_status else False
         except Exception:
             pass
-    recorder_ready = hasattr(plugin, "recorder") and titan_state.recorder is not None
+    recorder_ready = False  # RETIRED — offline-RL recorder gone (P1)
 
     capabilities = [
         {"name": name, "status": status}
@@ -2591,7 +2582,7 @@ async def _legacy_health_inline(request: Request):
                 cognee_ready = mem_status.get("cognee_ready", False) if mem_status else False
             except Exception:
                 pass
-        recorder_ready = hasattr(plugin, "recorder") and titan_state.recorder is not None
+        recorder_ready = False  # RETIRED — offline-RL recorder gone (P1)
 
         # Capabilities array for frontend
         capabilities = [
@@ -4727,7 +4718,6 @@ _RESTART_MODULE_ALLOWLIST = {
     "observatory",                    # §P2: flush async writer at MODULE_SHUTDOWN
     "outer_interface_worker",         # §P2: implement save_state + wire restore_state on boot
     "output_verifier",                # §P2: persist verified_count
-    "recorder",                       # §P2: IQL NN checkpoint (heavy → restart-only)
     "social_worker",                  # §P2: circuit-breaker vestigial-cleanup (state already durable)
     "warning_monitor",                # §P2: add shutdown handler + persist rate_window/spike_alerts
     "media",                          # §P1 held → §P4: audit reload_ok (eager-durable-write; scanner FP)

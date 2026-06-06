@@ -464,26 +464,11 @@ RL_CYCLE_REQUEST = "RL_CYCLE_REQUEST"
 # heartbeats interleaved so Guardian doesn't kill it during the wait.
 ANCHOR_REQUEST = "ANCHOR_REQUEST"
 
-# Microkernel v2 Layer 2 (2026-04-28) — Sage subprocess migration.
-# Parent (TitanHCL / SageGuardian) publishes transition records via this
-# message; rl_worker handles them by calling its in-subprocess SageRecorder.
-# Closes BUG-SAGE-INSTANTIATED-IN-PARENT (parent no longer holds the
-# 2GB LazyMemmapStorage). Payload is kwargs-shaped to match
-# SageRecorder.record_transition signature.
-SAGE_RECORD_TRANSITION = "SAGE_RECORD_TRANSITION"
-
-# Microkernel v2 §A.8.7 — Sage Scholar/Gatekeeper consolidation (2026-04-28).
-# Parent (legacy `__init__.py` path OR V6 `core/plugin.py` path via RLProxy)
-# routes IQL training + gatekeeper routing to rl_worker via these QUERY
-# actions. Worker owns Recorder + Scholar + Gatekeeper.
-# - SAGE_GATE_DECIDE  — request type alias for QUERY action="decide_execution_mode"
-# - SAGE_IQL_TRAIN_STEP — request type alias for QUERY action="dream"
-# - SAGE_STATS — broadcast every 60s from rl_worker (sovereignty_score etc.)
-# - SAGE_READY — boot signal (mirrors A.8.3/A.8.5 dual-emit pattern)
-SAGE_GATE_DECIDE = "SAGE_GATE_DECIDE"
-SAGE_IQL_TRAIN_STEP = "SAGE_IQL_TRAIN_STEP"
-SAGE_STATS = "SAGE_STATS"
-SAGE_READY = "SAGE_READY"
+# SAGE_RECORD_TRANSITION / SAGE_GATE_DECIDE / SAGE_IQL_TRAIN_STEP / SAGE_STATS /
+# SAGE_READY RETIRED with the offline-RL subsystem
+# (RFP_synthesis_decision_authority P1) — the recorder/scholar/gatekeeper
+# (IQL/torch) workers + their bus contracts are gone. Execution-mode routing is
+# the grounded router; sovereignty is the ONE S = 0.7E+0.3V.
 
 # V5 Dual-Layer Nervous System
 OUTER_DISPATCH = "OUTER_DISPATCH"  # Outer program → Agency direct dispatch

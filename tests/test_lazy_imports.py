@@ -50,7 +50,6 @@ WORKERS = [
     ("titan_hcl.modules.memory_worker", "memory_worker_main", "memory_worker"),
     ("titan_hcl.modules.llm_worker", "llm_worker_main", "llm_worker"),
     ("titan_hcl.modules.media_worker", "media_worker_main", "media_worker"),
-    ("titan_hcl.modules.recorder_worker", "recorder_worker_main", "recorder_worker"),
     ("titan_hcl.modules.cgn_worker", "cgn_worker_main", "cgn_worker"),
     ("titan_hcl.modules.timechain_worker", "timechain_worker_main", "timechain_worker"),
 ]

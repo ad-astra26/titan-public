@@ -651,17 +651,8 @@ class MemoryAccessor(_SubAccessorBase):
         return bool(status.get("cognee_ready", False))
 
 
-class RLAccessor(_SubAccessorBase):
-    """RL state — SHM-direct via recorder_state.bin (publisher:
-    recorder_worker per SPEC §7.1 row 782 / D-SPEC-61 / Session 3 / v1.9.2
-    rename rl→recorder). Phase A.3 migration: bus-cache retired per
-    Preamble G18."""
-
-    def __init__(self, shm: ShmReaderBank) -> None:
-        self._shm = shm
-
-    def get_stats(self) -> dict:
-        return self._shm.read_recorder_state() or {}
+# RLAccessor RETIRED — the recorder_state.bin slot + recorder_worker producer
+# are gone (RFP_synthesis_decision_authority P1).
 
 
 class LLMAccessor(_SubAccessorBase):
@@ -779,7 +770,6 @@ class TitanStateAccessor:
         self.language = LanguageAccessor(shm)
         self.social = SocialAccessor(shm)
         self.memory = MemoryAccessor(shm)
-        self.rl = RLAccessor(shm)
         self.timechain = TimechainAccessor(shm)
         self.soul = SoulAccessor(shm)
         self.cgn = CGNAccessor(shm)

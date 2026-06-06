@@ -56,7 +56,6 @@ ENTRY_ROSTER: list[tuple[str, str, str]] = [
     ("titan_hcl.modules.observatory_worker",             "observatory_worker_main", "observatory"),
     ("titan_hcl.modules.outer_interface_worker",         "outer_interface_worker_main", "outer_interface_worker"),
     ("titan_hcl.modules.output_verifier_worker",         "output_verifier_worker_main", "output_verifier"),
-    ("titan_hcl.modules.recorder_worker",                "recorder_worker_main", "recorder"),
     ("titan_hcl.modules.reflex_worker",                  "reflex_worker_main", "reflex"),
     ("titan_hcl.modules.self_reflection_worker",         "self_reflection_worker_main", "self_reflection_worker"),
     ("titan_hcl.modules.social_graph_worker",            "social_graph_worker_main", "social_graph"),

@@ -21,25 +21,18 @@ class SageGuardian:
     It evaluates proposed actions against hardcoded rules (Tier 1), semantic embeddings
     of Prime Directives (Tier 2), and sophisticated LLM oversight (Tier 3).
     """
-    def __init__(self, recorder, config: dict = None, record_transition_callable=None):
+    def __init__(self, config: dict = None):
         """
         Initializes the Guardian and prepares its 3-tier security infrastructure.
 
         Args:
-            recorder (SageRecorder): A reference to the central data hub to log Divine Trauma
-                                     if an action is blocked.
             config: [inference] section from config.toml.
-            record_transition_callable: Microkernel v2 Layer 2 (2026-04-28) — optional
-                                     async callable with the same signature as
-                                     `recorder.record_transition`. When provided,
-                                     `inject_divine_trauma` uses this instead of
-                                     `self.recorder.record_transition` so trauma
-                                     records can route through the bus to rl_worker.
-                                     Falls back to recorder when None.
+
+        (The `recorder` / `record_transition_callable` args were RETIRED with the
+        offline-RL subsystem — RFP_synthesis_decision_authority P1; the veto no
+        longer records a "Divine Trauma" into an RL buffer.)
         """
         config = config or {}
-        self.recorder = recorder
-        self._record_transition_callable = record_transition_callable
         self.directives_cache = {}    # Maps string directives -> their embeddings
         self.directives_matrix = None # numpy (num_directives, 384), L2-normalized
         self.directive_texts = []      # List of strings corresponding to row indices
@@ -254,51 +247,14 @@ class SageGuardian:
         return True
 
     async def _trigger_trauma(self, action_intent: str, veto_logic: str):
+        """Log a Guardian veto when an action is blocked.
+
+        The veto itself is enforced by the caller (the tier checks); this records
+        the block for visibility. The legacy "Divine Trauma" RL recording (a
+        -5.0 reward into the SageRecorder buffer so the IQL learned to avoid the
+        state-action pair) is RETIRED with the offline-RL subsystem
+        (RFP_synthesis_decision_authority P1 — there is no RL policy to train).
         """
-        Helper method to record a Divine Trauma immediately to the memory buffer when an action is blocked.
-        This provides a steep negative reward (-5.0) to teach the RL model (Scholar) to avoid this state-action pair.
-        
-        Args:
-            action_intent (str): The action that was blocked.
-            veto_logic (str): The textual reasoning for why the Guardian blocked the action.
-        """
-        logging.warning(f"[Guardian] ACTION BLOCKED. Initiating Divine Trauma. Logic: {veto_logic}")
-        
-        # We must pad our observation vector to 3072-dim or map to SageRecorder's expectation
-        # Using a dummy vector for testing as real observation vector comes from upstream context
-        dummy_obs = [0.0] * 3072
-        
-        metadata = {
-            "is_violation": True,
-            "directive_id": 1,
-            "trauma_score": -5.0,
-            "reasoning_trace": "Blocked by Sage Guardian Wrapper.",
-            # Write exactly to the requested dict key for Step 3 "The Scholar" re-evaluations
-            "guardian_veto_logic": veto_logic 
-        }
-        
-        # Microkernel v2 Layer 2 (2026-04-28): prefer injected callable
-        # (routes via bus to rl_worker subprocess) over direct recorder call.
-        if self._record_transition_callable is not None:
-            try:
-                # Callable may be sync (publishes to bus) or async — handle both.
-                _result = self._record_transition_callable(
-                    observation_vector=dummy_obs,
-                    action=action_intent,
-                    reward=-5.0,
-                    trauma_metadata=metadata,
-                )
-                import inspect
-                if inspect.isawaitable(_result):
-                    await _result
-            except Exception as e:
-                logging.error("[Guardian] Divine Trauma routing failed: %s", e)
-        elif self.recorder is not None:
-            await self.recorder.record_transition(
-                observation_vector=dummy_obs,
-                action=action_intent,
-                reward=-5.0,
-                trauma_metadata=metadata
-            )
-        else:
-            logging.error("[Guardian] No SageRecorder linked. Cannot inject Divine Trauma.")
+        logging.warning(
+            "[Guardian] ACTION BLOCKED (%s). Logic: %s",
+            action_intent, veto_logic)

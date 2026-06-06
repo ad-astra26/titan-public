@@ -155,10 +155,8 @@ class WorkerPlugin:
         from titan_hcl.proxies.mind_proxy import MindProxy
         return self._proxy("mind", lambda b: MindProxy(b, None))
 
-    @property
-    def recorder(self):
-        from titan_hcl.proxies.rl_proxy import RLProxy
-        return self._proxy("recorder", lambda b: RLProxy(b, None))
+    # recorder proxy RETIRED with the offline-RL subsystem
+    # (RFP_synthesis_decision_authority P1).
 
     # spirit proxy property retired Phase B.5 (2026-05-18) — callers now
     # use plugin._shm_reader_bank.compose_trinity() / .compose_v4_state()
@@ -207,17 +205,12 @@ class WorkerPlugin:
             self._proxy_cache["soul"] = _SoulShim(self.bus)
         return self._proxy_cache["soul"]
 
-    # gatekeeper + mood_engine — parent maps these to existing proxies.
-    # Per core/plugin.py:1927-1928:
-    #   _proxies["mood_engine"] = _proxies["mind"]   (mind proxy has get_mood_label())
-    #   _proxies["gatekeeper"]  = _proxies["recorder"]  (recorder proxy has evaluate())
+    # mood_engine — parent maps this to the mind proxy (get_mood_label()).
+    # gatekeeper proxy RETIRED with the offline-RL subsystem
+    # (RFP_synthesis_decision_authority P1).
     @property
     def mood_engine(self):
         return self.mind
-
-    @property
-    def gatekeeper(self):
-        return self.recorder
 
     # consciousness + sage_researcher are NOT separate L2 workers today —
     # both still live in the parent process. For agno_worker context,
@@ -285,14 +278,12 @@ class WorkerPlugin:
             "memory": self.memory,
             "social_graph": self.social_graph,
             "mind": self.mind,
-            "recorder": self.recorder,
             "spirit": None,  # retired Phase B.5 — see _shm_reader_bank
             "studio": self.studio,
             "metabolism": self.metabolism,
             "agency": self.agency,
             "soul": self.soul,
             "mood_engine": self.mood_engine,
-            "gatekeeper": self.gatekeeper,
             "neuromod": self.neuromod,
         }
 

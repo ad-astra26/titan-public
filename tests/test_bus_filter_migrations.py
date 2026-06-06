@@ -36,44 +36,15 @@ from titan_hcl.bus import (
     OUTER_SPIRIT_STATE,
     OUTER_TRINITY_STATE,
     QUERY,
-    SAGE_STATS,
     SOVEREIGNTY_EPOCH,
     SPHERE_PULSE,
     SPIRIT_STATE,
 )
 
 
-# ── rl_proxy_stats ──────────────────────────────────────────────────
-
-
-def test_rl_proxy_stats_filter_is_sage_stats_only():
-    """RLProxy declares types=[SAGE_STATS] at subscribe time so its queue
-    only receives SAGE_STATS broadcasts (T2: 308k drops + T3: 342k drops
-    pre-fix were all unwanted broadcasts saturating this queue)."""
-    bus = DivineBus()
-
-    # Mimic the construction path: rl_proxy.py:70 subscribes via
-    # bus.subscribe("rl_proxy_stats", types=[SAGE_STATS])
-    from titan_hcl.proxies.rl_proxy import RLProxy
-    # RLProxy needs a Guardian for spawn-on-demand. Use a stub — we only
-    # care about the subscribe() side effect at __init__.
-    class _StubGuardian:
-        def __init__(self):
-            self._modules = {}
-        def register(self, *a, **kw):
-            pass
-        def start(self, *a, **kw):
-            return None
-
-    proxy = RLProxy(bus, _StubGuardian())
-    assert proxy._stats_subscription is not None, (
-        "RLProxy did not subscribe — broadcast filter never installed")
-
-    flt = bus.get_broadcast_filter("rl_proxy_stats")
-    assert flt == frozenset({SAGE_STATS}), (
-        f"rl_proxy_stats filter drift: expected {{SAGE_STATS}}, got {flt}. "
-        f"If you changed the handler in plugin.py:_rl_stats_loop, also "
-        f"update the types= filter at proxies/rl_proxy.py:~70.")
+# (test_rl_proxy_stats_filter_is_sage_stats_only REMOVED — RLProxy + the
+# SAGE_STATS broadcast filter were retired with the offline-RL subsystem,
+# RFP_synthesis_decision_authority P1.)
 
 
 # ── v4_bridge ────────────────────────────────────────────────────────

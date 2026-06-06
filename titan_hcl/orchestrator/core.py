@@ -152,7 +152,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         bus = DivineBus()
         guardian = Guardian(bus)
         guardian.register(ModuleSpec("memory", memory_worker_fn, config={...}))
-        guardian.register(ModuleSpec("recorder", recorder_worker_fn, rss_limit_mb=2500))
         guardian.start_all()      # starts autostart=True modules
         guardian.start("memory")  # start a specific module on demand
         guardian.monitor_tick()   # call periodically (e.g. every 5s)

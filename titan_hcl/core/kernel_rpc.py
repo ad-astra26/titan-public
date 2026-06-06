@@ -143,7 +143,7 @@ _PROXY_CLASS_SUFFIX = "Proxy"
 
 def _is_proxy_object(obj: Any) -> bool:
     """True if obj's class name ends with 'Proxy' — heuristic that matches
-    BodyProxy, MindProxy, MemoryProxy, RLProxy, LLMProxy, MediaProxy,
+    BodyProxy, MindProxy, MemoryProxy, LLMProxy, MediaProxy,
     TimechainProxy. Avoids hardcoding the full proxy class list.
     """
     return type(obj).__name__.endswith(_PROXY_CLASS_SUFFIX)

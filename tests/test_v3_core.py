@@ -409,23 +409,22 @@ def test_proxy_creation():
     Phase C trinity-in-Rust: the body/mind/spirit proxies became Rust-backed
     SHM readers (BodyProxy/MindProxy construct but do NOT subscribe to the
     bus; SpiritProxy was removed entirely). The bus-subscribing proxies are
-    memory/rl/llm — those are what this test wires + asserts."""
+    memory/llm — those are what this test wires + asserts. (The `rl` proxy
+    RLProxy was retired with the offline-RL subsystem,
+    RFP_synthesis_decision_authority P1.)"""
     from titan_hcl.bus import DivineBus
     from titan_hcl.guardian_hcl import Guardian
     from titan_hcl.proxies.memory_proxy import MemoryProxy
-    from titan_hcl.proxies.rl_proxy import RLProxy
     from titan_hcl.proxies.llm_proxy import LLMProxy
 
     bus = DivineBus()
     guardian = Guardian(bus)
 
     mem = MemoryProxy(bus, guardian)
-    rl = RLProxy(bus, guardian)
     llm = LLMProxy(bus, guardian)
 
     # The bus-wired proxies should have subscribed to the bus.
     assert "memory_proxy" in bus.modules
-    assert "rl_proxy" in bus.modules
     assert "llm_proxy" in bus.modules
 
 

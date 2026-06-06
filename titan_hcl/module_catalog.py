@@ -77,7 +77,6 @@ def _mod_dep(name: str) -> Dependency:
 def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     """Register the full Titan module catalog with Guardian. See module docstring."""
     from titan_hcl.modules.memory_worker import memory_worker_main
-    from titan_hcl.modules.recorder_worker import recorder_worker_main
     from titan_hcl.modules.llm_worker import llm_worker_main
     from titan_hcl.modules.agno_worker import agno_worker_main
     from titan_hcl.modules.body_worker import body_worker_main
@@ -445,34 +444,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         boot_priority="post_boot",
     ))
 
-    # RL/Sage module (TorchRL — ~2500MB with mmap)
-    # ── §A.8.7 (2026-04-28) — autostart when Sage Scholar/Gatekeeper
-    # consolidation flag is on. Pre-warms rl_worker at kernel boot so the
-    # first /chat after restart doesn't hit a cold-boot timeout when
-    # RLProxy.decide_execution_mode bus-routes (5s timeout < ~3-5s
-    # LazyMemmapStorage init = first call falls through to Shadow
-    # fallback). With autostart on, rl module is READY before chat
-    # path's first decide_execution_mode call. Mirrors A.8.3/4/5/6 flag-bound
-    # autostart pattern.
-    _a8_sage_subproc_enabled = bool(
-        config.get("microkernel", {}).get(
-            "a8_sage_scholar_gatekeeper_subprocess_enabled", False))
-    # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
-    # rl drain at modules/rl_worker.py:136-147 consumes one broadcast
-    # type (SAGE_RECORD_TRANSITION); MODULE_SHUTDOWN + QUERY are targeted.
-    guardian.register(ModuleSpec(
-        name="recorder",
-        layer="L2",  # Microkernel v2 §A.5 — L2 higher cognition (IQL chain learning)
-        entry_fn=recorder_worker_main,
-        config=config.get("stealth_sage", {}),
-        rss_limit_mb=3000,
-        autostart=_a8_sage_subproc_enabled,  # §A.8.7: autostart when flag-on
-        lazy=not _a8_sage_subproc_enabled,   # §A.8.7: eager when flag-on
-        broadcast_topics=[_bus_constants.SAGE_RECORD_TRANSITION],
-        start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
-    ))
+    # RL/Sage `recorder` module (TorchRL IQL, ~3000MB) RETIRED with the
+    # offline-RL subsystem (RFP_synthesis_decision_authority P1) — execution-mode
+    # routing is the grounded router; sovereignty is the ONE S. ~366 MB/Titan
+    # RSS reclaimed (a torch worker gone), plus the `a8_sage_scholar_gatekeeper_
+    # subprocess_enabled` flag + the SAGE_RECORD_TRANSITION broadcast route.
 
     # LLM/Inference module (Agno agent — ~500MB)
     # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):

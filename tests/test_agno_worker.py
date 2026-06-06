@@ -102,21 +102,26 @@ class TestWorkerPluginProxies:
         return WorkerPlugin(bus_client=fake_bus)
 
     def test_proxies_dict_back_compat(self):
-        """agno_hooks.py:1357 does plugin._proxies.get("spirit") — must work."""
+        """agno_hooks.py does plugin._proxies.get("spirit") — must work.
+        (recorder/gatekeeper keys RETIRED with the offline-RL subsystem,
+        RFP_synthesis_decision_authority P1.)"""
         p = self._make_plugin()
         d = p._proxies
-        for key in ["memory", "social_graph", "mind", "recorder",
+        for key in ["memory", "social_graph", "mind",
                     "spirit", "studio", "metabolism", "agency",
-                    "soul", "mood_engine", "gatekeeper", "neuromod"]:
+                    "soul", "mood_engine", "neuromod"]:
             assert key in d
 
     def test_mood_engine_aliases_mind(self):
         p = self._make_plugin()
         assert p.mood_engine is p.mind
 
-    def test_gatekeeper_aliases_recorder(self):
+    def test_no_retired_recorder_gatekeeper_proxies(self):
+        """recorder/gatekeeper proxies are gone (offline-RL retired, P1)."""
         p = self._make_plugin()
-        assert p.gatekeeper is p.recorder
+        assert "recorder" not in p._proxies
+        assert "gatekeeper" not in p._proxies
+        assert not hasattr(p, "gatekeeper")
 
     def test_consciousness_returns_none(self):
         p = self._make_plugin()

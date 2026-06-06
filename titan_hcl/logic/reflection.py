@@ -194,51 +194,10 @@ class ReflectionLogic:
     # -------------------------------------------------------------------------
     # Sovereignty Stats
     # -------------------------------------------------------------------------
-    async def get_sovereignty_stats(self, recorder_instance) -> float:
-        """
-        Calculate ratio of Sovereign vs Shadow decisions from last 24 hours.
-        Returns the Sovereignty Index (0-100%).
-        """
-        try:
-            current_time = time.time()
-            twenty_four_hours_ago = current_time - 86400
-
-            buffer_size = len(recorder_instance.storage)
-            if buffer_size == 0:
-                return 0.0
-
-            sample_size = min(1000, buffer_size)
-            recent_transitions = recorder_instance.storage[-sample_size:]
-
-            sovereign_count = 0
-            total_valid_count = 0
-
-            for i in range(sample_size):
-                transition = recent_transitions[i]
-
-                ts_tensor = transition.get("timestamp")
-                if ts_tensor is not None and ts_tensor.item() >= twenty_four_hours_ago:
-                    trauma_dict = transition.get("trauma")
-                    if trauma_dict is not None:
-                        mode_bytes = trauma_dict.get("execution_mode")
-                        if mode_bytes is not None:
-                            mode_str = (
-                                bytes(mode_bytes.tolist())
-                                .decode("utf-8")
-                                .rstrip("\x00")
-                            )
-                            total_valid_count += 1
-                            if mode_str == "Sovereign":
-                                sovereign_count += 1
-
-            if total_valid_count == 0:
-                return 0.0
-
-            return (sovereign_count / total_valid_count) * 100.0
-
-        except Exception as e:
-            logger.warning("[Reflection] Error calculating Sovereignty Index: %s", e)
-            return 0.0
+    # get_sovereignty_stats RETIRED with the offline-RL subsystem
+    # (RFP_synthesis_decision_authority P1) — it computed a Sovereign/Shadow ratio
+    # from the SageRecorder buffer (now deleted). The ONE sovereignty score
+    # S = 0.7E+0.3V is read via synthesis.sovereignty_readout.
 
     # -------------------------------------------------------------------------
     # MyDay Diary

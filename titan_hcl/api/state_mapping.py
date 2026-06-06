@@ -30,8 +30,8 @@ from __future__ import annotations
 
 DIRECT_SUB_ACCESSORS = [
     "network", "soul", "guardian", "memory", "metabolism",
-    "studio", "social", "gatekeeper", "mood_engine",
-    "agency", "backup", "recorder", "language", "meta_teacher",
+    "studio", "social", "mood_engine",
+    "agency", "backup", "language", "meta_teacher",
     "experience",
     "cgn", "reasoning", "dreaming", "trinity", "neuromods",
     "epoch", "spirit", "body", "mind", "identity",
@@ -45,13 +45,12 @@ DIRECT_SUB_ACCESSORS = [
 # then used as `proxy.method()` further down.
 
 PROXY_NAMES = [
-    "spirit", "body", "mind", "memory", "recorder", "llm", "media",
+    "spirit", "body", "mind", "memory", "llm", "media",
     "timechain", "metabolism", "sovereignty", "studio", "social",
-    "mood_engine", "gatekeeper", "social_graph",
+    "mood_engine", "social_graph",
 ]
-# Note: "recorder" replaced legacy "rl" entry per SPEC v1.8.4 §4.N rename
-# (D-SPEC-58, 2026-05-15). RLProxy class name retained for back-compat;
-# registry key flipped from "rl" → "recorder".
+# Note: "recorder" + "gatekeeper" proxy entries RETIRED with the offline-RL
+# subsystem (RFP_synthesis_decision_authority P1).
 
 
 # ── Special-case patterns ─────────────────────────────────────────────
@@ -106,9 +105,6 @@ SPECIAL_PATTERNS: list[tuple[tuple[str, ...], str]] = [
     (("plugin", "_start_time"), "0.0"),
     (("plugin", "_is_meditating"), "False"),
     (("plugin", "get_v3_status"), "(lambda: {})"),
-
-    # Recorder
-    (("plugin", "recorder", "buffer"), "[]"),
 
     # Bus → commands
     (("plugin", "bus", "publish"), "titan_state.commands.publish"),

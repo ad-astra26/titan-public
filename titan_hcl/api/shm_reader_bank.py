@@ -59,7 +59,6 @@ from titan_hcl.logic.session3_state_specs import (
     ASSESSMENT_STATE_SPEC,
     OUTPUT_VERIFIER_STATE_SPEC,
     REFLEX_STATE_SPEC,
-    RL_STATE_SPEC,
     SOCIAL_PERCEPTION_STATE_SPEC,
     TIMECHAIN_STATE_SPEC,
 )
@@ -300,7 +299,7 @@ class ShmReaderBank:
         "_studio_state", "_expression_state", "_inner_perception_state",
         "_interface_advisor_state",
         "_assessment_state", "_agency_state", "_social_perception_state",
-        "_recorder_state", "_timechain_state", "_reflex_state",
+        "_timechain_state", "_reflex_state",
         "_output_verifier_state",
         "_body_state", "_mind_state", "_language_state",
         "_events_teacher_state",
@@ -443,8 +442,6 @@ class ShmReaderBank:
             AGENCY_STATE_SPEC, self.shm_root)
         self._social_perception_state = StateRegistryReader(
             SOCIAL_PERCEPTION_STATE_SPEC, self.shm_root)
-        self._recorder_state = StateRegistryReader(
-            RL_STATE_SPEC, self.shm_root)
         self._timechain_state = StateRegistryReader(
             TIMECHAIN_STATE_SPEC, self.shm_root)
         self._reflex_state = StateRegistryReader(
@@ -1241,13 +1238,8 @@ class ShmReaderBank:
         return self._read_msgpack_variable(
             self._social_perception_state, "social_perception_state")
 
-    def read_recorder_state(self) -> dict[str, Any] | None:
-        """RecorderStatePublisher payload — programs, current_program_id,
-        dream_quality, training_loss_ema, transitions, last_train_ts, ts.
-        Producer: recorder_worker (formerly rl_worker; slot path is
-        recorder_state.bin per RL_STATE_SLOT = 'recorder_state')."""
-        return self._read_msgpack_variable(
-            self._recorder_state, "recorder_state")
+    # read_recorder_state RETIRED — the recorder_state.bin slot + its
+    # recorder_worker producer are gone (RFP_synthesis_decision_authority P1).
 
     def read_timechain_state(self) -> dict[str, Any] | None:
         """TimechainStatePublisher payload — tx_latency_norm,
@@ -1468,7 +1460,6 @@ class ShmReaderBank:
             ("assessment_state", self._assessment_state),
             ("agency_state", self._agency_state),
             ("social_perception_state", self._social_perception_state),
-            ("recorder_state", self._recorder_state),
             ("timechain_state", self._timechain_state),
             ("reflex_state", self._reflex_state),
             ("output_verifier_state", self._output_verifier_state),

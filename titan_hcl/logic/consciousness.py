@@ -64,7 +64,7 @@ STATE_DIMS = [
     "energy",            # 1: life force from SOL balance (0-1, log-scaled)
     "memory_pressure",   # 2: mempool_size / (mempool_size + persistent) (0-1)
     "social_entropy",    # 3: unique_users / max(total_interactions, 1) (0-1)
-    "sovereignty",       # 4: gatekeeper sovereignty score (0-1)
+    "sovereignty",       # 4: the ONE sovereignty score S = 0.7E+0.3V (0-1)
     "learning_velocity", # 5: metabolism learning velocity (0-1)
     "social_density",    # 6: metabolism social density (0-1)
     "curvature",         # 7: self-referential — journey curvature from previous epoch
@@ -661,7 +661,6 @@ class ConsciousnessLoop:
         metabolism,
         mood_engine,
         social_graph,
-        gatekeeper,
         network,
         ollama_cloud=None,
         db_path: str = "./data/consciousness.db",
@@ -672,7 +671,6 @@ class ConsciousnessLoop:
         self.metabolism = metabolism
         self.mood_engine = mood_engine
         self.social_graph = social_graph
-        self.gatekeeper = gatekeeper
         self.network = network
         self._ollama_cloud = ollama_cloud
         self._bus = bus  # rFP #2 Phase 3: for TITAN_SELF_STATE emission
@@ -748,10 +746,15 @@ class ConsciousnessLoop:
         except Exception:
             sv[3] = 0.0
 
-        # [4] Sovereignty (0-100 from gatekeeper, normalize to 0-1)
+        # [4] Sovereignty — the ONE S = 0.7E+0.3V (already in [0,1]), rolling,
+        # read from the synthesis metrics snapshot (G18 file read, no recompute /
+        # no RPC). Re-pointed off the retired gatekeeper sovereignty_score
+        # (RFP_synthesis_decision_authority P1; the gatekeeper/offline-RL is gone).
         try:
-            sov = getattr(self.gatekeeper, "sovereignty_score", 0.0) if self.gatekeeper else 0.0
-            sv[4] = sov / 100.0
+            from titan_hcl.synthesis.sovereignty_readout import (
+                read_rolling_sovereignty,
+            )
+            sv[4] = float(read_rolling_sovereignty().get("s", 0.0))
         except Exception:
             sv[4] = 0.0
 

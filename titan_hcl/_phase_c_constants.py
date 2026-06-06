@@ -331,10 +331,8 @@ AGENCY_STATE_MAX_BYTES: Final[int] = 8192
 SOCIAL_PERCEPTION_STATE_SCHEMA_VERSION: Final[int] = 1
 # Max msgpack payload bytes for social_perception_state.bin.
 SOCIAL_PERCEPTION_STATE_MAX_BYTES: Final[int] = 2048
-# Schema version for recorder_state.bin slot — variable msgpack {programs[], current_program_id, dream_quality, training_loss_ema, transitions, last_train_ts, ts}. Owned by recorder_worker (was rl_worker prior to v1.8.4 §4.N rename, D-SPEC-58). (Session 2.)
-RL_STATE_SCHEMA_VERSION: Final[int] = 1
-# Max msgpack payload bytes for recorder_state.bin.
-RL_STATE_MAX_BYTES: Final[int] = 4096
+# RL_STATE (recorder_state.bin) schema/bytes RETIRED with the offline-RL
+# subsystem (RFP_synthesis_decision_authority P1) — recorder_worker is gone.
 # Schema version for interface_advisor_state.bin slot — variable msgpack {rates: {msg_type → current_rate_in_window}, limits: dict[msg_type → limit], window_s: float, rate_limit_count: int, schema_version: int, ts: float}. Owned by interface_advisor_worker (G21 single-writer). NEW v1.8.5 §4.H (D-SPEC-59).
 INTERFACE_ADVISOR_STATE_SCHEMA_VERSION: Final[int] = 1
 # Max msgpack payload bytes for interface_advisor_state.bin. NEW v1.8.5 §4.H (D-SPEC-59).

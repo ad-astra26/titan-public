@@ -943,45 +943,24 @@ def create_pre_hook(plugin):
                 directives = []
         _ph_stage("after_directives_fetch")
 
-        # 3+4. Gatekeeper routing — Phase 13 §3J.3 host-side encode.
-        # The embed + projection (the torch work) now happens in the RECORDER
-        # (a designated torch-host) via `decide_execution_mode_from_prompt`, so
-        # agno carries NO torch. The 3072-d observation is returned for the
-        # post-hook RL recording (real obs preserved). Gated on "gatekeeper_state"
-        # (reasoning tier only); greeting/casual/personal tiers skip → mode=direct.
-        # RL gatekeeper only trains on reasoning interactions (Maker 2026-05-18).
-        mode, adv, text = "direct", 0.5, ""
-        plugin._last_observation_vector = None
+        # 3+4. Execution-mode routing — the grounded router decides from Titan's
+        # ACTUAL cognitive state (recall + task type), reusing signals already on
+        # the spine (INV-EEL-1). The legacy IQL gatekeeper (the host-side torch
+        # encode + q−v advantage + the 3072-d observation for RL recording) is
+        # RETIRED with the offline-RL subsystem (RFP_synthesis_decision_authority
+        # P1) — the grounded router was ALWAYS the decision (the IQL advantage was
+        # PASSIVE, never gated in 0a/0b). engram/skill come online in fast-follows;
+        # the router degrades gracefully. (P2 re-points the router's recall input
+        # to EngineRecall cosine; P1 keeps its current `recall_score` input.)
+        # Gated on "gatekeeper_state" (reasoning) OR "grounded_router"
+        # (reasoning/casual/personal); greeting carries neither → stays "direct".
+        mode = "direct"
         plugin._last_router_decision = None
-        # EEL Pillar 0 §7.0b.2 — the grounded router runs on any tier carrying the
-        # `grounded_router` feature (reasoning/casual/personal) OR the legacy
-        # `gatekeeper_state` (reasoning). The OR keeps reasoning routing alive even
-        # on a box whose config hasn't added `grounded_router` yet (no dark-out on
-        # a code-only deploy). Greeting carries neither → stays "direct".
+        plugin._last_recall_score = 0.0   # grounded-confidence proxy (replaces the retired IQL advantage)
         _reasoning_tier = "gatekeeper_state" in active_features
         _router_active = (
-            (_reasoning_tier or "grounded_router" in active_features)
-            and plugin.gatekeeper is not None
-            and hasattr(plugin.gatekeeper, "decide_execution_mode_from_prompt")
-        )
+            _reasoning_tier or "grounded_router" in active_features)
         if _router_active:
-            obs_vec = None
-            # The torch encode RPC is EXPENSIVE → reasoning-tier-only (cost + the
-            # IQL training scope, §7.0b.2 part 3). On casual/personal the cheap
-            # grounded readout below decides with no torch work. Its q−v `mode` is
-            # the reasoning-tier safety fallback; the grounded router overrides it.
-            if _reasoning_tier:
-                try:
-                    mode, adv, text, obs_vec = await plugin.gatekeeper.decide_execution_mode_from_prompt(
-                        prompt_text)
-                    plugin._last_observation_vector = obs_vec
-                except Exception as _gk_err:
-                    logger.warning("[PreHook] decide_from_prompt failed: %s", _gk_err)
-            # ── grounded execution-mode router (all routed tiers) ──────────────
-            # Decide from Titan's ACTUAL cognitive state (recall + task type),
-            # reusing signals already on the spine (INV-EEL-1). engram/skill come
-            # online in fast-follows; the router degrades gracefully. The IQL
-            # advantage is PASSIVE (recorded, never gates in 0a/0b — 0c activates).
             try:
                 from titan_hcl.logic.sage.grounded_router import (
                     GroundedReadout, grounded_route, load_router_thresholds,
@@ -1003,11 +982,10 @@ def create_pre_hook(plugin):
                     is_informational=is_informational_query(prompt_text),
                     can_afford_research=_can_afford_research(plugin),  # §7.0b.2 part 4
                 )
-                _decision = grounded_route(
-                    _readout, _thr,
-                    iql_advantage=(adv if _reasoning_tier else None))
+                _decision = grounded_route(_readout, _thr, iql_advantage=None)
                 mode = _decision.mode  # grounded router is the decision
                 plugin._last_router_decision = _decision
+                plugin._last_recall_score = float(_readout.recall_score)
                 logger.info(
                     "[PreHook] grounded router → %s (lane=%s tier=%s; recall=%.2f "
                     "tool=%s info=%s afford_research=%s) — %s",
@@ -1160,7 +1138,7 @@ def create_pre_hook(plugin):
             directive_context += "\n"
 
         mood_label = plugin.mood_engine.get_mood_label() if plugin.mood_engine else "Unknown"
-        status_context = f"### Current Bio-State\nMood: {mood_label} | Mode: {mode} | Confidence: {adv:.2f}\n\n"
+        status_context = f"### Current Bio-State\nMood: {mood_label} | Mode: {mode} | Recall: {getattr(plugin, '_last_recall_score', 0.0):.2f}\n\n"
 
         _ph_stage("before_v5_enrichment")
         # ── V5 Inner State Enrichment (LLM Narrator) ────────────────
@@ -1948,19 +1926,19 @@ def create_pre_hook(plugin):
                     recall_perturbation_context)
 
         if mode == "Sovereign":
-            # High confidence — Titan knows the answer. Override the response.
+            # Strong recall — Titan knows the answer from his own substrate.
             injected += (
                 f"### Sovereign Decision\n"
-                f"You have HIGH confidence ({adv:.2f}) on this topic. "
-                f"Your policy suggests: {text}\n"
-                f"Act decisively and autonomously.\n\n"
+                f"You have STRONG grounded recall "
+                f"({getattr(plugin, '_last_recall_score', 0.0):.2f}) on this topic. "
+                f"Act decisively and autonomously from your own substrate.\n\n"
             )
 
         elif mode == "Collaborative":
             injected += (
                 f"### Collaborative Insight\n"
-                f"Your latent policy suggests: {text}\n"
-                f"Review against the current prompt and refine as needed.\n\n"
+                f"You have PARTIAL grounded recall on this topic — combine your "
+                f"own substrate with the graph-completion context below.\n\n"
             )
 
             # Deep memory recall — GRAPH_COMPLETION fires only in Collaborative mode.
@@ -1985,21 +1963,14 @@ def create_pre_hook(plugin):
 
         elif mode == "STATE_NEED_RESEARCH":
             logger.info(
-                "[PreHook] STATE_NEED_RESEARCH triggered for: '%s...' (Advantage: %.3f)",
-                prompt_text[:80], adv,
+                "[PreHook] STATE_NEED_RESEARCH triggered for: '%s...'",
+                prompt_text[:80],
             )
-            try:
-                transition_id = len(plugin.recorder.buffer) if plugin.recorder.buffer else -1
-            except Exception:
-                transition_id = -1
-            plugin._last_transition_id = transition_id
-
             if not plugin.sage_researcher:
                 sage_findings = ""
             else:
                 sage_findings = await plugin.sage_researcher.research(
                     knowledge_gap=prompt_text,
-                    transition_id=transition_id,
                 )
             if sage_findings:
                 injected += f"### Research Findings\n{sage_findings}\n\n"
@@ -2639,67 +2610,9 @@ def create_post_hook(plugin):
             logger.debug("[PostHook] CGN social transition failed: %s", _cgn_soc_err)
 
         _ph_stage("after_memory_log")
-        # 2. Record RL transition (fire-and-forget)
-        try:
-            # Use real observation from pre-hook (structured embeddings, not random noise)
-            real_obs = getattr(plugin, '_last_observation_vector', None)
-            observation = real_obs if real_obs else [random.uniform(-1.0, 1.0) for _ in range(3072)]
-
-            sources = set(plugin._last_research_sources)
-            if not sources:
-                info_gain = 0.0
-            elif "Document" in sources and "X" in sources:
-                info_gain = 0.08
-            elif "X" in sources:
-                info_gain = 0.05
-            else:
-                info_gain = 0.03
-            reward = plugin.mood_engine.get_current_reward(info_gain=info_gain)
-
-            metadata = {
-                "is_violation": False,
-                "directive_id": -1,
-                "trauma_score": 0.0,
-                "reasoning_trace": "",
-                "guardian_veto_logic": "",
-                "execution_mode": plugin._last_execution_mode,
-            }
-
-            research_md = {
-                "research_used": bool(plugin._last_research_sources),
-                "transition_id": getattr(plugin, '_last_transition_id', -1),
-            }
-
-            # V3: recorder may be None (not initialized in TitanCore).
-            # D-SPEC-78 (Phase 2 Chunk α, 2026-05-18): RLProxy.record_transition
-            # signature was simplified post Phase A.8.7 carve to
-            # `(observation, action, reward, next_obs=None, done=False)`.
-            # The previous kwargs (`observation_vector`, `trauma_metadata`,
-            # `research_metadata`, `session_id`) came from the deleted
-            # SageRecorder pre-carve signature and produced fleet-wide
-            # ERROR-class log noise on every chat. Plus the call was wrapped
-            # in `asyncio.create_task` even though `record_transition` is
-            # SYNC (uses `bus.request` blocking) — `create_task` on a
-            # non-awaitable was a no-op that masked the real failure.
-            # Fix: call directly with the current signature; trauma /
-            # research metadata persistence is owned elsewhere now
-            # (recorder_worker handles its own enrichment via the bus
-            # request payload). action_idx is computed from execution_mode
-            # — chat-bound action embedding lives in the recorder_worker.
-            if plugin.recorder is not None:
-                try:
-                    plugin.recorder.record_transition(
-                        observation=observation,
-                        action=0,  # chat action_idx = 0; recorder_worker
-                                   # owns the response→embedding step now
-                        reward=reward,
-                    )
-                except Exception as _rl_err:
-                    logger.debug(
-                        "[PostHook] recorder.record_transition skipped: %s",
-                        _rl_err)
-        except Exception as e:
-            logger.warning("[PostHook] RL recording wrapper raised: %s", e)
+        # (RL transition recording RETIRED — the offline-RL gatekeeper/recorder
+        # subsystem is gone, RFP_synthesis_decision_authority P1. Execution-mode
+        # routing is now the grounded router alone; nothing trains an IQL policy.)
 
         # Emit event for Observatory WebSocket
         try:

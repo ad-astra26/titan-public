@@ -73,64 +73,10 @@ class TestBannerRendering:
         assert "\n" not in banner
 
 
-class TestSovereigntyScore:
-    """Test gatekeeper sovereignty metric calculation."""
-
-    def _make_gatekeeper(self):
-        """Create a minimal SageGatekeeper with mocked scholar/recorder."""
-
-        class FakeScholar:
-            pass
-
-        class FakeRecorder:
-            storage = []
-
-        from titan_hcl.logic.sage.gatekeeper import SageGatekeeper
-        return SageGatekeeper(FakeScholar(), FakeRecorder())
-
-    def test_empty_history(self):
-        gk = self._make_gatekeeper()
-        assert gk.sovereignty_score == 0.0
-
-    def test_all_sovereign(self):
-        gk = self._make_gatekeeper()
-        for _ in range(10):
-            gk._record_decision("sovereign")
-        assert gk.sovereignty_score == 100.0
-
-    def test_all_shadow(self):
-        gk = self._make_gatekeeper()
-        for _ in range(10):
-            gk._record_decision("shadow")
-        assert gk.sovereignty_score == 0.0
-
-    def test_mixed_decisions(self):
-        gk = self._make_gatekeeper()
-        # 2 sovereign (2.0) + 2 collaborative (1.0) + 1 shadow (0) = 3.0 / 5 * 100 = 60%
-        gk._record_decision("sovereign")
-        gk._record_decision("sovereign")
-        gk._record_decision("collaborative")
-        gk._record_decision("collaborative")
-        gk._record_decision("shadow")
-        assert abs(gk.sovereignty_score - 60.0) < 0.01
-
-    def test_rolling_window(self):
-        gk = self._make_gatekeeper()
-        # Fill with 100 shadow decisions
-        for _ in range(100):
-            gk._record_decision("shadow")
-        assert gk.sovereignty_score == 0.0
-        # Add 1 sovereign — oldest shadow should be dropped
-        gk._record_decision("sovereign")
-        assert len(gk._decision_history) == 100
-        # 1 sovereign + 99 shadow = 1.0 / 100 * 100 = 1%
-        assert abs(gk.sovereignty_score - 1.0) < 0.01
-
-    def test_record_decision(self):
-        gk = self._make_gatekeeper()
-        gk._record_decision("sovereign")
-        assert len(gk._decision_history) == 1
-        assert gk._decision_history[0] == "sovereign"
+# (TestSovereigntyScore REMOVED — the SageGatekeeper sovereignty_score / shadow-
+# vs-sovereign decision ratio was retired with the offline-RL subsystem,
+# RFP_synthesis_decision_authority P1. The ONE sovereignty metric S = 0.7E+0.3V
+# is tested in tests/test_sovereignty_formula.py + test_phase10_sovereignty_meter.py.)
 
 
 # =========================================================================

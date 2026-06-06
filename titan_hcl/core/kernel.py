@@ -385,8 +385,6 @@ KERNEL_RPC_EXPOSED_METHODS: frozenset[str] = frozenset({
     "config_loader",
     "params",
     "persistence",
-    "recorder",
-    "recorder.buffer",
     "social",
     # Bus-backed proxies (route via bus's own IPC, not kernel_rpc;
     # listed for getattr resolution from API endpoint code)

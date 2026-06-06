@@ -142,7 +142,6 @@ class StealthSageResearcher:
     async def research(
         self,
         knowledge_gap: str,
-        transition_id: int = -1,
     ) -> str:
         """
         Executes the full Stealth-Sage research pipeline for the given knowledge gap.
@@ -152,16 +151,18 @@ class StealthSageResearcher:
 
         Args:
             knowledge_gap (str): The question or topic the Titan needs to research.
-            transition_id (int): The current SageRecorder buffer index at call time.
-                                 Used to link this research event to the RL transition log.
 
         Returns:
             str: A formatted "[SAGE_RESEARCH_FINDINGS]: ..." block ready for
                  injection into the LLM system prompt, or "" if nothing was found.
+
+        (The `transition_id` arg — which linked the research event to the
+        SageRecorder RL buffer — was RETIRED with the offline-RL subsystem,
+        RFP_synthesis_decision_authority P1.)
         """
         try:
             return await asyncio.wait_for(
-                self._research_pipeline(knowledge_gap, transition_id),
+                self._research_pipeline(knowledge_gap),
                 timeout=self._timeout,
             )
         except asyncio.TimeoutError:
@@ -178,7 +179,7 @@ class StealthSageResearcher:
     # Internal Pipeline Steps
     # ------------------------------------------------------------------
 
-    async def _research_pipeline(self, knowledge_gap: str, transition_id: int) -> str:
+    async def _research_pipeline(self, knowledge_gap: str) -> str:
         """Internal pipeline execution (called within the timeout wrapper)."""
         raw_chunks: list[str] = []
         sources_used: list[str] = []
@@ -230,7 +231,6 @@ class StealthSageResearcher:
             sources_used=sources_used,
             urls_scraped=urls,
             distilled_summary=distilled,
-            transition_id=transition_id,
         )
 
         findings = f"[SAGE_RESEARCH_FINDINGS]: {distilled}"
@@ -592,13 +592,9 @@ class StealthSageResearcher:
         sources_used: list[str],
         urls_scraped: list[str],
         distilled_summary: str,
-        transition_id: int,
     ) -> None:
         """
         Appends a structured JSON line to the Sage Research Chronicle log.
-
-        Each entry links to the SageRecorder transition_id so RL audit trails
-        can cross-reference research events with their downstream reward outcomes.
 
         Log format (one JSON object per line):
             {
@@ -606,8 +602,7 @@ class StealthSageResearcher:
               "knowledge_gap": "<query>",
               "sources_used": ["Web", "Document", "X"],
               "urls_scraped": ["https://..."],
-              "distilled_summary": "<3-5 sentence summary>",
-              "transition_id": 42
+              "distilled_summary": "<3-5 sentence summary>"
             }
 
         Args:
@@ -615,7 +610,10 @@ class StealthSageResearcher:
             sources_used (list[str]): Sources that contributed data (Web, Document, X).
             urls_scraped (list[str]): URLs passed to the scraping pipeline.
             distilled_summary (str): The Ollama-distilled summary.
-            transition_id (int): SageRecorder buffer index at research call time.
+
+        (The `transition_id` field — which linked the research event to the
+        SageRecorder RL transition log — was RETIRED with the offline-RL
+        subsystem, RFP_synthesis_decision_authority P1.)
         """
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -623,7 +621,6 @@ class StealthSageResearcher:
             "sources_used": sources_used,
             "urls_scraped": urls_scraped,
             "distilled_summary": distilled_summary,
-            "transition_id": transition_id,
         }
         try:
             with open(_RESEARCH_LOG_PATH, "a", encoding="utf-8") as f:

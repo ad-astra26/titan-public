@@ -1,10 +1,13 @@
 """Phase 13 §3J.3 — agno torch-ectomy regression guard.
 
-The reasoning-tier gatekeeper encode moved host-side (recorder worker). agno must
-NOT trigger a local torch SageEncoder. These assert the source-level contract so
-torch can't silently creep back into agno's process (the ~800MB→1GB-restart cause).
+agno must NOT carry torch in its process (the ~800MB→1GB-restart cause). These
+assert the source-level contract so torch can't silently creep back into agno.
+
+(The host-side gatekeeper/recorder encode tests were removed when the offline-RL
+subsystem — gatekeeper/scholar/recorder/rl_proxy — was retired in
+RFP_synthesis_decision_authority P1. The torch-ectomy guards below stand on their
+own: agno carries no torch regardless of what does the routing.)
 """
-import re
 
 
 def _src(path):
@@ -23,25 +26,3 @@ def test_prehook_no_local_encode_or_projection():
     # No local embed/projection in agno — that's what built the torch SageEncoder.
     assert "action_embedder.encode(" not in src, "agno must not encode locally (§3J)"
     assert "projection_layer(" not in src, "agno must not run the torch projection (§3J)"
-
-
-def test_prehook_uses_host_side_decide():
-    src = _src("titan_hcl/modules/agno_hooks.py")
-    # Must AWAIT it — the agno-side bus is async-only (_WorkerBusClient has no
-    # sync `request`); a non-awaited/sync call regressed it (2026-05-29).
-    assert "await plugin.gatekeeper.decide_execution_mode_from_prompt(" in src, \
-        "agno must AWAIT the host-side gatekeeper decide (async work-RPC, G19)"
-
-
-def test_rl_proxy_has_host_side_method():
-    src = _src("titan_hcl/proxies/rl_proxy.py")
-    # Must be async + use request_async — the agno bus (_WorkerBusClient) has NO
-    # sync `request`; the sync path failed every chat with AttributeError.
-    assert "async def decide_execution_mode_from_prompt(" in src
-    assert "encode_host_side" in src
-
-
-def test_recorder_supports_host_side_encode():
-    src = _src("titan_hcl/modules/recorder_worker.py")
-    assert "encode_host_side" in src
-    assert "observation_vector" in src

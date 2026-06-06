@@ -17,11 +17,10 @@ class SocialManager:
     Subsystem managing the agent's interaction with X (Twitter).
     Handles autonomous posting, engagement, and session recovery.
     """
-    def __init__(self, metabolism_client, mood_engine=None, recorder=None, memory=None,
+    def __init__(self, metabolism_client, mood_engine=None, memory=None,
                  stealth_sage_config: dict = None, social_graph=None):
         self.metabolism = metabolism_client
         self.mood_engine = mood_engine
-        self.recorder = recorder
         self.memory = memory  # TieredMemoryGraph for Cognee integration
         self.social_graph = social_graph  # Persistent user profiles (SQLite)
 
