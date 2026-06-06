@@ -1604,12 +1604,11 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # Phase 8 block constructs the store + tracker. When unfilled (skill store
     # disabled), the sink is a no-op. Closes the P8 increment_* gap + drives
     # repair-fork-on-failure (§9.3 / INV-Syn-24 not — this is the failure loop).
-    _skill_outcome_holder: dict = {"store": None, "tracker": None, "meter": None}
+    _skill_outcome_holder: dict = {"store": None, "tracker": None}
 
     def _skill_outcome_sink(skill_id: str, success: bool) -> None:
         _st = _skill_outcome_holder.get("store")
         _tr = _skill_outcome_holder.get("tracker")
-        _mt = _skill_outcome_holder.get("meter")
         if _st is not None:
             try:
                 if success:
@@ -1623,18 +1622,11 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 _tr.record_outcome(skill_id, success=success)
             except Exception as _te:
                 logger.debug("[synthesis_worker] failure tracker failed: %s", _te)
-        # Phase 10 — a successful delegated skill is a recall-satisfied moment.
-        if _mt is not None and success:
-            try:
-                # INV-Syn-27 (AUDIT §5.3): the knowledge_moment DENOMINATOR is
-                # per-TURN only (the KNOWLEDGE_MOMENT bus handler below, SPEC
-                # §25.9). A skill delegation contributes to the recall_satisfied
-                # NUMERATOR but must NOT mint a second knowledge_moment — doing
-                # so inflated the denominator per-delegation and biased the
-                # sovereignty ratio toward 1.0.
-                _mt.record_recall_satisfied(kind="skill_delegation")
-            except Exception:
-                pass
+        # P3 (RFP_synthesis_decision_authority): a successful delegated skill's
+        # sovereignty is captured in that turn's per-reply S (high E — the skill
+        # supplied the substrate from Titan's own compiled procedure), so the
+        # meter no longer records a separate skill-delegation satisfied mark.
+        # The skill OUTCOME recording above (utility + failure tracker) stays.
 
     # ── Phase 6 §P6.A–K — Oracle middleware + proof middleware + CGN ─────
     # MeaningOraclePlug + 4 ToolPlugs + coverage analyzer + snapshot
@@ -2209,20 +2201,30 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             _persist_mark = None
             try:
                 # Schema DDL — serialized on the writer thread (INV-Syn-28).
-                db_writer.submit_sync(lambda: store._conn.execute(
-                    "CREATE TABLE IF NOT EXISTS sovereignty_marks "
-                    "(ts DOUBLE, mark_type VARCHAR, kind VARCHAR)"))
+                # P3: each mark is now (ts, s) — one per-reply sovereignty score
+                # (S = 0.7E+0.3V). One-time migration: an old-schema table (no
+                # `s` column — the ts/mark_type/kind count-ratio store) is
+                # dropped + recreated. The marks are a rebuildable metric
+                # (INV-Syn-25), never Titan data, so discarding the old rows is
+                # safe — the rolling window refills from new replies.
+                def _ensure_marks_schema():
+                    cols = {r[0] for r in store._conn.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'sovereignty_marks'").fetchall()}
+                    if cols and "s" not in cols:
+                        store._conn.execute("DROP TABLE sovereignty_marks")
+                    store._conn.execute(
+                        "CREATE TABLE IF NOT EXISTS sovereignty_marks "
+                        "(ts DOUBLE, s DOUBLE)")
+                db_writer.submit_sync(_ensure_marks_schema)
 
-                def _persist_mark(mark_type, ts, kind):
+                def _persist_mark(ts, s):
                     # Fired by the meter OUTSIDE its lock; the actual write is
-                    # serialized on the SynthesisWriter. Open-ended `kind` (NULL
-                    # for knowledge marks) so BRAIN Phase 12 can add a new
-                    # satisfied-kind with zero migration. Soft-fail.
+                    # serialized on the SynthesisWriter. Soft-fail.
                     try:
                         db_writer.submit(lambda: store._conn.execute(
-                            "INSERT INTO sovereignty_marks (ts, mark_type, kind) "
-                            "VALUES (?, ?, ?)",
-                            [float(ts), str(mark_type), kind]))
+                            "INSERT INTO sovereignty_marks (ts, s) VALUES (?, ?)",
+                            [float(ts), float(s)]))
                         _prune_state["n"] += 1
                         if _prune_state["n"] % _prune_every == 0:
                             _cut = time.time() - _seed_window_s - _prune_margin_s
@@ -2249,7 +2251,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 def _marks_query_fn(since_ts, limit):
                     try:
                         return db_writer.submit_sync(lambda: store._conn.execute(
-                            "SELECT ts, mark_type, kind FROM sovereignty_marks "
+                            "SELECT ts, s FROM sovereignty_marks "
                             "WHERE ts > ? ORDER BY ts ASC LIMIT ?",
                             [float(since_ts), int(limit)]).fetchall())
                     except Exception:
@@ -2261,9 +2263,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         cap=int(metrics_cfg.get("sovereignty_boot_seed_cap", 50000)))
                     logger.info(
                         "[synthesis_worker] G9 sovereignty boot-seed (durable marks): "
-                        "scanned=%d knowledge_moments=%d recall_satisfied=%d capped=%s",
-                        _seed.get("scanned", 0), _seed.get("knowledge_moments", 0),
-                        _seed.get("recall_satisfied", 0), _seed.get("capped", False))
+                        "scanned=%d replies=%d capped=%s",
+                        _seed.get("scanned", 0), _seed.get("replies", 0),
+                        _seed.get("capped", False))
                     # One-shot boot prune so a long-idle table is trimmed even if
                     # live inserts are sparse.
                     _cut0 = time.time() - _seed_window_s - _prune_margin_s
@@ -2320,7 +2322,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             )
             metrics_aggregator.export()  # initial snapshot from boot
             metrics_exporter_holder["fn"] = lambda: metrics_aggregator.export()
-            _skill_outcome_holder["meter"] = sovereignty_meter
             logger.info(
                 "[synthesis_worker] Phase 10 metrics ready — sovereignty meter "
                 "+ aggregator, snapshot=%s", metrics_snapshot_path)
@@ -2566,22 +2567,23 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 continue
 
             if msg_type == KNOWLEDGE_MOMENT:
-                # Operator-closure C1 (SPEC §25.9) — the per-TURN sovereignty
-                # signal emitted post-LLM by agno. `needed` = the turn required
-                # knowledge (≥1 recall surfaced OR a tool call); `satisfied` =
-                # answered by ≥1 cited recall. One moment per turn, not per item.
+                # P3 (RFP_synthesis_decision_authority) — the per-TURN post-LLM
+                # event (the RFP's CHAT_TURN_COMPLETE, realized on this existing
+                # non-blocking topic) now carries `s_reply` = the ONE sovereignty
+                # score 0.7E+0.3V, computed agno-side at the OVG boundary. The
+                # meter records it as one per-reply mark (rolling-mean S). The
+                # recall-attribution leg below is unchanged.
                 _km_ts = payload.get("ts")
                 if not isinstance(_km_ts, (int, float)):
                     _km_ts = time.time()
                 if sovereignty_meter is not None:
-                    try:
-                        if payload.get("needed"):
-                            sovereignty_meter.record_knowledge_moment(float(_km_ts))
-                        if payload.get("satisfied"):
-                            sovereignty_meter.record_recall_satisfied(
-                                kind="cited_recall", ts=float(_km_ts))
-                    except Exception:
-                        pass
+                    _s_reply = payload.get("s_reply")
+                    if isinstance(_s_reply, (int, float)):
+                        try:
+                            sovereignty_meter.record_reply(
+                                float(_s_reply), float(_km_ts))
+                        except Exception:
+                            pass
                 # §7.E.0 — per-Engram citation attribution (OFF the chat hot path):
                 # resolve the surfaced + cited tx_hash sets → their latest Engram(s)
                 # and record recall-citation (feeds the live `fluent` axis + §7.E's
