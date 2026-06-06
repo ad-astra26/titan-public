@@ -568,6 +568,7 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                     title=s.get("title", ""),
                     content_snippet=s.get("content_snippet", ""),
                     concept_ids=s.get("concept_ids", []) or [],
+                    source=s.get("source", ""),
                 )
                 for s in _surfaced if s.get("item_id")
             ]
@@ -581,10 +582,27 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                        if isinstance(_cu_stash, dict) else None)
             if _cu_hit is not None:
                 _cited = set(_cu_hit.get("cited", []))
+                _s_reply = _cu_hit.get("s_reply")
             else:
                 _cited = set(_detector.detect(
                     response_text=response_text, surfaced_items=_items,
                 ))
+                _s_reply = None
+            # P3 (RFP_synthesis_decision_authority) — the per-reply sovereignty
+            # score S = 0.7E+0.3V. Prefer the value computed once at the OVG
+            # boundary (stash); fall back to computing it here so the meter
+            # always gets a mark. Cheap/deterministic; never blocks the path.
+            if not isinstance(_s_reply, (int, float)):
+                try:
+                    from titan_hcl.synthesis.sovereignty_score import (
+                        compute_sovereignty_score,
+                    )
+                    _s_reply = compute_sovereignty_score(
+                        response_text=response_text, surfaced_items=_items,
+                        cited_item_ids=_cited, detector=_detector,
+                    ).s
+                except Exception:
+                    _s_reply = 0.0
             _now = time.time()
             for _it in _items:
                 _send(send_queue, MEMORY_RETRIEVAL_USED, name, "all", {
@@ -600,6 +618,7 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
             _send(send_queue, KNOWLEDGE_MOMENT, name, "all", {
                 "needed": bool(_items),
                 "satisfied": bool(_cited),
+                "s_reply": float(_s_reply),
                 "ts": _now,
                 # §7.E.0 — per-Engram citation attribution: the surfaced + cited
                 # tx_hash sets (item_id = tx_hash, the tx-spine recall key) so

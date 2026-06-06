@@ -1124,6 +1124,10 @@ def create_pre_hook(plugin):
                         "title": _snip[:120],
                         "content_snippet": _snip[:512],
                         "concept_ids": [],
+                        # P3 sovereignty V-term source tag: these come from the
+                        # synthesis tx-hash spine recall. VCB/memory items get
+                        # their own tags as the P4 assembler itemizes them.
+                        "source": "recall",
                     })
                 if _lines:
                     synthesis_recall_context = (
@@ -2341,12 +2345,30 @@ def create_post_hook(plugin):
                                 title=s.get("title", ""),
                                 content_snippet=s.get("content_snippet", ""),
                                 concept_ids=s.get("concept_ids", []) or [],
+                                source=s.get("source", ""),
                             )
                             for s in _km_raw if s.get("item_id")
                         ]
                         _km_needed, _km_satisfied, _km_cited = (
                             knowledge_moment_signal(
                                 _km_det, _km_items, response_text))
+                        # P3 (RFP_synthesis_decision_authority) — the ONE
+                        # sovereignty score S = 0.7E+0.3V for this reply, computed
+                        # ONCE here (cheap/deterministic) reusing the cited set
+                        # just detected, so the reply's TIMECHAIN_COMMIT can anchor
+                        # it and agno_worker forwards it on the per-turn event.
+                        try:
+                            from titan_hcl.synthesis.sovereignty_score import (
+                                compute_sovereignty_score,
+                            )
+                            _km_s_reply = compute_sovereignty_score(
+                                response_text=response_text,
+                                surfaced_items=_km_items,
+                                cited_item_ids=_km_cited,
+                                detector=_km_det,
+                            ).s
+                        except Exception:
+                            _km_s_reply = 0.0
                         # Stash for agno_worker's live emits (the cited set
                         # drives per-item INV-Syn-23 reinforcement). Keyed
                         # identically to `_last_surfaced_items` so the worker's
@@ -2359,7 +2381,11 @@ def create_post_hook(plugin):
                             "needed": _km_needed,
                             "satisfied": _km_satisfied,
                             "cited": list(_km_cited),
+                            "s_reply": _km_s_reply,
                         }
+                        # Readable by the OVG tx-anchor (build_timechain_payload)
+                        # so S rides the reply's TIMECHAIN_COMMIT.
+                        plugin._last_sovereignty_s = _km_s_reply
                 except Exception as _km_err:
                     logger.debug(
                         "[PostHook:G9] knowledge-moment signal skipped "
