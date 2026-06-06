@@ -70,3 +70,37 @@ def test_all_window_has_no_trend():
     m, _ = _meter()
     m.record_reply(0.5, ts=10_000.0)
     assert m.compute(now_ts=10_000.0)["all"]["trend"] is None
+
+
+# ── E/V components roll alongside S (chronicle re-source 3-axis) ──────
+
+def test_ev_components_rolled():
+    """The meter rolls mean E + mean V alongside S so the chronicle re-source
+    can render the faithful S/E/V narrative without recomputing."""
+    m, _ = _meter()
+    m.record_reply(0.62, ts=10_000.0, e=0.7, v=0.2)
+    m.record_reply(0.50, ts=10_000.0, e=0.5, v=0.3)
+    out = m.compute(now_ts=10_000.0)["all"]
+    assert out["replies"] == 2
+    assert out["sovereignty"] == 0.56   # mean(0.62, 0.50)
+    assert out["e"] == 0.6              # mean(0.7, 0.5)
+    assert out["v"] == 0.25            # mean(0.2, 0.3)
+
+
+def test_ev_default_zero_for_legacy_callers():
+    """A caller that passes only s (no e/v) yields zeroed components — never
+    NaN, never affects the headline S."""
+    m, _ = _meter()
+    m.record_reply(0.8, ts=10_000.0)
+    out = m.compute(now_ts=10_000.0)["all"]
+    assert out["sovereignty"] == 0.8
+    assert out["e"] == 0.0
+    assert out["v"] == 0.0
+
+
+def test_ev_clamped():
+    m, _ = _meter()
+    m.record_reply(0.5, ts=10_000.0, e=1.7, v=-0.4)
+    out = m.compute(now_ts=10_000.0)["all"]
+    assert out["e"] == 1.0
+    assert out["v"] == 0.0

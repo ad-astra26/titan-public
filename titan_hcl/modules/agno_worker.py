@@ -583,26 +583,35 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
             if _cu_hit is not None:
                 _cited = set(_cu_hit.get("cited", []))
                 _s_reply = _cu_hit.get("s_reply")
+                _e_reply = _cu_hit.get("e_reply")
+                _v_reply = _cu_hit.get("v_reply")
             else:
                 _cited = set(_detector.detect(
                     response_text=response_text, surfaced_items=_items,
                 ))
                 _s_reply = None
+                _e_reply = None
+                _v_reply = None
             # P3 (RFP_synthesis_decision_authority) — the per-reply sovereignty
-            # score S = 0.7E+0.3V. Prefer the value computed once at the OVG
-            # boundary (stash); fall back to computing it here so the meter
-            # always gets a mark. Cheap/deterministic; never blocks the path.
+            # score S = 0.7E+0.3V + its E/V components. Prefer the values computed
+            # once at the OVG boundary (stash); fall back to computing them here
+            # so the meter always gets a full mark. Cheap/deterministic; never
+            # blocks the path. (E/V feed the chronicle re-source 3-axis.)
             if not isinstance(_s_reply, (int, float)):
                 try:
                     from titan_hcl.synthesis.sovereignty_score import (
                         compute_sovereignty_score,
                     )
-                    _s_reply = compute_sovereignty_score(
+                    _sov = compute_sovereignty_score(
                         response_text=response_text, surfaced_items=_items,
                         cited_item_ids=_cited, detector=_detector,
-                    ).s
+                    )
+                    _s_reply, _e_reply, _v_reply = _sov.s, _sov.e, _sov.v
                 except Exception:
                     _s_reply = 0.0
+            # Normalize E/V to floats (absent stash / pre-E/V PostHook → 0.0).
+            _e_reply = float(_e_reply) if isinstance(_e_reply, (int, float)) else 0.0
+            _v_reply = float(_v_reply) if isinstance(_v_reply, (int, float)) else 0.0
             _now = time.time()
             for _it in _items:
                 _send(send_queue, MEMORY_RETRIEVAL_USED, name, "all", {
@@ -619,6 +628,8 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                 "needed": bool(_items),
                 "satisfied": bool(_cited),
                 "s_reply": float(_s_reply),
+                "e_reply": _e_reply,
+                "v_reply": _v_reply,
                 "ts": _now,
                 # §7.E.0 — per-Engram citation attribution: the surfaced + cited
                 # tx_hash sets (item_id = tx_hash, the tx-spine recall key) so

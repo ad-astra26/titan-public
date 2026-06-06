@@ -39,10 +39,11 @@ def test_on_record_fires_on_live_marks():
     captured = []
     meter = SovereigntyRatioMeter(
         windows=["all"], clock=lambda: 100.0,
-        on_record=lambda ts, s: captured.append((ts, s)))
-    meter.record_reply(0.6, 10.0)
+        on_record=lambda ts, s, e, v: captured.append((ts, s, e, v)))
+    meter.record_reply(0.6, 10.0, e=0.7, v=0.2)
     meter.record_reply(0.3, 11.0)
-    assert captured == [(10.0, 0.6), (11.0, 0.3)]
+    # The durable callback carries the full (ts, s, e, v) mark.
+    assert captured == [(10.0, 0.6, 0.7, 0.2), (11.0, 0.3, 0.0, 0.0)]
 
 
 def test_on_record_not_fired_on_replay():
@@ -51,8 +52,8 @@ def test_on_record_not_fired_on_replay():
     captured = []
     meter = SovereigntyRatioMeter(
         windows=["all"], clock=lambda: 100.0,
-        on_record=lambda ts, s: captured.append((ts, s)))
-    meter.record_reply(0.5, 5.0, _persist=False)
+        on_record=lambda ts, s, e, v: captured.append((ts, s, e, v)))
+    meter.record_reply(0.5, 5.0, e=0.4, v=0.1, _persist=False)
     assert captured == []
 
 
@@ -111,18 +112,32 @@ def test_boot_seed_bad_row_skipped():
 
 def test_round_trip_persist_then_reseed_matches_live():
     # Full loop: live records → durable rows → fresh meter reseeds → identical
-    # windows (the restart invariant, G4).
+    # windows (the restart invariant, G4). The (ts, s, e, v) mark round-trips
+    # intact — rolling E/V survive a respawn alongside S.
     rows = []
     live = SovereigntyRatioMeter(
         windows=["all"], clock=lambda: 1300.0,
-        on_record=lambda ts, s: rows.append((ts, s)))
-    live.record_reply(0.7, 1000.0)
-    live.record_reply(0.3, 1100.0)
+        on_record=lambda ts, s, e, v: rows.append((ts, s, e, v)))
+    live.record_reply(0.7, 1000.0, e=0.8, v=0.1)
+    live.record_reply(0.3, 1100.0, e=0.2, v=0.5)
     live_stats = live.compute(1300.0)["all"]
+    assert live_stats["e"] == 0.5 and live_stats["v"] == 0.3  # rolled
 
     reborn = SovereigntyRatioMeter(windows=["all"], clock=lambda: 1300.0)
     boot_seed_from_marks(reborn, _query_fn(rows), since_ts=0.0)
     assert reborn.compute(1300.0)["all"] == live_stats
+
+
+def test_boot_seed_tolerates_legacy_two_col_rows():
+    # A pre-P3 marks table is (ts, s) only — those rows must still replay, with
+    # e/v defaulting to 0.0 (no migration crash, no NaN).
+    rows = [(1000.0, 0.6), (1100.0, 0.4)]   # 2-tuples, no e/v
+    meter = SovereigntyRatioMeter(windows=["all"], clock=lambda: 1300.0)
+    summary = boot_seed_from_marks(meter, _query_fn(rows), since_ts=0.0)
+    assert summary["replies"] == 2
+    stats = meter.compute(1300.0)["all"]
+    assert stats["sovereignty"] == 0.5
+    assert stats["e"] == 0.0 and stats["v"] == 0.0
 
 
 # ── knowledge_moment_signal (UNCHANGED — per-item INV-Syn-23 reinforcement +

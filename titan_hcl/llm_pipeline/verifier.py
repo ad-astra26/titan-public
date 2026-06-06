@@ -153,6 +153,10 @@ def verify_post(
     neuromods: Optional[dict] = None,
     embedding_hash: str = "",
     importance: float = 0.5,
+    # Synthesis Decision Authority P3 — the ONE per-reply sovereignty score
+    # S = 0.7·E + 0.3·V, anchored on the reply's conversation-fork TX. Default
+    # 0.0 (non-chat callers + honest "no substrate" reading).
+    sovereignty: float = 0.0,
 ) -> VerifiedResult:
     """Verify, sign, and TimeChain-commit an LLM response.
 
@@ -285,6 +289,7 @@ def verify_post(
                 topic_tags=topic_tags,
                 tool_calls=tool_calls, neuromods=neuromods,
                 embedding_hash=embedding_hash, importance=importance,
+                sovereignty=sovereignty,
             )
             if tc_payload:
                 from titan_hcl.bus import TIMECHAIN_COMMIT, make_msg
@@ -347,6 +352,9 @@ async def verify_post_async(
     neuromods: Optional[dict] = None,
     embedding_hash: str = "",
     importance: float = 0.5,
+    # Synthesis Decision Authority P3 — per-reply S = 0.7·E + 0.3·V (see
+    # verify_post() docstring). Threaded verbatim to build_timechain_payload.
+    sovereignty: float = 0.0,
 ) -> VerifiedResult:
     """Async verify_post with split safety / signing.
 
@@ -509,6 +517,7 @@ async def verify_post_async(
                 neuromods=neuromods,
                 embedding_hash=embedding_hash,
                 importance=importance,
+                sovereignty=sovereignty,
             )
         )
         return VerifiedResult(
@@ -544,6 +553,7 @@ async def verify_post_async(
         topic_tags=topic_tags,
         tool_calls=tool_calls, neuromods=neuromods,
         embedding_hash=embedding_hash, importance=importance,
+        sovereignty=sovereignty,
     )
 
 
@@ -558,7 +568,8 @@ async def _sign_and_attach(sign_coro, *, output_verifier, safety_result,
                            tool_calls: Optional[list] = None,
                            neuromods: Optional[dict] = None,
                            embedding_hash: str = "",
-                           importance: float = 0.5):
+                           importance: float = 0.5,
+                           sovereignty: float = 0.0):
     """Run the sign coroutine and publish TimeChain commit. Returns the
     SignedResult (or None on failure)."""
     signed = await sign_coro
@@ -590,7 +601,8 @@ async def _sign_and_attach(sign_coro, *, output_verifier, safety_result,
                 user_id=user_id, chat_id=chat_id, turn_index=turn_index,
                 topic_tags=topic_tags,
                 tool_calls=tool_calls, neuromods=neuromods,
-                embedding_hash=embedding_hash, importance=importance)
+                embedding_hash=embedding_hash, importance=importance,
+                sovereignty=sovereignty)
             if tc_payload:
                 from titan_hcl.bus import TIMECHAIN_COMMIT, make_msg
                 bus.publish(
@@ -617,7 +629,8 @@ def _assemble_signed_result(final_text: str, safety, signed,
                             tool_calls: Optional[list] = None,
                             neuromods: Optional[dict] = None,
                             embedding_hash: str = "",
-                            importance: float = 0.5) -> VerifiedResult:
+                            importance: float = 0.5,
+                            sovereignty: float = 0.0) -> VerifiedResult:
     """For concurrent_sign=False legacy path — assemble final result inline."""
     signature = getattr(signed, "signature", None) if signed else None
     merkle_root = getattr(signed, "merkle_root", "") if signed else ""
@@ -642,7 +655,8 @@ def _assemble_signed_result(final_text: str, safety, signed,
                 user_id=user_id, chat_id=chat_id, turn_index=turn_index,
                 topic_tags=topic_tags,
                 tool_calls=tool_calls, neuromods=neuromods,
-                embedding_hash=embedding_hash, importance=importance)
+                embedding_hash=embedding_hash, importance=importance,
+                sovereignty=sovereignty)
             if tc_payload:
                 from titan_hcl.bus import TIMECHAIN_COMMIT, make_msg
                 bus.publish(

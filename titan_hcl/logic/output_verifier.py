@@ -1150,7 +1150,8 @@ class OutputVerifier:
                                 tool_calls: Optional[list] = None,
                                 neuromods: Optional[dict] = None,
                                 embedding_hash: str = "",
-                                importance: float = 0.5) -> dict:
+                                importance: float = 0.5,
+                                sovereignty: float = 0.0) -> dict:
         """Build the TIMECHAIN_COMMIT payload for a verified/blocked output.
 
         **Phase 3 (rFP §18 — episode model, D-SPEC-127):** brings the
@@ -1165,7 +1166,9 @@ class OutputVerifier:
               signature, channel, checks, violation_type, titan_id,
               # P3 fields (NEW — arch §7 normative carry):
               user_msg, agent_response, tool_calls[], neuromods{},
-              embedding_hash (132D unified-spirit), importance, topic_tags[]
+              embedding_hash (132D unified-spirit), importance, topic_tags[],
+              # Synthesis Decision Authority P3 — the ONE sovereignty metric:
+              sovereignty (per-reply S = 0.7·E + 0.3·V, clamped [0,1])
             }
 
         With `cas_payload_slimming_enabled=true` (P3.F flip), the
@@ -1223,6 +1226,18 @@ class OutputVerifier:
             importance:  P3 §7 NEW. Default 0.5 (arch §5.3 cold-start);
                          lazy-scored in next dream cycle via bridge salience
                          (rFP §20 Q2 / §24 reframe).
+            sovereignty: RFP_synthesis_decision_authority P3 — the ONE
+                         per-reply sovereignty score `S = 0.7·E + 0.3·V`
+                         (`synthesis/sovereignty_score.py`), computed agno-side
+                         at the post-LLM OVG boundary and threaded here so the
+                         reply's conversation-fork TX *anchors* S (committed to
+                         `tx_merkle_root`; the searchable copy rides the promoted
+                         thought, the rolling aggregate lives durably in
+                         `synthesis.duckdb::sovereignty_marks`). Clamped to
+                         [0,1] defensively (OVG is the security surface — never
+                         trust the caller). Default 0.0 = honest "Titan supplied
+                         none of this reply from substrate" (also the value
+                         non-chat callers get).
 
         Returns dict ready to publish to the bus as a TIMECHAIN_COMMIT
         message. Blocked path (result.passed=False) unchanged — routes
@@ -1262,6 +1277,13 @@ class OutputVerifier:
                     if isinstance(tc, dict):
                         capped_tool_calls.append(tc)
 
+            # P3 sovereignty — defensive clamp (OVG never trusts the caller).
+            try:
+                _sov = float(sovereignty)
+            except (TypeError, ValueError):
+                _sov = 0.0
+            _sov = 0.0 if _sov < 0.0 else (1.0 if _sov > 1.0 else _sov)
+
             return {
                 "fork": "conversation",
                 "thought_type": "conversation",
@@ -1288,6 +1310,9 @@ class OutputVerifier:
                     "embedding_hash": str(embedding_hash or ""),
                     "importance": float(importance),
                     "topic_tags": normalized_topic_tags,
+                    # Synthesis Decision Authority P3 — the ONE sovereignty
+                    # metric, anchored on this reply's conversation-fork TX.
+                    "sovereignty": _sov,
                 },
                 "tags": tags,
                 "significance": 0.3,

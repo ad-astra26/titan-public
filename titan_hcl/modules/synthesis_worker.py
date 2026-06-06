@@ -2201,30 +2201,33 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             _persist_mark = None
             try:
                 # Schema DDL — serialized on the writer thread (INV-Syn-28).
-                # P3: each mark is now (ts, s) — one per-reply sovereignty score
-                # (S = 0.7E+0.3V). One-time migration: an old-schema table (no
-                # `s` column — the ts/mark_type/kind count-ratio store) is
-                # dropped + recreated. The marks are a rebuildable metric
-                # (INV-Syn-25), never Titan data, so discarding the old rows is
-                # safe — the rolling window refills from new replies.
+                # P3: each mark is now (ts, s, e, v) — one per-reply sovereignty
+                # score S = 0.7E+0.3V AND its E/V components (so the soul-Chronicle
+                # re-source renders the faithful 3-axis narrative without
+                # recomputing). One-time migration: a table missing any of
+                # `s`/`e`/`v` (the old count-ratio store, or the pre-E/V (ts,s)
+                # store) is dropped + recreated. The marks are a rebuildable
+                # metric (INV-Syn-25), never Titan data, so discarding old rows
+                # is safe — the rolling window refills from new replies.
                 def _ensure_marks_schema():
                     cols = {r[0] for r in store._conn.execute(
                         "SELECT column_name FROM information_schema.columns "
                         "WHERE table_name = 'sovereignty_marks'").fetchall()}
-                    if cols and "s" not in cols:
+                    if cols and not {"s", "e", "v"} <= cols:
                         store._conn.execute("DROP TABLE sovereignty_marks")
                     store._conn.execute(
                         "CREATE TABLE IF NOT EXISTS sovereignty_marks "
-                        "(ts DOUBLE, s DOUBLE)")
+                        "(ts DOUBLE, s DOUBLE, e DOUBLE, v DOUBLE)")
                 db_writer.submit_sync(_ensure_marks_schema)
 
-                def _persist_mark(ts, s):
+                def _persist_mark(ts, s, e=0.0, v=0.0):
                     # Fired by the meter OUTSIDE its lock; the actual write is
                     # serialized on the SynthesisWriter. Soft-fail.
                     try:
                         db_writer.submit(lambda: store._conn.execute(
-                            "INSERT INTO sovereignty_marks (ts, s) VALUES (?, ?)",
-                            [float(ts), float(s)]))
+                            "INSERT INTO sovereignty_marks (ts, s, e, v) "
+                            "VALUES (?, ?, ?, ?)",
+                            [float(ts), float(s), float(e), float(v)]))
                         _prune_state["n"] += 1
                         if _prune_state["n"] % _prune_every == 0:
                             _cut = time.time() - _seed_window_s - _prune_margin_s
@@ -2251,7 +2254,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 def _marks_query_fn(since_ts, limit):
                     try:
                         return db_writer.submit_sync(lambda: store._conn.execute(
-                            "SELECT ts, s FROM sovereignty_marks "
+                            "SELECT ts, s, e, v FROM sovereignty_marks "
                             "WHERE ts > ? ORDER BY ts ASC LIMIT ?",
                             [float(since_ts), int(limit)]).fetchall())
                     except Exception:
@@ -2579,9 +2582,19 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 if sovereignty_meter is not None:
                     _s_reply = payload.get("s_reply")
                     if isinstance(_s_reply, (int, float)):
+                        # E/V components ride the same event (chronicle re-source
+                        # 3-axis). Absent/old emitters → 0.0, only zeroing the
+                        # rolling-E/V projection, never the headline S.
+                        _e_reply = payload.get("e_reply")
+                        _v_reply = payload.get("v_reply")
+                        _e_reply = float(_e_reply) if isinstance(
+                            _e_reply, (int, float)) else 0.0
+                        _v_reply = float(_v_reply) if isinstance(
+                            _v_reply, (int, float)) else 0.0
                         try:
                             sovereignty_meter.record_reply(
-                                float(_s_reply), float(_km_ts))
+                                float(_s_reply), float(_km_ts),
+                                e=_e_reply, v=_v_reply)
                         except Exception:
                             pass
                 # §7.E.0 — per-Engram citation attribution (OFF the chat hot path):

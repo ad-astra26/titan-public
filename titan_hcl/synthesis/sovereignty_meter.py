@@ -53,22 +53,33 @@ class SovereigntyRatioMeter:
         self._windows = list(windows) if windows else ["24h", "7d", "all"]
         import time as _time
         self._clock = clock or _time.time
-        # Each mark is (ts, s) — one completed reply's sovereignty score.
+        # Each mark is (ts, s, e, v) — one completed reply's sovereignty score
+        # AND its two components (E = substrate-cited token share; V = inner-state
+        # share). The headline metric is S = 0.7·E + 0.3·V; E/V are rolled
+        # alongside so the soul-Chronicle re-source can render the faithful
+        # 3-axis narrative (S→Alignment, E→Knowledge, V→Insight) without
+        # recomputing (RFP_synthesis_decision_authority P3 — chronicle re-source).
         self._marks: deque = deque(maxlen=max_marks)
         self._lock = threading.Lock()
         # G9 durable persistence: an optional callback fired on every NEW mark —
-        # `on_record(ts, s)`. synthesis_worker injects a SynthesisWriter INSERT
-        # into synthesis.duckdb::sovereignty_marks (INV-Syn-28). Default None ⇒
-        # the class stays pure (unit tests unaffected). Boot-seed replays with
-        # `_persist=False` so it never re-fires.
+        # `on_record(ts, s, e, v)`. synthesis_worker injects a SynthesisWriter
+        # INSERT into synthesis.duckdb::sovereignty_marks (INV-Syn-28). Default
+        # None ⇒ the class stays pure (unit tests unaffected). Boot-seed replays
+        # with `_persist=False` so it never re-fires.
         self._on_record = on_record
 
     # ── recording ─────────────────────────────────────────────────────
 
     def record_reply(
-        self, s: float, ts: Optional[float] = None, *, _persist: bool = True,
+        self, s: float, ts: Optional[float] = None, *,
+        e: float = 0.0, v: float = 0.0, _persist: bool = True,
     ) -> None:
-        """Record one completed reply's sovereignty score `s ∈ [0,1]`.
+        """Record one completed reply's sovereignty score `s ∈ [0,1]` + its
+        components `e`/`v ∈ [0,1]` (the E/V of `S = 0.7·E + 0.3·V`).
+
+        `e`/`v` default 0.0 so legacy callers (and the unit tests) that pass
+        only `s` keep working — the mark then carries zeroed components, which
+        only affects the (new) rolling-E/V projection, never the headline S.
 
         `_persist=False` (boot-seed replay only) appends the mark WITHOUT firing
         the durable `on_record` callback — replaying durable rows must not
@@ -76,22 +87,25 @@ class SovereigntyRatioMeter:
         submit must not stall recording)."""
         t = float(ts if ts is not None else self._clock())
         sv = _clamp01(s)
+        ev = _clamp01(e)
+        vv = _clamp01(v)
         with self._lock:
-            self._marks.append((t, sv))
+            self._marks.append((t, sv, ev, vv))
         if _persist and self._on_record is not None:
             try:
-                self._on_record(t, sv)
+                self._on_record(t, sv, ev, vv)
             except Exception:
                 pass
 
     # ── compute ───────────────────────────────────────────────────────
 
     def compute(self, now_ts: Optional[float] = None) -> dict:
-        """Return {window: {replies, sovereignty, trend}} for each window.
+        """Return {window: {replies, sovereignty, e, v, trend}} for each window.
 
         `sovereignty` = rolling-mean S over the window (0.0 when no replies);
-        `trend` = this window's mean minus the prior equal-length window's mean
-        (None for the unbounded 'all' window)."""
+        `e`/`v` = rolling-mean of the E/V components (the chronicle re-source's
+        Knowledge/Insight axes); `trend` = this window's mean S minus the prior
+        equal-length window's mean S (None for the unbounded 'all' window)."""
         now = float(now_ts if now_ts is not None else self._clock())
         with self._lock:
             marks = list(self._marks)
@@ -101,23 +115,40 @@ class SovereigntyRatioMeter:
             out[w] = self._window_stats(marks, now, span)
         return out
 
+    @staticmethod
+    def _mark_fields(m):
+        """Unpack a mark tolerantly: (ts, s) legacy or (ts, s, e, v) current."""
+        t = m[0]
+        s = m[1]
+        e = m[2] if len(m) > 2 else 0.0
+        v = m[3] if len(m) > 3 else 0.0
+        return t, s, e, v
+
     def _window_stats(self, marks, now, span) -> dict:
         if span is None:
             lo, prev_lo = float("-inf"), None
         else:
             lo = now - span
             prev_lo = now - 2 * span
-        cur = [s for (t, s) in marks if t >= lo]
+        cur = [self._mark_fields(m) for m in marks if self._mark_fields(m)[0] >= lo]
         replies = len(cur)
-        mean_s = (sum(cur) / replies) if replies else 0.0
+        if replies:
+            mean_s = sum(f[1] for f in cur) / replies
+            mean_e = sum(f[2] for f in cur) / replies
+            mean_v = sum(f[3] for f in cur) / replies
+        else:
+            mean_s = mean_e = mean_v = 0.0
         trend = None
         if span is not None:
-            prev = [s for (t, s) in marks if prev_lo <= t < lo]
+            prev = [self._mark_fields(m)[1] for m in marks
+                    if prev_lo <= self._mark_fields(m)[0] < lo]
             prev_mean = (sum(prev) / len(prev)) if prev else 0.0
             trend = round(mean_s - prev_mean, 4)
         return {
             "replies": replies,
             "sovereignty": round(mean_s, 4),
+            "e": round(mean_e, 4),
+            "v": round(mean_v, 4),
             "trend": trend,
         }
 
@@ -142,11 +173,12 @@ def boot_seed_from_marks(
     The meter holds ephemeral rolling-window marks that a `synthesis_worker`
     respawn zeros (crash-loop audit §5.3 "respawn zeros windows"). INV-Syn-25
     makes metrics a rebuildable projection over a **canonical durable source**;
-    the source is `synthesis.duckdb::sovereignty_marks(ts, s)`, written by the
-    `on_record` callback. On boot we replay every in-window `(ts, s)` row via
-    `record_reply(s, ts, _persist=False)` so the replay never re-writes the rows.
+    the source is `synthesis.duckdb::sovereignty_marks(ts, s, e, v)`, written by
+    the `on_record` callback. On boot we replay every in-window row via
+    `record_reply(s, ts, e=, v=, _persist=False)` so the replay never re-writes
+    the rows (legacy 2-col `(ts, s)` rows replay with e=v=0).
 
-    `query_fn(since_ts, limit)` returns an iterable of `(ts, s)` rows; the caller
+    `query_fn(since_ts, limit)` returns an iterable of `(ts, s[, e, v])` rows; the caller
     supplies it as a **SynthesisWriter-serialized** read (INV-Syn-28). `since_ts`
     bounds the replay to the longest standard rolling window; `cap` is surfaced
     when hit — no silent truncation. Never raises.
@@ -170,11 +202,15 @@ def boot_seed_from_marks(
         try:
             ts = float(r[0])
             s = float(r[1])
+            # Tolerate legacy (ts, s) rows (e/v absent → 0.0) so a pre-P3
+            # marks table still replays cleanly.
+            e = float(r[2]) if len(r) > 2 and r[2] is not None else 0.0
+            v = float(r[3]) if len(r) > 3 and r[3] is not None else 0.0
         except Exception:
             continue
         out["scanned"] += 1
         try:
-            meter.record_reply(s, ts, _persist=False)
+            meter.record_reply(s, ts, e=e, v=v, _persist=False)
             out["replies"] += 1
         except Exception:
             continue

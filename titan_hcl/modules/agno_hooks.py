@@ -2166,6 +2166,12 @@ def create_post_hook(plugin):
         # fallback path tripped on agno_worker's worker bus client. The
         # async path uses request_async which IS implemented.
         _ovg_result = None
+        # P3 (Synthesis Decision Authority) — reset the per-reply sovereignty
+        # stash at the top of each turn so the OVG tx-anchor (verify_post_async
+        # → build_timechain_payload) carries THIS reply's S. The KM block below
+        # rewrites it only when items were surfaced; a no-surfaced-items turn
+        # must anchor S=0.0 (honest "no substrate"), never a carried-over value.
+        plugin._last_sovereignty_s = 0.0
         _ovg = getattr(plugin, '_output_verifier', None)
         if _ovg:
             try:
@@ -2361,18 +2367,23 @@ def create_post_hook(plugin):
                             from titan_hcl.synthesis.sovereignty_score import (
                                 compute_sovereignty_score,
                             )
-                            _km_s_reply = compute_sovereignty_score(
+                            _km_sov = compute_sovereignty_score(
                                 response_text=response_text,
                                 surfaced_items=_km_items,
                                 cited_item_ids=_km_cited,
                                 detector=_km_det,
-                            ).s
+                            )
+                            _km_s_reply = _km_sov.s
+                            _km_e_reply = _km_sov.e
+                            _km_v_reply = _km_sov.v
                         except Exception:
-                            _km_s_reply = 0.0
+                            _km_s_reply = _km_e_reply = _km_v_reply = 0.0
                         # Stash for agno_worker's live emits (the cited set
                         # drives per-item INV-Syn-23 reinforcement). Keyed
                         # identically to `_last_surfaced_items` so the worker's
-                        # `f"{user_id}:{session_id}"` lookup matches.
+                        # `f"{user_id}:{session_id}"` lookup matches. E/V ride
+                        # along so the KNOWLEDGE_MOMENT carries the full mark
+                        # (chronicle re-source 3-axis).
                         _km_stash = getattr(plugin, "_last_cited_use", None)
                         if not isinstance(_km_stash, dict):
                             _km_stash = {}
@@ -2382,6 +2393,8 @@ def create_post_hook(plugin):
                             "satisfied": _km_satisfied,
                             "cited": list(_km_cited),
                             "s_reply": _km_s_reply,
+                            "e_reply": _km_e_reply,
+                            "v_reply": _km_v_reply,
                         }
                         # Readable by the OVG tx-anchor (build_timechain_payload)
                         # so S rides the reply's TIMECHAIN_COMMIT.
@@ -2413,6 +2426,10 @@ def create_post_hook(plugin):
                     neuromods=_p3_snapshot.get("neuromods"),
                     embedding_hash=_p3_snapshot.get("embedding_hash", ""),
                     importance=_p3_snapshot.get("importance", 0.5),
+                    # P3 (Synthesis Decision Authority) — anchor THIS reply's
+                    # sovereignty S = 0.7·E + 0.3·V (computed in the KM block
+                    # above, reset per-turn) on the reply's conversation-fork TX.
+                    sovereignty=getattr(plugin, "_last_sovereignty_s", 0.0),
                 )
                 _ph_stage("ovg_post_verify")
                 response_text = _verified.text

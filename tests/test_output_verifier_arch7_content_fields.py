@@ -125,9 +125,47 @@ class TestArchSection7ContentFields(unittest.TestCase):
         self.assertEqual(payload["content"]["topic_tags"],
                          ["topic:solana", "topic:kuzu"])
 
-    # ── (G9 sovereignty is no longer a conv-TX content field — Phase F /
-    #    synthesis-engine 0.24.0 moved it to synthesis.duckdb::sovereignty_marks;
-    #    its tests live in tests/test_sovereignty_boot_seed.py.) ──
+    # ── P3 sovereignty anchor (RFP_synthesis_decision_authority) ──────
+    #
+    # History: the v0.22.0 `sovereignty{needed,satisfied}` dict was reverted
+    # in synthesis-engine 0.24.0 (it was used as a boot-seed READBACK source,
+    # which the conv-fork v2 seal made unreadable → the rolling meter now seeds
+    # from synthesis.duckdb::sovereignty_marks, tests in
+    # tests/test_sovereignty_boot_seed.py). The Decision-Authority RFP re-adds a
+    # DIFFERENT field — the ONE per-reply scalar `S = 0.7·E + 0.3·V` — to ANCHOR
+    # it on the reply's TX (committed to tx_merkle_root). It is NOT a readback
+    # source (that's sovereignty_marks); it rides the thought as provenance.
+
+    def test_sovereignty_anchored_on_pass_path(self):
+        payload = self.ov.build_timechain_payload(
+            _pass_result(), prompt_text="hi",
+            user_id="maker", chat_id="s1", sovereignty=0.59)
+        self.assertAlmostEqual(payload["content"]["sovereignty"], 0.59)
+
+    def test_sovereignty_clamped_to_unit_interval(self):
+        hi = self.ov.build_timechain_payload(
+            _pass_result(), prompt_text="hi",
+            user_id="maker", chat_id="s1", sovereignty=1.7)
+        self.assertEqual(hi["content"]["sovereignty"], 1.0)
+        lo = self.ov.build_timechain_payload(
+            _pass_result(), prompt_text="hi",
+            user_id="maker", chat_id="s1", sovereignty=-0.3)
+        self.assertEqual(lo["content"]["sovereignty"], 0.0)
+
+    def test_sovereignty_garbage_input_defaults_zero(self):
+        """OVG is the security surface — never trust the caller."""
+        payload = self.ov.build_timechain_payload(
+            _pass_result(), prompt_text="hi",
+            user_id="maker", chat_id="s1", sovereignty="not-a-number")
+        self.assertEqual(payload["content"]["sovereignty"], 0.0)
+
+    def test_sovereignty_default_is_zero(self):
+        """Non-chat callers (no sovereignty kwarg) anchor S=0.0 — the honest
+        'Titan supplied none of this reply from substrate' reading."""
+        payload = self.ov.build_timechain_payload(
+            _pass_result(), prompt_text="hi",
+            user_id="maker", chat_id="s1")
+        self.assertEqual(payload["content"]["sovereignty"], 0.0)
 
     # ── Defaults preserve byte-compatible behavior ────────────────
 
@@ -227,7 +265,8 @@ class TestArchSection7ContentFields(unittest.TestCase):
         self.assertEqual(payload["content"]["event"], "OVG_BLOCKED")
         # P3 fields NOT carried on blocked path.
         for f in ("user_msg", "agent_response", "tool_calls",
-                  "neuromods", "embedding_hash", "importance", "topic_tags"):
+                  "neuromods", "embedding_hash", "importance", "topic_tags",
+                  "sovereignty"):
             self.assertNotIn(f, payload["content"])
 
 
