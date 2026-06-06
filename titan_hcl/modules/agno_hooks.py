@@ -149,6 +149,46 @@ def _can_afford_research(plugin) -> bool:
         return True
 
 
+def _synthesis_decision_authority_enabled(plugin) -> bool:
+    """P2 (RFP_synthesis_decision_authority) — the D4 transient feature flag.
+
+    When ON, the grounded router routes on the EngineRecall top cosine (RELEVANCE
+    over the spine, INV-SDA-2) with gibberish-calibrated self-floors; when OFF
+    (default), the legacy VCB/memory-composite recall + static floors (byte-
+    identical to P1). Config: `[synthesis.decision_authority] enabled` (default
+    false; default-on after one clean T3 soak per D4)."""
+    try:
+        cfg = (getattr(plugin, "_full_config", {}) or {}).get("synthesis", {}) or {}
+        return bool((cfg.get("decision_authority", {}) or {}).get("enabled", False))
+    except Exception:
+        return False
+
+
+def _p2_router_thresholds(plugin):
+    """RouterThresholds with the recall floors SELF-CALIBRATED to the embedder's
+    gibberish noise floor (P2). The engram/skill floors keep their static config
+    values (only the cosine-recall floors calibrate)."""
+    from titan_hcl.logic.sage.grounded_router import (
+        RouterThresholds, load_router_thresholds,
+    )
+    from titan_hcl.synthesis.recall_calibration import GibberishBaseline
+    base = getattr(plugin, "_p2_gibberish_baseline", None)
+    if base is None:
+        base = GibberishBaseline()
+        plugin._p2_gibberish_baseline = base
+    known, present = base.floors()
+    static = getattr(plugin, "_grounded_router_thresholds", None)
+    if static is None:
+        static = load_router_thresholds()
+        plugin._grounded_router_thresholds = static
+    return RouterThresholds(
+        recall_known_floor=known,
+        recall_present_floor=present,
+        engram_ground_floor=static.engram_ground_floor,
+        skill_promote_floor=static.skill_promote_floor,
+    )
+
+
 def _compute_recall_perturbation(memories: list, current_time: float) -> dict:
     """Compute aggregate neuromod nudge from recalled memories' felt snapshots.
 
@@ -954,51 +994,123 @@ def create_pre_hook(plugin):
         # to EngineRecall cosine; P1 keeps its current `recall_score` input.)
         # Gated on "gatekeeper_state" (reasoning) OR "grounded_router"
         # (reasoning/casual/personal); greeting carries neither → stays "direct".
+        # P2 (RFP_synthesis_decision_authority): behind the decision-authority
+        # flag the router routes on the EngineRecall top cosine (RELEVANCE over
+        # the spine — INV-SDA-1/2) with SELF-CALIBRATING gibberish-baseline floors,
+        # not the VCB/memory composite (chain-confidence) + fixed floors. Flag off
+        # (default) → byte-identical to P1.
         mode = "direct"
         plugin._last_router_decision = None
-        plugin._last_recall_score = 0.0   # grounded-confidence proxy (replaces the retired IQL advantage)
+        plugin._last_recall_score = 0.0   # the router's recall signal this turn
         _reasoning_tier = "gatekeeper_state" in active_features
         _router_active = (
             _reasoning_tier or "grounded_router" in active_features)
+        # P2 single-recall: when the flag is on, run EngineRecall ONCE here so the
+        # decision routes on the cosine; the B3 recall section below REUSES this
+        # result (no double-run, no double-chi). Off → no pre-recall.
+        _p2_on = _synthesis_decision_authority_enabled(plugin)
+        _p2_results = None
+        _p2_top_cosine = 0.0
+        if _p2_on and _router_active:
+            try:
+                _p2_rc = getattr(plugin, "engine_recall", None)
+                if _p2_rc is not None and prompt_text:
+                    _p2_results = await asyncio.to_thread(
+                        _p2_rc.recall, prompt_text, k=6)
+                    _p2_top_cosine = max(
+                        (float(getattr(_r, "cosine", 0.0) or 0.0)
+                         for _r in (_p2_results or [])), default=0.0)
+            except Exception as _p2e:
+                logger.warning(
+                    "[PreHook] P2 pre-recall failed (fallback to memory recall): %s",
+                    _p2e)
+                _p2_results = None
         if _router_active:
             try:
                 from titan_hcl.logic.sage.grounded_router import (
                     GroundedReadout, grounded_route, load_router_thresholds,
                     is_informational_query, recall_score_from_memories)
                 from titan_hcl.synthesis.tool_intent import detect_tool_intent
-                _thr = getattr(plugin, "_grounded_router_thresholds", None)
-                if _thr is None:
-                    _thr = load_router_thresholds()
-                    plugin._grounded_router_thresholds = _thr
+                if _p2_on:
+                    _recall_input = _p2_top_cosine          # spine RELEVANCE
+                    _thr = _p2_router_thresholds(plugin)     # gibberish-calibrated
+                else:
+                    _recall_input = recall_score_from_memories(relevant_memories)
+                    _thr = getattr(plugin, "_grounded_router_thresholds", None)
+                    if _thr is None:
+                        _thr = load_router_thresholds()
+                        plugin._grounded_router_thresholds = _thr
                 try:
                     _requires_tool = bool(detect_tool_intent(prompt_text).requires_tool)
                 except Exception:
                     _requires_tool = False
                 _readout = GroundedReadout(
-                    recall_score=recall_score_from_memories(relevant_memories),
+                    recall_score=_recall_input,
                     engram_ground=0.0,         # fast-follow (recall-only for now)
                     skill_utility=None,        # B1 (skill-lane dormant until then)
                     requires_tool=_requires_tool,
                     is_informational=is_informational_query(prompt_text),
                     can_afford_research=_can_afford_research(plugin),  # §7.0b.2 part 4
                 )
-                _decision = grounded_route(_readout, _thr, iql_advantage=None)
+                _decision = grounded_route(_readout, _thr)
                 mode = _decision.mode  # grounded router is the decision
                 plugin._last_router_decision = _decision
                 plugin._last_recall_score = float(_readout.recall_score)
                 logger.info(
-                    "[PreHook] grounded router → %s (lane=%s tier=%s; recall=%.2f "
-                    "tool=%s info=%s afford_research=%s) — %s",
+                    "[PreHook] grounded router → %s (lane=%s tier=%s; recall=%.3f "
+                    "p2=%s floors=%.3f/%.3f tool=%s info=%s afford_research=%s) — %s",
                     _decision.mode, _decision.lane,
                     getattr(plugin, "_current_chat_tier", "?"),
-                    _readout.recall_score, _requires_tool,
-                    _readout.is_informational, _readout.can_afford_research,
-                    _decision.reason)
+                    _readout.recall_score, _p2_on,
+                    _thr.recall_known_floor, _thr.recall_present_floor,
+                    _requires_tool, _readout.is_informational,
+                    _readout.can_afford_research, _decision.reason)
             except Exception as _gr_err:
                 logger.warning(
                     "[PreHook] grounded router failed (keeping mode '%s'): %s",
                     mode, _gr_err)
         plugin._last_execution_mode = mode
+
+        # P2 gibberish-baseline calibration (flag-gated) — periodically probe the
+        # embedder's noise floor so the recall floors SELF-CALIBRATE to the live
+        # spine (gibberish prompts → top cosine → EMA ceiling → floors). Runs on
+        # the first routed turn + every N turns; updates the baseline for
+        # subsequent turns (not the critical path for THIS decision).
+        if _p2_on and _router_active:
+            try:
+                _da_cfg = ((plugin._full_config.get("synthesis", {}) or {})
+                           .get("decision_authority", {}) or {})
+                _gp_every = int(_da_cfg.get("gibberish_probe_every", 25))
+                _gc = int(getattr(plugin, "_p2_gibberish_turn_count", 0)) + 1
+                plugin._p2_gibberish_turn_count = _gc
+                _base = getattr(plugin, "_p2_gibberish_baseline", None)
+                if _base is None:
+                    from titan_hcl.synthesis.recall_calibration import (
+                        GibberishBaseline,
+                    )
+                    _base = GibberishBaseline()
+                    plugin._p2_gibberish_baseline = _base
+                if _gc == 1 or (_gp_every > 0 and _gc % _gp_every == 0):
+                    from titan_hcl.synthesis.recall_calibration import (
+                        GIBBERISH_PROMPTS,
+                    )
+                    _gprc = getattr(plugin, "engine_recall", None)
+                    if _gprc is not None:
+                        _gcos = []
+                        for _gp in GIBBERISH_PROMPTS:
+                            _grr = await asyncio.to_thread(_gprc.recall, _gp, k=6)
+                            _gcos.append(max(
+                                (float(getattr(_r, "cosine", 0.0) or 0.0)
+                                 for _r in (_grr or [])), default=0.0))
+                        if _gcos:
+                            _base.update(sum(_gcos) / len(_gcos))
+                            logger.info(
+                                "[PreHook] P2 gibberish calibration: %s",
+                                _base.snapshot())
+            except Exception as _gpe:
+                logger.warning(
+                    "[PreHook] P2 gibberish probe failed (keeping baseline): %s",
+                    _gpe)
 
         _ph_stage("after_gatekeeper_hostside")
 
@@ -1048,11 +1160,17 @@ def create_pre_hook(plugin):
                 except Exception:
                     pass
                 _t_recall0 = time.perf_counter()
-                _results = await asyncio.to_thread(_recall.recall, prompt_text, k=6)
+                # P2: reuse the routing pre-recall (same prompt, same k) when the
+                # decision-authority flag already ran it — no double-run / double-chi.
+                if _p2_results is not None:
+                    _results = _p2_results
+                else:
+                    _results = await asyncio.to_thread(_recall.recall, prompt_text, k=6)
                 _recall_latency_ms = (time.perf_counter() - _t_recall0) * 1000.0
                 logger.info(
-                    "[PreHook] B3 synthesis recall ran: %d raw results in %.0fms",
-                    len(_results or []), _recall_latency_ms)
+                    "[PreHook] B3 synthesis recall ran: %d raw results in %.0fms%s",
+                    len(_results or []), _recall_latency_ms,
+                    " (reused P2 pre-recall)" if _p2_results is not None else "")
                 # D5-probe (RFP_synthesis_decision_authority P0): emit per-result
                 # cosine so the known-vs-unknown discrimination that GATES P2 is
                 # readable from the journal. Self-guarding comprehension (getattr
