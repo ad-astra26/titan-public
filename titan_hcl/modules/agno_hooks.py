@@ -1142,6 +1142,7 @@ def create_pre_hook(plugin):
         # Soft-fail — chat never breaks on a recall error, and the block is
         # simply absent when engine_recall is None (a box without the spine).
         synthesis_recall_context = ""
+        _recall_surfaced = []  # P4: recall-partition rows fed to the context assembler
         try:
             _recall = getattr(plugin, "engine_recall", None)
             if _recall is not None and prompt_text:
@@ -1202,7 +1203,6 @@ def create_pre_hook(plugin):
                         "hits": len(_results or []),
                         "fork": "conversation", "source": "agno_chat"}
                 _lines = []
-                _surfaced = []
                 for _r in (_results or []):
                     _txh = getattr(_r, "tx_hash", "") or ""
                     if not _txh:
@@ -1214,15 +1214,16 @@ def create_pre_hook(plugin):
                         _snip = getattr(_r, "summary", "") or ""
                     if not _snip:
                         continue
-                    _lines.append(f"- [{getattr(_r, 'score', 0.0):.2f}] {_snip[:300]}")
-                    _surfaced.append({
+                    _score = float(getattr(_r, "score", 0.0) or 0.0)
+                    _lines.append(f"- [{_score:.2f}] {_snip[:300]}")
+                    _recall_surfaced.append({
                         "item_id": _txh,
                         "title": _snip[:120],
                         "content_snippet": _snip[:512],
                         "concept_ids": [],
-                        # P3 sovereignty V-term source tag: these come from the
-                        # synthesis tx-hash spine recall. VCB/memory items get
-                        # their own tags as the P4 assembler itemizes them.
+                        "weight": _score,
+                        # P3 sovereignty V-term source tag: the synthesis tx-hash
+                        # spine. VCB/memory items are tagged by the P4 assembler.
                         "source": "recall",
                     })
                 if _lines:
@@ -1230,14 +1231,6 @@ def create_pre_hook(plugin):
                         "### Synthesis Recall (your own verified experience — tx_hash spine)\n"
                         + "\n".join(_lines) + "\n\n"
                     )
-                    _uid = getattr(plugin, "_current_user_id", "") or ""
-                    _sid = getattr(plugin, "_current_session_id", "") or ""
-                    _cid = f"{_uid}:{_sid}"
-                    _reg = getattr(plugin, "_last_surfaced_items", None)
-                    if not isinstance(_reg, dict):
-                        _reg = {}
-                        plugin._last_surfaced_items = _reg
-                    _reg.setdefault(_cid, []).extend(_surfaced)
                     logger.info(
                         "[PreHook] synthesis recall augment: %d tx_hash hits injected",
                         len(_lines))
@@ -1247,6 +1240,93 @@ def create_pre_hook(plugin):
             logger.warning(
                 "[PreHook] synthesis recall augment failed (chat unaffected): %s",
                 _sr_err, exc_info=True)
+
+        # ── P4 context assembler (RFP_synthesis_decision_authority) ──────────
+        # Itemize ALL surfaced substrate this turn — VCB inner-state + the memory
+        # fallback + the recall spine — into ONE source-tagged, content-hash
+        # de-duplicated surfaced-item list (synthesis/context_assembler). This is
+        # the single thing that activates the sovereignty V-term: before P4 only
+        # recall items were registered, so VCB/memory citations were invisible and
+        # V was structurally pinned at 0. It also guarantees no fact is delivered
+        # or counted twice (gate G6 / INV-SDA-5). Soft-fail: a failure here must
+        # never break chat — the except restashes the recall-only set as before.
+        try:
+            from titan_hcl.synthesis.context_assembler import assemble as _assemble_ctx
+            _vcb_rows = []
+            _mem_rows = []
+            if _vcb_context is not None and getattr(_vcb_context, "records", None):
+                for _vr in _vcb_context.records:
+                    _vc = getattr(_vr, "content", "") or ""
+                    if not _vc.strip():
+                        continue
+                    _vcb_rows.append({
+                        "content": _vc,
+                        "title": (getattr(_vr, "db_ref", "") or getattr(_vr, "source", "")),
+                        "weight": float(getattr(_vr, "confidence", 0.0) or 0.0),
+                    })
+            elif relevant_memories:
+                # No-VCB fallback: relevant_memories are core.memory.query nodes.
+                for _m in relevant_memories[:5]:
+                    if not isinstance(_m, dict):
+                        continue
+                    _mc = (_m.get("content")
+                           or " ".join(x for x in (_m.get("user_prompt", ""),
+                                                    _m.get("agent_response", "")) if x).strip())
+                    if not _mc or not _mc.strip():
+                        continue
+                    _mid = _m.get("id")
+                    _mem_rows.append({
+                        "item_id": f"mem:{_mid}" if _mid is not None else "",
+                        "content": _mc,
+                        "weight": float(_m.get("effective_weight",
+                                              _m.get("mempool_weight", 0.0)) or 0.0),
+                    })
+            _assembled = _assemble_ctx(vcb=_vcb_rows, memory=_mem_rows,
+                                       recall=_recall_surfaced)
+            _uid = getattr(plugin, "_current_user_id", "") or ""
+            _sid = getattr(plugin, "_current_session_id", "") or ""
+            _cid = f"{_uid}:{_sid}"
+            _reg = getattr(plugin, "_last_surfaced_items", None)
+            if not isinstance(_reg, dict):
+                _reg = {}
+                plugin._last_surfaced_items = _reg
+            # The assembled set is THE canonical surfaced-item list for this turn
+            # (replaces, not extends — a stale un-popped prior turn can't leak in).
+            _reg[_cid] = [_it.to_stash_dict() for _it in _assembled]
+            # G6: if a recall snippet was deduped against a VCB/memory item, drop
+            # its injection line too so display == count. Rebuild only on overlap.
+            _kept_recall = [_it for _it in _assembled if _it.source == "recall"]
+            if len(_kept_recall) != len(_recall_surfaced):
+                if _kept_recall:
+                    _rl = [f"- [{_it.weight:.2f}] {_it.content[:300]}" for _it in _kept_recall]
+                    synthesis_recall_context = (
+                        "### Synthesis Recall (your own verified experience — tx_hash spine)\n"
+                        + "\n".join(_rl) + "\n\n")
+                else:
+                    synthesis_recall_context = ""
+            logger.info(
+                "[PreHook] P4 assembler: %d surfaced (vcb=%d mem=%d recall=%d) "
+                "deduped from %d raw",
+                len(_assembled),
+                sum(1 for _i in _assembled if _i.source == "vcb"),
+                sum(1 for _i in _assembled if _i.source == "memory"),
+                len(_kept_recall),
+                len(_vcb_rows) + len(_mem_rows) + len(_recall_surfaced))
+        except Exception as _asm_err:
+            logger.warning(
+                "[PreHook] P4 context assembler failed (chat unaffected): %s",
+                _asm_err, exc_info=True)
+            try:
+                _uid = getattr(plugin, "_current_user_id", "") or ""
+                _sid = getattr(plugin, "_current_session_id", "") or ""
+                _cid = f"{_uid}:{_sid}"
+                _reg = getattr(plugin, "_last_surfaced_items", None)
+                if not isinstance(_reg, dict):
+                    _reg = {}
+                    plugin._last_surfaced_items = _reg
+                _reg[_cid] = list(_recall_surfaced)
+            except Exception:
+                pass
 
         directive_context = ""
         if directives:
