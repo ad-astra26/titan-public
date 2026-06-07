@@ -14,7 +14,9 @@ Performance budget: ~10-20ms total (negligible vs 2-30s LLM call).
 import logging
 import re
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -269,11 +271,38 @@ class QueryParser:
 # STORE ROUTER — Execute queries against specific databases
 # ═════════════════════════════════════════════════════════════════════
 
+class _PooledConn:
+    """Thin proxy over a pooled sqlite3 connection. Forwards every attribute to
+    the real connection EXCEPT close(), which is a no-op so the per-query
+    `finally: conn.close()` in the store handlers does NOT tear down a pooled,
+    reused connection. The real connection is closed only on pool teardown.
+    sqlite3.Connection is a C type with no instance __dict__, so a proxy is the
+    only way to neutralise close() without editing every handler (P4)."""
+
+    __slots__ = ("_real",)
+
+    def __init__(self, real: sqlite3.Connection):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def close(self):  # pooled — the real close happens at _close_pool()
+        return None
+
+
 class StoreRouter:
     """Routes parsed queries to specific database tables and executes SQL."""
 
     def __init__(self, data_dir: str = "./data"):
         self._data_dir = Path(data_dir)
+        # P4 (RFP_synthesis_decision_authority): pooled, thread-local sqlite
+        # connections. VCB.build fans its ~14 store queries across a PERSISTENT
+        # thread pool (see VerifiedContextBuilder._query_pool), so caching one
+        # connection per (thread, db) reuses them across turns — ~0 reconnects/
+        # turn — while each connection stays owned by a single thread (no
+        # cross-thread sqlite use, so the per-build parallelism is preserved).
+        self._tls = threading.local()
 
     def query_store(self, store_key: str, parsed: ParsedQuery,
                     limit: int = 5) -> list[dict]:
@@ -288,14 +317,23 @@ class StoreRouter:
                          key="logic.verified_context_builder.store_query_failed_for", throttle=100)
             return []
 
-    def _connect(self, db_name: str) -> sqlite3.Connection:
+    def _connect(self, db_name: str):
         path = self._data_dir / db_name
         if not path.exists():
             return None
+        cache = getattr(self._tls, "conns", None)
+        if cache is None:
+            cache = {}
+            self._tls.conns = cache
+        pooled = cache.get(db_name)
+        if pooled is not None:
+            return pooled
         conn = sqlite3.connect(str(path), timeout=3)
         conn.execute("PRAGMA busy_timeout=3000")
         conn.row_factory = sqlite3.Row
-        return conn
+        pooled = _PooledConn(conn)
+        cache[db_name] = pooled
+        return pooled
 
     def _time_filter(self, parsed: ParsedQuery, col: str = "created_at") -> tuple:
         """Build SQL WHERE clause fragment for temporal filtering."""
@@ -693,6 +731,10 @@ class VerifiedContextBuilder:
         self._data_dir = data_dir
         self._parser = QueryParser(known_users=known_users)
         self._router = StoreRouter(data_dir=data_dir)
+        # P4: ONE persistent query thread-pool (not a per-build pool) so the
+        # StoreRouter's thread-local connection cache survives across turns.
+        self._query_pool = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="vcb-query")
         self._verifier = memory_verifier  # MemoryVerifier instance (optional)
         # Synthesis Engine Phase 1 (D-SPEC-123 / SPEC v1.56.0 §25 / 2026-05-23):
         # optional MEMORY_RETRIEVAL_USED emit per returned record. Item-id
@@ -749,58 +791,54 @@ class VerifiedContextBuilder:
         all_records: list[VerifiedRecord] = []
         per_store_limit = max(3, max_records // max(len(stores_to_query), 1))
 
-        from concurrent.futures import ThreadPoolExecutor
-        # Bound pool size to the smaller of (num stores, 8) — most builds
-        # query 4-6 stores; cap prevents thread sprawl if stores_to_query
-        # ever grows.
-        _pool_size = min(len(stores_to_query), 8) if stores_to_query else 1
-        with ThreadPoolExecutor(
-            max_workers=_pool_size,
-            thread_name_prefix="vcb-query",
-        ) as _pool:
-            _futures = {
-                store_key: _pool.submit(
-                    self._router.query_store, store_key, parsed, per_store_limit
-                )
-                for store_key in stores_to_query
-            }
-            for store_key in stores_to_query:
-                try:
-                    raw_results = _futures[store_key].result()
-                except Exception as _qs_err:
-                    # Per-store failure is non-fatal — log and move on so
-                    # one slow/broken store can't take down the whole VCB.
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "[VCB] query_store(%s) raised: %s — skipping",
-                        store_key, _qs_err)
-                    continue
-                chain_status = _CHAIN_STATUS.get(store_key, "NOT_COVERED")
-                confidence = _CONFIDENCE_MAP.get(chain_status, 0.3)
+        # P4: submit to the PERSISTENT pool (self._query_pool) so the router's
+        # thread-local connections survive across turns (~0 reconnects/turn).
+        # Same parallelism — each store query runs on its own pool thread; we
+        # collect in store_key order for deterministic downstream ranking.
+        _pool = self._query_pool
+        _futures = {
+            store_key: _pool.submit(
+                self._router.query_store, store_key, parsed, per_store_limit
+            )
+            for store_key in stores_to_query
+        }
+        for store_key in stores_to_query:
+            try:
+                raw_results = _futures[store_key].result()
+            except Exception as _qs_err:
+                # Per-store failure is non-fatal — log and move on so
+                # one slow/broken store can't take down the whole VCB.
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[VCB] query_store(%s) raised: %s — skipping",
+                    store_key, _qs_err)
+                continue
+            chain_status = _CHAIN_STATUS.get(store_key, "NOT_COVERED")
+            confidence = _CONFIDENCE_MAP.get(chain_status, 0.3)
 
-                for raw in raw_results:
-                    db_ref = raw.get("db_ref")
-                    # Check MemoryVerifier if available
-                    actual_status = chain_status
-                    block_height = None
-                    if self._verifier and db_ref:
-                        vr = self._verifier.verify(db_ref)
-                        if vr and vr.authentic:
-                            actual_status = "CHAINED"
-                            block_height = vr.block_height
-                            confidence = 1.0
-                        elif vr and vr.untracked:
-                            actual_status = chain_status  # Use store-level status
+            for raw in raw_results:
+                db_ref = raw.get("db_ref")
+                # Check MemoryVerifier if available
+                actual_status = chain_status
+                block_height = None
+                if self._verifier and db_ref:
+                    vr = self._verifier.verify(db_ref)
+                    if vr and vr.authentic:
+                        actual_status = "CHAINED"
+                        block_height = vr.block_height
+                        confidence = 1.0
+                    elif vr and vr.untracked:
+                        actual_status = chain_status  # Use store-level status
 
-                    all_records.append(VerifiedRecord(
-                        content=raw["content"],
-                        source=raw.get("source", store_key),
-                        timestamp=raw.get("timestamp", 0),
-                        chain_status=actual_status,
-                        block_height=block_height,
-                        db_ref=db_ref,
-                        confidence=confidence,
-                    ))
+                all_records.append(VerifiedRecord(
+                    content=raw["content"],
+                    source=raw.get("source", store_key),
+                    timestamp=raw.get("timestamp", 0),
+                    chain_status=actual_status,
+                    block_height=block_height,
+                    db_ref=db_ref,
+                    confidence=confidence,
+                ))
 
         t_query = time.time()
 

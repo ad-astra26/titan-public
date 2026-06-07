@@ -1472,6 +1472,30 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             "on legacy memory_context only", _er_err)
         worker_plugin.engine_recall = None
 
+    # ── VerifiedContextBuilder — the chat path's rich inner-titan-state recall ──
+    # (RFP_synthesis_decision_authority P4) The PreHook's VCB enrichment block
+    # (multi-store: vocabulary/knowledge_concepts/chain_archive/meta_wisdom/…) was
+    # carried over from the pre-agno chat path but its builder was NEVER wired onto
+    # the agno plugin — so chat silently fell back to memory.query and the
+    # sovereignty V-term (inner-state share, source=="vcb") was structurally pinned
+    # at 0. Wire it here so VCB runs in chat as the RFP intends, activating V.
+    # data_dir matches engine_recall; bus_emit left None (the strict Phase-9
+    # cited-use gate — not VCB's soft Phase-1 emit — drives reinforcement now).
+    # Soft-fail: on error chat falls back to memory.query exactly as before.
+    try:
+        from titan_hcl.logic.verified_context_builder import VerifiedContextBuilder
+        _vcb_data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+        worker_plugin._verified_context_builder = VerifiedContextBuilder(
+            data_dir=_vcb_data_dir)
+        logger.info(
+            "[AgnoWorker] VerifiedContextBuilder wired (chat inner-state recall "
+            "+ sovereignty V-term; data_dir=%s)", _vcb_data_dir)
+    except Exception as _vcb_err:
+        worker_plugin._verified_context_builder = None
+        logger.warning(
+            "[AgnoWorker] VCB wiring failed: %s — chat stays on memory.query "
+            "fallback (V-term inactive)", _vcb_err)
+
     # ── SHM publisher (G21 single-writer for agno_state.bin) ──
     try:
         publisher = AgnoStatePublisher(name=name)
