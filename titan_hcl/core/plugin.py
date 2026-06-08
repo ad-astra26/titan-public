@@ -1073,10 +1073,15 @@ class TitanHCL:
                 name = inner.get("name")
                 new_module_path = inner.get("new_module_path")
                 timeout_s = float(inner.get("timeout_s", 30.0))
+                # D-SPEC-151: align to GuardianHCLClient.reload_module(name, timeout,
+                # **kwargs) — post-peer-spawn `self.guardian` is the bus-client
+                # proxy (was the in-process Guardian's reload_module(module_name,
+                # timeout_s)). Wrong kw names = TypeError "missing 'name'" (the
+                # cutover never updated this caller; exposed once routing reached it).
                 result = await self.guardian.reload_module(
-                    module_name=name,
+                    name=name,
+                    timeout=timeout_s,
                     new_module_path=new_module_path,
-                    timeout_s=timeout_s,
                 )
                 # reload_module returns {swap_id, module_name, status,
                 # reason, total_elapsed_ms, ts} per SPEC §8.3 — add `ok`
