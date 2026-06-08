@@ -179,59 +179,23 @@ def setup_worker_bus(name: str, recv_q, send_q,
         # Phase 11 §11.I.2 (locked D1/D2): the legacy MODULE_READY bus emit is
         # DELETED. Readiness is SHM-only — the worker writes state=booted to its
         # own module_<name>_state.bin slot and titan_hcl drives it to running via
-        # the MODULE_PROBE_REQUEST contract. This callback now only handles the
-        # Phase B reload ADOPTION_REQUEST emit.
+        # the MODULE_PROBE_REQUEST contract.
         #
-        # SPEC §11.B.3 Phase B (D-SPEC-49): when this worker was spawned
-        # by Guardian.reload_module() (phase_b_reload_swap_id set on
-        # entry by _module_wrapper from config), the initial subscribe-ack
-        # ALSO triggers a one-shot ADOPTION_REQUEST emit so Guardian's
-        # orchestrator step 4 can complete. Flag is captured in a mutable
-        # holder so we can flip after first emission — subsequent
-        # subscribe-acks (reconnects) skip the ADOPTION_REQUEST path.
-        _first_subscribe_ack = [True]
-        _swap_id = phase_b_reload_swap_id
+        # Phase B (RFP_shm_native_hot_reload): the reload ADOPTION_REQUEST emit
+        # that used to fire on the first subscribe-ack is RETIRED. The titan_hcl
+        # Orchestrator spawned this worker and knows its pid, so it confirms
+        # readiness via the pid-validated SHM slot (`_wait_for_reload_running`) —
+        # no worker→Guardian adopt round-trip, which mis-routed to the
+        # guardian_hcl Supervisor in the peer-spawn split (never reaching the
+        # Orchestrator's rs.adoption_q → guaranteed adoption_timeout). The §10.C
+        # ADOPTION protocol stays live for B.2.1 kernel-swap (worker_swap_handler
+        # — INV-4). `phase_b_reload_swap_id` is kept only as a spawn-identity tag.
+        if phase_b_reload_swap_id is not None:
+            logger.info(
+                "[worker_bus_bootstrap] worker '%s' is a reload-spawn "
+                "(swap_id=%s) — readiness via pid-validated SHM slot, "
+                "no adopt emit", name, str(phase_b_reload_swap_id)[:8])
 
-        def _re_emit_module_ready() -> None:
-            from titan_hcl import bus as _bus_constants
-            # Phase B reload context: emit ADOPTION_REQUEST on the very first
-            # subscribe-ack only. Guardian's _process_guardian_messages routes
-            # it to the reload orchestrator's adoption_q when name+pid match the
-            # in-flight reload state. (No MODULE_READY emit — deleted per D1/D2.)
-            if _swap_id is not None and _first_subscribe_ack[0]:
-                _first_subscribe_ack[0] = False
-                try:
-                    import os as _os
-                    import uuid as _uuid
-                    _rid = str(_uuid.uuid4())
-                    client_ref.publish({
-                        "type": _bus_constants.BUS_WORKER_ADOPT_REQUEST,
-                        "src": name,
-                        "dst": "guardian",
-                        "rid": _rid,
-                        "payload": {
-                            "name": name,
-                            "pid": _os.getpid(),
-                            "start_method": "spawn",
-                            "boot_ts": time.time(),
-                            "phase_b_swap_id": _swap_id,
-                        },
-                    })
-                    logger.info(
-                        "[worker_bus_bootstrap] worker '%s' sent Phase B "
-                        "ADOPTION_REQUEST rid=%s swap_id=%s",
-                        name, _rid[:8], _swap_id[:8])
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "[worker_bus_bootstrap] worker '%s' Phase B "
-                        "ADOPTION_REQUEST publish failed:",
-                        name, exc_info=True)
-
-        # client_ref is a forward reference: the callback closes over
-        # the client object that's created on the next line. Set after
-        # construction (next line) so the closure resolves to the real
-        # client at first invocation.
-        client_ref = None
         client = BusSocketClient(
             titan_id=titan_id,
             authkey=authkey,
@@ -239,9 +203,8 @@ def setup_worker_bus(name: str, recv_q, send_q,
             sock_path=Path(sock_path),
             topics=list(topics) if topics else None,
             reply_only=reply_only,
-            on_subscribe_ack=_re_emit_module_ready,
+            on_subscribe_ack=None,
         )
-        client_ref = client
         client.start()
         # Phase B.2 IPC §D8 — BusSocketClient.publish buffers outbound
         # messages while the connection thread is still establishing the
