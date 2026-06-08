@@ -28,7 +28,10 @@ import pytest
 
 from titan_hcl.core.kernel import TITAN_HCL_BROADCAST_TOPICS
 
-SPEC_PATH = Path(__file__).resolve().parent.parent / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
+# §9.B titan_HCL block was extracted to SPEC_subscriber_hierarchy_matrix.md on
+# 2026-06-01 (to lean the main SPEC); SPEC_PATH updated to follow it — the prior
+# path to SPEC_titan_architecture.md silently broke this lockstep. D-SPEC-151.
+SPEC_PATH = Path(__file__).resolve().parent.parent / "titan-docs" / "specs" / "SPEC_subscriber_hierarchy_matrix.md"
 
 
 def _parse_titan_hcl_subscriptions_from_spec() -> set[str]:

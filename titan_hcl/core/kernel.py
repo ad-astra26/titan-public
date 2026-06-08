@@ -84,7 +84,19 @@ logger = logging.getLogger(__name__)
 # publisher attached to bus.publish() routing).
 IN_PROCESS_SUBSCRIBER_NAMES: tuple[str, ...] = (
     "titan_HCL",     # canonical plugin identity + outbound publisher
-    "guardian",      # MODULE_HEARTBEAT, MODULE_READY, SAVE_DONE, etc.
+    # "guardian" RETIRED v1.85.0 §9.B D-SPEC-151 (2026-06-08) — SAME stale-alias
+    # bug class as meditation/sovereignty below. Post the 2026-05-28 peer-spawn
+    # split (cf3dc86e3, D-SPEC-135/146) guardian_hcl became a SEPARATE process
+    # with its OWN "guardian" BusSocketClient (the liveness consumer). Keeping
+    # "guardian" here made the Rust broker ALSO fan every dst=guardian frame to
+    # titan_hcl's connection → re-injected into the Orchestrator's in-process
+    # "guardian" queue, which NOTHING in titan_hcl drains (the Supervisor's
+    # monitor_tick drain runs in guardian_hcl) → the 1000-slot queue fills in
+    # ~4 min and drops every subsequent MODULE_HEARTBEAT forever (fleet-wide
+    # flood: T1 15.7k / T2 15.5k / T3 43.5k drops/hr; it false-shm_pid_dead-
+    # killed T1's agno_worker). titan_hcl's spawn-side admin (reload/adopt/
+    # restart/QUERY) now arrives on "guardian_hcl_lifecycle" (its own alias),
+    # so this retirement loses titan_hcl NOTHING. Liveness stays guardian_hcl's.
     "core",          # core-loop messages
     # "meditation" RETIRED v1.9.5 §X1 D-SPEC-64 (2026-05-16) — pre-§4.D this
     # alias on titan_HCL's connection routed dst="meditation" to the

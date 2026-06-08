@@ -979,7 +979,11 @@ class TitanHCL:
         slow restart doesn't serialize subsequent admin calls.
         """
         try:
-            queue = self.bus.subscribe("guardian", types=[bus.QUERY])
+            # D-SPEC-151: admin QUERY (restart/start/stop/reload_module) now
+            # arrives on "guardian_hcl_lifecycle" (titan_hcl's executor name),
+            # NOT the retired "guardian" alias. Dispatches to the real
+            # Orchestrator via _handle_guardian_request (unchanged).
+            queue = self.bus.subscribe("guardian_hcl_lifecycle", types=[bus.QUERY])
         except Exception as e:
             logger.warning("[TitanHCL] guardian handler subscribe failed: %s", e)
             return

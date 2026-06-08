@@ -255,7 +255,9 @@ class GuardianHCLClient:
                 payload[k] = v
 
         msg = make_msg(
-            MODULE_RELOAD_REQUEST, src="titan_hcl", dst="guardian",
+            # D-SPEC-151: reload EXECUTES in titan_hcl (real Orchestrator) via
+            # the lifecycle subscriber — NOT guardian_hcl's metadata-only orch.
+            MODULE_RELOAD_REQUEST, src="titan_hcl", dst="guardian_hcl_lifecycle",
             payload=payload,
         )
         # Some make_msg variants don't propagate correlation_id at the top

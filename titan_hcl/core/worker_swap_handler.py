@@ -205,7 +205,10 @@ def request_adoption(state: SwapHandlerState) -> None:
     req = bus.make_msg(
         bus.BUS_WORKER_ADOPT_REQUEST,
         state.name,
-        "guardian",
+        # D-SPEC-151: adoption EXECUTES in titan_hcl (real Orchestrator owns the
+        # worker process) via the lifecycle subscriber — NOT the retired
+        # "guardian" alias (guardian_hcl's metadata-only orch).
+        "guardian_hcl_lifecycle",
         {
             "name": state.name,
             "pid": os.getpid(),

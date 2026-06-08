@@ -275,11 +275,17 @@ def _start_lifecycle_subscriber(bus, orchestrator, stop_event):
     from queue import Empty
     from titan_hcl.bus import (
         MODULE_START_REQUEST, MODULE_STOP_REQUEST, MODULE_RESTART_REQUEST,
+        MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST,
     )
     log = _logging.getLogger(__name__)
+    # D-SPEC-151: titan_hcl (the real Orchestrator) is the EXECUTOR for ALL
+    # spawn-side admin. reload + adopt join start/stop/restart here so they act
+    # on the real worker info.process (they were mis-routed to guardian_hcl's
+    # metadata-only orch via dst="guardian"; "guardian" alias retired).
     q = bus.subscribe(
         "guardian_hcl_lifecycle",
-        types=[MODULE_START_REQUEST, MODULE_STOP_REQUEST, MODULE_RESTART_REQUEST],
+        types=[MODULE_START_REQUEST, MODULE_STOP_REQUEST, MODULE_RESTART_REQUEST,
+               MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST],
         reply_only=True,
     )
 
@@ -316,6 +322,15 @@ def _start_lifecycle_subscriber(bus, orchestrator, stop_event):
                         name,
                         reason=payload.get("reason", "requested"),
                     )
+                elif mtype == MODULE_RELOAD_REQUEST:
+                    # D-SPEC-151: hot-reload EXECUTES here on the real
+                    # Orchestrator (titan_hcl owns the worker info.process);
+                    # _dispatch_reload_request runs it async on _restart_executor
+                    # so this subscriber thread never blocks.
+                    orchestrator._dispatch_reload_request(msg)
+                elif mtype == BUS_WORKER_ADOPT_REQUEST:
+                    # D-SPEC-151: worker-swap adoption executes on the real orch.
+                    orchestrator._handle_worker_adopt_request(msg)
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "[titan_hcl] lifecycle request %s for '%s' failed: %s",
@@ -417,7 +432,11 @@ async def run(health_only: bool = False, server_only: bool = False,
 
     from titan_hcl.orchestrator import Orchestrator
     from titan_hcl.module_catalog import build_catalog
-    _orchestrator = Orchestrator(_orch_bus, config=_orch_cfg.get("guardian", {}))
+    # D-SPEC-151: titan_hcl does NOT subscribe "guardian" (liveness is
+    # guardian_hcl's; titan_hcl receives spawn-side admin on
+    # guardian_hcl_lifecycle) — prevents the undrained-queue heartbeat flood.
+    _orchestrator = Orchestrator(_orch_bus, config=_orch_cfg.get("guardian", {}),
+                                 subscribe_guardian=False)
     # _kernel_ref = None: cross-process swap interlock degrades to no-op
     # (per Orchestrator.start docstring "None in legacy mode → swap
     # interlock degrades to no-op"). The TitanKernel constructed below

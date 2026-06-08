@@ -157,40 +157,40 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         guardian.monitor_tick()   # call periodically (e.g. every 5s)
     """
 
-    def __init__(self, bus: DivineBus, config: dict | None = None):
+    def __init__(self, bus: DivineBus, config: dict | None = None,
+                 subscribe_guardian: bool = True):
         self.bus = bus
         self._modules: dict[str, ModuleInfo] = {}
         self._module_recv_queues: dict[str, AnyQueue] = {}  # name → recv queue (for bus routing)
-        # Option B (2026-04-29): declare the msg_types Guardian actually
-        # consumes via this queue. All four are typically sent with
-        # dst="guardian" (targeted) and therefore bypass the broadcast
-        # filter regardless — but we still declare them so the contract is
-        # explicit and arch_map can verify it. The real win: every other
-        # broadcast (~150 msg types — SPHERE_PULSE, *_UPDATED, EXPRESSION_*,
-        # etc.) is now dropped at publish, freeing the guardian queue from
-        # the dst="all" flood that was causing 87 MODULE_HEARTBEAT drops
-        # per ~500-line window on T1 (false-restart risk).
-        self._guardian_queue = bus.subscribe(
-            "guardian",
-            types=[
-                MODULE_HEARTBEAT,
-                MODULE_SHUTDOWN,
-                BUS_WORKER_ADOPT_REQUEST,
-                # Phase B.2 §D9 (2026-05-02) — broker → Guardian peer-death
-                # signal. Broker detects peer PID dead via os.kill(pid, 0)
-                # and publishes BUS_PEER_DIED. Guardian triggers immediate
-                # restart for named workers (faster than 1Hz polling).
-                BUS_PEER_DIED,
-                # SPEC §8.3 Phase B (D-SPEC-49) — Maker CLI / future D9
-                # Guardian initiates per-module hot-reload via this targeted
-                # P0 message (dst="guardian"). Routed in
-                # `_process_guardian_messages` to `_dispatch_reload_request`.
-                MODULE_RELOAD_REQUEST,
-                # SAVE_DONE is targeted (dst="guardian") so it bypasses the
-                # filter regardless, but list it explicitly so arch_map can
-                # see the contract.
-            ],
-        )
+        # D-SPEC-151 (2026-06-08): the in-process "guardian" subscriber is the
+        # LIVENESS queue, drained ONLY by guardian_hcl's Supervisor.monitor_tick.
+        # titan_hcl (the real Orchestrator per D-SPEC-146) passes
+        # subscribe_guardian=False — it must NOT hold an undrained "guardian"
+        # queue (root of the fleet-wide MODULE_HEARTBEAT flood); its spawn-side
+        # admin (reload/adopt/restart/QUERY) arrives on "guardian_hcl_lifecycle".
+        # guardian_hcl passes True (default).
+        # Option B (2026-04-29): declared msg_types — all targeted dst="guardian"
+        # so they bypass the broadcast filter; declared so arch_map verifies the
+        # contract + ~150 other broadcasts are dropped at publish.
+        if subscribe_guardian:
+            self._guardian_queue = bus.subscribe(
+                "guardian",
+                types=[
+                    MODULE_HEARTBEAT,
+                    MODULE_SHUTDOWN,
+                    BUS_WORKER_ADOPT_REQUEST,
+                    BUS_PEER_DIED,
+                    MODULE_RELOAD_REQUEST,
+                ],
+            )
+        else:
+            # titan_hcl: no broker-routed "guardian" queue (D-SPEC-151). Keep a
+            # valid empty local queue so the (guardian_hcl-only) drain API never
+            # NPEs; titan_hcl never drains it (no monitor_tick in this process).
+            self._guardian_queue = bus.subscribe(
+                f"_orphan_guardian_unused_{id(self)}",
+                types=[MODULE_SHUTDOWN],
+            )
         self._stop_requested = False
         self._module_lock = threading.RLock()  # serialize start/stop/restart to prevent duplicate spawns
 
@@ -2172,81 +2172,71 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 self.restart_async(name, reason="broker_peer_dead")
 
             elif msg_type == BUS_WORKER_ADOPT_REQUEST:
-                # Microkernel v2 Phase B.2.1 — worker requesting adoption
-                # by this (shadow) Guardian. Validate + register without
-                # spawning + reply with BUS_WORKER_ADOPT_ACK (rid-matched).
-                payload = msg.get("payload", {}) or {}
-                worker_name = payload.get("name")
-                worker_pid = payload.get("pid")
-                rid = msg.get("rid")
-                if not worker_name or not isinstance(worker_pid, int):
-                    logger.warning(
-                        "[Guardian] BUS_WORKER_ADOPT_REQUEST malformed: %r", payload,
-                    )
-                    continue
-                # SPEC §11.B.3 (D-SPEC-49) — if this adoption corresponds to
-                # an in-flight per-module reload, route to the reload
-                # orchestrator's queue instead of the cross-kernel adopt
-                # path (which would reject the same-name case as
-                # "already_running"). The orchestrator emits its own
-                # BUS_WORKER_ADOPT_ACK (rid-matched) per §4.3 step 4.
-                #
-                # Closed BUG-PHASE-B-FIRST-RELOAD-ADOPTION-ROUTING-MISS-20260514:
-                # an earlier `rs.new_pid == worker_pid` guard had a memory-
-                # visibility race between the orchestrator thread (running on
-                # _restart_executor — sets rs.new_pid post-spawn) and the
-                # message-handler thread (reads rs.new_pid here). Even though
-                # the GIL makes individual reads atomic on CPython, with no
-                # explicit synchronization the reader could observe the
-                # initial None value while the writer was still pending in
-                # the executor's queue. Name-based routing is sufficient:
-                # the orchestrator validates `rs.new_pid == worker_pid` AND
-                # swap_id in the payload when it picks up the frame from
-                # adoption_q (defensive pid-validation moved into
-                # _reload_module_sync step 4). Mismatches (cross-kernel
-                # or stale) get rejected by the orchestrator with reason
-                # logged, not silently mis-routed here.
-                rs = self._reloads_in_flight.get(worker_name)
-                if rs is not None:
-                    try:
-                        rs.adoption_q.put_nowait(msg)
-                    except _queue_mod.Full:
-                        pass
-                    continue
-                ok = self.adopt_worker(worker_name, worker_pid)
-                ack_payload = {
-                    "name": worker_name,
-                    "pid": worker_pid,
-                    "shadow_pid": os.getpid(),
-                }
-                if ok:
-                    ack_payload["status"] = "adopted"
-                    ack_payload["reason"] = None
-                else:
-                    ack_payload["status"] = "rejected"
-                    # Best-effort distinguishability for logs/tests:
-                    if not self._pid_alive(worker_pid):
-                        ack_payload["reason"] = "pid_not_alive"
-                    elif worker_name not in self._modules:
-                        ack_payload["reason"] = "unknown_name"
-                    else:
-                        ack_payload["reason"] = "already_running"
-                self.bus.publish(make_msg(
-                    BUS_WORKER_ADOPT_ACK,
-                    "guardian",
-                    worker_name,
-                    ack_payload,
-                    rid=rid,
-                ))
+                # D-SPEC-151: shared with the titan_hcl lifecycle subscriber
+                # (the real Orchestrator post-D-SPEC-146). Adopt EXECUTES on
+                # whichever process owns the worker (titan_hcl); see
+                # _handle_worker_adopt_request.
+                self._handle_worker_adopt_request(msg)
 
             elif msg_type == MODULE_RELOAD_REQUEST:
-                # SPEC §8.3 + §11.B.3 (D-SPEC-49) — per-module hot-reload
-                # initiated by Maker CLI / future D9 Guardian. Dispatch
-                # asynchronously on _restart_executor so this queue drain
-                # remains responsive — the reload sequence takes up to
-                # MODULE_RELOAD_DEFAULT_TIMEOUT_S=30s and MUST NOT block
-                # heartbeat processing.
+                # SPEC §8.3 + §11.B.3 (D-SPEC-49/151) — per-module hot-reload.
+                # EXECUTES on the real Orchestrator (titan_hcl); dispatched
+                # async on _restart_executor so this drain stays responsive
+                # (reload takes up to MODULE_RELOAD_DEFAULT_TIMEOUT_S=30s).
                 self._dispatch_reload_request(msg)
+
+    def _handle_worker_adopt_request(self, msg: dict) -> None:
+        """Handle one BUS_WORKER_ADOPT_REQUEST on the REAL Orchestrator.
+
+        D-SPEC-151: extracted from the inline _process_guardian_messages branch
+        so the titan_hcl lifecycle subscriber (the real spawn-owner per
+        D-SPEC-146) can execute adoptions too. Validate + register without
+        spawning + reply BUS_WORKER_ADOPT_ACK (rid-matched), OR route to an
+        in-flight per-module reload's adoption_q (it emits its own rid-matched
+        ACK per §4.3 step 4; closed BUG-PHASE-B-FIRST-RELOAD-ADOPTION-ROUTING-
+        MISS-20260514 via name-based routing — orchestrator validates new_pid +
+        swap_id when it picks the frame off adoption_q).
+        """
+        payload = msg.get("payload", {}) or {}
+        worker_name = payload.get("name")
+        worker_pid = payload.get("pid")
+        rid = msg.get("rid")
+        if not worker_name or not isinstance(worker_pid, int):
+            logger.warning(
+                "[Guardian] BUS_WORKER_ADOPT_REQUEST malformed: %r", payload,
+            )
+            return
+        rs = self._reloads_in_flight.get(worker_name)
+        if rs is not None:
+            try:
+                rs.adoption_q.put_nowait(msg)
+            except _queue_mod.Full:
+                pass
+            return
+        ok = self.adopt_worker(worker_name, worker_pid)
+        ack_payload = {
+            "name": worker_name,
+            "pid": worker_pid,
+            "shadow_pid": os.getpid(),
+        }
+        if ok:
+            ack_payload["status"] = "adopted"
+            ack_payload["reason"] = None
+        else:
+            ack_payload["status"] = "rejected"
+            if not self._pid_alive(worker_pid):
+                ack_payload["reason"] = "pid_not_alive"
+            elif worker_name not in self._modules:
+                ack_payload["reason"] = "unknown_name"
+            else:
+                ack_payload["reason"] = "already_running"
+        self.bus.publish(make_msg(
+            BUS_WORKER_ADOPT_ACK,
+            "guardian",
+            worker_name,
+            ack_payload,
+            rid=rid,
+        ))
 
     @staticmethod
     def _get_rss_mb(pid: int) -> float:
