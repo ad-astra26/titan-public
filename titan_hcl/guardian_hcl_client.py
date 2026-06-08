@@ -249,7 +249,11 @@ class GuardianHCLClient:
         with self._pending_lock:
             self._pending_reloads[corr_id] = (event, result_holder)
 
-        payload = {"name": name, "correlation_id": corr_id}
+        # D-SPEC-151: the reload orchestrator (reload.py:_dispatch_reload_request)
+        # reads payload["module_name"] — publish that key, not "name" (the cutover
+        # producer/consumer key mismatch that yielded "malformed_request"). ACK
+        # matching is by correlation_id, unaffected.
+        payload = {"module_name": name, "correlation_id": corr_id}
         for k, v in kwargs.items():
             if isinstance(v, (str, int, float, bool, type(None), dict, list, tuple)):
                 payload[k] = v
