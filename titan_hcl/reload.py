@@ -417,6 +417,12 @@ class OrchestratorReloadMixin:
         """
         import copy as _copy
         import multiprocessing
+        # Lazy import: `_module_wrapper` lives in titan_hcl.orchestrator.core,
+        # which imports this module's OrchestratorReloadMixin at load time —
+        # a top-level import here would be circular. By reload-time core is
+        # fully loaded. (Latent NameError until the lifecycle-gate fix let the
+        # 7-step actually reach spawn for the first time.)
+        from titan_hcl.orchestrator.core import _module_wrapper
 
         method = info.spec.start_method
         if method not in ("fork", "spawn"):
