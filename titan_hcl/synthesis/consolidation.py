@@ -436,6 +436,15 @@ class ConsolidationPass:
                 logger.warning(
                     "[ConsolidationPass] population groundedness recompute "
                     "failed: %s", e)
+            # §7.E — retrain the learned grounding combiner on the latest recall-
+            # citation events (offline, at the dream boundary; self-gating). Soft.
+            if self._attribution is not None:
+                try:
+                    self._store.train_grounding_combiner(
+                        self._attribution.read_training_events())
+                except Exception as _gc_err:
+                    logger.debug(
+                        "[ConsolidationPass] combiner train soft-fail: %s", _gc_err)
 
         # Step 5 — anchor the pass-summary TX.
         result.finished_at = self._clock()

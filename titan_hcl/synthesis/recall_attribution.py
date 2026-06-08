@@ -239,6 +239,29 @@ class RecallAttribution:
             logger.debug("[RecallAttribution] fluent_map soft-fail: %s", e)
         return out
 
+    def read_training_events(
+        self, limit: int = 50000,
+    ) -> list[tuple[tuple[float, float, float, float], bool]]:
+        """§7.E — the (axes_at_recall, cited?) training tuples from
+        `engram_recall_events` (newest `limit` rows). Returns
+        [((used, verified, felt, fluent), cited)]; soft-fail → []. Both classes
+        are present once the §7.E.0 cited=false events accrue (else all-positive
+        → the combiner's guard keeps it inactive)."""
+        out: list[tuple[tuple[float, float, float, float], bool]] = []
+        try:
+            qr = self._writer.submit_sync(lambda: self._conn.execute(
+                "SELECT axis_used, axis_verified, axis_felt, axis_fluent, cited "
+                "FROM engram_recall_events ORDER BY ts DESC LIMIT ?",
+                [int(limit)]).fetchall())
+            for row in (qr or []):
+                out.append((
+                    (float(row[0] or 0.0), float(row[1] or 0.0),
+                     float(row[2] or 0.0), float(row[3] or 0.0)),
+                    bool(row[4])))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[RecallAttribution] read_training_events soft-fail: %s", e)
+        return out
+
     def update_axes_cache(self, axes_rows: Iterable[dict]) -> None:
         """Denormalize the freshly-recomputed axes into `engram_recall_stats` so
         event rows can snapshot axes_at_recall without a Kuzu read. `axes_rows`:

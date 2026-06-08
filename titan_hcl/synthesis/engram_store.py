@@ -35,13 +35,20 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Protocol
 
 from titan_hcl.synthesis.writer import on_writer, resolve_writer
+from titan_hcl.synthesis.grounding_combiner import GroundingCombiner
 
 logger = logging.getLogger(__name__)
+
+# §7.E — default persisted location of the learned grounding combiner. CWD-
+# relative `data/`, matching synthesis.duckdb's default (synthesis_worker runs
+# with CWD=repo root); overridable via EngramStore(combiner_path=…) for tests.
+_DEFAULT_COMBINER_PATH = os.path.join("data", "grounding_combiner.json")
 
 
 # ── Exceptions ──────────────────────────────────────────────────────
@@ -329,6 +336,7 @@ class EngramStore:
         groundedness_params: _GroundednessParams | None = None,
         clock: Any = time.time,                  # injectable for deterministic tests
         db_writer: Any = None,
+        combiner_path: str | None = None,
     ):
         self._graph = graph
         self._writer = outer_memory_writer
@@ -342,6 +350,10 @@ class EngramStore:
         self._params = groundedness_params or _GroundednessParams()
         self._blend = _load_blend_params_from_toml()  # §7.D percentile-blend params
         self._clock = clock
+        # §7.E — the learned grounding combiner. Loaded once; inactive (→ §7.D
+        # blend) until a train-step beats the blend on held-out citation AUC.
+        self._combiner_path = combiner_path or _DEFAULT_COMBINER_PATH
+        self._combiner = GroundingCombiner.load(self._combiner_path)
 
     # ── Public surface ────────────────────────────────────────
 
@@ -668,7 +680,14 @@ class EngramStore:
             if (r.get("used") or 0.0) <= 0.0 and (r.get("groundedness") or 0.0) > 0.0:
                 r["used"] = float(r["groundedness"])
                 r["_backfill_used"] = True
-        scalars = reduce_population_to_scalars(rows, self._blend)
+        # §7.E — reduce to the recall scalar via the LEARNED combiner when it is
+        # active (O(1) per-Engram dot-product over the raw axes), else the §7.D
+        # population percentile-blend. The combiner only activates after beating
+        # the blend on held-out citation AUC, so this is a safe, self-gated swap.
+        if self._combiner.is_active():
+            scalars = {r["key"]: self._combiner.score(r) for r in rows}
+        else:
+            scalars = reduce_population_to_scalars(rows, self._blend)
         n = 0
         for r in rows:
             sc = scalars.get(r["key"])
@@ -707,6 +726,31 @@ class EngramStore:
             "(percentile-blend, §7.D%s)", n, len(rows),
             "; fluent live" if fluent_lookup is not None else "")
         return n
+
+    def train_grounding_combiner(self, events: Iterable[tuple]) -> dict:
+        """§7.E — offline train-step (dream boundary / boot; idle-gated by the
+        caller). Retrain the learned combiner on the recall-citation `events`
+        ([(axes-record, cited-bool)]); it SELF-GATES (activates only if it beats
+        the §7.D percentile-blend on held-out citation AUC) and is hot-swapped +
+        persisted in place. The blend baseline is the very reduction it would
+        replace, computed via `reduce_population_to_scalars` on the holdout (the
+        callable is injected to avoid a grounding_combiner→engram_store circular
+        import). Soft-fail → keep prior state. Returns the metrics dict."""
+        try:
+            def _blend_scorer(axes_list: list[list[float]]) -> list[float]:
+                rows = [{"key": i, "used": a[0], "verified": a[1],
+                         "felt": a[2], "fluent": a[3]}
+                        for i, a in enumerate(axes_list)]
+                sc = reduce_population_to_scalars(rows, self._blend)
+                # {} (no axis varies) → neutral 0.5 baseline (chance).
+                return [sc.get(i, 0.5) for i in range(len(axes_list))]
+            metrics = self._combiner.train(
+                events, blend_scorer=_blend_scorer, clock=self._clock)
+            self._combiner.save(self._combiner_path)
+            return metrics
+        except Exception as e:
+            logger.warning("[EngramStore] train_grounding_combiner failed: %s", e)
+            return {"error": str(e), "activated": False}
 
     def backfill_domain_hints(self, derive_fn: Callable[..., str]) -> int:
         """One-time content backfill of the advisory §7.F `domain_hint` for pre-

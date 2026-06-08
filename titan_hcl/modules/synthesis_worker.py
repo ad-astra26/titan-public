@@ -1357,6 +1357,23 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 "[synthesis_worker] boot domain_hint backfill failed: %s",
                 _dh_err)
 
+        # §7.E — offline train-step of the learned grounding combiner on boot
+        # (idle: pre-tick). Self-gating — activates only if it beats the §7.D
+        # blend on held-out citation AUC, else the store keeps using the blend.
+        # With the current near-degenerate data the guard short-circuits before
+        # any sklearn import (no negative class yet). Safe to ship (falls back).
+        if recall_attribution is not None:
+            try:
+                _gc_metrics = engram_store.train_grounding_combiner(
+                    recall_attribution.read_training_events())
+                logger.info(
+                    "[synthesis_worker] boot grounding-combiner train (§7.E): %s",
+                    _gc_metrics)
+            except Exception as _gc_err:
+                logger.warning(
+                    "[synthesis_worker] boot grounding-combiner train failed: %s",
+                    _gc_err)
+
         # Initial export so the snapshot is non-empty + present before
         # the first 60s tick (api process gets data immediately on first
         # poll after worker boot).
