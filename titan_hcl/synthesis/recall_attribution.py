@@ -18,8 +18,10 @@ The mechanic (all OFF the chat hot path — every write/read runs on the one
      per-turn `KNOWLEDGE_MOMENT` carries the surfaced + cited tx_hash sets (the
      tx-spine recall surfaces `item_id = tx_hash`; `cited_use` already detects the
      cited subset). We resolve each tx → its **latest** Engram version (Maker:
-     latest-version-only credit) and bump `surfaced_count` / `cited_count`; each
-     cited Engram also appends an event row carrying the axes snapshot at recall.
+     latest-version-only credit) and bump `surfaced_count` / `cited_count`; every
+     SURFACED Engram appends an event row (cited=true for cited, cited=false for
+     surfaced-not-cited) carrying the axes snapshot at recall — both classes, so
+     §7.E's combiner has a real decision boundary, not an all-positive label.
   3. **`fluent` feed**: `fluent = cited_count / (surfaced_count + k)` (NARS-smoothed,
      same form as the `verified` axis), read at the dream-boundary population
      recompute → the axis now varies → it joins the §7.D percentile-blend.
@@ -132,17 +134,27 @@ class RecallAttribution:
         surf_engrams = self._resolve_set(surfaced)
         cite_engrams = self._resolve_set(cited)
         # Surfaced set is the UNION (a cited Engram was necessarily surfaced).
-        for (eid, ver) in (surf_engrams | cite_engrams):
+        surfaced_all = surf_engrams | cite_engrams
+        for (eid, ver) in surfaced_all:
             self._bump(eid, ver, surfaced=1, cited=0, ts=ts)
         for (eid, ver) in cite_engrams:
             self._bump(eid, ver, surfaced=0, cited=1, ts=ts)
+        # Write ONE (axes_at_recall, cited?) event per SURFACED Engram — BOTH
+        # classes: cited=True for the cited Engrams, cited=False for surfaced-
+        # but-not-cited ones. The negatives are §7.E's decision-boundary signal:
+        # without them the events table is all-positives, the citation label is
+        # constant, and the learned combiner has nothing to discriminate (it
+        # self-gates off forever). One row per Engram per turn (per-member dedup
+        # already done by `_resolve_set`).
+        for (eid, ver) in surfaced_all:
+            was_cited = (eid, ver) in cite_engrams
             axes = self._cached_axes(eid, ver)
             try:
                 self._conn.execute(
                     "INSERT INTO engram_recall_events (ts, engram_id, version, "
                     "axis_used, axis_verified, axis_felt, axis_fluent, cited) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [ts, eid, ver, axes[0], axes[1], axes[2], axes[3], True])
+                    [ts, eid, ver, axes[0], axes[1], axes[2], axes[3], was_cited])
             except Exception as e:  # noqa: BLE001
                 logger.debug("[RecallAttribution] event insert soft-fail: %s", e)
 
