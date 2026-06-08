@@ -1736,6 +1736,33 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         self._titan_hcl_state_writer = writer
         return writer
 
+    def _ensure_reload_status_writer(self):
+        """Lazy-construct the orchestrator's reload-status SHM writer.
+
+        Per `RFP_shm_native_hot_reload.md` Phase A — the canonical orchestrator
+        (the only process that runs `_reload_module_sync` / dispatches a
+        MODULE_RELOAD_REQUEST) is the G21 single-writer of `reload_status.bin`,
+        the SHM slot that REPLACES the deleted `dst="all"` MODULE_RELOAD_ACK
+        broadcast (SPEC §8.2 / G18). Returns None if SHM cannot be resolved
+        (test fixtures without /dev/shm) so reload still completes — the result
+        dict is still returned in-process; only the SHM mirror is skipped.
+        """
+        existing = getattr(self, "_reload_status_writer", None)
+        if existing is not None:
+            return existing
+        try:
+            from titan_hcl.core.reload_status import ReloadStatusWriter
+            from titan_hcl.core.state_registry import resolve_titan_id
+            writer = ReloadStatusWriter(titan_id=resolve_titan_id())
+        except Exception as e:  # noqa: BLE001
+            logger.info(
+                "[Orchestrator] reload_status.bin writer unavailable (%s) — "
+                "reload status SHM mirror disabled (reload still completes)", e)
+            self._reload_status_writer = None
+            return None
+        self._reload_status_writer = writer
+        return writer
+
     def start_all(self) -> None:
         """Phase 11 §11.I.7 — orchestrator boot pipeline.
 

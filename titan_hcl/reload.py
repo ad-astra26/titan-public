@@ -44,7 +44,6 @@ from titan_hcl.bus import (
     MODULE_CRASHED,
     MODULE_HEARTBEAT,
     MODULE_READY,
-    MODULE_RELOAD_ACK,
     MODULE_RELOAD_REQUEST,
     MODULE_SHUTDOWN,
     SUPERVISION_CHILD_DOWN,
@@ -190,28 +189,28 @@ class OrchestratorReloadMixin:
         with self._reload_lock:
             info = self._modules.get(module_name)
             if info is None:
-                self._emit_reload_ack(
+                self._write_reload_status(
                     swap_id, module_name, "failed",
                     "unknown_module", started_ts)
                 return self._reload_result(
                     swap_id, module_name, "failed",
                     "unknown_module", started_ts)
             if module_name in self._reloads_in_flight:
-                self._emit_reload_ack(
+                self._write_reload_status(
                     swap_id, module_name, "failed",
                     "reload_in_flight", started_ts)
                 return self._reload_result(
                     swap_id, module_name, "failed",
                     "reload_in_flight", started_ts)
             if info.state != ModuleState.RUNNING:
-                self._emit_reload_ack(
+                self._write_reload_status(
                     swap_id, module_name, "failed",
                     f"not_running:state={info.state.value}", started_ts)
                 return self._reload_result(
                     swap_id, module_name, "failed",
                     f"not_running:state={info.state.value}", started_ts)
             if info.process is None or info.pid is None:
-                self._emit_reload_ack(
+                self._write_reload_status(
                     swap_id, module_name, "failed",
                     "no_process", started_ts)
                 return self._reload_result(
@@ -232,7 +231,7 @@ class OrchestratorReloadMixin:
         deadline = started_ts + timeout_s
         try:
             # ── Step 2: ACK status="spawning" ──────────────────────────
-            self._emit_reload_ack(
+            self._write_reload_status(
                 swap_id, module_name, "spawning", None, started_ts)
 
             # ── Step 3: spawn NEW alongside OLD ────────────────────────
@@ -284,8 +283,9 @@ class OrchestratorReloadMixin:
                     "reason": None,
                 }, rid=rid))
             rs.status = "adopted"
-            self._emit_reload_ack(
-                swap_id, module_name, "adopted", None, started_ts)
+            self._write_reload_status(
+                swap_id, module_name, "adopted", None, started_ts,
+                new_pid=rs.new_pid, old_pid=old_pid)
 
             # ── Step 6: send MODULE_SHUTDOWN to OLD + grace + SIGKILL ─
             self.bus.publish(make_msg(
@@ -368,9 +368,10 @@ class OrchestratorReloadMixin:
                 # Leave NEW running as the slot's new owner; the supervisor's
                 # SHM liveness/heartbeat detector handles a truly-stuck worker
                 # post-reload. Emit failed status so the initiator knows.
-                self._emit_reload_ack(
+                self._write_reload_status(
                     swap_id, module_name, "failed",
-                    "ready_timeout", started_ts)
+                    "ready_timeout", started_ts,
+                    new_pid=rs.new_pid, old_pid=old_pid)
                 return self._reload_result(
                     swap_id, module_name, "failed",
                     "ready_timeout", started_ts)
@@ -393,8 +394,9 @@ class OrchestratorReloadMixin:
                         "[Guardian] Module '%s' state finalized RUNNING "
                         "post-reload (pid=%s, swap_id=%s)",
                         module_name, info.pid, swap_id)
-            self._emit_reload_ack(
-                swap_id, module_name, "ready", None, started_ts)
+            self._write_reload_status(
+                swap_id, module_name, "ready", None, started_ts,
+                new_pid=info.pid, old_pid=old_pid)
             return self._reload_result(
                 swap_id, module_name, "ready", None, started_ts)
         finally:
@@ -510,38 +512,51 @@ class OrchestratorReloadMixin:
                 pass
             except Exception:  # noqa: BLE001
                 pass
-        self._emit_reload_ack(
+        self._write_reload_status(
             rs.swap_id, rs.module_name, "rolled_back",
-            f"{failed_step}:{reason}", started_ts)
+            f"{failed_step}:{reason}", started_ts,
+            new_pid=rs.new_pid, old_pid=rs.old_pid)
         return self._reload_result(
             rs.swap_id, rs.module_name, "rolled_back",
             f"{failed_step}:{reason}", started_ts)
 
-    def _emit_reload_ack(self, swap_id: str, module_name: str, status: str,
-                         reason: Optional[str], started_ts: float) -> None:
-        """Publish a MODULE_RELOAD_ACK frame on the bus. dst="all" is the
-        practical broadcast because the initiator subscription is not
-        named (Maker CLI / future D9 Guardian). MODULE_RELOAD_ACK is
-        pre-listed in BOOT_BUFFERED_TYPES so transient subscription gaps
-        on the initiator side don't lose the terminal status (§8.0.bis).
+    def _write_reload_status(self, swap_id: str, module_name: str, status: str,
+                             reason: Optional[str], started_ts: float,
+                             *, new_pid: int = 0, old_pid: int = 0) -> None:
+        """Write one reload status transition to the orchestrator-owned
+        `reload_status.bin` SHM slot (per `RFP_shm_native_hot_reload.md` Phase A).
 
-        `total_elapsed_ms` is recorded on every ACK so observers can
-        track end-to-end timing per acceptance gate §4.6 #1.
+        REPLACES the legacy `_emit_reload_ack` `dst="all"` MODULE_RELOAD_ACK
+        bus broadcast — a SPEC §8.2 / Preamble G18 violation (reload *state*
+        belongs in SHM, not a bus fan-out). The initiator
+        (`GuardianHCLClient.reload_module`) polls this slot by `swap_id`.
+        Intermediate (`spawning`/`adopted`) AND terminal
+        (`ready`/`failed`/`rolled_back`) statuses are stamped into the
+        per-module ring (Observatory progress); the initiator resolves only on
+        a terminal status. `total_elapsed_ms` is recorded on every write for
+        end-to-end timing.
         """
-        elapsed_ms = int((time.time() - started_ts) * 1000)
+        from titan_hcl.core.reload_status import ReloadStatusEntry
+        writer = self._ensure_reload_status_writer()
+        if writer is None:
+            # No SHM (test fixture / non-canonical process) — reload still
+            # completes; only the SHM status mirror is skipped.
+            return
+        entry = ReloadStatusEntry(
+            module_name=module_name,
+            swap_id=swap_id,
+            status=status,
+            reason=reason,
+            new_pid=int(new_pid or 0),
+            old_pid=int(old_pid or 0),
+            total_elapsed_ms=int((time.time() - started_ts) * 1000),
+            written_at=time.time(),
+        )
         try:
-            self.bus.publish(make_msg(
-                MODULE_RELOAD_ACK, "guardian", "all", {
-                    "swap_id": swap_id,
-                    "module_name": module_name,
-                    "status": status,
-                    "reason": reason,
-                    "total_elapsed_ms": elapsed_ms,
-                    "ts": time.time(),
-                }))
+            writer.write(module_name, entry)
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "[Guardian] MODULE_RELOAD_ACK publish failed for '%s' "
+                "[Guardian] reload_status write failed for '%s' "
                 "(swap_id=%s, status=%s): %s",
                 module_name, swap_id, status, e)
 
@@ -606,7 +621,7 @@ class OrchestratorReloadMixin:
         if not module_name or not isinstance(module_name, str):
             logger.warning(
                 "[Guardian] MODULE_RELOAD_REQUEST malformed: %r", payload)
-            self._emit_reload_ack(
+            self._write_reload_status(
                 swap_id, str(module_name or ""),
                 status="failed",
                 reason="malformed_request",
@@ -627,7 +642,7 @@ class OrchestratorReloadMixin:
             logger.error(
                 "[Guardian] MODULE_RELOAD_REQUEST dispatch failed for "
                 "'%s': %s", module_name, e)
-            self._emit_reload_ack(
+            self._write_reload_status(
                 swap_id, module_name,
                 status="failed",
                 reason=f"dispatch_error:{e!r}",
