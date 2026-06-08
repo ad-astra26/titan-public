@@ -988,13 +988,20 @@ def _handle_query(msg: dict, ctx: WorkerContext) -> None:
         if action == "query":
             text = payload.get("text", "")
             top_k = payload.get("top_k", 5)
+            # P4 (RFP_synthesis_decision_authority) embed-once: the agno PreHook
+            # may ship a precomputed shared prompt vector — memory.query reuses
+            # it for FAISS + mempool cosine instead of re-embedding (1 embed/turn,
+            # G9). vec is a pure function of text, so the cache key stays (text,
+            # top_k) and remains correct whether or not vec was supplied.
+            vec = payload.get("vec")
             cache_key = (text, int(top_k))
             results = None
             if ctx.query_cache is not None:
                 results = ctx.query_cache.get(cache_key)
             if results is None:
                 results = loop.run_until_complete(
-                    asyncio.wait_for(memory.query(text, top_k=top_k), timeout=30.0)
+                    asyncio.wait_for(
+                        memory.query(text, top_k=top_k, vec=vec), timeout=30.0)
                 )
                 if ctx.query_cache is not None:
                     ctx.query_cache.set(cache_key, results)

@@ -279,11 +279,17 @@ class MemoryProxy:
         ):
             self._started = True
 
-    async def query(self, text: str, top_k: int = 5) -> list:
+    async def query(self, text: str, top_k: int = 5, vec=None) -> list:
         """Query semantic + episodic memory.
 
         Phase C Session 4 (rFP §4.C.13): true work-RPC (FAISS+Kuzu+DuckDB
         parameterized query — runs in worker). Migrated sync→async per G19.
+
+        P4 (RFP_synthesis_decision_authority) embed-once: ``vec`` is an optional
+        precomputed prompt embedding (a plain ``list[float]`` — the shared
+        get_text_embedder() vector from the agno PreHook). When supplied it
+        rides the bus payload so the worker's FAISS + mempool cosine reuse it
+        and skip embedding entirely (1 embed/turn fleet-wide, gate G9).
         """
         self._ensure_started()
         # Phase B (rFP §3.4.1) §B6 — G19 closure: 15s → 5s. The query LRU+TTL
@@ -292,10 +298,17 @@ class MemoryProxy:
         # <50ms (cache hit) or 200-1500ms (cache miss FAISS+Kuzu read). 5s
         # cap is bounded against tail latency; on persistent timeout this is
         # a real worker problem to investigate, not to paper over.
+        _q_payload = {"action": "query", "text": text, "top_k": top_k}
+        if vec is not None:
+            # Embed-once: ship the shared vector (list[float]); the worker reuses
+            # it instead of re-embedding. Kept OFF the query cache key (which is
+            # (text, top_k)) — vec is a pure function of text, so the cache stays
+            # correct whether or not the vector was supplied.
+            _q_payload["vec"] = vec
         try:
             reply = await self._bus.request_async(
                 "memory_proxy", "memory",
-                {"action": "query", "text": text, "top_k": top_k},
+                _q_payload,
                 5.0, self._reply_queue,
             )
         except Exception as e:
