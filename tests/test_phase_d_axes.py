@@ -116,6 +116,39 @@ def test_reduce_empty():
     assert reduce_population_to_scalars([], _BlendParams()) == {}
 
 
+# ── §6.2.3 spine-partition: `verified` is procedural-only → w_verified=0 ──
+# (SPEC v0.27.0 / BUG-ENGRAM-AXIS-VERIFIED — thought-Engrams ground on 3 axes)
+
+def test_blend_default_w_verified_is_zero():
+    # The intent-lock: the shipped default excludes verified from the thought
+    # blend (procedural-only; thought members carry no oracle scored_by).
+    assert _BlendParams().w_verified == 0.0
+
+
+def test_reduce_verified_alone_varying_is_excluded_keeps_provisional():
+    # used/felt/fluent flat, `verified` VARIES — but w_verified=0, so verified is
+    # NOT active → no positively-weighted axis varies → {} (provisional kept, NOT
+    # collapsed to 0). This is the weight>0 gate guarding the stray-value edge.
+    rows = [
+        {"key": "a", "used": 1.0, "verified": 0.1, "felt": 0.0, "fluent": 0.0},
+        {"key": "b", "used": 1.0, "verified": 0.5, "felt": 0.0, "fluent": 0.0},
+        {"key": "c", "used": 1.0, "verified": 0.9, "felt": 0.0, "fluent": 0.0},
+    ]
+    assert reduce_population_to_scalars(rows, _BlendParams()) == {}
+
+
+def test_reduce_used_drives_blend_verified_cannot_perturb():
+    # `used` ascending, `verified` descending (would invert ordering IF it counted).
+    # With w_verified=0 the ordering must still track `used` — verified is inert.
+    rows = [
+        {"key": "a", "used": 0.1, "verified": 0.9, "felt": 0.0, "fluent": 0.0},
+        {"key": "b", "used": 0.5, "verified": 0.5, "felt": 0.0, "fluent": 0.0},
+        {"key": "c", "used": 0.9, "verified": 0.1, "felt": 0.0, "fluent": 0.0},
+    ]
+    sc = reduce_population_to_scalars(rows, _BlendParams())
+    assert sc["a"] < sc["b"] < sc["c"]   # tracks `used`; verified did not perturb
+
+
 # ── population pass: pre-D backfill + whole-population discrimination (option-1) ──
 
 class _StubGraph:

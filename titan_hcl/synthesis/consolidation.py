@@ -554,6 +554,10 @@ class ConsolidationPass:
         # 3. Recompute groundedness + store the felt axis (§7.C). felt_coverage
         #    feeds the legacy scalar (w_f=0 → no scalar change yet) AND is stored
         #    to Engram.axis_felt so it's independently visible (Phase D consumes it).
+        #    NOTE: oracle_evidence is intentionally NOT passed → axis_verified=0.
+        #    `verified` is procedural-spine-only (§6.2.3 spine-partition /
+        #    BUG-ENGRAM-AXIS-VERIFIED): thought-Engram members carry no oracle
+        #    scored_by, so there is no evidence to attribute here. w_verified=0.
         felt_coverage = felt_coverage_from_members(cluster.members)
         self._store.recompute_groundedness(
             cv.concept_id, cv.version,
@@ -610,6 +614,9 @@ class ConsolidationPass:
             )
             return False
 
+        # oracle_evidence intentionally omitted → axis_verified=0 (procedural-only,
+        # §6.2.3 spine-partition / BUG-ENGRAM-AXIS-VERIFIED; thought members carry
+        # no scored_by). See the create-path note above; w_verified=0.
         felt_coverage = felt_coverage_from_members(cluster.members)
         self._store.recompute_groundedness(
             cv.concept_id, cv.version,

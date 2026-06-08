@@ -204,7 +204,7 @@ class _BlendParams:
     always driven by whatever actually varies."""
 
     w_used: float = 0.40
-    w_verified: float = 0.25
+    w_verified: float = 0.0   # procedural-only; N/A on thought-Engrams (§6.2.3 spine-partition / BUG-ENGRAM-AXIS-VERIFIED) — structurally 0, excluded from the thought-Engram blend
     w_felt: float = 0.20
     w_fluent: float = 0.15
     nars_k: float = 1.0
@@ -224,7 +224,7 @@ def _load_blend_params_from_toml() -> _BlendParams:
         sub = data.get("synthesis", {}).get("engram", {}).get("grounding", {})
         return _BlendParams(
             w_used=float(sub.get("w_used", 0.40)),
-            w_verified=float(sub.get("w_verified", 0.25)),
+            w_verified=float(sub.get("w_verified", 0.0)),
             w_felt=float(sub.get("w_felt", 0.20)),
             w_fluent=float(sub.get("w_fluent", 0.15)),
             nars_k=float(sub.get("nars_k", 1.0)),
@@ -247,7 +247,11 @@ def compute_axes(
                  Engrams are backfilled from their stored `groundedness`, same
                  scale, no magic constant). The pure log1p-B_i decomposition
                  graduates with the §7.E learned reduction.
-      verified = NARS c = n/(n+k), n = oracle scored_by evidence count
+      verified = NARS c = n/(n+k), n = oracle scored_by evidence count.
+                 PROCEDURAL-SPINE ONLY (§6.2.3 spine-partition): thought-Engram
+                 consolidation passes no oracle_evidence (members are thoughts →
+                 no scored_by) → 0; w_verified=0 in the blend. Column kept for
+                 BRAIN-compat (BRAIN derives c from procedural TXs at ingest).
       felt     = felt_coverage (§7.C; [0,1])
       fluent   = recall-citation rate ([0,1]; 0 at launch — attribution deferred)
     The recall scalar is the population percentile-blend of these (reduce step)."""
@@ -290,7 +294,12 @@ def reduce_population_to_scalars(
     for ax in _AXIS_NAMES:
         vals = [float(r.get(ax, 0.0) or 0.0) for r in axes_rows]
         pct[ax] = _percentile_ranks(vals)
-        if (max(vals) - min(vals)) > 1e-9:
+        # An axis joins the blend only if it BOTH varies AND carries positive
+        # weight. The weight>0 guard makes a zero-weight axis (today: `verified`,
+        # procedural-only per §6.2.3 spine-partition) a true exclusion — even if a
+        # stray value ever makes it vary, it cannot drive the scalar (which would
+        # otherwise collapse all scalars to 0 when it is the sole varying axis).
+        if (max(vals) - min(vals)) > 1e-9 and weights[ax] > 1e-12:
             active.append(ax)
     if not active:
         # No axis varies (single Engram, or a population not yet carrying axis
