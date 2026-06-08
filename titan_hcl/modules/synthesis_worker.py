@@ -1280,7 +1280,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         )
         from titan_hcl.synthesis.consolidation_defaults import (
             default_mine_recent_thoughts, make_default_llm_propose,
-            make_default_decompose,
+            make_default_decompose, derive_domain_hint,
         )
         # Reuse the kuzu_graph_obj constructed above for EngineRecall.
         # Soft-fail if it's missing: the worker keeps running with
@@ -1339,6 +1339,23 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         except Exception as _pop_err:
             logger.warning(
                 "[synthesis_worker] boot population recompute failed: %s", _pop_err)
+
+        # §7.F — one-time content backfill of the advisory `domain_hint` for
+        # pre-Phase-F Engrams (BUG-ENGRAM-DOMAIN-HINT-NOT-BACKFILLED). Phase F
+        # set it only at consolidation; existing Engrams predate it. Cheap
+        # deterministic name-classifier (fix-plan-sanctioned), idempotent (only
+        # touches blanks), owns the Kuzu RW handle here in the SynthesisWriter.
+        # Precedent = the §7.D axis_used boot backfill above.
+        try:
+            migrated_dh = engram_store.backfill_domain_hints(derive_domain_hint)
+            if migrated_dh:
+                logger.info(
+                    "[synthesis_worker] boot domain_hint backfill: %d Engrams "
+                    "labeled (§7.F)", migrated_dh)
+        except Exception as _dh_err:
+            logger.warning(
+                "[synthesis_worker] boot domain_hint backfill failed: %s",
+                _dh_err)
 
         # Initial export so the snapshot is non-empty + present before
         # the first 60s tick (api process gets data immediately on first

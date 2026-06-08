@@ -708,6 +708,55 @@ class EngramStore:
             "; fluent live" if fluent_lookup is not None else "")
         return n
 
+    def backfill_domain_hints(self, derive_fn: Callable[..., str]) -> int:
+        """One-time content backfill of the advisory §7.F `domain_hint` for pre-
+        Phase-F Engrams (BUG-ENGRAM-DOMAIN-HINT-NOT-BACKFILLED). Phase F set
+        `domain_hint` only at consolidation time (the LLM `DOMAIN:` line);
+        Engrams that predate it carry "". This pass reads every Engram and, for
+        each whose `domain_hint` is blank, derives a coarse advisory hint from
+        its NAME via `derive_fn(name, memory_type) -> str` (the cheap classifier
+        sanctioned by the §7.F fix-plan as the alternative to re-running the
+        LLM) and SETs it. Engrams that already carry a hint are NEVER touched; a
+        derive of "" leaves the row blank (test artifacts / low-confidence).
+
+        IDEMPOTENT + cheap (bounded Engram count) — safe to run every boot,
+        mirroring the §7.D population-recompute precedent. Runs INSIDE
+        synthesis_worker (the sole SynthesisWriter, G21) so it owns the Kuzu RW
+        handle — no external-process lock conflict. Returns rows updated."""
+        try:
+            rows = self._graph.spine_read_engram_domain_rows()
+        except Exception as e:
+            logger.warning("[EngramStore] backfill_domain_hints: read failed: %s", e)
+            return 0
+        if not rows:
+            return 0
+        n = 0
+        for r in rows:
+            if (r.get("domain_hint") or "").strip():
+                continue  # already labeled — never overwrite (mutable, advisory)
+            try:
+                dh = derive_fn(r.get("name") or "", r.get("memory_type") or "")
+            except Exception as e:
+                logger.debug(
+                    "[EngramStore] backfill_domain_hints: derive %s failed: %s",
+                    r.get("concept_id"), e)
+                continue
+            if not dh:
+                continue  # leave blank (test artifact / low-confidence)
+            try:
+                if self._graph.spine_set_domain_hint(
+                        r["concept_id"], int(r["version"]), dh):
+                    n += 1
+            except Exception as e:
+                logger.warning(
+                    "[EngramStore] backfill_domain_hints: set %s v%s failed: %s",
+                    r["concept_id"], r["version"], e)
+        if n:
+            logger.info(
+                "[EngramStore] domain_hint backfill: %d/%d Engrams labeled "
+                "(§7.F)", n, len(rows))
+        return n
+
     @on_writer
     def recompute_groundedness_batch(
         self,
