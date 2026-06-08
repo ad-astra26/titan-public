@@ -291,6 +291,21 @@ class _PooledConn:
         return None
 
 
+# P4 (RFP_synthesis_decision_authority) — per-session TTL cache for the
+# SESSION-STABLE stores only (identity + profile). These return the same rows
+# turn-after-turn within a session, yet were re-queried every turn:
+#   • self_insights — Titan's current self-model; query-INDEPENDENT
+#     (`ORDER BY timestamp DESC LIMIT` — no entity/keyword filter) → identity.
+#   • social_graph  — a person's `user_profiles` row; stable within a session,
+#     keyed by the person entity the query targets → profile.
+# Prompt-DEPENDENT stores (vocabulary/episodic/chain_archive/…) are deliberately
+# EXCLUDED — they must re-query per turn — so the cache can never serve stale
+# prompt-specific recall. A short TTL bounds staleness for the two it does hold.
+_SESSION_STABLE_STORES = frozenset({"self_insights", "social_graph"})
+_SESSION_CACHE_TTL_S = 120.0
+_SESSION_CACHE_MAX = 128
+
+
 class StoreRouter:
     """Routes parsed queries to specific database tables and executes SQL."""
 
@@ -303,19 +318,52 @@ class StoreRouter:
         # turn — while each connection stays owned by a single thread (no
         # cross-thread sqlite use, so the per-build parallelism is preserved).
         self._tls = threading.local()
+        # P4 per-session TTL cache (session-stable stores only — see above).
+        # Process-global + TTL-bounded: shared across sessions safely because
+        # the key carries every prompt input the store reads (so two sessions
+        # only share an entry when the query is genuinely identical).
+        self._session_cache: dict = {}
+        self._session_cache_lock = threading.Lock()
+
+    def _session_cache_key(self, store_key: str, parsed: ParsedQuery,
+                           limit: int):
+        """Cache key reflecting exactly what each session-stable store reads.
+        self_insights is query-independent (key = store+limit); social_graph
+        is keyed by the person entities it looks up."""
+        if store_key == "self_insights":
+            return (store_key, limit)
+        persons = tuple(sorted(
+            e for e, t in parsed.entity_types.items() if t == "person"))
+        return (store_key, limit, persons)
 
     def query_store(self, store_key: str, parsed: ParsedQuery,
                     limit: int = 5) -> list[dict]:
         """Query a specific store based on parsed dimensions."""
+        _cacheable = store_key in _SESSION_STABLE_STORES
+        _ck = None
+        if _cacheable:
+            _ck = self._session_cache_key(store_key, parsed, limit)
+            with self._session_cache_lock:
+                _hit = self._session_cache.get(_ck)
+                if _hit is not None and _hit[0] > time.time():
+                    return _hit[1]
         try:
             handler = getattr(self, f"_query_{store_key}", None)
-            if handler:
-                return handler(parsed, limit)
-            return []
+            results = handler(parsed, limit) if handler else []
         except Exception as e:
             swallow_warn(f'[VCB] Store query failed for {store_key}', e,
                          key="logic.verified_context_builder.store_query_failed_for", throttle=100)
             return []
+        if _cacheable and _ck is not None:
+            with self._session_cache_lock:
+                # Bounded: drop the soonest-to-expire entry on overflow.
+                if len(self._session_cache) >= _SESSION_CACHE_MAX:
+                    _oldest = min(self._session_cache,
+                                  key=lambda k: self._session_cache[k][0])
+                    self._session_cache.pop(_oldest, None)
+                self._session_cache[_ck] = (
+                    time.time() + _SESSION_CACHE_TTL_S, results)
+        return results
 
     def _connect(self, db_name: str):
         path = self._data_dir / db_name
