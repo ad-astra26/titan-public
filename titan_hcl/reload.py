@@ -55,7 +55,6 @@ from titan_hcl.bus import (
 from titan_hcl import bus
 from titan_hcl._phase_c_constants import (
     MODULE_RELOAD_DEFAULT_TIMEOUT_S,
-    MODULE_RELOAD_HAPPY_PATH_S,
     SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S,
 )
 from titan_hcl.supervision import (
@@ -335,8 +334,20 @@ class OrchestratorReloadMixin:
             # waits for NEW's own running transition. OLD is already dead by here
             # (Step 5), so NEW is the sole writer — the probe contract
             # (BOOTED→PROBING→RUNNING) drives cleanly with no dual-writer masking.
-            timeout_left = max(
-                1.0, min(MODULE_RELOAD_HAPPY_PATH_S, deadline - time.time()))
+            # Phase B: use the FULL remaining budget (bounded by the 30s
+            # MODULE_RELOAD_DEFAULT_TIMEOUT_S deadline), NOT the 10s
+            # MODULE_RELOAD_HAPPY_PATH_S cap. The 10s cap was sized for the OLD
+            # flow, where the §10.C adoption handshake had already pre-confirmed
+            # NEW reached subscribe-ack (booted), so the readiness wait only
+            # awaited the probe→running transition. Phase B retired adoption, so
+            # this wait now races NEW's FULL cold-boot (fork/exec + Python init +
+            # subscribe + probe + run) — 10s is too tight, especially the spawn
+            # latency under load (live T3 2026-06-08: ~8s spawn latency alone →
+            # ready_timeout, which left NEW running but info.state orphaned at
+            # STARTING, blocking the next reload's not_running validation). There
+            # is NO post-readiness rollback to reserve budget for — OLD is
+            # already dead by Step 5.
+            timeout_left = max(1.0, deadline - time.time())
             if not self._wait_for_reload_running(
                     module_name, rs.new_pid, timeout_left):
                 # NEW didn't reach state=running within budget. OLD is dead,
