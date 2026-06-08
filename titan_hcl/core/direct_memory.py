@@ -780,59 +780,6 @@ class TitanKnowledgeGraph:
             logger.warning("[KnowledgeGraph] spine_read_engram_axes failed: %s", e)
         return out
 
-    def spine_read_engram_domain_rows(self) -> list[dict]:
-        """Read every Engram's identity + name + memory_type + current
-        `domain_hint` for the one-time §7.F content backfill of pre-Phase-F
-        Engrams (BUG-ENGRAM-DOMAIN-HINT-NOT-BACKFILLED — Phase F set
-        `domain_hint` only at consolidation time; existing Engrams predate it).
-        Returns [{concept_id, version, name, memory_type, domain_hint}].
-        Soft-fail → []."""
-        out: list[dict] = []
-        try:
-            qr = self._conn.execute(
-                "MATCH (c:Engram) RETURN c.concept_id, c.version, c.name, "
-                "c.memory_type, c.domain_hint"
-            )
-            while qr.has_next():
-                row = qr.get_next()
-                out.append({
-                    "concept_id": row[0],
-                    "version": int(row[1]),
-                    "name": row[2] or "",
-                    "memory_type": row[3] or "",
-                    "domain_hint": row[4] if row[4] is not None else "",
-                })
-        except Exception as e:
-            logger.warning(
-                "[KnowledgeGraph] spine_read_engram_domain_rows failed: %s", e)
-        return out
-
-    def spine_set_domain_hint(
-        self, concept_id: str, version: int, domain_hint: str,
-    ) -> bool:
-        """SET one Engram row's advisory `domain_hint` column (§7.F — free-text,
-        mutable, never gates; allowed by INV-3 as an advisory metric column, not
-        the row's identity / version / lineage). Used by the one-time content
-        backfill of pre-Phase-F Engrams. Returns True on update, False if the
-        row is missing."""
-        pk = self._spine_pk(concept_id, version)
-        try:
-            # Verify row exists first (Kuzu MATCH+SET silently succeeds with
-            # zero rows; we want a definite signal).
-            if self.spine_get_concept_version(concept_id, version) is None:
-                return False
-            self._conn.execute(
-                "MATCH (c:Engram {pk: $pk}) SET c.domain_hint = $dh",
-                {"pk": pk, "dh": str(domain_hint or "")},
-            )
-            return True
-        except Exception as e:
-            logger.warning(
-                "[KnowledgeGraph] spine_set_domain_hint(%s,v%d) failed: %s",
-                concept_id, version, e,
-            )
-            return False
-
     def spine_add_composition_edge(
         self,
         from_concept_id: str, from_version: int,

@@ -19,15 +19,12 @@ This is NOT a shim of the old in-process Guardian — it is the canonical
 client for the new bus-message contract. Method names mirror Guardian's
 public API only to minimize call-site churn at plugin.py / kernel.py.
 
-Reload protocol (D-SPEC-50 §11.B.3 + RFP_shm_native_hot_reload.md Phase A):
-  - reload_module() publishes MODULE_RELOAD_REQUEST carrying a fresh
-    swap_id, then polls the orchestrator-owned `reload_status.bin` SHM slot
-    for that swap_id reaching a terminal status (ready/failed/rolled_back),
-    bounded by MODULE_RELOAD_DEFAULT_TIMEOUT_S.
-  - The terminal status is read from SHM (Preamble G18), NOT a bus
-    MODULE_RELOAD_ACK reply — the old `dst="all"` broadcast was a SPEC §8.2 /
-    G18 violation and is deleted. On timeout we return status="timeout";
-    caller policy decides whether to retry. We do NOT call back into Guardian
+Reload protocol (D-SPEC-50 §11.B.3):
+  - reload_module() publishes MODULE_RELOAD_REQUEST with a fresh
+    correlation_id and awaits MODULE_RELOAD_ACK for that id, with a
+    bounded timeout (default = MODULE_RELOAD_DEFAULT_TIMEOUT_S).
+  - On timeout we return the ack-not-received result; caller policy
+    decides whether to retry. We do NOT call back into Guardian
     internals.
 """
 from __future__ import annotations
@@ -43,6 +40,7 @@ from titan_hcl.bus import (
     MODULE_CRASHED,
     MODULE_HEARTBEAT,
     MODULE_READY,
+    MODULE_RELOAD_ACK,
     MODULE_RELOAD_REQUEST,
     MODULE_RESTART_REQUEST,
     MODULE_SHUTDOWN,
@@ -91,21 +89,18 @@ class GuardianHCLClient:
         # State cache populated by bus events. Each value is a dict with
         # keys: state, restart_count, last_event_ts.
         self._modules_cache: dict[str, dict] = {}
-        # SHM-native reload (RFP_shm_native_hot_reload.md Phase A): reload
-        # results are READ from the orchestrator-owned `reload_status.bin` SHM
-        # slot (G18), not awaited as a bus MODULE_RELOAD_ACK. Lazily built on
-        # first reload (None pre-boot / in test fixtures without /dev/shm).
-        self._reload_status_reader = None
+        # Pending reload futures keyed by correlation_id. Each value is a
+        # threading.Event + a result dict populated when the ack arrives.
+        self._pending_reloads: dict[str, tuple[threading.Event, dict]] = {}
+        self._pending_lock = threading.Lock()
         # Subscribe to status-population events. The bus.subscribe API
         # returns a queue; for our event-driven cache we want a callback
         # pattern instead. We attach a small dispatcher thread.
         self._stop_event = threading.Event()
         # Subscribe under name "guardian" so dst="guardian" targeted messages
-        # (MODULE_HEARTBEAT, MODULE_READY — workers always publish these
-        # dst="guardian") route to this subscriber via name match. (Reload
-        # status is NO LONGER a bus event — it's read from reload_status.bin
-        # SHM per RFP_shm_native_hot_reload.md Phase A.) Pre-Phase-6 the
-        # in-process Guardian held this name;
+        # (MODULE_HEARTBEAT, MODULE_READY, MODULE_RELOAD_ACK — workers
+        # always publish these dst="guardian") route to this subscriber via
+        # name match. Pre-Phase-6 the in-process Guardian held this name;
         # under Phase 6 Guardian lives in a separate process — this client
         # is the canonical "guardian" subscriber inside the titan_hcl
         # process. reply_only=False so broadcast dst="all" events like
@@ -115,6 +110,7 @@ class GuardianHCLClient:
             types=[
                 MODULE_READY, MODULE_HEARTBEAT, MODULE_CRASHED, MODULE_SHUTDOWN,
                 SUPERVISION_CHILD_RESTARTED, SUPERVISION_CHILD_DOWN,
+                MODULE_RELOAD_ACK,
             ],
             reply_only=False,
         )
@@ -145,6 +141,19 @@ class GuardianHCLClient:
         mtype = msg.get("type")
         payload = msg.get("payload", {}) or {}
         name = payload.get("name") or payload.get("module")
+
+        if mtype == MODULE_RELOAD_ACK:
+            # Ack-routing: payload includes correlation_id (echo from
+            # original MODULE_RELOAD_REQUEST). Wake the waiting future.
+            corr_id = payload.get("correlation_id") or msg.get("correlation_id")
+            if corr_id:
+                with self._pending_lock:
+                    entry = self._pending_reloads.pop(corr_id, None)
+                if entry is not None:
+                    event, result_holder = entry
+                    result_holder.update(payload)
+                    event.set()
+            return
 
         if not name:
             return
@@ -227,82 +236,46 @@ class GuardianHCLClient:
     async def reload_module(self, name: str,
                             timeout: float = MODULE_RELOAD_DEFAULT_TIMEOUT_S,
                             **kwargs) -> dict:
-        """Publish MODULE_RELOAD_REQUEST + poll the reload_status SHM slot.
+        """Publish MODULE_RELOAD_REQUEST + await MODULE_RELOAD_ACK ≤ timeout.
 
-        SHM-native (RFP_shm_native_hot_reload.md Phase A): we send a fresh
-        `swap_id` on the request, then poll the orchestrator-owned
-        `reload_status.bin` slot for that swap_id reaching a TERMINAL status
-        (ready/failed/rolled_back) — the result is read from SHM (G18), NOT a
-        bus reply (the old `dst="all"` MODULE_RELOAD_ACK was a §8.2/G18
-        violation, deleted). Returns the entry's result dict on a terminal
-        status; on timeout returns
+        Returns ack payload dict on success; on timeout returns
         {"status": "timeout", "name": name, "elapsed_s": <real_elapsed>}.
-        Caller policy (dashboard.reload_api / arch_map reload) decides retry.
+        Caller policy (typically dashboard.reload_api or arch_map reload)
+        decides retry — we do NOT call back into Guardian internals.
         """
-        swap_id = uuid.uuid4().hex
+        corr_id = uuid.uuid4().hex
+        event = threading.Event()
+        result_holder: dict = {}
+        with self._pending_lock:
+            self._pending_reloads[corr_id] = (event, result_holder)
 
-        # D-SPEC-151: the reload orchestrator (reload.py:_dispatch_reload_request)
-        # reads payload["module_name"] + honors payload["swap_id"] (reload.py:605),
-        # then stamps that SAME swap_id into every reload_status.bin entry — which
-        # is how this poll correlates the result.
-        payload = {"module_name": name, "swap_id": swap_id}
+        payload = {"name": name, "correlation_id": corr_id}
         for k, v in kwargs.items():
             if isinstance(v, (str, int, float, bool, type(None), dict, list, tuple)):
                 payload[k] = v
 
-        self._bus.publish(make_msg(
-            # reload EXECUTES in titan_hcl (real Orchestrator) via the lifecycle
-            # subscriber — NOT guardian_hcl's metadata-only orch.
+        msg = make_msg(
+            # D-SPEC-151: reload EXECUTES in titan_hcl (real Orchestrator) via
+            # the lifecycle subscriber — NOT guardian_hcl's metadata-only orch.
             MODULE_RELOAD_REQUEST, src="titan_hcl", dst="guardian_hcl_lifecycle",
             payload=payload,
-        ))
+        )
+        # Some make_msg variants don't propagate correlation_id at the top
+        # level — set it explicitly so the broker / consumers can see it
+        # either way.
+        msg["correlation_id"] = corr_id
+        self._bus.publish(msg)
 
-        reader = self._ensure_reload_status_reader()
         t0 = time.time()
-        deadline = t0 + timeout
-
-        def _poll_terminal() -> Optional[dict]:
-            # Poll the SHM ring for OUR swap_id reaching a terminal status.
-            while time.time() < deadline:
-                if reader is not None:
-                    try:
-                        entry = reader.read_swap(name, swap_id)
-                    except Exception:  # noqa: BLE001
-                        entry = None
-                    if entry is not None and entry.is_terminal:
-                        return entry.as_result_dict()
-                time.sleep(0.1)
-            return None
-
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, _poll_terminal)
-        if result is not None:
-            return result
-        return {"status": "timeout", "name": name,
-                "elapsed_s": time.time() - t0}
-
-    def _ensure_reload_status_reader(self):
-        """Lazy-construct the reload_status.bin reader (RFP Phase A).
-
-        Returns None if SHM can't be resolved yet (pre-boot / test fixture
-        without /dev/shm provisioned) — reload_module then bounded-polls to a
-        `timeout` result. Re-attempts on the next call so it recovers once the
-        orchestrator has provisioned the slot.
-        """
-        existing = getattr(self, "_reload_status_reader", None)
-        if existing is not None:
-            return existing
-        try:
-            from titan_hcl.core.reload_status import ReloadStatusReader
-            from titan_hcl.core.state_registry import resolve_titan_id
-            self._reload_status_reader = ReloadStatusReader(
-                titan_id=resolve_titan_id())
-        except Exception as e:  # noqa: BLE001
-            logger.debug(
-                "[GuardianHCLClient] reload_status reader init deferred "
-                "(pre-boot / test harness): %s", e)
-            self._reload_status_reader = None
-        return self._reload_status_reader
+        ok = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: event.wait(timeout=timeout))
+        elapsed = time.time() - t0
+        if ok:
+            return result_holder
+        # Timeout — clean up the pending entry.
+        with self._pending_lock:
+            self._pending_reloads.pop(corr_id, None)
+        return {"status": "timeout", "name": name, "elapsed_s": elapsed}
 
     def stop_all(self, reason: str = "shutdown") -> None:
         """Broadcast a stop request to guardian_hcl.

@@ -3109,7 +3109,7 @@ reasoning = "data/reasoning_cgn/state_snapshot.json"
 # the blend is variance-gated (a flat axis is dropped + the remaining weights
 # renormalize), so the spread is always driven by whatever signal actually exists.
 w_used     = 0.40   # ACT-R B_i (episodic encounters + distinct contexts)
-w_verified = 0.0    # procedural-only; N/A on thought-Engrams (§6.2.3 spine-partition / BUG-ENGRAM-AXIS-VERIFIED) — kept 0 so a stray verified value can't enter the thought-Engram blend. The variance-gate already excluded the flat axis; this locks the intent.
+w_verified = 0.25   # NARS c = n/(n+k) from oracle scored_by evidence
 w_felt     = 0.20   # felt-at-lived-time coverage (§7.C)
 w_fluent   = 0.15   # recall-citation rate (0 at launch — per-Engram attribution deferred)
 nars_k     = 1.0    # NARS evidence horizon (verified = n/(n+nars_k))

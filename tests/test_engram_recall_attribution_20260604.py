@@ -79,30 +79,10 @@ def test_record_recall_counters_and_events(attribution):
     # gokart surfaced, not cited.
     assert stats[("glacier", 2)] == (1, 1)
     assert stats[("gokart", 1)] == (1, 0)
-    # EVERY surfaced Engram logs a training event — glacier cited=True, gokart
-    # cited=False (the negative class §7.E's combiner needs to discriminate).
-    events = sorted(conn.execute(
-        "SELECT engram_id, version, cited FROM engram_recall_events").fetchall())
-    assert events == [("glacier", 2, True), ("gokart", 1, False)]
-
-
-def test_negative_events_accumulate_as_training_tuples(attribution):
-    # §7.E.0 fix: surfaced-but-not-cited recalls must accrue cited=False events
-    # so §7.E's combiner has BOTH classes (the prior bug logged only positives →
-    # a constant label → the learner self-gated off forever).
-    attr, conn = attribution
-    attr.record_membership("glacier", 2, ["tx_a"])
-    attr.record_membership("gokart", 1, ["tx_c"])
-    # 2 turns cite glacier; 3 turns surface gokart without citing it.
-    attr.record_recall(["tx_a"], ["tx_a"], ts=1.0)
-    attr.record_recall(["tx_a"], ["tx_a"], ts=2.0)
-    attr.record_recall(["tx_c"], [], ts=3.0)
-    attr.record_recall(["tx_c"], [], ts=4.0)
-    attr.record_recall(["tx_c"], [], ts=5.0)
-    counts = dict(conn.execute(
-        "SELECT cited, COUNT(*) FROM engram_recall_events GROUP BY cited").fetchall())
-    assert counts.get(True) == 2     # glacier positives
-    assert counts.get(False) == 3    # gokart negatives — the decision-boundary signal
+    # Only cited Engrams log a training event.
+    events = conn.execute(
+        "SELECT engram_id, version, cited FROM engram_recall_events").fetchall()
+    assert events == [("glacier", 2, True)]
 
 
 def test_record_recall_accumulates_across_turns(attribution):

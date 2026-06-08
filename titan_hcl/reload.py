@@ -23,6 +23,7 @@ from __future__ import annotations  # PEP-563 lazy annotations (Phase 11 §11.I.
 import asyncio
 import logging
 import os
+import queue as _queue_mod
 import signal
 import threading
 import time
@@ -37,10 +38,13 @@ from typing import Callable, Optional
 from titan_hcl.bus import (
     AnyQueue,
     BUS_PEER_DIED,
+    BUS_WORKER_ADOPT_ACK,
+    BUS_WORKER_ADOPT_REQUEST,
     DivineBus,
     MODULE_CRASHED,
     MODULE_HEARTBEAT,
     MODULE_READY,
+    MODULE_RELOAD_ACK,
     MODULE_RELOAD_REQUEST,
     MODULE_SHUTDOWN,
     SUPERVISION_CHILD_DOWN,
@@ -54,6 +58,7 @@ from titan_hcl.bus import (
 )
 from titan_hcl import bus
 from titan_hcl._phase_c_constants import (
+    ADOPTION_TIMEOUT_S,
     MODULE_RELOAD_DEFAULT_TIMEOUT_S,
     MODULE_RELOAD_HAPPY_PATH_S,
     SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S,
@@ -185,28 +190,28 @@ class OrchestratorReloadMixin:
         with self._reload_lock:
             info = self._modules.get(module_name)
             if info is None:
-                self._write_reload_status(
+                self._emit_reload_ack(
                     swap_id, module_name, "failed",
                     "unknown_module", started_ts)
                 return self._reload_result(
                     swap_id, module_name, "failed",
                     "unknown_module", started_ts)
             if module_name in self._reloads_in_flight:
-                self._write_reload_status(
+                self._emit_reload_ack(
                     swap_id, module_name, "failed",
                     "reload_in_flight", started_ts)
                 return self._reload_result(
                     swap_id, module_name, "failed",
                     "reload_in_flight", started_ts)
             if info.state != ModuleState.RUNNING:
-                self._write_reload_status(
+                self._emit_reload_ack(
                     swap_id, module_name, "failed",
                     f"not_running:state={info.state.value}", started_ts)
                 return self._reload_result(
                     swap_id, module_name, "failed",
                     f"not_running:state={info.state.value}", started_ts)
             if info.process is None or info.pid is None:
-                self._write_reload_status(
+                self._emit_reload_ack(
                     swap_id, module_name, "failed",
                     "no_process", started_ts)
                 return self._reload_result(
@@ -227,7 +232,7 @@ class OrchestratorReloadMixin:
         deadline = started_ts + timeout_s
         try:
             # ── Step 2: ACK status="spawning" ──────────────────────────
-            self._write_reload_status(
+            self._emit_reload_ack(
                 swap_id, module_name, "spawning", None, started_ts)
 
             # ── Step 3: spawn NEW alongside OLD ────────────────────────
@@ -236,30 +241,53 @@ class OrchestratorReloadMixin:
                 return self._rollback_reload(
                     rs, info, old_process, "spawn", spawn_err, started_ts)
 
-            # ── Step 4: confirm NEW is alive before retiring OLD ──────
-            # Phase B (RFP_shm_native_hot_reload): the §10.C bus ADOPTION
-            # handshake is RETIRED for reload. THIS orchestrator spawned NEW
-            # (rs.new_pid), so the ADOPTION_REQUEST/ACK round-trip is redundant —
-            # and it mis-routed in the peer-spawn split anyway: NEW's
-            # dst="guardian" adopt request reaches the guardian_hcl Supervisor,
-            # whose _reloads_in_flight is empty, so it NEVER fed this
-            # Orchestrator's rs.adoption_q → guaranteed adoption_timeout (the
-            # handoff's suspect (a), live-confirmed 2026-06-08: the 7-step never
-            # reached here because the lifecycle gate dropped the request first).
-            # NEW's readiness is confirmed by its pid-validated SHM slot in
-            # Step 7. Here we only assert NEW did not die in the instant after
-            # spawn before we retire OLD. (§10.C ADOPTION stays live for B.2.1
-            # kernel-swap — INV-4.)
-            if not self._pid_alive(rs.new_pid):
+            # ── Step 4: wait ADOPTION_REQUEST from NEW pid ────────────
+            # Drains adoption_q until we get a frame whose payload.pid matches
+            # rs.new_pid (defensive — race-free routing in
+            # _process_guardian_messages places frames by name only; here we
+            # validate the actual sender). Defensive pid-validation moved
+            # here per BUG-PHASE-B-FIRST-RELOAD-ADOPTION-ROUTING-MISS-20260514
+            # closure (race-free Guardian-side routing relies on this
+            # validation site, not the broker-routing site).
+            adoption_msg: dict | None = None
+            while True:
+                timeout_left = max(
+                    0.5, min(ADOPTION_TIMEOUT_S, deadline - time.time()))
+                if timeout_left <= 0.5 and deadline - time.time() <= 0:
+                    break
+                try:
+                    candidate = rs.adoption_q.get(timeout=timeout_left)
+                except _queue_mod.Empty:
+                    break
+                cand_pid = (candidate.get("payload") or {}).get("pid")
+                if cand_pid == rs.new_pid:
+                    adoption_msg = candidate
+                    break
+                logger.warning(
+                    "[Guardian] reload '%s' (swap_id=%s) ignoring stale "
+                    "ADOPTION_REQUEST from pid=%s (expected rs.new_pid=%s) — "
+                    "likely fanout from a sibling/prior reload",
+                    module_name, rs.swap_id, cand_pid, rs.new_pid)
+            if adoption_msg is None:
                 return self._rollback_reload(
                     rs, info, old_process,
-                    "spawn", "new_died_post_spawn", started_ts)
-            rs.status = "adopted"
-            self._write_reload_status(
-                swap_id, module_name, "adopted", None, started_ts,
-                new_pid=rs.new_pid, old_pid=old_pid)
+                    "adoption", "adoption_timeout", started_ts)
 
-            # ── Step 5: send MODULE_SHUTDOWN to OLD + grace + SIGKILL ─
+            # ── Step 5: emit ADOPTION_ACK + ACK status="adopted" ──────
+            rid = adoption_msg.get("rid")
+            self.bus.publish(make_msg(
+                BUS_WORKER_ADOPT_ACK, "guardian", module_name, {
+                    "name": module_name,
+                    "pid": rs.new_pid,
+                    "shadow_pid": os.getpid(),
+                    "status": "adopted",
+                    "reason": None,
+                }, rid=rid))
+            rs.status = "adopted"
+            self._emit_reload_ack(
+                swap_id, module_name, "adopted", None, started_ts)
+
+            # ── Step 6: send MODULE_SHUTDOWN to OLD + grace + SIGKILL ─
             self.bus.publish(make_msg(
                 MODULE_SHUTDOWN, "guardian", module_name, {
                     "reason": "reload",
@@ -293,7 +321,7 @@ class OrchestratorReloadMixin:
                         break
                     time.sleep(0.05)
 
-            # ── Step 6: atomic swap of info.process / info.pid / queues ─
+            # ── Step 7: atomic swap of info.process / info.pid / queues ─
             with self._module_lock:
                 if old_process is not None:
                     try:
@@ -321,46 +349,41 @@ class OrchestratorReloadMixin:
                 # so NEW gets boot grace without monitor_tick heartbeat-timeout
                 # restart-cycling it. Cleared in `finally`.
 
-            # ── Step 7: probe-new — wait for NEW (pid=rs.new_pid) to reach
-            # SHM state=running ──
+            # ── Step 8: probe-new — wait for NEW to reach SHM state=running ──
             # §11.I.2/§11.I.6 (D-SPEC-141): readiness is the worker's OWN
             # `module_<name>_state.bin` SHM slot, NOT a MODULE_READY bus event
-            # (that broadcast was DELETED in Phase 11 — locked D1). Phase B
-            # (RFP_shm_native_hot_reload): use the PID-VALIDATED variant
-            # `_wait_for_reload_running` — OLD's SIGKILLed last-write
-            # (state="running", pid=old_pid) lingers in the shared name-keyed
-            # slot, so the pid-BLIND `_wait_for_module_running` would read it and
-            # return ready immediately even though NEW is still booting (the
-            # handoff's stale-OLD-running bug). Requiring entry.pid==rs.new_pid
-            # waits for NEW's own running transition. OLD is already dead by here
-            # (Step 5), so NEW is the sole writer — the probe contract
-            # (BOOTED→PROBING→RUNNING) drives cleanly with no dual-writer masking.
+            # (that broadcast was DELETED in Phase 11 — locked D1). The legacy
+            # `rs.ready_q.get()` wait here was orphaned by that migration:
+            # nothing ever fed ready_q, so every in-place reload silently hit
+            # `ready_timeout` even when NEW booted fine. `_wait_for_module_running`
+            # is the canonical primitive (its docstring already names reload as a
+            # caller): it drives the probe (BOOTED→PROBING→RUNNING) and polls the
+            # slot — the SAME path normal boot (§11.I.7) + dep-activation
+            # (§11.G.2.5) use, sharing the probe-dispatch throttle (no double-probe).
             timeout_left = max(
                 1.0, min(MODULE_RELOAD_HAPPY_PATH_S, deadline - time.time()))
-            if not self._wait_for_reload_running(
-                    module_name, rs.new_pid, timeout_left):
+            if not self._wait_for_module_running(module_name, timeout_left):
                 # NEW didn't reach state=running within budget. OLD is dead,
                 # NEW is alive — this is NOT a rollback (no recovery path).
                 # Leave NEW running as the slot's new owner; the supervisor's
                 # SHM liveness/heartbeat detector handles a truly-stuck worker
                 # post-reload. Emit failed status so the initiator knows.
-                self._write_reload_status(
+                self._emit_reload_ack(
                     swap_id, module_name, "failed",
-                    "ready_timeout", started_ts,
-                    new_pid=rs.new_pid, old_pid=old_pid)
+                    "ready_timeout", started_ts)
                 return self._reload_result(
                     swap_id, module_name, "failed",
                     "ready_timeout", started_ts)
 
-            # NEW reached state=running (pid-validated). Phase B: unlike the old
-            # `_wait_for_module_running`, `_wait_for_reload_running` does NOT
-            # mutate `info` (OLD remained the registered owner until Step 6's
-            # swap), so THIS block is now the sole finalize of info.state=RUNNING
-            # after the swap left it STARTING. (Pre-Phase-B this was a defensive
-            # guard against the D-SPEC-93 race where the swap reset state→STARTING
-            # after the slot already read running — T3 2026-05-19,
-            # knowledge_worker pid=1090355 stuck STARTING after pid=1090080
-            # SIGKILL.)
+            # NEW reached state=running. `_wait_for_module_running` already
+            # mirrored info.state=RUNNING + ready_time on the observed slot
+            # transition; this defensive finalize covers the race where Step 7's
+            # atomic swap reset state→STARTING AFTER the slot already read running
+            # (NEW boots faster than Step 6's 10s SIGKILL grace). Without it the
+            # module could stay stuck state=starting forever despite being fully
+            # alive. Live-discovered 2026-05-19 during T3 cascade of D-SPEC-93
+            # (knowledge_worker pid=1090355 stuck STARTING after pid=1090080
+            # SIGKILL). Part of D-SPEC-93 closure.
             with self._module_lock:
                 if info.state != ModuleState.RUNNING:
                     info.state = ModuleState.RUNNING
@@ -370,9 +393,8 @@ class OrchestratorReloadMixin:
                         "[Guardian] Module '%s' state finalized RUNNING "
                         "post-reload (pid=%s, swap_id=%s)",
                         module_name, info.pid, swap_id)
-            self._write_reload_status(
-                swap_id, module_name, "ready", None, started_ts,
-                new_pid=info.pid, old_pid=old_pid)
+            self._emit_reload_ack(
+                swap_id, module_name, "ready", None, started_ts)
             return self._reload_result(
                 swap_id, module_name, "ready", None, started_ts)
         finally:
@@ -393,12 +415,6 @@ class OrchestratorReloadMixin:
         """
         import copy as _copy
         import multiprocessing
-        # Lazy import: `_module_wrapper` lives in titan_hcl.orchestrator.core,
-        # which imports this module's OrchestratorReloadMixin at load time —
-        # a top-level import here would be circular. By reload-time core is
-        # fully loaded. (Latent NameError until the lifecycle-gate fix let the
-        # 7-step actually reach spawn for the first time.)
-        from titan_hcl.orchestrator.core import _module_wrapper
 
         method = info.spec.start_method
         if method not in ("fork", "spawn"):
@@ -494,51 +510,38 @@ class OrchestratorReloadMixin:
                 pass
             except Exception:  # noqa: BLE001
                 pass
-        self._write_reload_status(
+        self._emit_reload_ack(
             rs.swap_id, rs.module_name, "rolled_back",
-            f"{failed_step}:{reason}", started_ts,
-            new_pid=rs.new_pid, old_pid=rs.old_pid)
+            f"{failed_step}:{reason}", started_ts)
         return self._reload_result(
             rs.swap_id, rs.module_name, "rolled_back",
             f"{failed_step}:{reason}", started_ts)
 
-    def _write_reload_status(self, swap_id: str, module_name: str, status: str,
-                             reason: Optional[str], started_ts: float,
-                             *, new_pid: int = 0, old_pid: int = 0) -> None:
-        """Write one reload status transition to the orchestrator-owned
-        `reload_status.bin` SHM slot (per `RFP_shm_native_hot_reload.md` Phase A).
+    def _emit_reload_ack(self, swap_id: str, module_name: str, status: str,
+                         reason: Optional[str], started_ts: float) -> None:
+        """Publish a MODULE_RELOAD_ACK frame on the bus. dst="all" is the
+        practical broadcast because the initiator subscription is not
+        named (Maker CLI / future D9 Guardian). MODULE_RELOAD_ACK is
+        pre-listed in BOOT_BUFFERED_TYPES so transient subscription gaps
+        on the initiator side don't lose the terminal status (§8.0.bis).
 
-        REPLACES the legacy `_emit_reload_ack` `dst="all"` MODULE_RELOAD_ACK
-        bus broadcast — a SPEC §8.2 / Preamble G18 violation (reload *state*
-        belongs in SHM, not a bus fan-out). The initiator
-        (`GuardianHCLClient.reload_module`) polls this slot by `swap_id`.
-        Intermediate (`spawning`/`adopted`) AND terminal
-        (`ready`/`failed`/`rolled_back`) statuses are stamped into the
-        per-module ring (Observatory progress); the initiator resolves only on
-        a terminal status. `total_elapsed_ms` is recorded on every write for
-        end-to-end timing.
+        `total_elapsed_ms` is recorded on every ACK so observers can
+        track end-to-end timing per acceptance gate §4.6 #1.
         """
-        from titan_hcl.core.reload_status import ReloadStatusEntry
-        writer = self._ensure_reload_status_writer()
-        if writer is None:
-            # No SHM (test fixture / non-canonical process) — reload still
-            # completes; only the SHM status mirror is skipped.
-            return
-        entry = ReloadStatusEntry(
-            module_name=module_name,
-            swap_id=swap_id,
-            status=status,
-            reason=reason,
-            new_pid=int(new_pid or 0),
-            old_pid=int(old_pid or 0),
-            total_elapsed_ms=int((time.time() - started_ts) * 1000),
-            written_at=time.time(),
-        )
+        elapsed_ms = int((time.time() - started_ts) * 1000)
         try:
-            writer.write(module_name, entry)
+            self.bus.publish(make_msg(
+                MODULE_RELOAD_ACK, "guardian", "all", {
+                    "swap_id": swap_id,
+                    "module_name": module_name,
+                    "status": status,
+                    "reason": reason,
+                    "total_elapsed_ms": elapsed_ms,
+                    "ts": time.time(),
+                }))
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "[Guardian] reload_status write failed for '%s' "
+                "[Guardian] MODULE_RELOAD_ACK publish failed for '%s' "
                 "(swap_id=%s, status=%s): %s",
                 module_name, swap_id, status, e)
 
@@ -603,7 +606,7 @@ class OrchestratorReloadMixin:
         if not module_name or not isinstance(module_name, str):
             logger.warning(
                 "[Guardian] MODULE_RELOAD_REQUEST malformed: %r", payload)
-            self._write_reload_status(
+            self._emit_reload_ack(
                 swap_id, str(module_name or ""),
                 status="failed",
                 reason="malformed_request",
@@ -624,7 +627,7 @@ class OrchestratorReloadMixin:
             logger.error(
                 "[Guardian] MODULE_RELOAD_REQUEST dispatch failed for "
                 "'%s': %s", module_name, e)
-            self._write_reload_status(
+            self._emit_reload_ack(
                 swap_id, module_name,
                 status="failed",
                 reason=f"dispatch_error:{e!r}",

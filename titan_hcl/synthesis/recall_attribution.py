@@ -18,10 +18,8 @@ The mechanic (all OFF the chat hot path — every write/read runs on the one
      per-turn `KNOWLEDGE_MOMENT` carries the surfaced + cited tx_hash sets (the
      tx-spine recall surfaces `item_id = tx_hash`; `cited_use` already detects the
      cited subset). We resolve each tx → its **latest** Engram version (Maker:
-     latest-version-only credit) and bump `surfaced_count` / `cited_count`; every
-     SURFACED Engram appends an event row (cited=true for cited, cited=false for
-     surfaced-not-cited) carrying the axes snapshot at recall — both classes, so
-     §7.E's combiner has a real decision boundary, not an all-positive label.
+     latest-version-only credit) and bump `surfaced_count` / `cited_count`; each
+     cited Engram also appends an event row carrying the axes snapshot at recall.
   3. **`fluent` feed**: `fluent = cited_count / (surfaced_count + k)` (NARS-smoothed,
      same form as the `verified` axis), read at the dream-boundary population
      recompute → the axis now varies → it joins the §7.D percentile-blend.
@@ -134,27 +132,17 @@ class RecallAttribution:
         surf_engrams = self._resolve_set(surfaced)
         cite_engrams = self._resolve_set(cited)
         # Surfaced set is the UNION (a cited Engram was necessarily surfaced).
-        surfaced_all = surf_engrams | cite_engrams
-        for (eid, ver) in surfaced_all:
+        for (eid, ver) in (surf_engrams | cite_engrams):
             self._bump(eid, ver, surfaced=1, cited=0, ts=ts)
         for (eid, ver) in cite_engrams:
             self._bump(eid, ver, surfaced=0, cited=1, ts=ts)
-        # Write ONE (axes_at_recall, cited?) event per SURFACED Engram — BOTH
-        # classes: cited=True for the cited Engrams, cited=False for surfaced-
-        # but-not-cited ones. The negatives are §7.E's decision-boundary signal:
-        # without them the events table is all-positives, the citation label is
-        # constant, and the learned combiner has nothing to discriminate (it
-        # self-gates off forever). One row per Engram per turn (per-member dedup
-        # already done by `_resolve_set`).
-        for (eid, ver) in surfaced_all:
-            was_cited = (eid, ver) in cite_engrams
             axes = self._cached_axes(eid, ver)
             try:
                 self._conn.execute(
                     "INSERT INTO engram_recall_events (ts, engram_id, version, "
                     "axis_used, axis_verified, axis_felt, axis_fluent, cited) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [ts, eid, ver, axes[0], axes[1], axes[2], axes[3], was_cited])
+                    [ts, eid, ver, axes[0], axes[1], axes[2], axes[3], True])
             except Exception as e:  # noqa: BLE001
                 logger.debug("[RecallAttribution] event insert soft-fail: %s", e)
 
@@ -237,29 +225,6 @@ class RecallAttribution:
                 out[(eid, ver)] = (cited / denom) if denom > 0 else 0.0
         except Exception as e:  # noqa: BLE001
             logger.debug("[RecallAttribution] fluent_map soft-fail: %s", e)
-        return out
-
-    def read_training_events(
-        self, limit: int = 50000,
-    ) -> list[tuple[tuple[float, float, float, float], bool]]:
-        """§7.E — the (axes_at_recall, cited?) training tuples from
-        `engram_recall_events` (newest `limit` rows). Returns
-        [((used, verified, felt, fluent), cited)]; soft-fail → []. Both classes
-        are present once the §7.E.0 cited=false events accrue (else all-positive
-        → the combiner's guard keeps it inactive)."""
-        out: list[tuple[tuple[float, float, float, float], bool]] = []
-        try:
-            qr = self._writer.submit_sync(lambda: self._conn.execute(
-                "SELECT axis_used, axis_verified, axis_felt, axis_fluent, cited "
-                "FROM engram_recall_events ORDER BY ts DESC LIMIT ?",
-                [int(limit)]).fetchall())
-            for row in (qr or []):
-                out.append((
-                    (float(row[0] or 0.0), float(row[1] or 0.0),
-                     float(row[2] or 0.0), float(row[3] or 0.0)),
-                    bool(row[4])))
-        except Exception as e:  # noqa: BLE001
-            logger.debug("[RecallAttribution] read_training_events soft-fail: %s", e)
         return out
 
     def update_axes_cache(self, axes_rows: Iterable[dict]) -> None:

@@ -299,14 +299,7 @@ def _start_lifecycle_subscriber(bus, orchestrator, stop_event):
                 continue
             mtype = msg.get("type")
             payload = msg.get("payload", {}) or {}
-            # MODULE_RELOAD_REQUEST carries the module under `module_name`
-            # (SPEC §8.3 / rFP §4.4 payload), every other request type under
-            # `name`. Gate on EITHER — else reload requests are silently
-            # dropped here (the producer/consumer key mismatch that made the
-            # 7-step never run: client sends module_name, this gate required
-            # name → drop → caller times out). _dispatch_reload_request reads
-            # module_name itself; the others read `name`.
-            name = payload.get("name") or payload.get("module_name")
+            name = payload.get("name")
             if not name:
                 continue
             try:

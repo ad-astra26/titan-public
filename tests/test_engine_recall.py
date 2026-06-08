@@ -436,49 +436,5 @@ class TestStats(unittest.TestCase):
             conn.close()
 
 
-class TestEmbedOnce(unittest.TestCase):
-    """P4 embed-once (RFP_synthesis_decision_authority): a caller-supplied
-    ``query_vec`` (the shared get_text_embedder() vector threaded from the agno
-    PreHook) is reused verbatim — the injected embedder is NOT invoked (G9)."""
-
-    def test_query_vec_works_without_an_embedder(self) -> None:
-        # No embedder at all, but the shared vector is supplied → recall still
-        # runs the SEARCH (the embed-once path does not require an embedder).
-        faiss_results = [{"tx_hash": "v1", "score": 0.9, "fork": "conversation"}]
-        er, conn = _build_engine(embedder_vec=None, faiss_results=faiss_results)
-        try:
-            result = er.recall("anything", query_vec=[0.1] * 8)
-            assert result is not None
-            assert {r.tx_hash for r in result} == {"v1"}
-        finally:
-            conn.close()
-
-    def test_query_vec_short_circuits_the_embedder(self) -> None:
-        # An embedder that would RAISE must never be called when query_vec is
-        # supplied — proving the shared vector is used, not a fresh embed.
-        calls: list = []
-
-        def _boom(_t):
-            calls.append(_t)
-            raise RuntimeError("embedder must not be called under embed-once")
-
-        faiss_results = [{"tx_hash": "v2", "score": 0.8, "fork": "conversation"}]
-        conn = _make_conv_index_db([])
-        evaluator = RuleEvaluator(
-            faiss_reader=_StubFaiss(faiss_results), index_db=conn)
-        er = EngineRecall(
-            rule_evaluator=evaluator,
-            activation_lookup=lambda ids: {},
-            embedder=_boom,
-        )
-        try:
-            result = er.recall("anything", query_vec=[0.2] * 8)
-            assert result is not None
-            assert {r.tx_hash for r in result} == {"v2"}
-            assert calls == []   # embedder never invoked
-        finally:
-            conn.close()
-
-
 if __name__ == "__main__":
     unittest.main()

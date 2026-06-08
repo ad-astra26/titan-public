@@ -50,83 +50,6 @@ logger = logging.getLogger(__name__)
 _MINE_ROW_CAP = 500
 
 
-# ── §7.F advisory domain_hint — normalization + one-time content backfill ──
-
-
-def _normalize_domain_hint(raw: str) -> str:
-    """Fold a free-text domain hint to its stored form: lowercased + stripped;
-    placeholder / non-answer tokens → "" (§7.F — advisory, mutable, never
-    gates). The SINGLE source of this rule, shared by the live LLM-`DOMAIN:`
-    parse (`_parse_llm_response`) and the one-time content backfill
-    (`derive_domain_hint`) so both produce identical stored values."""
-    h = (raw or "").strip().lower()
-    if h.startswith("<") or h in ("empty", "unclear", "none"):
-        return ""
-    return h
-
-
-# Ordered keyword → domain rules for the one-time content backfill of pre-
-# Phase-F Engrams whose `domain_hint` is "" (BUG-ENGRAM-DOMAIN-HINT-NOT-
-# BACKFILLED). The §7.F fix-plan sanctions "a cheap classifier, normalized per
-# consolidation_defaults" as the alternative to re-running the consolidation
-# LLM. First-match-wins, most-specific → general. The vocabulary is the LIVE
-# observed set (self / philosophy_of_mind / philosophy / sociology /
-# neuroscience) plus the two unambiguous domains present in the pre-F blanks
-# (security, coding). A name matching nothing confident → "" (left blank — a
-# future re-consolidation fills it; never fabricate a low-confidence label).
-_DOMAIN_BACKFILL_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("consciousness", "phenomenolog", "pre-conceptual", "pre conceptual",
-      "pre-label", "pre label", "qualia", "sentience"), "philosophy_of_mind"),
-    (("neuroscience", "neural correlate", "neuro"), "neuroscience"),
-    (("adversarial", "social engineering", "prompt attack", "prompt pattern",
-      "prompting pattern", "jailbreak", "injection"), "security"),
-    (("coding", "sandbox", "code verification", "compiler", "programming"),
-     "coding"),
-    (("sociolog",), "sociology"),
-    # The dominant introspective / interpersonal / social bucket — matches how
-    # the live LLM labeled this content ("Seaside Philosophical Dialogue",
-    # "Interpersonal Dialogue Fragments", "User Interpersonal Dynamics" → self).
-    (("interpersonal", "social", "dialogue", "human", "self", "introspect",
-      "reflection", "presence", "stillness", "contemplation", "resonance",
-      "bond", "emotional", "musician", "seaside", "wisdom",
-      "dream consolidation", "interaction"), "self"),
-    # Remaining philosophical content with no social/dialogue/reflection cue.
-    (("philosoph", "metaphysic", "epistemolog", "ontolog"), "philosophy"),
-)
-
-# Names that are test pollution, not real Engrams — never label these (they
-# stay blank + are surfaced for separate hygiene cleanup).
-_DOMAIN_BACKFILL_SKIP = ("e2e_test", "newconcept_", "test_newconcept",
-                         "__test", "pytest")
-
-
-def derive_domain_hint(name: str, memory_type: str = "",
-                       member_text: str = "") -> str:
-    """Cheap deterministic content→domain classifier for the one-time backfill
-    of pre-Phase-F Engrams whose `domain_hint` is "" (Phase F set it only at
-    consolidation time; existing Engrams predate it). Derives a coarse advisory
-    hint from the Engram NAME (+ optional `member_text` where available — pre-F
-    Engrams have no persisted membership, so the descriptive name is the
-    practical signal). Returns a label from the live vocabulary or "" (leave
-    blank — never fabricate). Output is `_normalize_domain_hint`-folded so it is
-    byte-identical to what the LLM path stores. Advisory / mutable / never gates
-    (§7.F).
-
-    NOT the consolidation path: new Engrams still get `domain_hint` from the LLM
-    `DOMAIN:` line (`_parse_llm_response`). This retro-labels existing blanks
-    only (BUG-ENGRAM-DOMAIN-HINT-NOT-BACKFILLED; precedent = the `axis_used`
-    one-time backfill)."""
-    blob = " ".join(p for p in (name, member_text) if p).strip().lower()
-    if not blob:
-        return ""
-    if any(tok in blob for tok in _DOMAIN_BACKFILL_SKIP):
-        return ""  # test pollution — leave blank, flag for hygiene cleanup
-    for keywords, domain in _DOMAIN_BACKFILL_RULES:
-        if any(kw in blob for kw in keywords):
-            return _normalize_domain_hint(domain)
-    return ""
-
-
 # ── Default mine ────────────────────────────────────────────────────
 
 
@@ -300,7 +223,9 @@ def _parse_llm_response(text: str) -> LLMProposal:
 
     # §7.F — advisory domain_hint (free-text, normalized; "" if the LLM omitted
     # it or returned the placeholder). Never gates behaviour; mutable.
-    domain_hint = _normalize_domain_hint(fields.get("DOMAIN", ""))
+    domain_hint = fields.get("DOMAIN", "").strip().lower()
+    if domain_hint.startswith("<") or domain_hint in ("empty", "unclear", "none"):
+        domain_hint = ""
 
     return LLMProposal(
         action=action_raw,  # type: ignore[arg-type]

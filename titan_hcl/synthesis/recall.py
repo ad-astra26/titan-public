@@ -244,11 +244,6 @@ class EngineRecall:
         granularity: Optional[str] = None,
         chat_id: Optional[str] = None,
         topic_tag: Optional[str] = None,
-        # P4 (RFP_synthesis_decision_authority) embed-once: a caller-supplied
-        # shared prompt vector (get_text_embedder() output threaded from the
-        # agno PreHook). When provided it is reused verbatim for the SEARCH
-        # cosine — the injected embedder is NOT invoked (1 embed/turn, G9).
-        query_vec: Optional[list] = None,
     ) -> Optional[list[RecallResult]]:
         """Contract-driven episodic recall.
 
@@ -354,10 +349,7 @@ class EngineRecall:
             self._tally(results)
             return results
 
-        # P4 embed-once: a caller-supplied query_vec (the shared
-        # get_text_embedder() vector threaded from the agno PreHook) is reused
-        # verbatim; only when it is absent do we require + invoke the embedder.
-        if query_vec is None and not self._embedder:
+        if not self._embedder:
             logger.debug("[EngineRecall] no embedder injected — fallback")
             self._total_fallbacks += 1
             return None
@@ -367,17 +359,14 @@ class EngineRecall:
             self._total_fallbacks += 1
             return None
 
-        # 1. Embed the query (or reuse the shared embed-once vector).
-        if query_vec is not None:
-            qe = list(query_vec)
-        else:
-            try:
-                qe = list(self._embedder(query_text))
-            except Exception as exc:
-                logger.warning(
-                    "[EngineRecall] embedder failed: %s — fallback", exc)
-                self._total_fallbacks += 1
-                return None
+        # 1. Embed the query.
+        try:
+            qe = list(self._embedder(query_text))
+        except Exception as exc:
+            logger.warning(
+                "[EngineRecall] embedder failed: %s — fallback", exc)
+            self._total_fallbacks += 1
+            return None
         if not qe:
             self._total_fallbacks += 1
             return None

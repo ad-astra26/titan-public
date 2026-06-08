@@ -11,11 +11,9 @@ Covers the Guardian-side orchestrator without spawning real subprocesses:
   `module_<name>_state.bin` SHM `state=running` slot (`_wait_for_module_running`),
   not the deleted MODULE_READY bus event. BUS_WORKER_ADOPT_REQUEST routed to the
   reload orchestrator's adoption queue when matching in-flight state.
-- Dispatch (_dispatch_reload_request): malformed payload writes a failed
-  status to reload_status.bin SHM without spawning (RFP_shm_native_hot_reload
-  Phase A — the old dst="all" MODULE_RELOAD_ACK broadcast is deleted).
-- Status shape: _write_reload_status writes a SPEC §8.3-conformant SHM entry
-  and publishes NO bus MODULE_RELOAD_ACK.
+- Dispatch (_dispatch_reload_request): malformed payload emits failed ACK
+  without spawning.
+- ACK shape: _emit_reload_ack publishes a SPEC §8.3-conformant payload.
 
 Full subprocess integration (happy path + rollback through real spawn)
 requires worker-side ADOPTION_REQUEST emission on Phase B reload which is
@@ -299,15 +297,12 @@ def test_adoption_request_falls_through_when_name_not_in_flight():
 # ── _dispatch_reload_request from MODULE_RELOAD_REQUEST ──────────────────
 
 
-def test_dispatch_reload_request_malformed_writes_failed_status():
-    """RFP Phase A: a malformed MODULE_RELOAD_REQUEST writes a `failed`
-    status to reload_status.bin SHM (no spawn) and publishes NO bus ACK."""
-    from titan_hcl.core.reload_status import ReloadStatusReader
-    from titan_hcl.core.state_registry import resolve_titan_id
-
+def test_dispatch_reload_request_malformed_emits_failed_ack():
     g = Guardian(DivineBus())
-    # No dst="all" MODULE_RELOAD_ACK must ever be published (deleted path).
+    # Subscribe to MODULE_RELOAD_ACK so we can observe what guardian emits
     ack_q = g.bus.subscribe("test_observer", types=[MODULE_RELOAD_ACK])
+    # Note: ack is published with dst="all" so subscribe-all observer
+    # would also see it; we use a named observer + verify the type.
 
     g._dispatch_reload_request(make_msg(
         MODULE_RELOAD_REQUEST, "maker_cli", "guardian", {
@@ -315,66 +310,70 @@ def test_dispatch_reload_request_malformed_writes_failed_status():
             "swap_id": "abc-123",
         }
     ))
-
-    # The malformed branch writes synchronously (no executor submit).
-    reader = ReloadStatusReader(titan_id=resolve_titan_id())
-    entry = reader.read_swap("", "abc-123")  # module_name normalizes to ""
-    reader.close()
-    assert entry is not None, "expected a reload_status entry for malformed dispatch"
-    assert entry.status == "failed"
-    assert entry.reason == "malformed_request"
-
-    # Assert the deleted bus path is truly gone.
-    bus_acks = []
-    for _ in range(3):
-        bus_acks.extend(g.bus.drain(ack_q, max_msgs=10))
-        time.sleep(0.02)
-    assert not any(m.get("type") == MODULE_RELOAD_ACK for m in bus_acks), (
-        "MODULE_RELOAD_ACK must NOT be published — reload status is SHM-only"
+    # Drain the observer queue
+    found = []
+    for _ in range(5):
+        msgs = g.bus.drain(ack_q, max_msgs=10)
+        found.extend(msgs)
+        if found:
+            break
+        time.sleep(0.05)
+    statuses = [
+        m["payload"].get("status") for m in found
+        if m.get("type") == MODULE_RELOAD_ACK
+    ]
+    assert "failed" in statuses, (
+        f"expected failed ACK on malformed dispatch; got {statuses}"
     )
+    failed_acks = [
+        m["payload"] for m in found
+        if m.get("type") == MODULE_RELOAD_ACK
+        and m["payload"].get("status") == "failed"
+    ]
+    assert any(
+        a.get("reason") == "malformed_request" for a in failed_acks
+    ), f"expected malformed_request reason; got {failed_acks}"
     g.stop_all()
 
 
-# ── reload status SHM entry shape (RFP Phase A; replaces the bus ACK) ─────
+# ── ACK payload shape per SPEC §8.3 ──────────────────────────────────────
 
 
-def test_write_reload_status_shm_entry_shape_and_no_bus_ack():
-    """RFP Phase A: _write_reload_status writes a SPEC §8.3-shaped entry to
-    reload_status.bin SHM (+ new_pid/old_pid) and publishes NO bus ACK."""
-    from titan_hcl.core.reload_status import ReloadStatusReader
-    from titan_hcl.core.state_registry import resolve_titan_id
-
+def test_emit_reload_ack_payload_shape_matches_spec_8_3():
+    """Per SPEC §8.3 MODULE_RELOAD_ACK row:
+    {swap_id, module_name, status, reason, total_elapsed_ms, ts}.
+    """
     g = Guardian(DivineBus())
     observer = g.bus.subscribe("observer", types=[MODULE_RELOAD_ACK])
     started = time.time()
-    g._write_reload_status(
-        swap_id="abc-999",
+    g._emit_reload_ack(
+        swap_id="abc-123",
         module_name="m",
         status="spawning",
         reason=None,
         started_ts=started,
     )
-
-    reader = ReloadStatusReader(titan_id=resolve_titan_id())
-    entry = reader.read_swap("m", "abc-999")
-    reader.close()
-    assert entry is not None
-    assert entry.swap_id == "abc-999"
-    assert entry.module_name == "m"
-    assert entry.status == "spawning"
-    assert entry.reason is None
-    assert isinstance(entry.total_elapsed_ms, int)
-    assert entry.total_elapsed_ms >= 0
-    assert not entry.is_terminal  # spawning is intermediate, not terminal
-
-    # The deleted dst="all" bus broadcast must NOT fire.
+    # Allow the bus to deliver
     msgs = []
-    for _ in range(3):
-        msgs.extend(g.bus.drain(observer, max_msgs=10))
+    for _ in range(5):
+        msgs = g.bus.drain(observer, max_msgs=10)
+        if msgs:
+            break
         time.sleep(0.02)
-    assert not any(m.get("type") == MODULE_RELOAD_ACK for m in msgs), (
-        "MODULE_RELOAD_ACK must NOT be published — reload status is SHM-only"
-    )
+    ack_msgs = [m for m in msgs if m.get("type") == MODULE_RELOAD_ACK]
+    assert len(ack_msgs) == 1
+    payload = ack_msgs[0]["payload"]
+    assert set(payload.keys()) == {
+        "swap_id", "module_name", "status", "reason",
+        "total_elapsed_ms", "ts",
+    }
+    assert payload["swap_id"] == "abc-123"
+    assert payload["module_name"] == "m"
+    assert payload["status"] == "spawning"
+    assert payload["reason"] is None
+    assert isinstance(payload["total_elapsed_ms"], int)
+    assert payload["total_elapsed_ms"] >= 0
+    assert payload["ts"] >= started
     g.stop_all()
 
 
@@ -539,66 +538,3 @@ def test_dual_pid_name_aliased_subscription_only_target_receives_shutdown():
     assert new_types == [], (
         "NEW pid client must DROP the MODULE_SHUTDOWN intended for OLD "
         "(D-SPEC-93 — prevents the dual-pid fanout crash-loop)")
-
-
-# ── Phase B (RFP_shm_native_hot_reload) — pid-validated SHM readiness ──────
-
-
-def test_wait_for_reload_running_requires_matching_pid():
-    """Phase B: `_wait_for_reload_running` gates on `state=="running" AND
-    pid==new_pid`. OLD's lingering SIGKILLed last-write (state="running",
-    pid=old_pid) in the shared name-keyed slot must NOT satisfy it (the
-    pid-blind bug the handoff flagged); only NEW's own running transition does.
-    Replaces the retired bus ADOPTION handshake for reload (INV-5).
-    """
-    from titan_hcl.guardian_hcl import Guardian
-    from titan_hcl.core.module_state import BootPriority, ModuleStateEntry
-
-    g = Guardian(DivineBus())
-    OLD_PID, NEW_PID = 111111, 222222
-
-    class _FakeBank:
-        entry = None
-
-        def read(self, _name):
-            return self.entry
-
-    bank = _FakeBank()
-    # Bypass _ensure_module_state_reader_bank (it returns this cached attr).
-    g._module_state_reader_bank = bank
-
-    def _entry(state, pid):
-        return ModuleStateEntry(
-            name="m", layer="L2", boot_priority=BootPriority.MANDATORY,
-            state=state, pid=pid)
-
-    # OLD's lingering "running" (old pid) must NOT pass → bounded wait → False.
-    bank.entry = _entry("running", OLD_PID)
-    assert g._wait_for_reload_running("m", NEW_PID, timeout_s=0.4) is False, (
-        "OLD's stale running (pid mismatch) must not satisfy reload readiness")
-
-    # NEW "running" with the matching pid → True.
-    bank.entry = _entry("running", NEW_PID)
-    assert g._wait_for_reload_running("m", NEW_PID, timeout_s=1.0) is True
-
-    # NEW present but only "booted" (not yet running) → bounded wait → False.
-    bank.entry = _entry("booted", NEW_PID)
-    assert g._wait_for_reload_running("m", NEW_PID, timeout_s=0.4) is False
-
-    g.stop_all()
-
-
-def test_reload_module_sync_has_no_adoption_handshake():
-    """Phase B: the reload 7-step no longer drains rs.adoption_q nor emits a
-    BUS_WORKER_ADOPT_ACK (the §10.C handshake is retired for reload — it
-    mis-routed in the peer-spawn split). The §10.C primitives stay live for
-    B.2.1 kernel-swap (asserted by test_guardian_adopt_worker / b2_1 e2e)."""
-    from titan_hcl.guardian_hcl import Guardian
-    import inspect
-    src = inspect.getsource(Guardian._reload_module_sync)
-    assert "adoption_q.get(" not in src, (
-        "reload 7-step must NOT drain rs.adoption_q (adoption retired for reload)")
-    assert "BUS_WORKER_ADOPT_ACK" not in src, (
-        "reload 7-step must NOT emit BUS_WORKER_ADOPT_ACK (adoption retired)")
-    assert "_wait_for_reload_running" in src, (
-        "reload 7-step must use the pid-validated _wait_for_reload_running")
