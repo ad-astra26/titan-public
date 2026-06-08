@@ -1003,15 +1003,23 @@ pub fn project_inner_spirit_45d(
     spirit[16] = safe_clamp(combined_coh) as f32;
     // [17] discernment_quality RE-GROUNDED (rFP_trinity_dim_resonance, greenlit
     //   2026-05-20): the Titan's judgment apparatus — output_verifier
-    //   verified/rejected volume + sovereignty score — plus the original
-    //   action_chains as the meta-reasoning chains crystallize. Replaces the
-    //   bare `min(1, action_chains/20)` that sat at 0.5 fleet-wide because
+    //   verified/rejected volume + sovereignty — plus the original action_chains
+    //   as the meta-reasoning chains crystallize. Replaces the bare
+    //   `min(1, action_chains/20)` that sat at 0.5 fleet-wide because
     //   action_chains=0 (the known meta-reasoning crystallization gap).
+    //   RFP_synthesis_decision_authority P3/P5 (INV-SDA-3): the sovereignty term
+    //   is the ONE synthesis metric S = 0.7·E + 0.3·V, replacing the retired
+    //   output_verifier sovereignty_score (P3 removed it → it published 0.0,
+    //   silently zeroing this term until now). The sidecar passes the rolling S
+    //   (TTL-cached read of the synthesis metrics snapshot) as `sovereignty.s`;
+    //   absent until the first scored reply → neutral 0.5 default so the dim
+    //   never collapses at boot (preserves the prior default semantics).
     {
         let ov = lookup_map(map, "output_verifier_stats");
         let verified = field_or_default(ov.as_ref(), "verified_count", 0.0);
         let rejected = field_or_default(ov.as_ref(), "rejected_count", 0.0);
-        let sovereignty = field_or_default(ov.as_ref(), "sovereignty_score", 0.5);
+        let sov_map = lookup_map(map, "sovereignty");
+        let sovereignty = field_or_default(sov_map.as_ref(), "s", 0.5);
         let action_chains = field_or_default(memory_stats.as_ref(), "action_chains", 0.0);
         let judgment_volume = ((verified + rejected) / 50.0).min(1.0);
         spirit[17] = safe_clamp(
@@ -1570,6 +1578,36 @@ mod tests {
     }
 
     #[test]
+    fn project_inner_spirit_45d_discernment_uses_synthesis_sovereignty() {
+        // CHIT[17] discernment_quality (RFP_synthesis_decision_authority P3/P5,
+        // INV-SDA-3): the sovereignty term reads the ONE synthesis metric S from
+        // the `sovereignty.s` source-dict sub-map, NOT the retired
+        // output_verifier.sovereignty_score. verified=10,rejected=0 →
+        // judgment_volume=0.2; S=0.9; action_chains=20 → chains term=1.0:
+        //   0.4·0.2 + 0.3·0.9 + 0.3·1.0 = 0.08 + 0.27 + 0.30 = 0.65.
+        // The retired ov.sovereignty_score=0.0 is present and MUST be ignored
+        // (if it were still read, out[17] would be 0.38, not 0.65).
+        let ov = rmpv::Value::Map(vec![
+            f_pair("verified_count", 10.0),
+            f_pair("rejected_count", 0.0),
+            f_pair("sovereignty_score", 0.0),
+        ]);
+        let mem = rmpv::Value::Map(vec![f_pair("action_chains", 20.0)]);
+        let sov = rmpv::Value::Map(vec![f_pair("s", 0.9)]);
+        let payload = encode_msgpack_map(vec![
+            ("output_verifier_stats", ov),
+            ("memory_stats", mem),
+            ("sovereignty", sov),
+        ]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        assert!(
+            (out[17] - 0.65).abs() < 1e-4,
+            "discernment with synthesis S=0.9 should be 0.65, got {}",
+            out[17]
+        );
+    }
+
+    #[test]
     fn project_inner_spirit_45d_hormone_fires_no_longer_consumed() {
         // D-SPEC-101 Phase-1 completion: hormone_fires cumulative counts are
         // NO LONGER read — all fire dims read the windowed fire-RATES from the
@@ -1847,14 +1885,17 @@ mod tests {
             out[17]
         );
 
-        // OV active: verified=30, rejected=20 → vol=min(1,50/50)=1.0; sovereignty=0.8;
-        //   action_chains=0 → 0.4·1 + 0.3·0.8 + 0.3·0 = 0.64.
+        // OV verified=30,rejected=20 → vol=min(1,50/50)=1.0; the sovereignty term
+        //   now reads the synthesis S from `sovereignty.s` (P3/P5, INV-SDA-3),
+        //   NOT the retired ov.sovereignty_score; S=0.8; action_chains=0 →
+        //   0.4·1 + 0.3·0.8 + 0.3·0 = 0.64.
         let ov = rmpv::Value::Map(vec![
             f_pair("verified_count", 30.0),
             f_pair("rejected_count", 20.0),
-            f_pair("sovereignty_score", 0.8),
         ]);
-        let payload2 = encode_msgpack_map(vec![("output_verifier_stats", ov)]);
+        let sov = rmpv::Value::Map(vec![f_pair("s", 0.8)]);
+        let payload2 =
+            encode_msgpack_map(vec![("output_verifier_stats", ov), ("sovereignty", sov)]);
         let out2 = project_inner_spirit_45d(&payload2, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
         assert!(
             (out2[17] - 0.64).abs() < 1e-4,
