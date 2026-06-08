@@ -1666,6 +1666,49 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             time.sleep(0.1)
         return False
 
+    def _wait_for_reload_running(
+        self,
+        name: str,
+        new_pid: int,
+        timeout_s: float,
+    ) -> bool:
+        """Phase B (`RFP_shm_native_hot_reload`) — block until the NEW reload
+        worker (identified by `new_pid`) reaches `state=running` in its
+        `module_<name>_state.bin` SHM slot.
+
+        PID-VALIDATED, unlike `_wait_for_module_running`: the name-keyed slot is
+        shared by OLD's lingering last-write and NEW during the swap, so
+        `state=="running"` alone can read OLD's stale value (the pid-blind bug
+        the handoff flagged). We require `entry.pid == new_pid`.
+
+        This REPLACES the §10.C bus ADOPTION handshake for reload — THIS
+        orchestrator spawned NEW and already knows `new_pid`, so readiness is a
+        direct SHM read with no `ADOPTION_REQUEST/ACK` round-trip (which also
+        mis-routed in the peer-spawn split: NEW's `dst="guardian"` adopt request
+        reaches the guardian_hcl Supervisor, not this Orchestrator). Drives the
+        same booted→running probe contract as `_wait_for_module_running` (shared
+        throttle). Does NOT mutate `info` — the caller's atomic swap owns it.
+        Returns True iff NEW reached running within the timeout.
+        """
+        deadline = time.time() + timeout_s
+        reader_bank = self._ensure_module_state_reader_bank()
+        if reader_bank is None:
+            # No SHM (test fixtures without /dev/shm) — cannot pid-validate;
+            # treat as ready so the swap proceeds (real fleets always have SHM).
+            return True
+        while time.time() < deadline:
+            try:
+                entry = reader_bank.read(name)
+            except Exception:  # noqa: BLE001
+                entry = None
+            if (entry is not None and entry.state == "running"
+                    and entry.pid == new_pid):
+                return True
+            self._maybe_dispatch_probe(
+                name, entry.state if entry is not None else "", time.time())
+            time.sleep(0.1)
+        return False
+
     def _ensure_module_state_reader_bank(self):
         """Lazy-construct the per-Titan ModuleStateReaderBank.
 
@@ -1734,6 +1777,33 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             self._titan_hcl_state_writer = None
             return None
         self._titan_hcl_state_writer = writer
+        return writer
+
+    def _ensure_reload_status_writer(self):
+        """Lazy-construct the orchestrator's reload-status SHM writer.
+
+        Per `RFP_shm_native_hot_reload.md` Phase A — the canonical orchestrator
+        (the only process that runs `_reload_module_sync` / dispatches a
+        MODULE_RELOAD_REQUEST) is the G21 single-writer of `reload_status.bin`,
+        the SHM slot that REPLACES the deleted `dst="all"` MODULE_RELOAD_ACK
+        broadcast (SPEC §8.2 / G18). Returns None if SHM cannot be resolved
+        (test fixtures without /dev/shm) so reload still completes — the result
+        dict is still returned in-process; only the SHM mirror is skipped.
+        """
+        existing = getattr(self, "_reload_status_writer", None)
+        if existing is not None:
+            return existing
+        try:
+            from titan_hcl.core.reload_status import ReloadStatusWriter
+            from titan_hcl.core.state_registry import resolve_titan_id
+            writer = ReloadStatusWriter(titan_id=resolve_titan_id())
+        except Exception as e:  # noqa: BLE001
+            logger.info(
+                "[Orchestrator] reload_status.bin writer unavailable (%s) — "
+                "reload status SHM mirror disabled (reload still completes)", e)
+            self._reload_status_writer = None
+            return None
+        self._reload_status_writer = writer
         return writer
 
     def start_all(self) -> None:

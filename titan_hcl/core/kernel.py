@@ -84,19 +84,20 @@ logger = logging.getLogger(__name__)
 # publisher attached to bus.publish() routing).
 IN_PROCESS_SUBSCRIBER_NAMES: tuple[str, ...] = (
     "titan_HCL",     # canonical plugin identity + outbound publisher
-    # "guardian" RETIRED v1.85.0 §9.B D-SPEC-151 (2026-06-08) — SAME stale-alias
-    # bug class as meditation/sovereignty below. Post the 2026-05-28 peer-spawn
-    # split (cf3dc86e3, D-SPEC-135/146) guardian_hcl became a SEPARATE process
-    # with its OWN "guardian" BusSocketClient (the liveness consumer). Keeping
-    # "guardian" here made the Rust broker ALSO fan every dst=guardian frame to
-    # titan_hcl's connection → re-injected into the Orchestrator's in-process
-    # "guardian" queue, which NOTHING in titan_hcl drains (the Supervisor's
-    # monitor_tick drain runs in guardian_hcl) → the 1000-slot queue fills in
-    # ~4 min and drops every subsequent MODULE_HEARTBEAT forever (fleet-wide
-    # flood: T1 15.7k / T2 15.5k / T3 43.5k drops/hr; it false-shm_pid_dead-
-    # killed T1's agno_worker). titan_hcl's spawn-side admin (reload/adopt/
-    # restart/QUERY) now arrives on "guardian_hcl_lifecycle" (its own alias),
-    # so this retirement loses titan_hcl NOTHING. Liveness stays guardian_hcl's.
+    # "guardian" KEPT (D-SPEC-151, 2026-06-08) — the plugin's `_guardian_handler_loop`
+    # (titan_hcl/core/plugin.py) consumes the ADMIN QUERY (restart/start/stop/
+    # reload_module) on dst="guardian" via this alias; that is titan_hcl's job
+    # (it owns spawn+restart per D-SPEC-146) and is the ORIGINAL hot-reload /
+    # restart-module design. The fleet-wide MODULE_HEARTBEAT flood was NOT this
+    # alias — it was the Orchestrator separately subscribing "guardian" and never
+    # draining (its monitor_tick drain moved to guardian_hcl at the 2026-05-28
+    # peer-spawn split). Fix = Orchestrator(subscribe_guardian=False) in
+    # scripts/titan_hcl.py (the undrained queue is gone); _guardian_handler_loop
+    # keeps draining its own "guardian" queue at 10 Hz (QUERY handled, heartbeats
+    # discarded — original behavior, no accumulation). Liveness (heartbeat→restart
+    # decisions) is guardian_hcl's OWN client; spawn-side EXECUTION (MODULE_*_REQUEST
+    # incl. reload/adopt) routes to "guardian_hcl_lifecycle" (the Orchestrator alias).
+    "guardian",      # ADMIN QUERY (restart/start/stop/reload_module) → _guardian_handler_loop
     "core",          # core-loop messages
     # "meditation" RETIRED v1.9.5 §X1 D-SPEC-64 (2026-05-16) — pre-§4.D this
     # alias on titan_HCL's connection routed dst="meditation" to the

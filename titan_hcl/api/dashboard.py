@@ -4789,7 +4789,7 @@ async def post_v4_restart_module(name: str, request: Request,
             return _error("chat_bridge_bus not bound (api_subprocess required)")
         try:
             reply = await chat_bridge_bus.request_async(
-                "api", "guardian_hcl_lifecycle",
+                "api", "guardian",
                 {"action": "restart_module", "payload": {
                     "name": name, "reason": reason,
                     "start_method": ("spawn" if spawn else None),
@@ -4924,7 +4924,7 @@ async def post_v4_reload_module(name: str, request: Request):
             return _error("chat_bridge_bus not bound (api_subprocess required)")
         try:
             reply = await chat_bridge_bus.request_async(
-                "api", "guardian_hcl_lifecycle",
+                "api", "guardian",
                 {"action": "reload_module", "payload": {
                     "name": name,
                     "new_module_path": new_module_path,

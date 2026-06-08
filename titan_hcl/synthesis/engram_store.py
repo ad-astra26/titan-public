@@ -35,13 +35,20 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Protocol
 
 from titan_hcl.synthesis.writer import on_writer, resolve_writer
+from titan_hcl.synthesis.grounding_combiner import GroundingCombiner
 
 logger = logging.getLogger(__name__)
+
+# §7.E — default persisted location of the learned grounding combiner. CWD-
+# relative `data/`, matching synthesis.duckdb's default (synthesis_worker runs
+# with CWD=repo root); overridable via EngramStore(combiner_path=…) for tests.
+_DEFAULT_COMBINER_PATH = os.path.join("data", "grounding_combiner.json")
 
 
 # ── Exceptions ──────────────────────────────────────────────────────
@@ -204,7 +211,7 @@ class _BlendParams:
     always driven by whatever actually varies."""
 
     w_used: float = 0.40
-    w_verified: float = 0.25
+    w_verified: float = 0.0   # procedural-only; N/A on thought-Engrams (§6.2.3 spine-partition / BUG-ENGRAM-AXIS-VERIFIED) — structurally 0, excluded from the thought-Engram blend
     w_felt: float = 0.20
     w_fluent: float = 0.15
     nars_k: float = 1.0
@@ -224,7 +231,7 @@ def _load_blend_params_from_toml() -> _BlendParams:
         sub = data.get("synthesis", {}).get("engram", {}).get("grounding", {})
         return _BlendParams(
             w_used=float(sub.get("w_used", 0.40)),
-            w_verified=float(sub.get("w_verified", 0.25)),
+            w_verified=float(sub.get("w_verified", 0.0)),
             w_felt=float(sub.get("w_felt", 0.20)),
             w_fluent=float(sub.get("w_fluent", 0.15)),
             nars_k=float(sub.get("nars_k", 1.0)),
@@ -247,7 +254,11 @@ def compute_axes(
                  Engrams are backfilled from their stored `groundedness`, same
                  scale, no magic constant). The pure log1p-B_i decomposition
                  graduates with the §7.E learned reduction.
-      verified = NARS c = n/(n+k), n = oracle scored_by evidence count
+      verified = NARS c = n/(n+k), n = oracle scored_by evidence count.
+                 PROCEDURAL-SPINE ONLY (§6.2.3 spine-partition): thought-Engram
+                 consolidation passes no oracle_evidence (members are thoughts →
+                 no scored_by) → 0; w_verified=0 in the blend. Column kept for
+                 BRAIN-compat (BRAIN derives c from procedural TXs at ingest).
       felt     = felt_coverage (§7.C; [0,1])
       fluent   = recall-citation rate ([0,1]; 0 at launch — attribution deferred)
     The recall scalar is the population percentile-blend of these (reduce step)."""
@@ -290,7 +301,12 @@ def reduce_population_to_scalars(
     for ax in _AXIS_NAMES:
         vals = [float(r.get(ax, 0.0) or 0.0) for r in axes_rows]
         pct[ax] = _percentile_ranks(vals)
-        if (max(vals) - min(vals)) > 1e-9:
+        # An axis joins the blend only if it BOTH varies AND carries positive
+        # weight. The weight>0 guard makes a zero-weight axis (today: `verified`,
+        # procedural-only per §6.2.3 spine-partition) a true exclusion — even if a
+        # stray value ever makes it vary, it cannot drive the scalar (which would
+        # otherwise collapse all scalars to 0 when it is the sole varying axis).
+        if (max(vals) - min(vals)) > 1e-9 and weights[ax] > 1e-12:
             active.append(ax)
     if not active:
         # No axis varies (single Engram, or a population not yet carrying axis
@@ -320,6 +336,7 @@ class EngramStore:
         groundedness_params: _GroundednessParams | None = None,
         clock: Any = time.time,                  # injectable for deterministic tests
         db_writer: Any = None,
+        combiner_path: str | None = None,
     ):
         self._graph = graph
         self._writer = outer_memory_writer
@@ -333,6 +350,10 @@ class EngramStore:
         self._params = groundedness_params or _GroundednessParams()
         self._blend = _load_blend_params_from_toml()  # §7.D percentile-blend params
         self._clock = clock
+        # §7.E — the learned grounding combiner. Loaded once; inactive (→ §7.D
+        # blend) until a train-step beats the blend on held-out citation AUC.
+        self._combiner_path = combiner_path or _DEFAULT_COMBINER_PATH
+        self._combiner = GroundingCombiner.load(self._combiner_path)
 
     # ── Public surface ────────────────────────────────────────
 
@@ -659,7 +680,14 @@ class EngramStore:
             if (r.get("used") or 0.0) <= 0.0 and (r.get("groundedness") or 0.0) > 0.0:
                 r["used"] = float(r["groundedness"])
                 r["_backfill_used"] = True
-        scalars = reduce_population_to_scalars(rows, self._blend)
+        # §7.E — reduce to the recall scalar via the LEARNED combiner when it is
+        # active (O(1) per-Engram dot-product over the raw axes), else the §7.D
+        # population percentile-blend. The combiner only activates after beating
+        # the blend on held-out citation AUC, so this is a safe, self-gated swap.
+        if self._combiner.is_active():
+            scalars = {r["key"]: self._combiner.score(r) for r in rows}
+        else:
+            scalars = reduce_population_to_scalars(rows, self._blend)
         n = 0
         for r in rows:
             sc = scalars.get(r["key"])
@@ -697,6 +725,80 @@ class EngramStore:
             "[EngramStore] population groundedness recomputed: %d/%d Engrams "
             "(percentile-blend, §7.D%s)", n, len(rows),
             "; fluent live" if fluent_lookup is not None else "")
+        return n
+
+    def train_grounding_combiner(self, events: Iterable[tuple]) -> dict:
+        """§7.E — offline train-step (dream boundary / boot; idle-gated by the
+        caller). Retrain the learned combiner on the recall-citation `events`
+        ([(axes-record, cited-bool)]); it SELF-GATES (activates only if it beats
+        the §7.D percentile-blend on held-out citation AUC) and is hot-swapped +
+        persisted in place. The blend baseline is the very reduction it would
+        replace, computed via `reduce_population_to_scalars` on the holdout (the
+        callable is injected to avoid a grounding_combiner→engram_store circular
+        import). Soft-fail → keep prior state. Returns the metrics dict."""
+        try:
+            def _blend_scorer(axes_list: list[list[float]]) -> list[float]:
+                rows = [{"key": i, "used": a[0], "verified": a[1],
+                         "felt": a[2], "fluent": a[3]}
+                        for i, a in enumerate(axes_list)]
+                sc = reduce_population_to_scalars(rows, self._blend)
+                # {} (no axis varies) → neutral 0.5 baseline (chance).
+                return [sc.get(i, 0.5) for i in range(len(axes_list))]
+            metrics = self._combiner.train(
+                events, blend_scorer=_blend_scorer, clock=self._clock)
+            self._combiner.save(self._combiner_path)
+            return metrics
+        except Exception as e:
+            logger.warning("[EngramStore] train_grounding_combiner failed: %s", e)
+            return {"error": str(e), "activated": False}
+
+    def backfill_domain_hints(self, derive_fn: Callable[..., str]) -> int:
+        """One-time content backfill of the advisory §7.F `domain_hint` for pre-
+        Phase-F Engrams (BUG-ENGRAM-DOMAIN-HINT-NOT-BACKFILLED). Phase F set
+        `domain_hint` only at consolidation time (the LLM `DOMAIN:` line);
+        Engrams that predate it carry "". This pass reads every Engram and, for
+        each whose `domain_hint` is blank, derives a coarse advisory hint from
+        its NAME via `derive_fn(name, memory_type) -> str` (the cheap classifier
+        sanctioned by the §7.F fix-plan as the alternative to re-running the
+        LLM) and SETs it. Engrams that already carry a hint are NEVER touched; a
+        derive of "" leaves the row blank (test artifacts / low-confidence).
+
+        IDEMPOTENT + cheap (bounded Engram count) — safe to run every boot,
+        mirroring the §7.D population-recompute precedent. Runs INSIDE
+        synthesis_worker (the sole SynthesisWriter, G21) so it owns the Kuzu RW
+        handle — no external-process lock conflict. Returns rows updated."""
+        try:
+            rows = self._graph.spine_read_engram_domain_rows()
+        except Exception as e:
+            logger.warning("[EngramStore] backfill_domain_hints: read failed: %s", e)
+            return 0
+        if not rows:
+            return 0
+        n = 0
+        for r in rows:
+            if (r.get("domain_hint") or "").strip():
+                continue  # already labeled — never overwrite (mutable, advisory)
+            try:
+                dh = derive_fn(r.get("name") or "", r.get("memory_type") or "")
+            except Exception as e:
+                logger.debug(
+                    "[EngramStore] backfill_domain_hints: derive %s failed: %s",
+                    r.get("concept_id"), e)
+                continue
+            if not dh:
+                continue  # leave blank (test artifact / low-confidence)
+            try:
+                if self._graph.spine_set_domain_hint(
+                        r["concept_id"], int(r["version"]), dh):
+                    n += 1
+            except Exception as e:
+                logger.warning(
+                    "[EngramStore] backfill_domain_hints: set %s v%s failed: %s",
+                    r["concept_id"], r["version"], e)
+        if n:
+            logger.info(
+                "[EngramStore] domain_hint backfill: %d/%d Engrams labeled "
+                "(§7.F)", n, len(rows))
         return n
 
     @on_writer
