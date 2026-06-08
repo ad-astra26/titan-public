@@ -562,6 +562,15 @@ def start_inner_spirit_sensor_refresh(
         _window_tracker = InnerSpiritWindowTracker()
         # D-SPEC-101 Phase-1 completion: rich expression rolling-window breath.
         _expr_window_tracker = ExpressionWindowTracker()
+        # RFP_synthesis_decision_authority P3/P5 (INV-SDA-3): the ONE sovereignty
+        # metric S = 0.7·E + 0.3·V feeds the live Rust CHIT[17] discernment_quality
+        # dim (replacing the retired output_verifier sovereignty_score). The rolling
+        # S lives in the synthesis metrics snapshot (a cross-process FILE) — too
+        # expensive to read on this 70 Hz path, so TTL-cache it and pass it into the
+        # source dict as `sovereignty.s`. `replies==0` (no scored reply yet) → the
+        # key is omitted → Rust uses its neutral 0.5 default (dim never collapses).
+        _sov_cache = {"s": 0.0, "replies": 0, "ts": 0.0}
+        _SOV_TTL_S = 30.0
 
         def _provide_spirit_45d():
             """tensor_provider for InnerSpiritSensorRefresh — Sprint 7
@@ -587,6 +596,19 @@ def start_inner_spirit_sensor_refresh(
                 # the re-grounded inner_spirit dims (replaces saturating
                 # cumulative-count / pinned-epoch formulas).
                 _now = time.time()
+                # P3/P5 (INV-SDA-3): refresh the rolling-sovereignty cache at
+                # most every _SOV_TTL_S — the synthesis metrics snapshot is a
+                # cross-process file; never read it per-tick on this 70 Hz path.
+                if _now - _sov_cache["ts"] > _SOV_TTL_S:
+                    try:
+                        from titan_hcl.synthesis.sovereignty_readout import (
+                            read_rolling_sovereignty)
+                        _sov = read_rolling_sovereignty()
+                        _sov_cache["s"] = float(_sov.get("s", 0.0) or 0.0)
+                        _sov_cache["replies"] = int(_sov.get("replies", 0) or 0)
+                    except Exception:
+                        pass  # keep last-known; never break the 45D provider
+                    _sov_cache["ts"] = _now
                 _clocks = _read_sphere_clocks()
                 _window = _window_tracker.update(
                     now=_now,
@@ -627,6 +649,10 @@ def start_inner_spirit_sensor_refresh(
                     "history": _build_expression_history(
                         _read_msgpack_slot(_expression_state_reader)),
                 }
+                # INV-SDA-3: feed the ONE synthesis sovereignty S → Rust CHIT[17].
+                # Omit until the first scored reply so Rust keeps its neutral 0.5.
+                if _sov_cache["replies"] > 0:
+                    payload["sovereignty"] = {"s": _sov_cache["s"]}
                 payload = {k: v for k, v in payload.items() if v is not None}
                 return _msgpack.packb(payload, use_bin_type=True)
             except Exception as _e:

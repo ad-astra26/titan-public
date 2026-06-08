@@ -1430,8 +1430,10 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     # retrieval fires. Phase E (0.24.1 / RFP §7.E): PROMOTED from flag-gated
     # augment to canonical — wired unconditionally; the PreHook runs it whenever
     # engine_recall is not None (soft-fail / block simply absent on a box without
-    # the spine infra). VCB enriches the context; memory.query() is the
-    # fallback/reflex path. (No `synthesis_recall_augment` flag — de-flagged.)
+    # the spine infra). P4 (RFP_synthesis_decision_authority): VCB and
+    # memory.query BOTH enrich (disjoint by DB per §5.1); the context_assembler
+    # dedups (recall-wins) + renders the one grounded block. (No
+    # `synthesis_recall_augment` flag — de-flagged.)
     worker_plugin.engine_recall = None
     worker_plugin.synthesis_tx_deref = None
     try:
@@ -1532,6 +1534,53 @@ def agno_worker_main(recv_queue, send_queue, name: str,
         "[AgnoWorker] Ready in %.0fms — awaiting CHAT_REQUEST",
         (time.time() - boot_start) * 1000,
     )
+
+    # ── Warm-infra (G20 / RFP_synthesis_decision_authority P4) ──
+    # Front-load the cold-start cost of the chat hot path so the FIRST real
+    # turn doesn't pay the ~712 ms cold first-query (embedder model load +
+    # tx-hash-spine FAISS mmap + VCB sqlite conn-pool open). Runs in a DAEMON
+    # thread kicked off AFTER the AGNO_WORKER_READY broadcast above, so it never
+    # delays readiness / the boot-grace window, and it adds NO steady-state RSS
+    # — it only loads, at boot, exactly what the first chat would load lazily.
+    # A modest startup delay lets the co-boot burst pass first (this is a
+    # daemon side-thread, never the worker/heartbeat thread). Single pass,
+    # fully guarded: a warm-up failure must never affect the worker.
+    def _warm_infra():
+        try:
+            time.sleep(3.0)   # let the co-boot CPU/IO burst subside (daemon thread)
+        except Exception:
+            pass
+        _t0 = time.time()
+        _warmed = []
+        try:
+            from titan_hcl.utils.text_embedder import get_text_embedder
+            get_text_embedder().encode("warmup")
+            _warmed.append("embedder")
+        except Exception as _we:
+            logger.debug("[AgnoWorker] warm embedder: %s", _we)
+        try:
+            _er = getattr(worker_plugin, "engine_recall", None)
+            if _er is not None:
+                _er.recall("warmup", k=1)        # loads spine FAISS + contract
+                _warmed.append("engine_recall_faiss")
+        except Exception as _we:
+            logger.debug("[AgnoWorker] warm engine_recall: %s", _we)
+        try:
+            _vcb = getattr(worker_plugin, "_verified_context_builder", None)
+            if _vcb is not None:                 # opens the persistent sqlite conn-pool
+                _vcb.build(query="warmup", user_id="", max_tokens=64, max_records=1)
+                _warmed.append("vcb_conn_pool")
+        except Exception as _we:
+            logger.debug("[AgnoWorker] warm vcb: %s", _we)
+        logger.info("[AgnoWorker] warm-infra (G20) done in %.0fms: %s",
+                    (time.time() - _t0) * 1000.0, ",".join(_warmed) or "none")
+
+    try:
+        import threading as _warm_threading
+        _warm_threading.Thread(
+            target=_warm_infra, name="agno-warm-infra", daemon=True).start()
+    except Exception as _wte:
+        logger.debug("[AgnoWorker] warm-infra thread spawn failed: %s", _wte)
 
     # ── Main dispatch loop ──
     # D-SPEC-128 (BUG-AGNO-SILENT-HANG fix): read from the bus client's

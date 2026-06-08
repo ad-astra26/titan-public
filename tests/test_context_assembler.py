@@ -13,6 +13,7 @@ from titan_hcl.synthesis.context_assembler import (
     SOURCE_PRIORITY,
     assemble,
     content_hash,
+    render_grounded_block,
 )
 from titan_hcl.synthesis.cited_use import SurfacedItem, CitedUseDetector
 from titan_hcl.synthesis.sovereignty_score import compute_sovereignty_score, VCB_SOURCE
@@ -67,18 +68,32 @@ def test_same_content_deduped_across_partitions():
         recall=[{"content": "Go-Karts   at the BRNO circuit"}],  # same fact, diff format
     )
     assert len(out) == 1
-    # vcb has priority → the survivor is the wholesale-injected one (display==count)
-    assert out[0].source == "vcb"
+    # D2 (recall-wins): the synthesis-supplied recall item is authoritative —
+    # the enriching vcb duplicate is dropped (display==count, recall kept).
+    assert out[0].source == "recall"
 
 
 def test_dedup_priority_follows_source_priority():
-    assert SOURCE_PRIORITY[0] == "vcb"
+    # D2 / INV-SDA-5 — recall WINS a content collision.
+    assert SOURCE_PRIORITY[0] == "recall"
     out = assemble(
         memory=[{"content": "shared fact"}],
         recall=[{"content": "shared fact"}],
     )
     assert len(out) == 1
-    assert out[0].source == "memory"   # memory precedes recall in SOURCE_PRIORITY
+    assert out[0].source == "recall"   # recall is authoritative over enrichment
+
+
+def test_recall_wins_over_both_enrichers():
+    # The full collision: same fact surfaced by all three partitions → recall
+    # (synthesis-supplied) is the single survivor.
+    out = assemble(
+        vcb=[{"content": "the same fact"}],
+        memory=[{"content": "the SAME fact"}],
+        recall=[{"content": "The same   fact"}],
+    )
+    assert len(out) == 1
+    assert out[0].source == "recall"
 
 
 def test_distinct_content_all_kept():
@@ -169,3 +184,67 @@ def test_cited_use_detector_consumes_assembled_surfaced_items():
     )
     vcb_item = next(it for it in out if it.source == "vcb")
     assert vcb_item.item_id in cited
+
+
+# ── render_grounded_block: the assembler DRIVES the one grounded block (P4) ──
+
+def test_render_empty_items_is_empty_string():
+    assert render_grounded_block([]) == ""
+
+
+def test_render_groups_vcb_by_store_with_chain_stamps():
+    out = assemble(
+        vcb=[
+            {"content": "the word 'sovereign'", "title": "vocabulary:sovereign",
+             "meta": {"chain_status": "CHAINED", "block_height": 42,
+                      "timestamp": 0.0}},
+            {"content": "concept of metabolism", "title": "knowledge_concepts:metabolism",
+             "meta": {"chain_status": "WIRED"}},
+        ],
+    )
+    block = render_grounded_block(out)
+    assert "### Verified Memory Recall" in block
+    assert "**vocabulary:**" in block
+    assert "**knowledge_concepts:**" in block
+    assert "[CHAINED ✓]" in block      # chain stamp preserved
+    assert "Block #42" in block        # block height preserved
+    # anti-hallucination footer preserved
+    assert "verified against your TimeChain" in block
+
+
+def test_render_display_equals_count_recall_wins():
+    # A fact shared by vcb + recall → deduped to ONE recall item; the block
+    # the LLM sees contains it exactly once (display == count), under the
+    # recall sub-header (recall wins), NOT duplicated under a vcb store.
+    out = assemble(
+        vcb=[{"content": "shared verified fact", "title": "meta_wisdom:x",
+              "meta": {"chain_status": "WIRED"}}],
+        recall=[{"content": "shared verified fact", "weight": 0.9}],
+    )
+    assert len(out) == 1 and out[0].source == "recall"
+    block = render_grounded_block(out)
+    assert block.count("shared verified fact") == 1
+    assert "**Your own verified experience (tx_hash spine):**" in block
+
+
+def test_render_includes_all_three_sources():
+    out = assemble(
+        vcb=[{"content": "inner state fact", "title": "self_insights:a",
+              "meta": {"chain_status": "WIRED"}}],
+        memory=[{"content": "legacy graph recall fact"}],
+        recall=[{"content": "spine experience fact", "weight": 0.7}],
+    )
+    block = render_grounded_block(out)
+    assert "inner state fact" in block
+    assert "legacy graph recall fact" in block
+    assert "spine experience fact" in block
+    assert "**Recalled memory:**" in block
+
+
+def test_render_never_raises_on_bad_meta():
+    # meta with a non-numeric timestamp / missing keys must not blow up render.
+    out = assemble(vcb=[{"content": "x", "title": "vocabulary:y",
+                         "meta": {"chain_status": None, "timestamp": "not-a-ts",
+                                  "block_height": None}}])
+    block = render_grounded_block(out)
+    assert "x" in block
