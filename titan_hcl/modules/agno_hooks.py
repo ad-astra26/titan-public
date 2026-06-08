@@ -798,6 +798,10 @@ def create_pre_hook(plugin):
                 _emb_model = _get_emb()
                 _prompt_vec = await asyncio.to_thread(
                     lambda: [float(_x) for _x in _emb_model.encode(prompt_text)])
+                logger.info(
+                    "[PreHook] embed-once: 1 shared prompt vector (dim=%d) → "
+                    "memory.query + EngineRecall (G9)",
+                    len(_prompt_vec) if _prompt_vec else 0)
             except Exception as _emb_err:
                 logger.warning(
                     "[PreHook] embed-once failed (paths self-embed): %s", _emb_err)

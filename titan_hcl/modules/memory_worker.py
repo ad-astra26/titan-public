@@ -994,6 +994,11 @@ def _handle_query(msg: dict, ctx: WorkerContext) -> None:
             # G9). vec is a pure function of text, so the cache key stays (text,
             # top_k) and remains correct whether or not vec was supplied.
             vec = payload.get("vec")
+            if vec is not None:
+                logger.info(
+                    "[memory_worker] query: reusing precomputed embed-once vector "
+                    "(dim=%d) — skipping worker-side embed (G9)",
+                    len(vec) if hasattr(vec, "__len__") else -1)
             cache_key = (text, int(top_k))
             results = None
             if ctx.query_cache is not None:
