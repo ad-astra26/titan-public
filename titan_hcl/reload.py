@@ -198,12 +198,35 @@ class OrchestratorReloadMixin:
                     swap_id, module_name, "failed",
                     "reload_in_flight", started_ts)
             if info.state != ModuleState.RUNNING:
-                self._write_reload_status(
-                    swap_id, module_name, "failed",
-                    f"not_running:state={info.state.value}", started_ts)
-                return self._reload_result(
-                    swap_id, module_name, "failed",
-                    f"not_running:state={info.state.value}", started_ts)
+                # G18: info.state is an IN-PROCESS mirror that can LAG the
+                # canonical `module_<name>_state.bin` SHM slot. On a load-volatile
+                # box (T3 = 2 Titans / 4 cores), a boot OR prior-reload readiness
+                # wait can time out → info.state stuck STARTING while the worker's
+                # OWN slot already reached running. Trust the SHM slot (the
+                # canonical state per Preamble G18): if it shows running for the
+                # registered pid and that pid is alive, sync the stale mirror and
+                # proceed; else the module is genuinely not running.
+                _orig_state = info.state
+                synced = False
+                if info.pid is not None and self._pid_alive(info.pid):
+                    reader_bank = self._ensure_module_state_reader_bank()
+                    slot = reader_bank.read(module_name) if reader_bank else None
+                    if (slot is not None and slot.state == "running"
+                            and slot.pid == info.pid):
+                        info.state = ModuleState.RUNNING
+                        synced = True
+                        logger.info(
+                            "[Guardian] reload '%s': info.state was %s but its "
+                            "SHM slot shows running (pid=%s) — synced to RUNNING "
+                            "(G18) before reload",
+                            module_name, _orig_state.value, info.pid)
+                if not synced:
+                    self._write_reload_status(
+                        swap_id, module_name, "failed",
+                        f"not_running:state={_orig_state.value}", started_ts)
+                    return self._reload_result(
+                        swap_id, module_name, "failed",
+                        f"not_running:state={_orig_state.value}", started_ts)
             if info.process is None or info.pid is None:
                 self._write_reload_status(
                     swap_id, module_name, "failed",

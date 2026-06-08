@@ -602,3 +602,36 @@ def test_reload_module_sync_has_no_adoption_handshake():
         "reload 7-step must NOT emit BUS_WORKER_ADOPT_ACK (adoption retired)")
     assert "_wait_for_reload_running" in src, (
         "reload 7-step must use the pid-validated _wait_for_reload_running")
+
+
+def test_reload_validation_trusts_shm_slot_when_info_state_lags():
+    """G18: when the orchestrator's in-process info.state LAGS at STARTING (e.g.
+    boot/reload readiness timed out under load) but the worker's OWN SHM slot
+    shows running for the registered LIVE pid, step-1 validation syncs from the
+    slot and proceeds — instead of bailing not_running. Live-discovered on T3
+    (load-volatile 2-Titan box) 2026-06-08."""
+    import os
+    from titan_hcl.core.module_state import BootPriority, ModuleStateEntry
+
+    g = Guardian(DivineBus())
+    g.register(_spec("lagmod"))
+    info = g._modules["lagmod"]
+    info.state = ModuleState.STARTING       # stale in-process mirror
+    info.pid = os.getpid()                   # a genuinely-alive pid
+    info.process = MagicMock()
+
+    class _Bank:  # SHM slot (canonical G18 truth) shows running for that pid
+        def read(self, n):
+            return ModuleStateEntry(
+                name=n, layer="L3", boot_priority=BootPriority.MANDATORY,
+                state="running", pid=os.getpid())
+    g._module_state_reader_bank = _Bank()
+
+    # Stop before a real spawn — we only exercise step-1 validation here.
+    g._spawn_for_reload = MagicMock(return_value="test_blocked_after_validation")
+
+    res = asyncio.run(g.reload_module("lagmod", timeout_s=2.0))
+    assert "not_running" not in (res.get("reason") or ""), (
+        f"validation must trust the SHM slot when info.state lags: {res}")
+    assert info.state == ModuleState.RUNNING, "info.state must sync to RUNNING"
+    g.stop_all()
