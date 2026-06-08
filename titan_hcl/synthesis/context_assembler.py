@@ -21,27 +21,23 @@ consume), and de-duplicates by a normalised content hash so a fact surfaced by
 two paths is delivered **and** counted exactly once (gate G6 — no content
 twice).
 
-De-dup collisions are resolved by ``SOURCE_PRIORITY`` = **recall-wins** (D2 /
-INV-SDA-5): the synthesis-supplied ``recall`` partition (Titan's own
-timechain-anchored experience) is authoritative, so on a content collision the
-``recall`` item is kept and the enriching ``vcb`` / ``memory`` duplicate is
-dropped — from BOTH the surfaced-item set (what gets *counted*) and the rendered
-grounded block (what the LLM *sees*). Since P4 the assembler DRIVES the one
-grounded prompt: ``render_grounded_block(...)`` renders the deduped items into a
-single block, so display == count by construction (no separate wholesale-VCB +
-line-by-line-recall blocks that can fall out of sync).
+De-dup collisions are resolved by ``SOURCE_PRIORITY``: the partition that is
+injected into the prompt *wholesale* wins, so the surfaced-item set (what gets
+*counted*) matches what the LLM actually *sees*. In the live PreHook the VCB (or
+its memory fallback) block is injected as a whole formatted block, while the
+recall block is rendered line-by-line and so can be filtered — therefore
+``vcb``/``memory`` keep a colliding item and the redundant ``recall`` duplicate
+line is suppressed. Display == count.
 
 Pure + deterministic — no I/O, no LLM, never raises. The hot path imports
-``assemble(...)`` + ``render_grounded_block(...)``; persistence + scoring stay
-downstream (INV-SDA-11).
+``assemble(...)``; persistence + scoring stay downstream (INV-SDA-11).
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
 from titan_hcl.synthesis.cited_use import SurfacedItem
@@ -49,17 +45,14 @@ from titan_hcl.synthesis.cited_use import SurfacedItem
 __all__ = [
     "AssembledItem",
     "assemble",
-    "render_grounded_block",
     "SOURCE_PRIORITY",
     "content_hash",
 ]
 
-# De-dup keep-order (D2 / INV-SDA-5): RECALL WINS. The synthesis-supplied recall
-# partition is authoritative — on a content collision its item is kept and the
-# enriching vcb / memory duplicate is dropped. vcb precedes memory only as a
-# stable tiebreak between the two enrichers (they are disjoint by DB per §5.1,
-# so a vcb↔memory content collision is not expected by construction).
-SOURCE_PRIORITY = ("recall", "vcb", "memory")
+# De-dup keep-order: the partition injected into the prompt wholesale wins a
+# content collision (see module docstring). vcb / memory are mutually exclusive
+# in the live path, so their relative order is immaterial; both beat recall.
+SOURCE_PRIORITY = ("vcb", "memory", "recall")
 
 _WS_RE = re.compile(r"\s+")
 _HASH_ID_LEN = 16          # stable id suffix for partitions with no native id
@@ -81,11 +74,6 @@ class AssembledItem:
     title: str = ""
     weight: float = 0.0
     concept_ids: tuple[str, ...] = ()
-    # Source-specific render hints carried through verbatim (chain_status,
-    # block_height, timestamp for vcb; the assembler never interprets them —
-    # only ``render_grounded_block`` reads them). NOT projected to SurfacedItem
-    # (sovereignty counting is render-agnostic).
-    meta: Mapping[str, Any] = field(default_factory=dict)
 
     def to_surfaced(self) -> SurfacedItem:
         """Project to the ``SurfacedItem`` the cited-use / sovereignty path eats."""
@@ -168,7 +156,6 @@ def assemble(
             except (TypeError, ValueError):
                 weight = 0.0
             concept_ids = tuple(str(c) for c in (row.get("concept_ids") or ()) if c)
-            _meta = row.get("meta")
             item = AssembledItem(
                 item_id=item_id,
                 source=source,
@@ -177,123 +164,8 @@ def assemble(
                 title=str(row.get("title") or content[:120]),
                 weight=weight,
                 concept_ids=concept_ids,
-                meta=dict(_meta) if isinstance(_meta, Mapping) else {},
             )
             seen[h] = item
             order.append(h)
 
     return [seen[h] for h in order]
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Render — the assembler DRIVES the one grounded prompt (P4 / handoff §1.3).
-# ─────────────────────────────────────────────────────────────────────────
-
-_VCB_STATUS_TAG = {
-    "CHAINED": "[CHAINED ✓]",
-    "PARTIAL": "[PARTIAL]",
-    "WIRED": "[WIRED]",
-    "NOT_COVERED": "[unverified]",
-}
-
-
-def _vcb_store(item: "AssembledItem") -> str:
-    """The store key a vcb item came from (for source-grouped display). The
-    title carries VCB's ``db_ref`` (``"knowledge_concepts:solana"`` →
-    ``knowledge_concepts``)."""
-    ref = (item.title or "").strip()
-    if ":" in ref:
-        return ref.split(":", 1)[0]
-    return ref or "inner state"
-
-
-def render_grounded_block(
-    items: Sequence["AssembledItem"], *, max_tokens: int = 2000
-) -> str:
-    """Render the deduped, source-tagged ``AssembledItem``s into ONE grounded
-    markdown block for LLM injection.
-
-    Since P4 this REPLACES the separate ``memory_context`` (VCB wholesale text)
-    and ``synthesis_recall_context`` blocks: the LLM sees exactly the deduped
-    item set the ``CitedUseDetector`` counts (display == count, gate G6).
-
-    Sections, in display order:
-      • **vcb**    — inner-titan state, grouped by store, each line stamped with
-        its TimeChain ``chain_status`` (``[CHAINED ✓]`` …) + block height, the
-        way ``VerifiedContextBuilder._assemble_text`` rendered it before P4 (no
-        chat-quality regression).
-      • **recall** — Titan's own verified experience (tx_hash spine), scored.
-      • **memory** — consolidated legacy graph recall.
-
-    Closes with the anti-hallucination footer. Pure + deterministic; returns
-    ``""`` when there are no items (matches the pre-P4 "no block" behaviour —
-    the empty-VCB honesty notice was never injected on the live path).
-    """
-    if not items:
-        return ""
-
-    lines: list[str] = ["### Verified Memory Recall"]
-    token_est = 0.0
-    _truncated = False
-
-    def _emit(line: str) -> bool:
-        """Append a line under the rolling token budget. Returns False once the
-        budget is hit (caller stops)."""
-        nonlocal token_est, _truncated
-        token_est += len(line.split()) * 1.3
-        if token_est > max_tokens:
-            lines.append("- *(truncated — token budget reached)*")
-            _truncated = True
-            return False
-        lines.append(line)
-        return True
-
-    # ── vcb — grouped by store, chain-stamped ──────────────────────────────
-    vcb_items = [it for it in items if it.source == "vcb"]
-    by_store: dict[str, list["AssembledItem"]] = {}
-    for it in vcb_items:
-        by_store.setdefault(_vcb_store(it), []).append(it)
-    for store, recs in by_store.items():
-        if _truncated:
-            break
-        lines.append(f"**{store}:**")
-        for it in recs:
-            meta = it.meta or {}
-            status_tag = _VCB_STATUS_TAG.get(str(meta.get("chain_status") or ""), "")
-            ts_str = ""
-            _ts = meta.get("timestamp")
-            if _ts:
-                try:
-                    ts_str = datetime.fromtimestamp(
-                        float(_ts), tz=timezone.utc).strftime(" (%Y-%m-%d %H:%M)")
-                except (OSError, ValueError, TypeError):
-                    ts_str = ""
-            _bh = meta.get("block_height")
-            block_ref = f" Block #{_bh}" if _bh else ""
-            if not _emit(f"- {it.content}{ts_str} {status_tag}{block_ref}".rstrip()):
-                break
-        lines.append("")
-
-    # ── recall — Titan's own verified experience ───────────────────────────
-    recall_items = [it for it in items if it.source == "recall"]
-    if recall_items and not _truncated:
-        lines.append("**Your own verified experience (tx_hash spine):**")
-        for it in recall_items:
-            if not _emit(f"- [{it.weight:.2f}] {it.content[:300]}"):
-                break
-        lines.append("")
-
-    # ── memory — consolidated legacy recall ────────────────────────────────
-    memory_items = [it for it in items if it.source == "memory"]
-    if memory_items and not _truncated:
-        lines.append("**Recalled memory:**")
-        for it in memory_items:
-            if not _emit(f"- {it.content[:300]}"):
-                break
-        lines.append("")
-
-    lines.append("⚠ These memories are verified against your TimeChain.")
-    lines.append("Only reference what is provided here. If asked about "
-                 "something not in your memories, say honestly that you "
-                 "don't recall.")
-    return "\n".join(lines) + "\n\n"

@@ -272,17 +272,14 @@ class TieredMemoryGraph:
         """Remove a node's embedding from the index."""
         self._mempool_embeddings.pop(node_id, None)
 
-    def _mempool_semantic_search(self, prompt: str, top_k: int = 5, vec=None) -> List[Dict]:
+    def _mempool_semantic_search(self, prompt: str, top_k: int = 5) -> List[Dict]:
         """
         Semantic search over mempool embeddings using cosine similarity.
         Returns top-k matching mempool nodes sorted by similarity.
-
-        P4 embed-once: reuse the caller-supplied shared vector ``vec`` when
-        present; self-embed only as a fallback.
         """
         if not self._mempool_embeddings:
             return []
-        query_emb = vec if vec is not None else self._embed_text(prompt)
+        query_emb = self._embed_text(prompt)
         if query_emb is None:
             return []
 
@@ -410,37 +407,16 @@ class TieredMemoryGraph:
     # -------------------------------------------------------------------------
     # Query — Semantic search via Cognee + local mempool scan
     # -------------------------------------------------------------------------
-    async def query(self, prompt: str, top_k: int = 10, vec=None) -> List[Dict]:
+    async def query(self, prompt: str, top_k: int = 10) -> List[Dict]:
         """
         Fetch relevant memories for the pre-prompt.
         Three-layer search:
           1. Cognee semantic search (persistent memories)
           2. Mempool semantic search (lightweight embeddings, pre-meditation recall)
           3. Local keyword fallback (both tiers)
-
-        P4 (RFP_synthesis_decision_authority) embed-once: ``vec`` is an optional
-        precomputed prompt embedding — the shared ``get_text_embedder()`` vector
-        threaded cross-process from the agno PreHook. When provided it is reused
-        for BOTH the FAISS cosine and the mempool cosine (zero embeds in the
-        worker). When absent it is computed ONCE here and shared between the two
-        sub-searches (collapses the prior 2 internal embeds → 1). All paths bind
-        the same normalising singleton, so the vector is identical regardless of
-        origin → 1 embed/turn fleet-wide (gate G9).
         """
         results = []
         now = time.time()
-
-        # P4 embed-once: normalise to a float32 ndarray, computing it once here
-        # only when the caller did not supply the shared vector. None → the
-        # sub-searches self-embed (degraded embedder-unavailable path).
-        _qvec = None
-        if vec is not None:
-            try:
-                _qvec = np.asarray(vec, dtype=np.float32)
-            except Exception:
-                _qvec = None
-        if _qvec is None:
-            _qvec = self._embed_text(prompt)
 
         # 0. Global decay tick — apply forgetting curve to all persistent nodes
         for v in self._node_store.values():
@@ -448,7 +424,7 @@ class TieredMemoryGraph:
                 self._apply_decay(v)
 
         # 1. Semantic search via FAISS for persistent memories
-        faiss_results = await self._cognee_search(prompt, top_k=top_k, vec=_qvec)
+        faiss_results = await self._cognee_search(prompt, top_k=top_k)
         if faiss_results:
             for node in faiss_results:
                 self._apply_decay(node)
@@ -458,7 +434,7 @@ class TieredMemoryGraph:
                 results.append(node)
 
         # 2. Mempool semantic search (pre-meditation recall via fastembed)
-        mempool_hits = self._mempool_semantic_search(prompt, top_k=5, vec=_qvec)
+        mempool_hits = self._mempool_semantic_search(prompt, top_k=5)
         seen_ids = {r["id"] for r in results}
         for node in mempool_hits:
             if node["id"] not in seen_ids:
@@ -543,7 +519,7 @@ class TieredMemoryGraph:
         # honest signal for the per-item reinforcement + per-turn sovereignty.
         return results
 
-    async def _cognee_search(self, prompt: str, top_k: int = 10, vec=None) -> list:
+    async def _cognee_search(self, prompt: str, top_k: int = 10) -> list:
         """
         FAISS vector search for persistent memories (replaces Cognee search).
         Returns list of node dicts matching the query semantically.
@@ -562,9 +538,7 @@ class TieredMemoryGraph:
             return []
 
         try:
-            # P4 embed-once: reuse the shared vector when supplied (identical to
-            # self._vectors.embed — both are get_text_embedder().encode).
-            query_vec = vec if vec is not None else self._vectors.embed(prompt)
+            query_vec = self._vectors.embed(prompt)
             hits = self._vectors.search(query_vec, top_k=top_k)
         except Exception as e:
             logger.debug("[Memory] FAISS search failed: %s", e)
