@@ -776,7 +776,6 @@ def create_pre_hook(plugin):
         relevant_memories = []
         _vcb_context = None
         _vcb_skip_reason = None
-        _prompt_vec = None   # P4 embed-once: shared get_text_embedder() vector
         # ζ.1: gate VCB+memory.query on "topic_memory" feature. Greeting and
         # casual tiers skip the entire 14-store memory scan (saves ~100-400ms
         # on warm SQLite; saves 9s+ under WAL contention).
@@ -784,50 +783,16 @@ def create_pre_hook(plugin):
             _vcb_skip_reason = "tier_no_topic_memory"
         elif user_id.startswith("pitch-visitor-"):
             _vcb_skip_reason = "pitch_visitor_anonymous"
-        # RFP_synthesis_decision_authority P4 — EMBED-ONCE. Embed the prompt ONE
-        # time per routed turn (off the event loop) and reuse the vector for
-        # memory.query (cross-process, rides the bus payload) AND EngineRecall
-        # (the P2 routing pre-recall + the B3 recall, in-process). All three
-        # bind the SAME normalising get_text_embedder() singleton, so the shared
-        # vector is byte-identical to what each path would self-compute — this
-        # collapses ~3 redundant embeds/turn to 1 (gate G9). On any embed error
-        # _prompt_vec stays None and every path self-embeds (no behaviour change).
-        if _vcb_skip_reason is None and prompt_text:
-            try:
-                from titan_hcl.utils.text_embedder import get_text_embedder as _get_emb
-                _emb_model = _get_emb()
-                _prompt_vec = await asyncio.to_thread(
-                    lambda: [float(_x) for _x in _emb_model.encode(prompt_text)])
-                logger.info(
-                    "[PreHook] embed-once: 1 shared prompt vector (dim=%d) → "
-                    "memory.query + EngineRecall (G9)",
-                    len(_prompt_vec) if _prompt_vec else 0)
-            except Exception as _emb_err:
-                logger.warning(
-                    "[PreHook] embed-once failed (paths self-embed): %s", _emb_err)
-                _prompt_vec = None
-        # RFP_synthesis_decision_authority P4 — ENRICH (both, partitioned).
-        # VCB (inner-titan state across 6 SQLite stores) AND the consolidated
-        # legacy memory.query (titan_memory.duckdb) BOTH enrich every routed
-        # turn. They are DISJOINT by database (§5.1 partition audit), so both
-        # run with NO inter-dedup — the assembler's content-hash pass is the
-        # only safety net. The two legs run CONCURRENTLY (INV-SDA-11
-        # "(parallel) recall"), so the turn pays max(VCB, memory), not the sum.
-        # (Pre-P4 they were mutually exclusive — memory.query was a VCB-absent
-        # fallback — which pinned the sovereignty V-term: VCB citations were
-        # never registered as surfaced. See synthesis/context_assembler.)
-        if _vcb_skip_reason is None:
-            import asyncio as _asyncio
-
-            async def _enrich_vcb():
-                # VCB.build() opens multiple sqlite3 connections (pooled since
-                # P4) synchronously — to_thread keeps titan_pre_hook off the
-                # event loop for the ~100-400ms of DB work.
+        try:
+            _vcb = getattr(plugin, '_verified_context_builder', None)
+            if _vcb and _vcb_skip_reason is None:
+                # VCB.build() opens multiple sqlite3 connections (chain_archive,
+                # meta_wisdom, + 12 other stores) synchronously. Wrap in
+                # to_thread so titan_pre_hook doesn't block the event loop on
+                # /v4/chat for the ~100-400ms of combined DB work.
                 # See API_FIX_NEXT_SESSION.md (2026-04-14).
-                _vcb = getattr(plugin, '_verified_context_builder', None)
-                if not _vcb:
-                    return None
-                return await _asyncio.to_thread(
+                import asyncio as _asyncio
+                _vcb_context = await _asyncio.to_thread(
                     lambda: _vcb.build(
                         query=prompt_text,
                         user_id=user_id,
@@ -835,33 +800,6 @@ def create_pre_hook(plugin):
                         max_records=30,
                     )
                 )
-
-            async def _enrich_memory():
-                # Consolidated legacy graph recall — cross-process work-RPC
-                # (memory worker, 5s G19 cap). Carries felt_state_snapshots →
-                # drives recall-perturbation; also the legacy router's
-                # recall_score input and the assembler's `memory` partition.
-                return await plugin.memory.query(prompt_text, vec=_prompt_vec)
-
-            try:
-                _vcb_res, _mem_res = await _asyncio.gather(
-                    _enrich_vcb(), _enrich_memory(), return_exceptions=True)
-            except Exception as e:
-                logger.warning("[PreHook] Memory enrich gather failed: %s", e)
-                _vcb_res, _mem_res = None, []
-            if isinstance(_vcb_res, BaseException):
-                logger.warning("[PreHook] VCB enrich failed (chat unaffected): %s",
-                               _vcb_res)
-                _vcb_context = None
-            else:
-                _vcb_context = _vcb_res
-            if isinstance(_mem_res, BaseException):
-                logger.warning("[PreHook] memory.query enrich failed: %s", _mem_res)
-                relevant_memories = []
-            else:
-                relevant_memories = _mem_res or []
-
-            if _vcb_context is not None:
                 logger.info("[PreHook] VCB: %d records (%d CHAINED) in %.1fms",
                             _vcb_context.total_records,
                             _vcb_context.chained_count,
@@ -898,11 +836,29 @@ def create_pre_hook(plugin):
                     logger.debug(
                         "[PreHook] VCB knowledge_usage emit: %s",
                         _vcb_usage_err)
-        # else: pitch-visitor / no-topic_memory skip path — both VCB and
-        # memory.query skipped. Agno's per-session history (num_history_runs=5
-        # keyed by session_id="pitch-<thread_id>") covers followup-question
-        # context within the same pitch session. Cross-session context for an
-        # anonymous visitor is meaningless by definition.
+                # Build compatible relevant_memories list for recall perturbation
+                relevant_memories = [
+                    {"user_prompt": r.content[:100], "agent_response": "",
+                     "effective_weight": r.confidence,
+                     "felt_state_snapshot": None}
+                    for r in (_vcb_context.records or [])
+                ]
+            elif _vcb_skip_reason is None:
+                # No VCB available — fall back to plugin.memory.query (memory
+                # worker bus round-trip; 30s timeout cap per memory_proxy).
+                relevant_memories = await plugin.memory.query(prompt_text)
+            # else: pitch-visitor skip path — both VCB and memory.query skipped.
+            # Agno's per-session history (num_history_runs=5 keyed by
+            # session_id="pitch-<thread_id>") covers followup-question context
+            # within the same pitch session. Cross-session context for an
+            # anonymous visitor is meaningless by definition.
+        except Exception as e:
+            logger.warning("[PreHook] Memory recall failed: %s", e)
+            if _vcb_skip_reason is None:
+                try:
+                    relevant_memories = await plugin.memory.query(prompt_text)
+                except Exception:
+                    relevant_memories = []
 
         if _vcb_skip_reason:
             logger.info("[PreHook] VCB+memory.query skipped (%s) — Agno session "
@@ -1059,9 +1015,8 @@ def create_pre_hook(plugin):
             try:
                 _p2_rc = getattr(plugin, "engine_recall", None)
                 if _p2_rc is not None and prompt_text:
-                    # embed-once: reuse the shared prompt vector (P4).
                     _p2_results = await asyncio.to_thread(
-                        lambda: _p2_rc.recall(prompt_text, k=6, query_vec=_prompt_vec))
+                        _p2_rc.recall, prompt_text, k=6)
                     _p2_top_cosine = max(
                         (float(getattr(_r, "cosine", 0.0) or 0.0)
                          for _r in (_p2_results or [])), default=0.0)
@@ -1160,27 +1115,33 @@ def create_pre_hook(plugin):
         _ph_stage("after_gatekeeper_hostside")
 
         _ph_stage("after_gatekeeper")
-        # 5. Build context injection. P4 (RFP_synthesis_decision_authority): the
-        # context_assembler DRIVES the one grounded block — built below from the
-        # content-hash-deduped VCB + memory + recall items (recall wins, D2) and
-        # rendered by render_grounded_block. It REPLACES the pre-P4 separate
-        # `memory_context` (VCB wholesale `.text`) and `synthesis_recall_context`
-        # blocks, so what the LLM sees == what the CitedUseDetector counts
-        # (display == count, gate G6 / INV-SDA-5).
-        grounded_context = ""
+        # 5. Build context injection based on routing mode
+        memory_context = ""
+        if _vcb_context and _vcb_context.total_records > 0:
+            # Use VCB's rich verified context (multi-store with chain stamps)
+            memory_context = _vcb_context.text + "\n\n"
+        elif relevant_memories:
+            # Legacy fallback: simple graph memory recall
+            memory_lines = []
+            for m in relevant_memories[:5]:
+                p = m.get("user_prompt", "")[:100]
+                r = m.get("agent_response", "")[:100]
+                w = m.get("effective_weight", 1.0)
+                memory_lines.append(f"- [{w:.1f}] Q: {p} | A: {r}")
+            memory_context = "### Recalled Memories\n" + "\n".join(memory_lines) + "\n\n"
 
         # ── Synthesis tx_hash-spine recall — the CANONICAL thought-recall road ──
         # Run EngineRecall composite retrieval over the tx_hash spine (Phase A):
         # SEARCH returns tx_hashes, we dereference them into content snippets and
-        # record them as the `recall` partition (P4) so the post-LLM
-        # CitedUseDetector (INV-Syn-23) can score what the response actually
-        # cited (feeds the sovereignty ratio). Phase E (0.24.1): PROMOTED from
-        # flag-gated augment to canonical — runs unconditionally wherever the
-        # spine is wired. P4: VCB and memory.query BOTH enrich (partitioned,
-        # §5.1); the context_assembler dedups (recall wins) + renders the ONE
-        # grounded block — recall is no longer injected as a separate block.
-        # Soft-fail — chat never breaks on a recall error, and recall is simply
-        # absent when engine_recall is None (a box without the spine).
+        # inject as a DISTINCT block, and record the surfaced items so the
+        # post-LLM CitedUseDetector (INV-Syn-23) can score what the response
+        # actually cited (feeds W3 / the sovereignty ratio). Phase E (0.24.1):
+        # PROMOTED from flag-gated augment to canonical — runs unconditionally
+        # wherever the spine is wired (no `synthesis_recall_augment` flag); VCB
+        # enriches the context, memory.query() is the fallback/reflex path.
+        # Soft-fail — chat never breaks on a recall error, and the block is
+        # simply absent when engine_recall is None (a box without the spine).
+        synthesis_recall_context = ""
         _recall_surfaced = []  # P4: recall-partition rows fed to the context assembler
         try:
             _recall = getattr(plugin, "engine_recall", None)
@@ -1205,9 +1166,7 @@ def create_pre_hook(plugin):
                 if _p2_results is not None:
                     _results = _p2_results
                 else:
-                    # embed-once: reuse the shared prompt vector (P4).
-                    _results = await asyncio.to_thread(
-                        lambda: _recall.recall(prompt_text, k=6, query_vec=_prompt_vec))
+                    _results = await asyncio.to_thread(_recall.recall, prompt_text, k=6)
                 _recall_latency_ms = (time.perf_counter() - _t_recall0) * 1000.0
                 logger.info(
                     "[PreHook] B3 synthesis recall ran: %d raw results in %.0fms%s",
@@ -1243,6 +1202,7 @@ def create_pre_hook(plugin):
                         "chi_spent": 0.0, "evaluations": 0,
                         "hits": len(_results or []),
                         "fork": "conversation", "source": "agno_chat"}
+                _lines = []
                 for _r in (_results or []):
                     _txh = getattr(_r, "tx_hash", "") or ""
                     if not _txh:
@@ -1255,6 +1215,7 @@ def create_pre_hook(plugin):
                     if not _snip:
                         continue
                     _score = float(getattr(_r, "score", 0.0) or 0.0)
+                    _lines.append(f"- [{_score:.2f}] {_snip[:300]}")
                     _recall_surfaced.append({
                         "item_id": _txh,
                         "title": _snip[:120],
@@ -1265,10 +1226,14 @@ def create_pre_hook(plugin):
                         # spine. VCB/memory items are tagged by the P4 assembler.
                         "source": "recall",
                     })
-                if _recall_surfaced:
+                if _lines:
+                    synthesis_recall_context = (
+                        "### Synthesis Recall (your own verified experience — tx_hash spine)\n"
+                        + "\n".join(_lines) + "\n\n"
+                    )
                     logger.info(
-                        "[PreHook] synthesis recall: %d tx_hash hits surfaced "
-                        "(rendered by the P4 assembler)", len(_recall_surfaced))
+                        "[PreHook] synthesis recall augment: %d tx_hash hits injected",
+                        len(_lines))
         except Exception as _sr_err:
             # Error-visibility: a recall failure that silently zeroes the operator
             # loop (telemetry/sovereignty) must be LOUD, not swallowed at debug.
@@ -1276,49 +1241,32 @@ def create_pre_hook(plugin):
                 "[PreHook] synthesis recall augment failed (chat unaffected): %s",
                 _sr_err, exc_info=True)
 
-        # ── P4 context assembler — DRIVES the one grounded block ─────────────
-        # Itemize ALL surfaced substrate this turn — VCB inner-state + the
-        # consolidated memory.query recall + the recall spine — into ONE
-        # source-tagged, content-hash de-duplicated list (recall WINS, D2), then
-        # render it as the single grounded block the LLM sees. This both (a)
-        # activates the sovereignty V-term (pre-P4 only recall items were
-        # registered, so VCB/memory citations were invisible and V was pinned at
-        # 0) and (b) guarantees display == count — no fact delivered or counted
-        # twice (gate G6 / INV-SDA-5). VCB and memory are DISJOINT by DB (§5.1)
-        # so both partitions are fed unconditionally. Soft-fail: a failure here
-        # must never break chat — the except restashes the recall-only set and
-        # leaves the grounded block empty.
+        # ── P4 context assembler (RFP_synthesis_decision_authority) ──────────
+        # Itemize ALL surfaced substrate this turn — VCB inner-state + the memory
+        # fallback + the recall spine — into ONE source-tagged, content-hash
+        # de-duplicated surfaced-item list (synthesis/context_assembler). This is
+        # the single thing that activates the sovereignty V-term: before P4 only
+        # recall items were registered, so VCB/memory citations were invisible and
+        # V was structurally pinned at 0. It also guarantees no fact is delivered
+        # or counted twice (gate G6 / INV-SDA-5). Soft-fail: a failure here must
+        # never break chat — the except restashes the recall-only set as before.
         try:
-            from titan_hcl.synthesis.context_assembler import (
-                assemble as _assemble_ctx,
-                render_grounded_block as _render_grounded)
+            from titan_hcl.synthesis.context_assembler import assemble as _assemble_ctx
             _vcb_rows = []
             _mem_rows = []
-            # VCB partition — inner-titan state; carries chain-stamp render meta
-            # so render_grounded_block reproduces VCB's verified-recall framing.
-            # item_id `vcb:<db_ref>` matches VCB's MEMORY_RETRIEVAL_USED emit so
-            # the post-LLM cited-use attribution lines up.
             if _vcb_context is not None and getattr(_vcb_context, "records", None):
                 for _vr in _vcb_context.records:
                     _vc = getattr(_vr, "content", "") or ""
                     if not _vc.strip():
                         continue
-                    _vref = getattr(_vr, "db_ref", "") or getattr(_vr, "source", "") or ""
                     _vcb_rows.append({
-                        "item_id": f"vcb:{_vref}" if _vref else "",
                         "content": _vc,
-                        "title": _vref,
+                        "title": (getattr(_vr, "db_ref", "") or getattr(_vr, "source", "")),
                         "weight": float(getattr(_vr, "confidence", 0.0) or 0.0),
-                        "meta": {
-                            "chain_status": getattr(_vr, "chain_status", "") or "",
-                            "block_height": getattr(_vr, "block_height", None),
-                            "timestamp": getattr(_vr, "timestamp", 0.0) or 0.0,
-                        },
                     })
-            # memory partition — consolidated legacy graph recall (core.memory
-            # MemoryNodes; disjoint DB from VCB per §5.1 → BOTH run, no inter-dedup).
-            if relevant_memories:
-                for _m in relevant_memories[:8]:
+            elif relevant_memories:
+                # No-VCB fallback: relevant_memories are core.memory.query nodes.
+                for _m in relevant_memories[:5]:
                     if not isinstance(_m, dict):
                         continue
                     _mc = (_m.get("content")
@@ -1335,9 +1283,6 @@ def create_pre_hook(plugin):
                     })
             _assembled = _assemble_ctx(vcb=_vcb_rows, memory=_mem_rows,
                                        recall=_recall_surfaced)
-            # The assembler DRIVES the prompt: render the deduped items into the
-            # single grounded block (display == count, recall-wins).
-            grounded_context = _render_grounded(_assembled)
             _uid = getattr(plugin, "_current_user_id", "") or ""
             _sid = getattr(plugin, "_current_session_id", "") or ""
             _cid = f"{_uid}:{_sid}"
@@ -1348,20 +1293,29 @@ def create_pre_hook(plugin):
             # The assembled set is THE canonical surfaced-item list for this turn
             # (replaces, not extends — a stale un-popped prior turn can't leak in).
             _reg[_cid] = [_it.to_stash_dict() for _it in _assembled]
+            # G6: if a recall snippet was deduped against a VCB/memory item, drop
+            # its injection line too so display == count. Rebuild only on overlap.
+            _kept_recall = [_it for _it in _assembled if _it.source == "recall"]
+            if len(_kept_recall) != len(_recall_surfaced):
+                if _kept_recall:
+                    _rl = [f"- [{_it.weight:.2f}] {_it.content[:300]}" for _it in _kept_recall]
+                    synthesis_recall_context = (
+                        "### Synthesis Recall (your own verified experience — tx_hash spine)\n"
+                        + "\n".join(_rl) + "\n\n")
+                else:
+                    synthesis_recall_context = ""
             logger.info(
                 "[PreHook] P4 assembler: %d surfaced (vcb=%d mem=%d recall=%d) "
-                "deduped from %d raw → grounded block %d chars",
+                "deduped from %d raw",
                 len(_assembled),
                 sum(1 for _i in _assembled if _i.source == "vcb"),
                 sum(1 for _i in _assembled if _i.source == "memory"),
-                sum(1 for _i in _assembled if _i.source == "recall"),
-                len(_vcb_rows) + len(_mem_rows) + len(_recall_surfaced),
-                len(grounded_context))
+                len(_kept_recall),
+                len(_vcb_rows) + len(_mem_rows) + len(_recall_surfaced))
         except Exception as _asm_err:
             logger.warning(
                 "[PreHook] P4 context assembler failed (chat unaffected): %s",
                 _asm_err, exc_info=True)
-            grounded_context = ""
             try:
                 _uid = getattr(plugin, "_current_user_id", "") or ""
                 _sid = getattr(plugin, "_current_session_id", "") or ""
@@ -2158,7 +2112,7 @@ def create_pre_hook(plugin):
         # V5: inner state sections + V6: MSL/CGN/social/reasoning enrichment
         injected = (perceptual_field_text + interface_coloring + consciousness_context +
                     maker_context + voice_context + social_context + user_memory_context +
-                    grounded_context + directive_context + status_context +
+                    memory_context + synthesis_recall_context + directive_context + status_context +
                     neuromod_context + embodied_context + temporal_context +
                     creative_context + metabolic_context + experience_context +
                     meta_reasoning_context + own_language_context +

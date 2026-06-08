@@ -201,16 +201,17 @@ class TestBusClientAttach:
 class TestInProcessSubscriberNames:
     """Phase C C-S7 — the constant must include all names workers target."""
 
-    def test_includes_guardian_for_admin_query(self):
+    def test_guardian_retired_from_in_process_aliases(self):
         from titan_hcl.core.kernel import IN_PROCESS_SUBSCRIBER_NAMES
-        # D-SPEC-151 (2026-06-08): "guardian" KEPT — the plugin's
-        # _guardian_handler_loop consumes the ADMIN QUERY (restart/start/stop/
-        # reload_module, dst="guardian") via this alias (titan_hcl owns
-        # spawn+restart per D-SPEC-146). The MODULE_HEARTBEAT flood was the
-        # Orchestrator separately subscribing "guardian" and never draining
-        # (post-peer-spawn its monitor_tick drain moved to guardian_hcl) — fixed
-        # by Orchestrator(subscribe_guardian=False), NOT by retiring this alias.
-        assert "guardian" in IN_PROCESS_SUBSCRIBER_NAMES
+        # D-SPEC-151 (2026-06-08): "guardian" RETIRED from titan_hcl's in-process
+        # aliases. Post the 2026-05-28 peer-spawn split, guardian_hcl is a
+        # SEPARATE process with its OWN "guardian" client (the liveness consumer);
+        # keeping the alias here gave titan_hcl an undrained "guardian" queue →
+        # the fleet-wide MODULE_HEARTBEAT flood. Liveness (MODULE_HEARTBEAT/READY,
+        # dst=guardian) is handled by guardian_hcl; titan_hcl's spawn-side admin
+        # arrives on "guardian_hcl_lifecycle". Same closure as meditation/
+        # sovereignty (D-SPEC-64).
+        assert "guardian" not in IN_PROCESS_SUBSCRIBER_NAMES
 
     def test_includes_titan_HCL_as_canonical_outbound(self):
         from titan_hcl.core.kernel import IN_PROCESS_SUBSCRIBER_NAMES

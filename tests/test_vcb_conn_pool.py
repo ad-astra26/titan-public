@@ -9,76 +9,13 @@ survives across turns while parallelism (one conn per pool thread) is preserved.
 
 import sqlite3
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 from titan_hcl.logic.verified_context_builder import (
-    ParsedQuery,
     StoreRouter,
     VerifiedContextBuilder,
     _PooledConn,
 )
-
-
-# ── P4 per-session TTL cache — session-stable stores only (identity + profile) ──
-
-def _row(content="r"):
-    return {"content": content, "source": "s", "timestamp": 0, "db_ref": "d"}
-
-
-def test_self_insights_cached_query_independent(tmp_path):
-    """self_insights is query-INDEPENDENT → cached by (store, limit); a 2nd
-    query with a DIFFERENT parse still hits (handler invoked once)."""
-    r = StoreRouter(data_dir=str(tmp_path))
-    calls = []
-    r._query_self_insights = lambda parsed, limit: (calls.append(1) or [_row("identity")])
-    a = r.query_store("self_insights", ParsedQuery(entities=["alpha"]), limit=5)
-    b = r.query_store("self_insights", ParsedQuery(entities=["beta", "gamma"]), limit=5)
-    assert a == b == [_row("identity")]
-    assert len(calls) == 1   # cache hit despite a different parse
-
-
-def test_social_graph_cached_by_person_entity(tmp_path):
-    """social_graph (profile) is keyed by the person entity: same person hits,
-    a different person misses."""
-    r = StoreRouter(data_dir=str(tmp_path))
-    calls = []
-    r._query_social_graph = lambda parsed, limit: (calls.append(1) or [_row("profile")])
-    alice = ParsedQuery(entities=["alice"], entity_types={"alice": "person"})
-    alice2 = ParsedQuery(entities=["alice"], entity_types={"alice": "person"})
-    bob = ParsedQuery(entities=["bob"], entity_types={"bob": "person"})
-    r.query_store("social_graph", alice, limit=5)
-    r.query_store("social_graph", alice2, limit=5)    # same person → hit
-    assert len(calls) == 1
-    r.query_store("social_graph", bob, limit=5)        # different person → miss
-    assert len(calls) == 2
-
-
-def test_prompt_dependent_store_not_cached(tmp_path):
-    """vocabulary is prompt-dependent → NOT in the session-stable allowlist →
-    re-queried every turn (the cache can never serve stale prompt-specific recall)."""
-    r = StoreRouter(data_dir=str(tmp_path))
-    calls = []
-    r._query_vocabulary = lambda parsed, limit: (calls.append(1) or [_row("v")])
-    p = ParsedQuery(entities=["x"])
-    r.query_store("vocabulary", p, limit=5)
-    r.query_store("vocabulary", p, limit=5)
-    assert len(calls) == 2   # not cached
-
-
-def test_session_cache_ttl_expiry(tmp_path):
-    """An expired entry is not served — the store re-queries."""
-    r = StoreRouter(data_dir=str(tmp_path))
-    calls = []
-    r._query_self_insights = lambda parsed, limit: (calls.append(1) or [_row("id")])
-    p = ParsedQuery()
-    r.query_store("self_insights", p, limit=5)
-    assert len(calls) == 1
-    key = r._session_cache_key("self_insights", p, 5)
-    _expiry, results = r._session_cache[key]
-    r._session_cache[key] = (time.time() - 1.0, results)   # force-expire
-    r.query_store("self_insights", p, limit=5)
-    assert len(calls) == 2   # expired → re-query
 
 
 def _make_db(tmp_path, name="inner_memory.db"):
