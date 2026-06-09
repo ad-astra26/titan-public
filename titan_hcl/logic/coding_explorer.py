@@ -902,38 +902,6 @@ class CodingExplorer:
                             "[META-CGN] Producer #5 coding.problem_solved DROPPED by bus "
                             "— concept=%s tests=%d/%d (rate-gate or queue-full)",
                             result.concept, result.tests_passed, result.tests_total)
-                    # ── Phase A (RFP_cgn_enhancements §9.1) ──────────────────
-                    # coding.problem_solved is a learning event: fire a
-                    # learning-event chain trigger so the meta chain walks THIS
-                    # concept (§5.3 FORMULATE-collapse fix) instead of collapsing
-                    # to FORMULATE.define. question_type synthesize_insight →
-                    # SYNTHESIZE 0.70 (SIGNAL_TO_PRIMITIVE dominant). Rides the
-                    # meta-service rate-limiter; never breaks the producer loop.
-                    try:
-                        from titan_hcl.logic.meta_service_client import (
-                            send_meta_request as _cd_mrq)
-                        from titan_hcl.logic.meta_consumer_contexts import (
-                            build_coding_meta_context_30d as _cd_mrq_ctx)
-                        _cd_mrq(
-                            consumer_id="coding",
-                            question_type="synthesize_insight",
-                            context_vector=_cd_mrq_ctx(),
-                            time_budget_ms=2000,
-                            send_queue=self._send_queue,
-                            src="coding",
-                            grounding_payload={
-                                "concept_id": str(result.concept)[:128]},
-                            payload_snippet=(
-                                f"coding.problem_solved:{str(result.concept)[:40]}"),
-                        )
-                        logger.info(
-                            "[Phase A] coding.problem_solved → "
-                            "META_REASON_REQUEST (concept=%s)",
-                            str(result.concept)[:40])
-                    except Exception as _cd_mrq_err:
-                        logger.warning(
-                            "[Phase A] coding problem_solved meta-request "
-                            "failed: %s", _cd_mrq_err)
                 # Producer #6 — test_failed: any test failed
                 if result.tests_passed < result.tests_total:
                     _p6_failed = result.tests_total - result.tests_passed
@@ -959,35 +927,6 @@ class CodingExplorer:
                             "[META-CGN] Producer #6 coding.test_failed DROPPED by bus "
                             "— concept=%s tests_failed=%d/%d (rate-gate or queue-full)",
                             result.concept, _p6_failed, result.tests_total)
-                    # ── Phase A (RFP_cgn_enhancements §9.1) ──────────────────
-                    # coding.test_failed is a learning event: break_impasse →
-                    # BREAK 0.55 (SIGNAL_TO_PRIMITIVE dominant). Walk THIS concept
-                    # downstream (§5.3 fix). Rides the meta-service rate-limiter.
-                    try:
-                        from titan_hcl.logic.meta_service_client import (
-                            send_meta_request as _cd_mrq6)
-                        from titan_hcl.logic.meta_consumer_contexts import (
-                            build_coding_meta_context_30d as _cd_mrq6_ctx)
-                        _cd_mrq6(
-                            consumer_id="coding",
-                            question_type="break_impasse",
-                            context_vector=_cd_mrq6_ctx(),
-                            time_budget_ms=2000,
-                            send_queue=self._send_queue,
-                            src="coding",
-                            grounding_payload={
-                                "concept_id": str(result.concept)[:128]},
-                            payload_snippet=(
-                                f"coding.test_failed:{str(result.concept)[:40]}"),
-                        )
-                        logger.info(
-                            "[Phase A] coding.test_failed → "
-                            "META_REASON_REQUEST (concept=%s)",
-                            str(result.concept)[:40])
-                    except Exception as _cd_mrq6_err:
-                        logger.warning(
-                            "[Phase A] coding test_failed meta-request "
-                            "failed: %s", _cd_mrq6_err)
             except Exception as _cp_emit_err:
                 logger.warning(
                     "[META-CGN] Producer #5/#6 coding emit FAILED — concept=%s "

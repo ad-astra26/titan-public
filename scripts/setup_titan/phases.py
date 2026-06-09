@@ -317,10 +317,7 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
                verify_only: bool = False, config_src: str | None = None,
                titan_pubkey: str | None = None,
                toolchain_pins: dict[str, str] | None = None,
-               directives_file: str | None = None,
-               inference_provider: str | None = None,
-               inference_key: str | None = None,
-               simulate: bool = False) -> int:
+               directives_file: str | None = None) -> int:
     """Walk the install phases (Phase 1 already ran in preflight). Returns exit code.
 
     ``prompter`` injects the input source: the default :class:`StdinPrompter`
@@ -380,8 +377,7 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
         (PhaseDef("phase_backup", "Sovereign backup posture (encryption + config-in-backup)", "W1.5/§24.4.B", None),
          lambda: run_backup_config_phase(install_root, mode, prompter=prompter, default=default)),
         (PhaseDef("phase_4", "Inference autodetect", "W1.c", None),
-         lambda: run_inference_phase(default=default, install_root=install_root, prompter=prompter,
-                                     provider=inference_provider, key=inference_key)),
+         lambda: run_inference_phase(default=default, install_root=install_root, prompter=prompter)),
         (PhaseDef("phase_5", "Comms (Telegram / X)", "W1.d", None),
          lambda: run_comms_phase(default=default, state=state, prompter=prompter)),
         (PhaseDef("phase_identity", "Genesis identity (name · Maker · directives)", "W1.f", None),
@@ -390,25 +386,12 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
                                           directives_file=directives_file)),
         (PhaseDef("phase_6", "Genesis ceremony", "W1.b", None),
          lambda: ([Result("genesis", "warn", "--skip-genesis requested.")] if skip_genesis
-                  else run_genesis_phase(install_root, mode, venv_python=venv_python(install_root),
-                                         simulate=simulate))),
+                  else run_genesis_phase(install_root, mode, venv_python=venv_python(install_root)))),
         (PhaseDef("phase_7", "Systemd install + first start + health", "W1.e", None),
          lambda: run_systemd_phase(state, install_root, mode, default=default, prompter=prompter)),
         (PhaseDef("phase_console", "TC² Console Agent (owner UI — the sole shipped front-end)", "W8", None),
          lambda: run_console_phase(state, install_root, user=getpass.getuser())),
     ]
-    # --simulate is a MAINNET-readiness rehearsal: the genesis phase runs the
-    # ceremony's --simulate (0 SOL, nothing minted), so there is no bootable
-    # identity to install/boot. Drop systemd + console and end with a readiness
-    # summary instead of standing up a (non-existent) live Titan.
-    if simulate:
-        phases = [p for p in phases if p[0].id not in ("phase_7", "phase_console")]
-        phases.append(
-            (PhaseDef("phase_simready", "Mainnet-readiness summary", "RFP §8/G7", None),
-             lambda: [Result("readiness", "ok",
-                             "Mainnet-readiness SIMULATION complete — toolchain, venv, binaries, "
-                             "config + the full genesis ceremony all exercised; 0 SOL spent, "
-                             "nothing minted. Re-run without --simulate to perform the real birth.")]))
     return _walk(phases, state)
 
 

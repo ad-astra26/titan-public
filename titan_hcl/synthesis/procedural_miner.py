@@ -283,10 +283,7 @@ class ProceduralMiner:
             if total_skills_compiled >= self._max_skills_per_pass:
                 break
             split = self.split_success_failure(cluster)
-            # EEL B1 (D-SPEC-153) — the miner is NEGATIVE-ONLY: positive skills now
-            # form per oracle-verified use (the skill_score_events queue), so the
-            # miner only compiles recurrent FAILURE shapes (INV-5 / B2 replay fuel).
-            for kind in ("negative",):
+            for kind in ("positive", "negative"):
                 if total_skills_compiled >= self._max_skills_per_pass:
                     break
                 members = split[kind]
@@ -301,38 +298,26 @@ class ProceduralMiner:
                 if not abstracted:
                     llm_failures += 1
                     continue
-                # EEL B1 — a recurrent failure shape → a NEGATIVE cell on an
-                # outcome derived from the abstraction (goal_class) + the recurrent
-                # tool-path (task_shape). Never delegated (INV-EEL-5 polarity guard);
-                # serves avoidance + the B2 replay queue. oracle_id sentinel marks
-                # the recurrence origin (distinct from the per-use oracle outcomes).
-                from titan_hcl.synthesis.goal_class import (
-                    goal_class as _derive_goal_class,
-                    make_task_shape as _derive_task_shape,
-                )
+                skill_id = compute_skill_id(cluster["sequence"], kind)
+                # Persist with kind annotation in the name for operator visibility.
                 base_name = abstracted["nl_description"].split(".")[0][:64] or "compiled_skill"
-                full_name = f"[negative] {base_name}"
-                _gclass = _derive_goal_class(abstracted["nl_description"])
-                _seq = cluster.get("sequence")
-                _tool_sig = ("+".join(str(s) for s in _seq)
-                             if isinstance(_seq, (list, tuple)) else str(_seq))
-                _task_shape = _derive_task_shape("procedural", _tool_sig[:80], "")
+                full_name = f"[{kind}] {base_name}"
                 try:
-                    skill_id = self._skill_store.persist_negative_skill(
-                        oracle_id="miner_recurrence",
-                        goal_class=_gclass,
-                        task_shape=_task_shape,
+                    self._skill_store.persist_skill(
+                        skill_id=skill_id,
                         name=full_name,
                         nl_description=abstracted["nl_description"],
-                        compiled_from=abstracted["compiled_from"],
                         executable_spec=abstracted["executable_spec"],
                         preconditions=abstracted["preconditions"],
                         postconditions=abstracted["postconditions"],
+                        compiled_from=abstracted["compiled_from"],
                         ts=now,
                     )
                 except Exception as e:
                     logger.warning(
-                        "[ProceduralMiner] persist_negative_skill failed: %s", e)
+                        "[ProceduralMiner] persist_skill failed for %s: %s",
+                        skill_id, e,
+                    )
                     llm_failures += 1
                     continue
                 compiled_ids.append(skill_id)

@@ -4325,7 +4325,7 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                                 # closure scope-tight.
                                 _send_msg(
                                     send_queue, "CGN_TRANSITION", name, "cgn", {
-                                        "type": "experience",  # (b) complete transition → record_experience → observe_for (DEFERRED G1)
+                                        "type": "outcome",
                                         "consumer": "reasoning_strategy",
                                         "concept_id": _cgn_concept,
                                         "reward": float(_cgn_payload.get(
@@ -4601,41 +4601,6 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                                     "bus — threshold=%.1f chi=%.3f "
                                     "(rate-gate or queue-full)",
                                     _p14_thr, _p14_chi)
-                            # ── Phase A (RFP_cgn_enhancements §9.1) ──────────
-                            # A coherence-threshold crossing is a self_model
-                            # learning event: spirit_self_nudge → SPIRIT_SELF.
-                            # Walk the self-coherence concept downstream so the
-                            # chain reasons about THIS event (§5.3 fix) rather
-                            # than collapsing to FORMULATE. Same EdgeDetector
-                            # gate as the emit; rides the meta-service
-                            # rate-limiter; never breaks the drain loop.
-                            try:
-                                from titan_hcl.logic.meta_service_client import (
-                                    send_meta_request as _p14_mrq)
-                                from titan_hcl.logic.meta_consumer_contexts import (
-                                    build_self_model_meta_context_30d
-                                    as _p14_mrq_ctx)
-                                _p14_mrq(
-                                    consumer_id="self_model",
-                                    question_type="spirit_self_nudge",
-                                    context_vector=_p14_mrq_ctx(),
-                                    time_budget_ms=2000,
-                                    send_queue=send_queue,
-                                    src="self_model",
-                                    grounding_payload={
-                                        "concept_id": "self_coherence"},
-                                    payload_snippet=(
-                                        "self_model.coherence_gain:"
-                                        f"thr_{_p14_thr}"),
-                                )
-                                logger.info(
-                                    "[Phase A] self_model.coherence_gain → "
-                                    "META_REASON_REQUEST (thr=%.1f)",
-                                    _p14_thr)
-                            except Exception as _p14_mrq_err:
-                                logger.warning(
-                                    "[Phase A] self_model coherence_gain "
-                                    "meta-request failed: %s", _p14_mrq_err)
                             # Record stage (rFP_experience_distillation_phase_c
                             # §5) — a coherence-threshold crossing is a self_model
                             # experience. Targeted self-emit (D-SPEC-52).

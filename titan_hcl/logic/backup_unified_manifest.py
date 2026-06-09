@@ -426,11 +426,11 @@ def make_event(
     if event_type not in ("baseline", "incremental"):
         raise ValueError(f"event_type must be 'baseline' or 'incremental', got {event_type!r}")
     if event_type == "baseline" and baseline_trigger not in (
-        "month_boundary", "depth_cap", "first_event", "self_heal",
+        "month_boundary", "depth_cap", "first_event",
     ):
         raise ValueError(
             f"baseline event must have baseline_trigger ∈ "
-            f"{{month_boundary, depth_cap, first_event, self_heal}}, got {baseline_trigger!r}"
+            f"{{month_boundary, depth_cap, first_event}}, got {baseline_trigger!r}"
         )
     if event_type == "incremental" and baseline_trigger is not None:
         raise ValueError("incremental events must have baseline_trigger=None")

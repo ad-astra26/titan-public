@@ -944,8 +944,7 @@ def _build_local_tool_plugs(send_queue) -> dict:
     # verdict over the bus so it joins the dream-boundary OracleVerdictBatch flush
     # (→ §A.6 coverage). Fire-and-forget; never re-executes the sandbox.
     def _companion_verdict_sink(*, parent_tool_call_tx, oracle_id, verdict,
-                                evidence_ref="", latency_ms=0,
-                                parent_goal="", tool_id=""):
+                                evidence_ref="", latency_ms=0):
         try:
             send_queue.put_nowait({
                 "type": bus.TOOL_CALL_VERDICT_RECORD,
@@ -954,9 +953,6 @@ def _build_local_tool_plugs(send_queue) -> dict:
                     "parent_tool_call_tx": parent_tool_call_tx,
                     "oracle_id": oracle_id, "verdict": verdict,
                     "evidence_ref": evidence_ref, "latency_ms": latency_ms,
-                    # EEL B1 — goal+tool so synthesis can form the (outcome,
-                    # task-shape) skill-score event (INV-Syn-28).
-                    "parent_goal": parent_goal, "tool_id": tool_id,
                 },
             })
         except Exception:

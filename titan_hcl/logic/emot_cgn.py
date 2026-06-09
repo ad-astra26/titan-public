@@ -966,7 +966,6 @@ class EmotCGNConsumer:
                         state_30d = self.encode_state_30d(prim_id, ctx)
                         action_idx = EMOT_PRIMITIVE_INDEX.get(prim_id, 0)
                         transition = {
-                            "type": "experience",  # (b) complete transition → record_experience → observe_for (DEFERRED G1)
                             "consumer": CGN_CONSUMER_NAME,
                             "concept_id": prim_id,
                             "state": state_30d.tolist(),

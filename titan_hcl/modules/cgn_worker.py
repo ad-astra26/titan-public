@@ -859,32 +859,13 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # ── CGN_TRANSITION — experience from any consumer ──────────
         if msg_type == "CGN_TRANSITION":
             try:
-                _ptype = payload.get("type")
-                if _ptype in ("outcome", "experience"):
-                    if _ptype == "experience":
-                        # (b) Single-shot COMPLETE transition (action+reward in one
-                        # message). record_experience buffers the action as pending
-                        # then self-matches via record_outcome → FULL Sigma + journey
-                        # + causal observe_for + (the HAOV select_test below). For
-                        # simultaneous-outcome consumers (emotional / meta / self_model
-                        # / reasoning_strategy / knowledge); SPEC §6.5 / DEFERRED G1 —
-                        # the dormant-consumer wake the two-phase pending→outcome split
-                        # otherwise blocked. Falls through to the same downstream.
-                        cgn.record_experience(
-                            consumer=payload["consumer"],
-                            concept_id=payload["concept_id"],
-                            reward=payload["reward"],
-                            action=payload.get("action", 0),
-                            state=payload.get("state"),
-                            action_params=payload.get("action_params"),
-                            outcome_context=payload.get("outcome_context"))
-                    else:
-                        # Delayed reward for an existing pending transition
-                        cgn.record_outcome(
-                            consumer=payload["consumer"],
-                            concept_id=payload["concept_id"],
-                            reward=payload["reward"],
-                            outcome_context=payload.get("outcome_context"))
+                if payload.get("type") == "outcome":
+                    # Delayed reward for existing transition
+                    cgn.record_outcome(
+                        consumer=payload["consumer"],
+                        concept_id=payload["concept_id"],
+                        reward=payload["reward"],
+                        outcome_context=payload.get("outcome_context"))
                     _stats["outcomes_recorded"] += 1
 
                     # Sigma micro-update happened inside record_outcome()

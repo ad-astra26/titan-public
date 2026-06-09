@@ -163,16 +163,12 @@ class ToolPlugBase:
                         parent_tool_call_tx=parent_tx, oracle_id=self.tool_id,
                         verdict=_verdict_str, evidence_ref=_ev_ref,
                         latency_ms=latency_ms, fork="procedural",
-                        # EEL B1 — name the goal+tool so the verdict can become a
-                        # (outcome, task-shape) skill-score event at flush.
-                        parent_goal=call.parent_goal, tool_id=self.tool_id,
                     )
                 elif self._companion_verdict_sink is not None:
                     self._companion_verdict_sink(
                         parent_tool_call_tx=parent_tx, oracle_id=self.tool_id,
                         verdict=_verdict_str, evidence_ref=_ev_ref,
                         latency_ms=latency_ms,
-                        parent_goal=call.parent_goal, tool_id=self.tool_id,
                     )
             except Exception:
                 logger.exception(
@@ -200,8 +196,6 @@ class ToolPlugBase:
                         companion_claim,
                         parent_tool_call_tx=parent_tx,
                         parent_tool_call_fork="procedural",
-                        # EEL B1 — name the goal+tool for the skill-score capture.
-                        parent_goal=call.parent_goal, tool_id=self.tool_id,
                     )
                 except Exception:
                     logger.exception(

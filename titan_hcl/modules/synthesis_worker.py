@@ -644,45 +644,6 @@ def _tx_index_loop(tx_index_holder: dict, stop_event: threading.Event,
         stop_event.wait(interval_s)
 
 
-# EEL B1 (D-SPEC-153 / INV-Syn-28) — back off the off-hot-path skill-score drain
-# when the box is loaded. get_cpu_load() ∈ [0,1] (1 = all cores busy).
-_SKILL_DRAIN_CPU_BACKOFF = 0.75
-
-
-def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
-                            interval_s: float, name: str) -> None:
-    """Daemon thread — drain the `skill_score_events` queue into `skill_cells`
-    off the hot path (EEL Pillar B1). Its OWN cadence (like `_tx_index_loop`) so
-    a drain never delays the recompute watermark publish, and **resource-gated**
-    (`system_sensor.get_cpu_load`): bulk learning backs off when the box is busy
-    — the sharpened INV-EEL-1 ("continuous-idle, score-driven, resource-gated,
-    NOT dream-only"). All writes route through the SynthesisWriter (Option C /
-    INV-Syn-19)."""
-    stop_event.wait(min(interval_s, 15.0))
-    try:
-        from titan_hcl.utils.system_sensor import get_cpu_load
-    except Exception:
-        get_cpu_load = None
-    while not stop_event.is_set():
-        try:
-            load = float(get_cpu_load()) if get_cpu_load is not None else 0.0
-            if load <= _SKILL_DRAIN_CPU_BACKOFF:
-                summary = skill_store.drain_score_events()
-                if summary.get("drained"):
-                    logger.info(
-                        "[synthesis_worker] skill-score drain — events=%d cells=%d "
-                        "promoted=%d (cpu_load=%.2f)",
-                        summary.get("drained", 0), summary.get("cells_touched", 0),
-                        summary.get("promoted", 0), load)
-            else:
-                logger.debug(
-                    "[synthesis_worker] skill-score drain backed off "
-                    "(cpu_load=%.2f > %.2f)", load, _SKILL_DRAIN_CPU_BACKOFF)
-        except Exception as e:
-            logger.debug("[synthesis_worker] skill-score drain tick failed: %s", e)
-        stop_event.wait(interval_s)
-
-
 def _recompute_loop(store: "ActivationStore",
                     bundle_store: "StandingBundleStore",
                     status_writer: "SynthStatusWriter",
@@ -1680,14 +1641,16 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     _skill_outcome_holder: dict = {"store": None, "tracker": None}
 
     def _skill_outcome_sink(skill_id: str, success: bool) -> None:
-        # EEL B1 (D-SPEC-153): a delegated skill's cell scoring now happens via
-        # the per-oracle-verified-use path (the tool call it runs goes through the
-        # verdict→skill_score_events queue), so the old delegation-only utility
-        # bump (increment_success/failure — removed from the store) is superseded:
-        # it scored on ANY delegation outcome, oracle or not, which violates
-        # INV-EEL-2 (oracle-verified only). The SkillFailureTracker (repair-fork-
-        # on-failure, §9.3) is LIVE logic and STAYS.
+        _st = _skill_outcome_holder.get("store")
         _tr = _skill_outcome_holder.get("tracker")
+        if _st is not None:
+            try:
+                if success:
+                    _st.increment_success(skill_id)
+                else:
+                    _st.increment_failure(skill_id)
+            except Exception as _se:
+                logger.debug("[synthesis_worker] skill utility update failed: %s", _se)
         if _tr is not None:
             try:
                 _tr.record_outcome(skill_id, success=success)
@@ -1697,6 +1660,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # sovereignty is captured in that turn's per-reply S (high E — the skill
         # supplied the substrate from Titan's own compiled procedure), so the
         # meter no longer records a separate skill-delegation satisfied mark.
+        # The skill OUTCOME recording above (utility + failure tracker) stays.
 
     # ── Phase 6 §P6.A–K — Oracle middleware + proof middleware + CGN ─────
     # MeaningOraclePlug + 4 ToolPlugs + coverage analyzer + snapshot
@@ -2005,9 +1969,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             faiss_path=skills_faiss_path,
             snapshot_path=skills_snapshot_path,
             embedder=_shared_embedder,
-            # EEL B1 — time_cost ∈ [0,1] (high=proficient); floors live in that space.
-            promote_floor=float(skill_cfg.get("promote_floor", 0.7)),
-            soft_retire_floor=float(skill_cfg.get("soft_retire_floor", 0.1)),
+            soft_retire_floor=float(skill_cfg.get("soft_retire_floor", -0.5)),
             on_soft_retire=_skill_soft_retire_emit,
         )
         procedural_skill_store.snapshot_export()
@@ -2020,67 +1982,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             "[synthesis_worker] Phase 8 ProceduralSkillStore wiring failed: %s",
             exc, exc_info=True,
         )
-
-    # EEL B1 (D-SPEC-153 / INV-Syn-28) — start the off-hot-path, resource-gated
-    # skill-score drain daemon. Its OWN thread (like tx-index) so a drain never
-    # delays the recompute watermark; backs off when the box is loaded (INV-EEL-1).
-    if procedural_skill_store is not None:
-        _skill_drain_thread = threading.Thread(
-            target=_skill_score_drain_loop,
-            args=(procedural_skill_store, stop_event, interval_s, name),
-            daemon=True, name=f"synthesis-skill-drain-{name}")
-        _skill_drain_thread.start()
-        logger.info("[synthesis_worker] EEL B1 skill-score drain daemon started")
-
-    # EEL B1 (D-SPEC-153 / INV-Syn-28) — wire the OracleRouter's skill-score
-    # capture to the store. At each companion-batch flush, every canonical
-    # verdict naming its (goal, tool) is forwarded here → derive (outcome,
-    # task-shape) → enqueue an off-hot-path score event (synthesis sole-writer).
-    if procedural_skill_store is not None and oracle_router is not None:
-        from titan_hcl.synthesis.goal_class import (
-            goal_class as _derive_goal_class,
-            task_shape_for_goal as _derive_task_shape,
-        )
-        # task_type per oracle (the oracle IS the verification domain — §1.0).
-        _TASK_TYPE_BY_ORACLE = {
-            "coding_sandbox": "computational", "solana_oracle": "procedural",
-            "web_api_oracle": "informational", "cgn": "informational",
-        }
-        _POSITIVE_VERDICTS = frozenset((
-            "true", "success", "pass", "passed", "confirmed", "supported",
-            "verified", "ok", "correct"))
-        _NEGATIVE_VERDICTS = frozenset((
-            "false", "fail", "failed", "refuted", "rejected", "error", "incorrect"))
-
-        def _skill_score_sink(*, oracle_id, verdict, parent_tool_call_tx,
-                              parent_goal, tool_id):
-            try:
-                v = str(verdict or "").strip().lower()
-                if v in _POSITIVE_VERDICTS:
-                    success = True
-                elif v in _NEGATIVE_VERDICTS:
-                    success = False
-                else:
-                    # "unknown"/undecided — NOT an oracle-verified outcome; never
-                    # score it (INV-EEL-2: oracle-verified, never an assumption).
-                    return
-                gc = _derive_goal_class(parent_goal)
-                tt = _TASK_TYPE_BY_ORACLE.get(str(oracle_id), "procedural")
-                ts_shape = _derive_task_shape(tt, tool_id or str(oracle_id), parent_goal)
-                procedural_skill_store.enqueue_score_event(
-                    oracle_id=str(oracle_id), goal_class=gc, task_shape=ts_shape,
-                    success=success, parent_tool_call_tx=parent_tool_call_tx or "")
-            except Exception as _sse:
-                logger.debug("[synthesis_worker] skill score sink failed: %s", _sse)
-
-        try:
-            oracle_router.set_score_event_sink(_skill_score_sink)
-            logger.info(
-                "[synthesis_worker] EEL B1 skill-score capture wired "
-                "(OracleRouter flush → skill_store.enqueue_score_event)")
-        except Exception as _sw_err:
-            logger.warning(
-                "[synthesis_worker] skill-score sink wiring failed: %s", _sw_err)
 
     if procedural_skill_store is not None:
         try:
@@ -2782,10 +2683,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         evidence_ref=str(payload.get("evidence_ref", "")),
                         latency_ms=int(payload.get("latency_ms", 0) or 0),
                         fork="procedural",
-                        # EEL B1 — carry goal+tool so the flush can form the
-                        # (outcome, task-shape) skill-score event (INV-Syn-28).
-                        parent_goal=str(payload.get("parent_goal", "") or ""),
-                        tool_id=str(payload.get("tool_id", "") or ""),
                     )
                 except Exception as _tcv_err:
                     logger.debug(

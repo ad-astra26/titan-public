@@ -1567,7 +1567,6 @@ def _send_transition(send_queue, name: str, cgn_client,
         state[6] = (hash(topic) % 1000) / 1000.0
 
         _send_msg(send_queue, "CGN_TRANSITION", name, "cgn", {
-            "type": "experience",  # (b) complete transition → record_experience → observe_for (DEFERRED G1)
             "consumer": "knowledge",
             "concept_id": topic[:50],
             "state": state.tolist(),

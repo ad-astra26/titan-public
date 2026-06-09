@@ -77,11 +77,8 @@ def _make_tx(*, tx_hash, tool, args, success, scored_by, parent_chat_tx, ts):
 
 
 def test_phase8_full_dream_pass_end_to_end(tmp_path):
-    """EEL B1: the miner is negative-only — 1 dream pass over a recurrent FAILURE
-    shape compiles 1 NEGATIVE skill that survives first-invocation lineage
-    verification but is NEVER delegatable (the INV-EEL-5 polarity guard). The
-    positive→delegatable path is now per-use (test_skill_cells_b1 / test_phase8_
-    skill_store)."""
+    """The big one: 1 dream pass produces 1 compiled positive skill that
+    survives first-invocation verification and passes the delegate gate."""
     # 1. Seed: 10 tool-call TXs across 5 chats, each chat has 2 calls:
     #    (read_buffer with name=goal) → (write_buffer with name=retrieval, content=text)
     #    All 5 chats share the same canonical shape. 5 are oracle-scored
@@ -92,13 +89,13 @@ def test_phase8_full_dream_pass_end_to_end(tmp_path):
         ts_base = 1000.0 + i * 10
         seed_txs.append(_make_tx(
             tx_hash=f"tx_r_{i}", tool="read_buffer",
-            args={"name": "goal"}, success=False,
+            args={"name": "goal"}, success=True,
             scored_by="oracle" if i < 3 else None,
             parent_chat_tx=chat_id, ts=ts_base,
         ))
         seed_txs.append(_make_tx(
             tx_hash=f"tx_w_{i}", tool="write_buffer",
-            args={"name": "retrieval", "content": "x"}, success=False,
+            args={"name": "retrieval", "content": "x"}, success=True,
             scored_by="oracle" if i < 3 else None,
             parent_chat_tx=chat_id, ts=ts_base + 1,
         ))
@@ -167,7 +164,7 @@ def test_phase8_full_dream_pass_end_to_end(tmp_path):
     miner = ProceduralMiner(
         skill_store=store,
         tool_call_reader=patched_reader,
-        llm_proposer=lambda meta, kind: miner_response if kind == "negative" else None,
+        llm_proposer=lambda meta, kind: miner_response if kind == "positive" else None,
         outer_memory_writer=writer,
         min_occurrences=3,
         min_seq_len=2,
@@ -175,8 +172,7 @@ def test_phase8_full_dream_pass_end_to_end(tmp_path):
         max_skills_per_pass=10,
     )
     miner_summary = miner.mine_pass(dream_pass_id="dp_test_1")
-    assert miner_summary["negative_skills_compiled"] >= 1
-    assert miner_summary["positive_skills_compiled"] == 0  # miner negative-only (B1)
+    assert miner_summary["positive_skills_compiled"] >= 1
     assert len(miner_summary["compiled_ids"]) >= 1
 
     # 5. ProceduralSkillStore should have the skill
@@ -197,15 +193,17 @@ def test_phase8_full_dream_pass_end_to_end(tmp_path):
     )
     assert verifier.verify_skill(skill_id) is True
 
-    # Skill lineage is now verified (INV-Syn-20 resolves its compiled_from)…
+    # Skill should now be verified
     skill_row_v = store.read_skill(skill_id)
     assert skill_row_v["verified_at"] is not None
 
-    # 7. …but a NEGATIVE skill is NEVER delegatable (INV-EEL-5 polarity guard):
-    # read_for_match returns positives only, so the reader never surfaces it.
+    # 7. ProceduralSkillReader should find the skill, should_delegate=True
     reader = ProceduralSkillReader(store, utility_floor=0.3, match_floor=0.0)
     results = reader.recall("read goal write retrieval", k=5)
-    assert skill_id not in [r["skill_id"] for r in results]
+    assert len(results) > 0
+    top = results[0]
+    assert top["skill_id"] == skill_id
+    assert reader.should_delegate(top) is True
 
 
 def test_phase8_pipeline_idempotent_across_two_passes(tmp_path):
@@ -293,11 +291,8 @@ def test_phase8_failure_skill_compiled_distinct_from_success(tmp_path):
         min_occurrences=3, min_seq_len=2, max_seq_len=2,
     )
     summary = miner.mine_pass()
-    # EEL B1: miner is negative-only — the good (terminal-success) members are
-    # skipped (positives form per-use); only the bad (terminal-failure) shape
-    # compiles → 1 negative skill.
-    assert summary["positive_skills_compiled"] == 0
+    assert summary["positive_skills_compiled"] == 1
     assert summary["negative_skills_compiled"] == 1
     all_skills = store.list_all()
     ids = {s["skill_id"] for s in all_skills}
-    assert len(ids) == 1  # one negative outcome
+    assert len(ids) == 2  # distinct skill_ids
