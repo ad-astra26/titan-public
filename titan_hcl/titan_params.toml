@@ -3661,3 +3661,11 @@ recall_present_floor = 0.30   # recall ≥ this (but < known) → Collaborative 
 engram_ground_floor  = 0.30   # EngramStore reduced groundedness ≥ this counts as strong substrate
 skill_promote_floor  = 0.70   # verified skill utility ≥ this → Skill-Delegate (active once B1 lands)
 iql_veto_margin      = 0.25   # |IQL advantage| beyond this may veto the grounded mode (0c only; passive in 0a/0b)
+
+[eel.confirm]
+# EEL Pillar A / Phase A2 — research learn-on-confirm (RFP_emergent_experience_learning §7.A2).
+# Bootstrap values (Maker-ratified 2026-06-09); emergence supersedes over time (INV-EEL-4).
+confirm_window_turns = 3      # next-user-turns a researched node stays pending confirm/dispute
+delta                = 1.0    # explicit confirm ("thanks/correct") → confirmation_score += this → promote
+delta_weak           = 0.3    # no dispute within the window (silence ≠ endorsement) → weak-confirm → promote
+dispute_delta        = -1.0   # explicit dispute ("no/wrong/search more") → confirmation_score += this → prune + re-research

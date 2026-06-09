@@ -47,6 +47,16 @@ _MEMPOOL_PROMOTE_SCORE = 40.0  # LLM score threshold for promotion (was 50 batch
 _DECAY_ALL_INTERVAL_S = 300.0
 
 
+def _eel_confirm_window() -> int:
+    """EEL A2 — the confirm/dispute window length (turns) from
+    `titan_params.toml [eel.confirm]`. Bootstrap default 3 (INV-EEL-4)."""
+    try:
+        from titan_hcl.params import get_params
+        return int(get_params("eel").get("confirm", {}).get("confirm_window_turns", 3))
+    except Exception:
+        return 3
+
+
 # PERSISTENCE_BY_DESIGN: TieredMemoryGraph._duckdb is a database-connection
 # object reference rebuilt on boot; _next_id is reloaded from disk via
 # direct DuckDB query (MAX(id)+1) rather than via self-assignment, which
@@ -348,24 +358,76 @@ class TieredMemoryGraph:
         """Update mempool_weight on a node using sigmoid decay."""
         node["mempool_weight"] = self._compute_mempool_weight(node)
 
-    def reinforce_mempool_node(self, node_id: int):
+    def reinforce_mempool_node(self, node_id: int, delta: Optional[float] = None):
         """
         Reinforce a mempool node — resets its decay clock and boosts weight.
         Called when the same topic comes up again before meditation.
+
+        EEL A2 (INV-EEL-6): when `delta` is given it is the signed confirmation
+        signal for a researched node — `+δ` confirm · `+δ_weak` weak-confirm ·
+        `−δ` dispute. It accumulates into `confirmation_score` (the meditation
+        promote gate reads it for acquired:research nodes) and resolves the
+        pending window. The survival bump (decay-clock reset + weight) runs for a
+        positive / no delta — to keep a confirmed node alive long enough to
+        promote; a dispute (negative delta) does NOT bump survival, so the
+        disputed node fades/prunes. `delta=None` = the original
+        topic-reinforcement behavior, unchanged (the 3 legacy callers).
         """
         if node_id not in self._node_store:
             return
         node = self._node_store[node_id]
         if node.get("status") != "mempool":
             return
-        node["last_reinforced"] = time.time()
-        node["mempool_reinforcements"] = node.get("mempool_reinforcements", 0) + 1
+        if delta is not None:
+            node["confirmation_score"] = float(node.get("confirmation_score") or 0.0) + float(delta)
+            node["confirm_turns_left"] = None  # confirm/dispute/weak all close the window
+        if delta is None or delta > 0:
+            node["last_reinforced"] = time.time()
+            node["mempool_reinforcements"] = node.get("mempool_reinforcements", 0) + 1
         self._apply_mempool_decay(node)
         self._persist_node(node)
         logger.debug(
-            "[Memory] Mempool node %d reinforced (count=%d, weight=%.3f).",
+            "[Memory] Mempool node %d reinforced (count=%d, weight=%.3f, "
+            "delta=%s, confirmation_score=%.2f).",
             node_id, node["mempool_reinforcements"], node["mempool_weight"],
+            delta, float(node.get("confirmation_score") or 0.0),
         )
+
+    def find_pending_confirmation_nodes(self, user_identifier: str) -> List[Dict]:
+        """EEL A2: the user's `acquired:research` mempool nodes still awaiting
+        confirm/dispute (`confirm_turns_left > 0`), newest-first. The next user
+        turn is classified against these (the most-recent is the one the user is
+        reacting to; the rest age out via `tick_confirmation_window`)."""
+        sid = f"identity_{user_identifier}"
+        pending = [
+            v for v in self._node_store.values()
+            if v.get("type") == "MemoryNode"
+            and v.get("status") == "mempool"
+            and v.get("source_id") == sid
+            and "acquired:research" in (v.get("tags") or [])
+            and (v.get("confirm_turns_left") or 0) > 0
+        ]
+        pending.sort(key=lambda n: n.get("created_at", 0), reverse=True)
+        return pending
+
+    def tick_confirmation_window(self, node_id: int, weak_delta: float) -> str:
+        """EEL A2: a neutral user turn elapses one turn of a pending node's
+        window. On expiry (reaches 0) it is weak-confirmed (`+weak_delta` →
+        promote; silence ≠ dispute). Returns "expired_weak" | "pending" | "gone".
+        """
+        node = self._node_store.get(node_id)
+        if not node or node.get("status") != "mempool":
+            return "gone"
+        left = int(node.get("confirm_turns_left") or 0) - 1
+        if left <= 0:
+            node["confirm_turns_left"] = None
+            node["confirmation_score"] = float(node.get("confirmation_score") or 0.0) + float(weak_delta)
+            self._apply_mempool_decay(node)
+            self._persist_node(node)
+            return "expired_weak"
+        node["confirm_turns_left"] = left
+        self._persist_node(node)
+        return "pending"
 
     def find_similar_mempool_node(self, text: str, threshold: float = 0.6) -> Optional[int]:
         """
@@ -862,11 +924,15 @@ class TieredMemoryGraph:
                 existing["tags"] = _et
             if source and not existing.get("acquired_source"):
                 existing["acquired_source"] = source
+            # EEL A2: a research answer deduping into an existing node (re)opens
+            # its confirm/dispute window so the next turn can confirm it.
+            if tags and "acquired:research" in tags:
+                existing["confirm_turns_left"] = _eel_confirm_window()
             # Re-index with updated content
             self._index_mempool_node(existing)
             self._persist_node(existing)
             logger.debug("[Memory] Reinforced existing mempool node %d (similar topic).", similar_id)
-            return
+            return similar_id
 
         node_id = self._next_id
         node = {
@@ -891,6 +957,11 @@ class TieredMemoryGraph:
             "neuromod_context": neuromod_context,  # felt-at-lived-time (§7.C)
             "tags": list(tags) if tags else [],     # EEL A1 (INV-EEL-6) provenance
             "acquired_source": source,               # e.g. "searxng:<query>"
+            "confirmation_score": 0.0,               # EEL A2 — signed confirm signal
+            # EEL A2 — open the confirm/dispute window for researched nodes only.
+            "confirm_turns_left": (
+                _eel_confirm_window() if (tags and "acquired:research" in tags) else None
+            ),
         }
         self._node_store[node_id] = node
         self._next_id += 1
@@ -900,6 +971,7 @@ class TieredMemoryGraph:
 
         # Persist to SQLite
         self._persist_node(node)
+        return node_id
 
     async def fetch_mempool(self) -> List[Dict]:
         """Retrieves all memory nodes currently residing in the mempool."""

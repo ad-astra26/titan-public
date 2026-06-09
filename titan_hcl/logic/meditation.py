@@ -34,6 +34,34 @@ Score the following memory interaction on two dimensions:
 Respond with ONLY a JSON object: {"value": <number>, "intensity": <number>}"""
 
 
+def _eel_weak_delta() -> float:
+    """EEL A2 — the weak-confirm magnitude (silence default) from
+    `titan_params.toml [eel.confirm]`. Bootstrap default 0.3 (INV-EEL-4)."""
+    try:
+        from titan_hcl.params import get_params
+        return float(get_params("eel").get("confirm", {}).get("delta_weak", 0.3))
+    except Exception:
+        return 0.3
+
+
+def classify_research_node(node: dict, weak_delta: float) -> tuple[str, float]:
+    """EEL Pillar A / A2 (INV-EEL-6) — the confirmation-gated promote decision for
+    an `acquired:research` node, factored out so it is unit-testable.
+
+    Returns ("promote" | "prune", confirmation_score). A node still unresolved at
+    meditation (score ≈ 0 — the conversation ended before confirm/dispute) is
+    weak-confirmed in place (silence ≠ dispute) so the fact still promotes;
+    a confirmed (>0) node promotes; a disputed (<0) node prunes (it is
+    re-researched the next time the topic arises).
+    """
+    cs = float(node.get("confirmation_score") or 0.0)
+    if abs(cs) < 1e-9:
+        cs = float(weak_delta)
+        node["confirmation_score"] = cs
+        node["confirm_turns_left"] = None
+    return ("promote" if cs > 0.0 else "prune", cs)
+
+
 class MeditationEpoch:
     """
     Controls the 6-hour Small Epoch where the agent processes its mempool,
@@ -325,6 +353,19 @@ class MeditationEpoch:
         pruned_low = []
 
         for node in candidates:
+            # EEL Pillar A / A2 (INV-EEL-6): researched memories are
+            # CONFIRMATION-gated, not hippocampus-scored — only confirmed research
+            # strengthens recall (disputed research can't quietly raise the cosine).
+            if "acquired:research" in (node.get("tags") or []):
+                _decision, _cs = classify_research_node(node, _eel_weak_delta())
+                if _decision == "promote":
+                    node["_meditation_score"] = 100  # confirmed-research provenance
+                    node["_meditation_intensity"] = 5
+                    promoted.append((node, 100, 5))
+                else:  # disputed (< 0) → prune (re-researched on next ask)
+                    pruned_low.append(node)
+                continue
+
             score, intensity = await self.get_hippocampus_score([node])
             node["_meditation_score"] = score
             node["_meditation_intensity"] = intensity

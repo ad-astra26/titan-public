@@ -63,7 +63,9 @@ class TitanDuckDB:
                 memory_type TEXT DEFAULT 'episodic',
                 timechain_tx_hash TEXT,
                 tags TEXT,
-                acquired_source TEXT
+                acquired_source TEXT,
+                confirmation_score DOUBLE DEFAULT 0,
+                confirm_turns_left INTEGER
             )
         """)
         # Synthesis Engine Phase 1 / D-SPEC-123 — additive memory_type column
@@ -93,6 +95,17 @@ class TitanDuckDB:
         self._conn.execute(
             "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS acquired_source TEXT"
         )
+        # EEL Pillar A / A2 (INV-EEL-6) — confirmation-gated promotion of researched
+        # memories: `confirmation_score` (signed ±δ accumulator; the meditation
+        # promote gate reads it for acquired:research nodes) + `confirm_turns_left`
+        # (the pending confirm/dispute window; NULL = not pending). Persisted so the
+        # pending state survives a restart. Additive + idempotent.
+        self._conn.execute(
+            "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS confirmation_score DOUBLE DEFAULT 0"
+        )
+        self._conn.execute(
+            "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS confirm_turns_left INTEGER"
+        )
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS identity_nodes (
                 id TEXT PRIMARY KEY,
@@ -119,6 +132,7 @@ class TitanDuckDB:
             "mempool_reinforcements", "effective_weight", "created_at",
             "last_accessed", "last_reinforced", "embedding_id", "cognified",
             "neuromod_context", "tags", "acquired_source",
+            "confirmation_score", "confirm_turns_left",
         ]
         vals = []
         for c in cols:

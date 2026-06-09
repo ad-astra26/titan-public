@@ -1116,6 +1116,41 @@ def create_pre_hook(plugin):
                     mode, _gr_err)
         plugin._last_execution_mode = mode
 
+        # ── EEL Pillar A / A2 — learn-on-confirm (RFP §7.A2; INV-EEL-2/6) ─────
+        # If this user has a researched node still awaiting confirmation, classify
+        # THIS turn {confirm, dispute, neutral} and gate the node's promotion.
+        # Pure-regex classify, only when a pending node exists → off the critical
+        # path. Confirm → +δ (promote); dispute → −δ + re-research the ORIGINAL
+        # topic; neutral → elapse one turn (weak-confirm on window expiry).
+        try:
+            _a2_pendings = plugin.memory.find_pending_confirmation_nodes(user_id)
+            if _a2_pendings:
+                from titan_hcl.synthesis.confirmation_intent import detect_confirmation
+                from titan_hcl.params import get_params as _get_params
+                _a2c = _get_params("eel").get("confirm", {})
+                _a2_delta = float(_a2c.get("delta", 1.0))
+                _a2_weak = float(_a2c.get("delta_weak", 0.3))
+                _a2_dispute = float(_a2c.get("dispute_delta", -1.0))
+                _a2_intent = detect_confirmation(prompt_text)
+                _a2_top = _a2_pendings[0]  # the node the user is reacting to
+                if _a2_intent == "confirm":
+                    plugin.memory.reinforce_mempool_node(_a2_top["id"], _a2_delta)
+                    logger.info("[PreHook][A2] confirm → node %s (+%.2f)",
+                                _a2_top["id"], _a2_delta)
+                elif _a2_intent == "dispute":
+                    plugin.memory.reinforce_mempool_node(_a2_top["id"], _a2_dispute)
+                    plugin._force_research_topic = _a2_top.get("user_prompt") or prompt_text
+                    mode = "STATE_NEED_RESEARCH"            # VC: flows to the :2208 dispatch
+                    plugin._last_execution_mode = mode
+                    logger.info("[PreHook][A2] dispute → node %s (%.2f) + re-research '%s'",
+                                _a2_top["id"], _a2_dispute,
+                                (plugin._force_research_topic or "")[:60])
+                else:  # neutral — elapse one turn of every pending window
+                    for _a2_pn in _a2_pendings:
+                        plugin.memory.tick_confirmation_window(_a2_pn["id"], _a2_weak)
+        except Exception as _a2_err:
+            logger.debug("[PreHook][A2] confirmation gate skipped: %s", _a2_err)
+
         # P2 gibberish-baseline calibration (flag-gated) — periodically probe the
         # embedder's noise floor so the recall floors SELF-CALIBRATE to the live
         # spine (gibberish prompts → top cosine → EMA ceiling → floors). Runs on
@@ -2213,8 +2248,12 @@ def create_pre_hook(plugin):
             if not plugin.sage_researcher:
                 sage_findings = ""
             else:
+                # EEL A2 dispute → re-research the ORIGINAL topic (one-shot flag
+                # set by the A2 gate above), else the current prompt.
+                _research_gap = getattr(plugin, "_force_research_topic", None) or prompt_text
+                plugin._force_research_topic = None
                 sage_findings = await plugin.sage_researcher.research(
-                    knowledge_gap=prompt_text,
+                    knowledge_gap=_research_gap,
                 )
             if sage_findings:
                 injected += f"### Research Findings\n{sage_findings}\n\n"
