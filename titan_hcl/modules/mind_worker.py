@@ -56,7 +56,12 @@ logger = logging.getLogger(__name__)
 # liveness. Under `l0_rust_enabled=true` mind_worker runs as a SHADOW
 # providing sensor_cache_inner_mind.bin input — the SHM slot tracks the
 # Python shadow lifecycle, not the Rust daemon's.
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 _state_writer = None  # type: ignore[assignment]
 
 # Sub-sense decay: media digest features decay over time (half-life 30 min)
@@ -188,8 +193,9 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     from queue import Empty
 
     # Phase 11 §11.I.5 — reset module-level readiness flags.
-    global _WORKER_READY, _state_writer
+    global _WORKER_READY, _BOOT_DEADLINE, _state_writer
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
     _state_writer = None
 
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -1064,7 +1070,7 @@ def _send_heartbeat(send_queue, name: str) -> None:
     except Exception:
         rss_mb = 0
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})
-    if _state_writer is not None and _WORKER_READY:
+    if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
         try:
             _state_writer.heartbeat()
         except Exception:  # noqa: BLE001 — never crash the heartbeat

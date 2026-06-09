@@ -193,6 +193,14 @@ def test_anchor_freshness_stubbed(cold_inputs):
     assert out["anchor_freshness"] == _STUB_ANCHOR_FRESHNESS == 0.5
 
 
+def test_anchor_freshness_real_passthrough(cold_inputs):
+    # When cognitive_worker passes a cached freshness (linear-over-24h of
+    # timechain_state.recent_anchor_age_s), the builder uses it, not the stub
+    # (BUG-LIFEFORCE-INPUT-STUBS).
+    out = compute_life_force_inputs(**{**cold_inputs, "anchor_freshness": 0.75})
+    assert out["anchor_freshness"] == 0.75
+
+
 def test_hormonal_vitality_from_nns(cold_inputs, warm_nns):
     out = compute_life_force_inputs(
         **{**cold_inputs, "neural_nervous_system": warm_nns}

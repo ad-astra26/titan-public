@@ -49,7 +49,7 @@
 //! until the TOML loader lands.
 
 /// Which trinity layer a daemon owns — selects the quant→qual gradient (INV-9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Layer {
     /// Body (material) — leans quantitative.
     Body,
@@ -92,7 +92,7 @@ pub const fn gradient(layer: Layer) -> (f32, f32) {
 pub const CENTRE: f32 = 0.5;
 
 /// Restoring-force + observable-feedback configuration for one layer (SPEC §G5.2 item 5).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RestoringCfg {
     /// Drive coefficient — how fast tensor tracks the raw producer.
     pub k_drive: f32,

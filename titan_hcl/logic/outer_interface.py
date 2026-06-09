@@ -171,7 +171,10 @@ class OuterInterface:
         self._stats["total_words_reinforced"] += len(vocab_analysis["known_words"])
         self._stats["total_words_unknown"] += len(vocab_analysis["unknown_words"])
 
-        logger.info(
+        # DEBUG, not INFO: a normal per-action event (every narration) — at INFO
+        # it was a top /var/log filler on the shared box
+        # (BUG-EXPRESSION-OUTER-INFO-LOG-VERBOSITY-20260530).
+        logger.debug(
             "[OuterInterface] Processed %s: %d body_deltas, %d mind_deltas, "
             "narration='%s', %d known words, %d unknown",
             action_type,

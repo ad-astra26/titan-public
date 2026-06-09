@@ -682,7 +682,12 @@ def _handle_action_result(
 # Flipped True after NeuralNervousSystem + (optional) IMPULSE pipeline init
 # complete. Gates SHM-slot heartbeat so titan_hcl's 1Hz poll sees real
 # liveness rather than the boot-time "subscribed-but-not-warm" lie.
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 @with_error_envelope(module_name="ns_module", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -702,8 +707,9 @@ def ns_worker_main(
             config, and the microkernel.shm_ns_enabled flag.
     """
     # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -883,7 +889,7 @@ def ns_worker_main(
             except Exception:
                 pass
             # Phase 11 §11.I.5 — SHM-slot heartbeat sidecar.
-            if _state_writer is not None and _WORKER_READY:
+            if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
                 try:
                     _state_writer.heartbeat()
                 except Exception:  # noqa: BLE001

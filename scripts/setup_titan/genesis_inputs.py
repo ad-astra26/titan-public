@@ -10,10 +10,6 @@ genesis phase runs:
   - prime directives   → ``titan_constitution.md`` via the Maker's $EDITOR
                          (templated). Prime Directives are MAKER-SUPPLIED and
                          MANDATORY — never defaults (fundamental architecture).
-                         A headless / non-tty / ``--default`` install supplies
-                         them without an editor via (precedence, highest first)
-                         ``--directives-file <path>`` › ``TITAN_DIRECTIVES_FILE``
-                         (env path) › ``TITAN_DIRECTIVES`` (env literal text).
 
 On-chain modes (devnet / mainnet) only; ``local`` has no on-chain identity, so
 this phase is a clean skip there. Stdlib-only (runs on the system interpreter,
@@ -138,62 +134,9 @@ def _persist_maker(install_root: Path, state: dict) -> Result:
                   "could not write [network].maker_pubkey — set it via `setup_titan config`.")
 
 
-def _read_directives_path(raw: str, label: str) -> tuple[str | None, str, str | None]:
-    """Read a directives file named by flag/env. Returns (text, label, problem)."""
-    p = Path(raw).expanduser()
-    if not p.is_file():
-        return None, label, f"{label} path not found: {raw} — no directives written."
-    try:
-        text = p.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return None, label, f"{label} unreadable ({raw}): {exc}"
-    if not text.strip():
-        return None, label, f"{label} file is empty: {raw} — no directives written."
-    return text, label, None
-
-
-def _supplied_directives(directives_file: str | None
-                         ) -> tuple[str | None, str, str | None]:
-    """Resolve Maker-supplied directives for a headless / non-tty install.
-
-    Precedence (highest first): ``--directives-file`` (flag, path) ›
-    ``TITAN_DIRECTIVES_FILE`` (env, path) › ``TITAN_DIRECTIVES`` (env, literal
-    text). Returns (text, source_label, problem):
-      - (None, "", None)       → nothing supplied; the caller falls through to
-                                  the interactive editor / pre-existing file.
-      - (None, label, problem) → a source was named but is missing/empty/unreadable.
-      - (text, label, None)    → directives text to write to the constitution.
-    """
-    if directives_file:
-        return _read_directives_path(directives_file, "--directives-file")
-    env_path = os.environ.get("TITAN_DIRECTIVES_FILE")
-    if env_path:
-        return _read_directives_path(env_path, "TITAN_DIRECTIVES_FILE")
-    env_text = os.environ.get("TITAN_DIRECTIVES")
-    if env_text and env_text.strip():
-        return env_text, "TITAN_DIRECTIVES", None
-    return None, "", None
-
-
 def _collect_directives(install_root: Path, prompter: Prompter,
-                        *, interactive: bool, directives_file: str | None = None) -> Result:
+                        *, interactive: bool) -> Result:
     path = _constitution_path(install_root)
-
-    # Explicit Maker supply (flag/env) wins over BOTH the interactive editor and
-    # any pre-existing file: it is the only way a non-tty / --default install can
-    # satisfy the MANDATORY directives without an editor. Comment-only/blank
-    # supply still warns — never fabricate directives.
-    text, source, problem = _supplied_directives(directives_file)
-    if problem:
-        return Result("directives", "warn", problem)
-    if text is not None:
-        path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
-        if not _has_directive_content(path):
-            return Result("directives", "warn",
-                          f"{source} held only comments/blanks — no real directives. "
-                          "The genesis ceremony will refuse an on-chain birth.")
-        return Result("directives", "ok", f"prime directives ← {source} → {path.name}")
-
     has_content = _has_directive_content(path)
 
     if not interactive:
@@ -230,15 +173,11 @@ def _collect_directives(install_root: Path, prompter: Prompter,
 
 
 def run_genesis_inputs_phase(install_root: Path, mode: Mode, state: dict, *,
-                             prompter: Prompter, default: bool = False,
-                             directives_file: str | None = None) -> list[Result]:
+                             prompter: Prompter, default: bool = False) -> list[Result]:
     """Collect the Maker-supplied genesis identity (name · maker · directives).
 
     Local mode has no on-chain identity → clean skip. devnet/mainnet write the
     inputs the ceremony reads (and hard-fails without, for maker + directives).
-    ``directives_file`` (the ``--directives-file`` flag) lets a headless install
-    supply the constitution without an editor; ``TITAN_DIRECTIVES_FILE`` /
-    ``TITAN_DIRECTIVES`` env vars are the lower-precedence fallbacks.
     """
     if mode == Mode.LOCAL:
         return [Result("genesis_inputs", "ok",
@@ -252,7 +191,6 @@ def run_genesis_inputs_phase(install_root: Path, mode: Mode, state: dict, *,
     results = [
         _collect_name(install_root, state, prompter, interactive=interactive),
         _persist_maker(install_root, state),
-        _collect_directives(install_root, prompter, interactive=interactive,
-                            directives_file=directives_file),
+        _collect_directives(install_root, prompter, interactive=interactive),
     ]
     return results

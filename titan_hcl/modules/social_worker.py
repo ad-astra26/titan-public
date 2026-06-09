@@ -127,7 +127,12 @@ _SOCIAL_WORKER_SUBSCRIBE_TOPICS = [
 # SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
 # the boot window so guardian_HCL's stale-heartbeat detector doesn't
 # kill a slow boot).
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 @with_error_envelope(module_name="social_worker", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -164,8 +169,9 @@ def social_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     except Exception as _err:
         logger.debug("[SocialWorker] pdeathsig install skipped: %s", _err)
 
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     titan_id = resolve_titan_id()
     boot_ts = time.time()
@@ -1033,7 +1039,7 @@ def _send_heartbeat(send_queue, name: str, extra: dict | None = None,
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
-    if state_writer is not None and _WORKER_READY:
+    if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
         try:
             state_writer.heartbeat()
         except Exception:  # noqa: BLE001 — never crash the heartbeat

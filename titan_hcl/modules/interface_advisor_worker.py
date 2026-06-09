@@ -92,7 +92,12 @@ HEARTBEAT_INTERVAL_S = 30.0
 # SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
 # the boot window so guardian_HCL's stale-heartbeat detector doesn't
 # kill a slow boot).
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 def _send(send_queue, msg_type: str, src: str, dst: str,
@@ -118,7 +123,7 @@ def _heartbeat_loop(send_queue, name: str,
     """
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
-        if state_writer is not None and _WORKER_READY:
+        if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
             try:
                 state_writer.heartbeat()
             except Exception:  # noqa: BLE001 — never crash the heartbeat
@@ -145,8 +150,9 @@ def interface_advisor_worker_main(recv_queue, send_queue, name: str,
                                  INTERFACE_ADVISOR_RATE_REFRESH_CADENCE_S
            - MODULE_SHUTDOWN   → graceful exit
     """
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = resolve_titan_id(config.get("titan_id") if config else None)
