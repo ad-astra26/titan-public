@@ -158,6 +158,18 @@ def select_restore_chain(
 ArweaveFetcher = Callable[[str], "Awaitable[bytes]"]
 
 
+def _sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
+    """Streamed sha256 of a file — constant memory regardless of size (used to
+    verify a stream-fetched tarball against its manifest merkle_root without
+    materializing the multi-hundred-MB tarball in RAM)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 async def fetch_event_components(
     arweave_fetch: ArweaveFetcher,
     event: dict,
@@ -480,6 +492,7 @@ async def restore_full(
     target_event_id: Optional[str] = None,
     verify_zk_chain: bool = True,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    arweave_fetch_to_file: Optional[Callable[[str, str], "Awaitable[bool]"]] = None,
 ) -> RestoreResult:
     """rFP §3.1 — full crash-recovery restore protocol (steps 5-10).
 
@@ -574,6 +587,50 @@ async def restore_full(
                         f"event {event_id!r} {component}.tx_id missing")
                     out.duration_s = time.time() - started
                     return out
+                tmp = os.path.join(staging_dir, f"{event_id}.{component}.tar")
+                if arweave_fetch_to_file is not None:
+                    # STREAMING path (the live reconstruction) — fetch the
+                    # tarball straight to disk in fixed chunks, constant memory
+                    # regardless of tarball size. The prior in-RAM `arweave_fetch`
+                    # held the whole 595MB compressed salvage tarball → ~960MB
+                    # peak, over backup's 500MB rss_limit. Streaming → <100MB.
+                    # The callable yields a PLAINTEXT tarball at `tmp` (Mode-B
+                    # decryption, if any, handled inside it), so the staged file's
+                    # streamed sha256 must equal the component merkle_root.
+                    try:
+                        ok = await arweave_fetch_to_file(tx_id, tmp)
+                    except Exception as e:
+                        out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                        out.halt_event_id = event_id
+                        out.errors.append(
+                            f"Arweave stream-fetch failed for event {event_id!r} "
+                            f"{component} tx_id={tx_id!r}: {e}")
+                        out.duration_s = time.time() - started
+                        return out
+                    if not ok or not os.path.exists(tmp):
+                        out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                        out.halt_event_id = event_id
+                        out.errors.append(
+                            f"Arweave stream-fetch returned no data for event "
+                            f"{event_id!r} {component} tx_id={tx_id!r}")
+                        out.duration_s = time.time() - started
+                        return out
+                    expected = sub.get("merkle_root") or ""
+                    if expected:
+                        actual = _sha256_file(tmp)
+                        if actual != expected:
+                            out.halt_reason = HALT_TARBALL_HASH_MISMATCH
+                            out.halt_event_id = event_id
+                            out.errors.append(
+                                f"{HALT_TARBALL_HASH_MISMATCH}: event {event_id!r} "
+                                f"{component} staged tarball sha256 mismatch: "
+                                f"expected {expected}, got {actual}")
+                            out.duration_s = time.time() - started
+                            return out
+                    out.bytes_fetched += os.path.getsize(tmp)
+                    staged.append((component, tmp))
+                    continue
+                # In-memory bytes path (hermetic tests + non-streaming callers).
                 try:
                     data = await arweave_fetch(tx_id)
                 except Exception as e:
@@ -603,7 +660,6 @@ async def restore_full(
                     out.errors.append(str(e))
                     out.duration_s = time.time() - started
                     return out
-                tmp = os.path.join(staging_dir, f"{event_id}.{component}.tar")
                 with open(tmp, "wb") as f:
                     f.write(data)
                 staged.append((component, tmp))
