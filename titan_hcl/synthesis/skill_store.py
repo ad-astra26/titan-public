@@ -268,10 +268,16 @@ class ProceduralSkillStore:
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name = 'procedural_skills_legacy'"
         ).fetchall()
+        # DuckDB refuses `ALTER TABLE … RENAME` while dependent objects (the
+        # pre-B1 secondary indexes) still reference the table — so drop them
+        # first. The legacy table is archival (never queried hot), so it needs
+        # no indexes. (Caught live on T3 2026-06-09: the rename threw "Cannot
+        # alter entry … entries that depend on it" → store init failed.)
+        self._drop_pre_b1_indexes()
         if legacy:
-            # legacy already exists from a prior migration attempt — drop the
-            # half-made new table is NOT safe; instead leave legacy intact and
-            # rename the stray pre-B1 table aside with a suffix so CREATE proceeds.
+            # legacy already exists from a prior migration attempt — leave it
+            # intact + rename the stray pre-B1 table aside with a suffix so the
+            # CREATE below proceeds.
             logger.warning(
                 "[ProceduralSkillStore] both procedural_skills (pre-B1) and "
                 "procedural_skills_legacy exist — preserving legacy; renaming the "
@@ -284,6 +290,15 @@ class ProceduralSkillStore:
             "procedural_skills → procedural_skills_legacy (never-delete §8.4/INV-3)")
         self._db.execute(
             "ALTER TABLE procedural_skills RENAME TO procedural_skills_legacy")
+
+    def _drop_pre_b1_indexes(self) -> None:
+        """Drop the pre-B1 secondary indexes on `procedural_skills` so the table
+        can be renamed (DuckDB blocks RENAME while indexes depend on it)."""
+        for idx in ("idx_procedural_skills_utility", "idx_procedural_skills_last_used"):
+            try:
+                self._db.execute(f"DROP INDEX IF EXISTS {idx}")
+            except Exception as e:  # pragma: no cover — defensive
+                logger.debug("[ProceduralSkillStore] drop pre-B1 index %s: %s", idx, e)
 
     # ── FAISS lifecycle (lazy load / save) — preserved verbatim ──────────
 

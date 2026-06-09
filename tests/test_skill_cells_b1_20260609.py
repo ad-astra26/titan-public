@@ -170,13 +170,18 @@ def test_drain_marks_processed(tmp_path):
 
 def test_legacy_migration_preserves_pre_b1_table(tmp_path):
     conn = duckdb.connect(":memory:")
-    # Simulate a pre-B1 procedural_skills (skill_id PK, NO oracle_id column) + a row.
+    # Simulate a pre-B1 procedural_skills (skill_id PK, NO oracle_id column) WITH
+    # its secondary indexes — those dependents are what blocked the RENAME live
+    # on T3 (2026-06-09): DuckDB errors "Cannot alter entry … entries depend on
+    # it" unless they're dropped first. This reproduces that exact failure.
     conn.execute(
         "CREATE TABLE procedural_skills ("
         " skill_id TEXT PRIMARY KEY, name TEXT, nl_description TEXT, "
-        " utility_score DOUBLE)")
+        " utility_score DOUBLE, last_used DOUBLE)")
+    conn.execute("CREATE INDEX idx_procedural_skills_utility ON procedural_skills(utility_score DESC)")
+    conn.execute("CREATE INDEX idx_procedural_skills_last_used ON procedural_skills(last_used DESC)")
     conn.execute(
-        "INSERT INTO procedural_skills VALUES ('skill_oldneg', '[negative] old', 'x', 0.7)")
+        "INSERT INTO procedural_skills VALUES ('skill_oldneg', '[negative] old', 'x', 0.7, NULL)")
     # Booting the B1 store must rename the old table aside (never drop it).
     store, _ = _store(tmp_path, conn=conn)
     cols = {r[0].lower() for r in conn.execute(
