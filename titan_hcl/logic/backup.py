@@ -28,6 +28,14 @@ from titan_hcl.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
+# Phase B (RFP_backup_arweave_sustainability) — committed default for the chained
+# diff model. Runtime config.toml [backup].chained_incrementals overrides it. NOT a
+# phase-c/Rust-synced constant (a Python-only L2 feature flag, so it must NOT live in
+# the generated _phase_c_constants.py — that file is kept in lock-step with the Rust
+# kernel's constants.rs by the phase-c generator-parity gate). The no-silent-full-ship
+# safety is ALWAYS on regardless of this flag (INV-BR-9).
+_BACKUP_CHAINED_INCREMENTALS_DEFAULT = False
+
 
 def _l5_cleanup_old_local_tarballs(local_dir: str, retention_days: int = 30) -> int:
     """L5 retention helper — prune personality_baseline_*.tar.gz and
@@ -2237,11 +2245,10 @@ class RebirthBackup:
 
     def _chained_incrementals_enabled(self) -> bool:
         """Flag gate. Runtime config.toml [backup].chained_incrementals overrides
-        the committed default BACKUP_CHAINED_INCREMENTALS_ENABLED."""
-        from titan_hcl._phase_c_constants import BACKUP_CHAINED_INCREMENTALS_ENABLED
+        the committed default _BACKUP_CHAINED_INCREMENTALS_DEFAULT."""
         cfg = (self._full_config or {}).get("backup", {}) or {}
         return bool(cfg.get("chained_incrementals",
-                            BACKUP_CHAINED_INCREMENTALS_ENABLED))
+                            _BACKUP_CHAINED_INCREMENTALS_DEFAULT))
 
     def _mirror_state_path(self) -> str:
         return os.path.join(self._baseline_working_dir(), ".mirror_state.json")
