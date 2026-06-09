@@ -63,12 +63,7 @@ logger = logging.getLogger(__name__)
 # Flipped True after EmotCGN init + SHM mirror first write complete. Gates
 # SHM-slot heartbeat so titan_hcl's 1Hz poll sees real liveness, not the
 # boot-time "subscribed-but-not-warm" lie.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 @with_error_envelope(module_name="emot_cgn", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -85,9 +80,8 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
     from queue import Empty
 
     # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # Project root for imports (same pattern as language_worker)
     project_root = os.path.normpath(
@@ -562,7 +556,7 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
     def _heartbeat_loop():
         while not _hb_stop.is_set():
             _send_heartbeat(send_queue, name)
-            if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+            if _state_writer is not None and _WORKER_READY:
                 try:
                     _state_writer.heartbeat()
                 except Exception:  # noqa: BLE001

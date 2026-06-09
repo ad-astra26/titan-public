@@ -40,12 +40,7 @@ logger = logging.getLogger(__name__)
 # SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
 # the boot window so guardian_HCL's stale-heartbeat detector doesn't
 # kill a slow boot — Sage init + DB schema + routing learner can be 5-10s).
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 # ── Knowledge concepts table schema ──────────────────────────────────
@@ -90,9 +85,8 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         name: module name ("knowledge")
         config: dict from merged [knowledge] + [inference] + [stealth_sage]
     """
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -358,7 +352,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         while not _hb_stop.is_set():
             _send_heartbeat(send_queue, name)
             # Phase 11 §11.I.5 — SHM heartbeat once worker is ready.
-            if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+            if _state_writer is not None and _WORKER_READY:
                 try:
                     _state_writer.heartbeat()
                 except Exception:  # noqa: BLE001 — never crash the heartbeat

@@ -28,12 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; SHM heartbeat
 # is suppressed until the worker has finished in-process scaffolding.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 # RFP_synthesis_spine_reads_real_data Phase B — process-lifetime ThoughtSidecar
 # (sqlite-WAL tx_hash→thought content), keyed by data_dir. Constructed lazily on
@@ -60,7 +55,7 @@ def _phase11_hb_loop(send_queue, name: str, stop_event: threading.Event,
             })
         except Exception:
             pass
-        if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+        if state_writer is not None and _WORKER_READY:
             try:
                 state_writer.heartbeat()
             except Exception:
@@ -96,9 +91,8 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[MemoryWorker] Initializing TieredMemoryGraph...")
     init_start = time.time()
 
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
     # Created BEFORE the slow ~30-60s TieredMemoryGraph init so the slot

@@ -115,12 +115,7 @@ HEARTBEAT_INTERVAL_S = 30.0
 # publish completes. Until True, the heartbeat thread skips
 # `state_writer.heartbeat()` so the slot stays at state="starting"/"booted"
 # rather than prematurely asserting "running".
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 def _send(send_queue, msg_type: str, src: str, dst: str,
@@ -146,7 +141,7 @@ def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
     """
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
-        if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+        if state_writer is not None and _WORKER_READY:
             try:
                 state_writer.heartbeat()
             except Exception:  # noqa: BLE001 — never crash heartbeat
@@ -205,9 +200,8 @@ def dream_state_worker_main(recv_queue, send_queue, name: str,
     # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel
     # on every entry (fork-mode re-entries inherit parent's True;
     # spawn-mode re-spawns get fresh False; explicit reset covers both).
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # Resolve titan_id (per feedback_titan_id_canonical_resolve.md — SPEC §23.17 R-PORT-1).
     from titan_hcl.core.state_registry import resolve_titan_id

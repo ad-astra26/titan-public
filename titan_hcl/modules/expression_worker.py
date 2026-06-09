@@ -512,12 +512,9 @@ def _drive_evaluate_all(
                     "[ExpressionWorker] strong_composition catalyst raised: "
                     "%s", _caterr)
 
-            # 5) Per-fire log for non-SPEAK fires. DEBUG, not INFO: this is a
-            # normal high-frequency operational event — at INFO it was a top
-            # /var/log filler on the shared box
-            # (BUG-EXPRESSION-OUTER-INFO-LOG-VERBOSITY-20260530).
+            # 5) Info log for non-SPEAK fires (matches legacy semantics).
             if composite_name != "SPEAK":
-                logger.debug(
+                logger.info(
                     "[EXPRESSION.%s] FIRED — urge=%.3f, helper=%s, "
                     "intensity=%.3f",
                     composite_name, urge, tf.get("action_helper", ""),
@@ -537,12 +534,7 @@ def _drive_evaluate_all(
 # Flipped True after ExpressionManager + HormonalShmReader + state publisher
 # init complete. Gates SHM-slot heartbeat so titan_hcl's 1Hz poll sees real
 # liveness rather than the boot-time "subscribed-but-not-warm" lie.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 @with_error_envelope(module_name="expression_worker", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -559,9 +551,8 @@ def expression_worker_main(recv_queue, send_queue, name: str,
     expression_composites_state.bin at 1 Hz.
     """
     # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # === BOILERPLATE: spawn-mode sys.path bootstrap ===
     project_root = os.path.normpath(
@@ -821,7 +812,7 @@ def expression_worker_main(recv_queue, send_queue, name: str,
         if now - last_heartbeat > _HEARTBEAT_INTERVAL_S:
             _send_heartbeat(send_queue, name)
             # Phase 11 §11.I.5 — SHM-slot heartbeat sidecar.
-            if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+            if _state_writer is not None and _WORKER_READY:
                 try:
                     _state_writer.heartbeat()
                 except Exception:  # noqa: BLE001
