@@ -104,3 +104,119 @@ def test_missing_config_fails(tmp_path):
         tmp_path, Mode.DEVNET, {"maker_wallet": DEPLOYER},
         prompter=StdinPrompter(), default=True)
     assert len(res) == 1 and res[0].severity == "fail"
+
+
+# ── headless directive supply: --directives-file / TITAN_DIRECTIVES[_FILE] ─────
+# Precedence (highest first): --directives-file (flag, path) ›
+# TITAN_DIRECTIVES_FILE (env, path) › TITAN_DIRECTIVES (env, literal text).
+
+REAL = "# Prime Directives\n1. Sovereign Growth.\n2. Truthfulness.\n"
+
+
+def _constitution(root):
+    return root / "titan_constitution.md"
+
+
+def _run(root, *, monkeypatch=None, **kw):
+    # Default to a clean env so a stray runner var can't leak into the supply path.
+    if monkeypatch is not None:
+        monkeypatch.delenv("TITAN_DIRECTIVES_FILE", raising=False)
+        monkeypatch.delenv("TITAN_DIRECTIVES", raising=False)
+    return {r.name: r for r in gi.run_genesis_inputs_phase(
+        root, Mode.DEVNET, {"maker_wallet": DEPLOYER},
+        prompter=StdinPrompter(), default=True, **kw)}
+
+
+def test_directives_file_flag_writes_and_oks(tmp_path, monkeypatch):
+    root = _make_install_root(tmp_path)
+    src = tmp_path / "dir.md"
+    src.write_text(REAL)
+    by = _run(root, monkeypatch=monkeypatch, directives_file=str(src))
+    assert by["directives"].severity == "ok"
+    assert _constitution(root).read_text() == REAL  # written verbatim
+    assert "--directives-file" in by["directives"].detail
+
+
+def test_directives_file_comment_only_warns_no_fabrication(tmp_path, monkeypatch):
+    root = _make_install_root(tmp_path)
+    src = tmp_path / "dir.md"
+    src.write_text("# only a comment\n#\n   \n")
+    by = _run(root, monkeypatch=monkeypatch, directives_file=str(src))
+    assert by["directives"].severity == "warn"
+    assert "comments" in by["directives"].detail.lower()
+
+
+def test_directives_file_missing_path_warns_and_writes_nothing(tmp_path, monkeypatch):
+    root = _make_install_root(tmp_path)
+    by = _run(root, monkeypatch=monkeypatch, directives_file=str(tmp_path / "nope.md"))
+    assert by["directives"].severity == "warn"
+    assert "not found" in by["directives"].detail
+    assert not _constitution(root).exists()
+
+
+def test_env_file_path_oks(tmp_path, monkeypatch):
+    root = _make_install_root(tmp_path)
+    src = tmp_path / "envdir.md"
+    src.write_text(REAL)
+    monkeypatch.setenv("TITAN_DIRECTIVES_FILE", str(src))
+    by = {r.name: r for r in gi.run_genesis_inputs_phase(
+        root, Mode.DEVNET, {"maker_wallet": DEPLOYER},
+        prompter=StdinPrompter(), default=True)}
+    assert by["directives"].severity == "ok"
+    assert "TITAN_DIRECTIVES_FILE" in by["directives"].detail
+    assert _constitution(root).read_text() == REAL
+
+
+def test_env_literal_text_oks_and_newline_normalised(tmp_path, monkeypatch):
+    root = _make_install_root(tmp_path)
+    monkeypatch.delenv("TITAN_DIRECTIVES_FILE", raising=False)
+    monkeypatch.setenv("TITAN_DIRECTIVES", "1. Sovereign Growth.\n2. Truthfulness.")
+    by = {r.name: r for r in gi.run_genesis_inputs_phase(
+        root, Mode.DEVNET, {"maker_wallet": DEPLOYER},
+        prompter=StdinPrompter(), default=True)}
+    assert by["directives"].severity == "ok"
+    assert "TITAN_DIRECTIVES" in by["directives"].detail
+    text = _constitution(root).read_text()
+    assert text.endswith("\n")  # trailing newline added
+    assert gi._has_directive_content(_constitution(root))
+
+
+def test_precedence_flag_beats_env(tmp_path, monkeypatch):
+    root = _make_install_root(tmp_path)
+    flag_src = tmp_path / "flag.md"
+    flag_src.write_text("1. FLAG directive.\n")
+    envfile = tmp_path / "envfile.md"
+    envfile.write_text("1. ENVFILE directive.\n")
+    monkeypatch.setenv("TITAN_DIRECTIVES_FILE", str(envfile))
+    monkeypatch.setenv("TITAN_DIRECTIVES", "1. ENVTEXT directive.")
+    _run(root, directives_file=str(flag_src))
+    assert "FLAG directive" in _constitution(root).read_text()
+
+
+def test_precedence_envfile_beats_envtext(tmp_path, monkeypatch):
+    root = _make_install_root(tmp_path)
+    envfile = tmp_path / "envfile.md"
+    envfile.write_text("1. ENVFILE directive.\n")
+    monkeypatch.setenv("TITAN_DIRECTIVES_FILE", str(envfile))
+    monkeypatch.setenv("TITAN_DIRECTIVES", "1. ENVTEXT directive.")
+    _run(root)
+    assert "ENVFILE directive" in _constitution(root).read_text()
+
+
+def test_explicit_supply_overwrites_existing(tmp_path, monkeypatch):
+    root = _make_install_root(tmp_path)
+    _constitution(root).write_text("# old\n1. OLD directive.\n")
+    src = tmp_path / "new.md"
+    src.write_text("1. NEW directive.\n")
+    _run(root, monkeypatch=monkeypatch, directives_file=str(src))
+    out = _constitution(root).read_text()
+    assert "NEW directive" in out and "OLD" not in out
+
+
+def test_supplied_directives_resolver_unit(tmp_path, monkeypatch):
+    monkeypatch.delenv("TITAN_DIRECTIVES_FILE", raising=False)
+    monkeypatch.delenv("TITAN_DIRECTIVES", raising=False)
+    assert gi._supplied_directives(None) == (None, "", None)   # nothing → fall through
+    monkeypatch.setenv("TITAN_DIRECTIVES", "1. X.")
+    text, label, problem = gi._supplied_directives(None)
+    assert label == "TITAN_DIRECTIVES" and problem is None and "X" in text
