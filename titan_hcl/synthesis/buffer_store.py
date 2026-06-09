@@ -35,6 +35,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
@@ -51,6 +52,18 @@ DEFAULT_MAX_ENTITIES: int = 20
 # the snapshot file under the watermark cap. 8 KiB matches the user-message
 # truncation applied in the pre-LLM goal hook.
 MAX_CONTENT_BYTES: int = 8192
+
+# Degradation observability (D-SPEC-154). A healthy actr_buffers persist is
+# sub-millisecond; sustained latency growth is the early signature of DuckDB
+# ART-index churn re-accruing (the precursor — days ahead — of the FATAL
+# crash-loop the index-removal fix targets). When the rolling-avg persist
+# latency crosses the threshold we fire the `on_degraded` callback → the
+# synthesis_worker emits a WARN MODULE_ERROR onto the kernel journal (the
+# SPEC error cascade, INV-SDA-12). Rate-limited so the journal isn't flooded.
+PERSIST_LATENCY_WINDOW: int = 128
+PERSIST_DEGRADE_AVG_MS: float = 50.0      # ~10× a healthy persist — a clear creep
+DEGRADE_EMIT_COOLDOWN_S: float = 300.0    # at most one degradation alert / 5 min
+PERSIST_DEGRADE_MIN_SAMPLES: int = 20
 
 
 class _DuckDBConnLike:
@@ -97,10 +110,19 @@ class ActrBufferStore:
         snapshot_path: str | os.PathLike,
         clock: Any = time.time,
         writer: Any = None,
+        on_degraded: Optional[Any] = None,
     ):
         self._db = duckdb_conn
         self._snapshot_path = str(snapshot_path)
         self._clock = clock
+        # Degradation observability (D-SPEC-154): rolling persist-latency window;
+        # a sustained rise → `on_degraded(avg_ms, max_ms, samples)` → the worker
+        # emits a WARN MODULE_ERROR (SPEC cascade). None (tests/default) = off.
+        self._on_degraded = on_degraded
+        self._persist_latencies: deque = deque(maxlen=PERSIST_LATENCY_WINDOW)
+        self._max_persist_ms = 0.0
+        self._slow_persists = 0
+        self._last_degrade_emit = 0.0
         # Single-writer-thread (Option C): every DuckDB op runs on the one
         # SynthesisWriter thread (the @on_writer methods below) → the writer IS
         # the serializer. INV-Syn-16 sole writer preserved. Tests inject no
@@ -133,14 +155,22 @@ class ActrBufferStore:
                 "  PRIMARY KEY (chat_id, buffer_name)"
                 ")"
             )
-            self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_actr_buffers_chat "
-                "ON actr_buffers(chat_id)"
-            )
-            self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_actr_buffers_updated "
-                "ON actr_buffers(updated_at DESC)"
-            )
+            # Root-cause fix (D-SPEC-154 / INV-Syn-30): NO secondary ART indexes
+            # on this high-churn UPSERT'd table. `idx_actr_buffers_updated` churned
+            # the ART tree on EVERY write (updated_at changes each persist) and was
+            # never queried; `idx_actr_buffers_chat` is redundant with the PK prefix
+            # (PK = (chat_id, buffer_name)). DuckDB secondary indexes degrade
+            # pathologically under sustained UPSERT churn → the runtime FATAL
+            # crash-loop (reproduced 2026-06-09: ~2.5× slowdown WITH indexes, clean
+            # + fast WITHOUT). The 2026-06-01 INSERT-OR-REPLACE→ON-CONFLICT fix only
+            # closed the PK churn, not these. actr_buffers is tiny (4 buffers ×
+            # active chats) → the PK index covers every query. DROP IF EXISTS
+            # self-heals existing fleet DBs (removes the corruption source on boot).
+            for _idx in ("idx_actr_buffers_chat", "idx_actr_buffers_updated"):
+                try:
+                    self._db.execute(f"DROP INDEX IF EXISTS {_idx}")
+                except Exception:  # pragma: no cover — defensive
+                    pass
 
     # ── Write surface (INV-Syn-16) ──────────────────────────────────────
 
@@ -171,15 +201,15 @@ class ActrBufferStore:
         emb_hash = _canonical_payload_hash(content, concept_ids)
         ts_val = float(ts) if ts is not None else float(self._clock())
         concepts_json = json.dumps(concept_ids, ensure_ascii=False)
+        _t0 = time.perf_counter()
         with self._lock:
-            # True in-place UPSERT (NOT `INSERT OR REPLACE`). DuckDB implements
-            # OR REPLACE as DELETE+INSERT, which re-touches every secondary index
-            # (idx_actr_buffers_chat / idx_actr_buffers_updated) and can corrupt
-            # the ART index → a later commit/revert throws a FATAL "duplicate key
-            # in PRIMARY_actr_buffers" that ABORTS the whole synthesis_worker
-            # (observed crash-loop on the devnet soak DB, 2026-06-01). ON CONFLICT
-            # DO UPDATE mutates the existing row in place, so the PK index is never
-            # deleted+reinserted. INV-Syn-16 (sole writer) preserved.
+            # In-place UPSERT (ON CONFLICT DO UPDATE, NOT `INSERT OR REPLACE` —
+            # OR REPLACE is DELETE+INSERT, re-touching the PK index every write).
+            # The table also carries NO secondary ART indexes (removed D-SPEC-154 /
+            # INV-Syn-30): they churned on every UPSERT (updated_at changes each
+            # write) and were the runtime corruption source behind the
+            # actr_buffers FATAL crash-loop. PK-only + in-place update = no ART
+            # churn. INV-Syn-16 (sole writer) preserved.
             self._db.execute(
                 "INSERT INTO actr_buffers "
                 "(chat_id, buffer_name, content, concept_ids, embedding_hash, updated_at) "
@@ -192,7 +222,37 @@ class ActrBufferStore:
                 [chat_id, buffer_name, content, concepts_json, emb_hash, ts_val],
             )
             self._writes_seen += 1
+            # Degradation observability (D-SPEC-154) — record persist latency.
+            _lat_ms = (time.perf_counter() - _t0) * 1000.0
+            self._persist_latencies.append(_lat_ms)
+            if _lat_ms > self._max_persist_ms:
+                self._max_persist_ms = _lat_ms
+            if _lat_ms > PERSIST_DEGRADE_AVG_MS:
+                self._slow_persists += 1
+        self._maybe_emit_degraded()
         self.snapshot_export()
+
+    def _maybe_emit_degraded(self) -> None:
+        """Fire `on_degraded` when the rolling-avg persist latency crosses the
+        threshold (rate-limited). The early-warning signature of ART-index churn
+        re-accruing — days ahead of the FATAL crash (D-SPEC-154). Soft: never
+        raises into the persist path."""
+        if self._on_degraded is None:
+            return
+        with self._lock:
+            n = len(self._persist_latencies)
+            if n < PERSIST_DEGRADE_MIN_SAMPLES:
+                return
+            avg = sum(self._persist_latencies) / n
+            now = float(self._clock())
+            if avg <= PERSIST_DEGRADE_AVG_MS or (now - self._last_degrade_emit) < DEGRADE_EMIT_COOLDOWN_S:
+                return
+            self._last_degrade_emit = now
+            mx = self._max_persist_ms
+        try:
+            self._on_degraded(avg_ms=avg, max_ms=mx, samples=n)
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("[ActrBufferStore] on_degraded callback raised: %s", e)
 
     @on_writer
     def clear(self, *, chat_id: str, buffer_name: str) -> None:
@@ -339,10 +399,17 @@ class ActrBufferStore:
     def stats(self) -> dict:
         """Counters for the A.7 acceptance gate + Observatory."""
         with self._lock:
+            n = len(self._persist_latencies)
+            avg = (sum(self._persist_latencies) / n) if n else 0.0
             return {
                 "writes_seen": self._writes_seen,
                 "clears_seen": self._clears_seen,
                 "snapshot_path": self._snapshot_path,
+                # D-SPEC-154 degradation observability — flat = healthy; a rising
+                # avg signals ART-index churn re-accruing (the FATAL precursor).
+                "persist_avg_ms": round(avg, 3),
+                "persist_max_ms": round(self._max_persist_ms, 3),
+                "slow_persists": self._slow_persists,
             }
 
 
