@@ -350,7 +350,6 @@ def test_output_verifier_state_round_trip(shm_root):
     class _Verifier:
         verified_count = 142
         rejected_count = 7
-        sovereignty_score = 0.95
         threats_24h = {
             "directive": 2, "injection": 1, "consistency": 0,
             "identity": 0, "qualia": 1,
@@ -364,7 +363,9 @@ def test_output_verifier_state_round_trip(shm_root):
     decoded = _read_slot(OUTPUT_VERIFIER_STATE_SPEC, shm_root)
     assert decoded["verified_count"] == 142
     assert decoded["rejected_count"] == 7
-    assert decoded["sovereignty_score"] == pytest.approx(0.95)
+    # output_integrity = verified/(verified+rejected) = 142/149 (a verifier-owned
+    # metric, NOT the sovereignty score S)
+    assert decoded["output_integrity"] == pytest.approx(142 / 149, abs=1e-4)
     assert decoded["threats_24h"]["directive"] == 2
     assert len(decoded["recent_rejections_digest"]) == 2
 
@@ -374,7 +375,7 @@ def test_output_verifier_state_cold_boot(shm_root):
     pub.publish(None)
     decoded = _read_slot(OUTPUT_VERIFIER_STATE_SPEC, shm_root)
     assert decoded["verified_count"] == 0
-    assert decoded["sovereignty_score"] == 0.0
+    assert decoded["output_integrity"] == 1.0  # no outputs yet → full integrity
     assert all(v == 0 for v in decoded["threats_24h"].values())
 
 

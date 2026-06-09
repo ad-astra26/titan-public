@@ -1257,7 +1257,8 @@ class ShmReaderBank:
 
     def read_output_verifier_state(self) -> dict[str, Any] | None:
         """OutputVerifierStatePublisher payload — verified_count,
-        rejected_count, sovereignty_score, threats_24h,
+        rejected_count, output_integrity (verified/(verified+rejected) — a
+        verifier-owned metric, NOT the sovereignty score S), threats_24h,
         recent_rejections_digest, ts. Producer: output_verifier_worker."""
         return self._read_msgpack_variable(
             self._output_verifier_state, "output_verifier_state")

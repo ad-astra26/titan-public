@@ -33,8 +33,15 @@ class OutputVerifierStatePublisher(BaseStatePublisher):
 
         verified_count = int(getattr(verifier, "verified_count", 0) or 0)
         rejected_count = int(getattr(verifier, "rejected_count", 0) or 0)
-        sovereignty_score = float(
-            getattr(verifier, "sovereignty_score", 0.0) or 0.0)
+        # output_integrity — the fraction of Titan's outputs that passed his own
+        # verification: verified / (verified + rejected); 1.0 when nothing has
+        # been verified yet. A verifier-OWNED metric of output trustworthiness,
+        # distinct from the ONE sovereignty score S (synthesis). Replaces the
+        # retired, always-0.0 `sovereignty_score` field (output_verifier.py:438)
+        # which read as a misleading second sovereignty score ("only one
+        # sovereignty score = S"; sovereignty-audit 2026-06-09).
+        _ov_total = verified_count + rejected_count
+        output_integrity = (verified_count / _ov_total) if _ov_total > 0 else 1.0
 
         # threats_24h — best-effort (verifier may track aggregate or per-
         # category counts under different attribute names; defensive walk)
@@ -78,7 +85,7 @@ class OutputVerifierStatePublisher(BaseStatePublisher):
         return {
             "verified_count": verified_count,
             "rejected_count": rejected_count,
-            "sovereignty_score": sovereignty_score,
+            "output_integrity": round(output_integrity, 4),
             "threats_24h": threats,
             "recent_rejections_digest": recent_rejections,
             "ts": time.time(),
@@ -89,7 +96,7 @@ class OutputVerifierStatePublisher(BaseStatePublisher):
         return {
             "verified_count": 0,
             "rejected_count": 0,
-            "sovereignty_score": 0.0,
+            "output_integrity": 1.0,
             "threats_24h": {
                 "directive": 0, "injection": 0, "consistency": 0,
                 "identity": 0, "qualia": 0,
