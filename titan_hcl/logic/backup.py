@@ -204,11 +204,17 @@ class RebirthBackup:
                          key="logic.backup.no_backup_state_loaded", throttle=100)
 
     def _save_backup_state(self):
-        """Persist backup tracking state to disk."""
+        """Persist backup tracking state to disk — ATOMIC (§11.H.2 / §11.H.9).
+
+        Used by both the periodic path and the §11.H.9 SAVE_NOW + MODULE_SHUTDOWN
+        flush wiring (backup_worker). tmp+os.replace so a crash mid-write can never
+        corrupt backup_state.json (a torn file → silent loss of the dedup dates →
+        duplicate/re-shipped backups)."""
         import json
         os.makedirs(os.path.dirname(self._BACKUP_STATE_PATH) or ".", exist_ok=True)
         try:
-            with open(self._BACKUP_STATE_PATH, "w") as f:
+            tmp = self._BACKUP_STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump({
                     "last_personality_date": self._last_personality_date,
                     "last_soul_date": self._last_soul_date,
@@ -217,6 +223,7 @@ class RebirthBackup:
                     "meditation_count_since_nft": self._meditation_count_since_nft,
                     "updated_at": time.time(),
                 }, f, indent=2)
+            os.replace(tmp, self._BACKUP_STATE_PATH)
         except Exception as e:
             logger.warning("[Backup] Failed to save state: %s", e)
 

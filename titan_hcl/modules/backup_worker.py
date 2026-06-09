@@ -388,7 +388,44 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[BackupWorker] Shutdown: %s",
                         msg.get("payload", {}).get("reason"))
+            # §11.H.9(2) flush-on-MODULE_SHUTDOWN — durably persist the in-memory
+            # tracking state (dedup dates + meditation counters) before exit.
+            try:
+                backup._save_backup_state()
+            except Exception as _sd_err:  # noqa: BLE001
+                logger.warning("[BackupWorker] shutdown state flush failed: %s",
+                               _sd_err)
             break
+
+        # ── §11.H.9(1) SAVE_NOW → durable write + SAVE_DONE (D-SPEC-146 / INV-HRP-1) ──
+        # backup was MISSED in the 2026-06-01 persistence rollout
+        # (BUG-MODULE-PERSISTENCE-AUDIT-20260601): with no SAVE_NOW handler, the
+        # Guardian's restart-time save_first waited the FULL 30s save_timeout for a
+        # SAVE_DONE that never came — EVERY restart. Under restart-module that 30s
+        # window raced the dual-guardian shm_pid_dead detection → a 5×/600s flap →
+        # module DISABLED (the recurring backup instability, observed live 2026-06-09).
+        # Reply SAVE_DONE right after the fast atomic state write so the orchestrator
+        # proceeds immediately (no timeout) — backup's manifest/L5 are already atomic
+        # on-disk; the only in-memory critical state is the tracking dict below.
+        if msg_type == bus.SAVE_NOW:
+            _save_rid = (msg.get("payload") or {}).get("request_id")
+            _save_t0 = time.time()
+            _save_ok, _save_errs = True, 0
+            try:
+                backup._save_backup_state()
+            except Exception as _save_err:  # noqa: BLE001
+                _save_ok, _save_errs = False, 1
+                logger.warning("[BackupWorker] SAVE_NOW checkpoint failed: %s",
+                               _save_err)
+            try:
+                _send(send_queue, bus.SAVE_DONE, name, "guardian", {
+                    "module": name, "request_id": _save_rid,
+                    "saved": _save_ok, "errors": _save_errs,
+                    "duration_ms": int((time.time() - _save_t0) * 1000),
+                })
+            except Exception:  # noqa: BLE001
+                pass
+            continue
 
         try:
             if msg_type == bus.MEDITATION_COMPLETE:
