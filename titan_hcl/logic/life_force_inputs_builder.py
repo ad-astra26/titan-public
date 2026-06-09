@@ -67,7 +67,6 @@ def compute_life_force_inputs(
     expression_state_reader: Any = None,
     vocab_db_path: str = "data/inner_memory.db",
     sol_balance: Optional[float] = None,
-    anchor_freshness: Optional[float] = None,
 ) -> dict[str, Any]:
     """Aggregate the 16 LifeForceEngine.evaluate inputs into a single dict.
 
@@ -181,13 +180,7 @@ def compute_life_force_inputs(
     # Falls back to the stub ONLY on cold-boot before the first balance fetch.
     sol_balance = (
         float(sol_balance) if sol_balance is not None else _STUB_SOL_BALANCE)
-    # anchor_freshness — REAL: linear-over-24h freshness from the cached
-    # on-chain anchor age (timechain_state.bin.recent_anchor_age_s; a cheap G18
-    # SHM read passed by cognitive_worker). 1.0 = just anchored, 0.0 = ≥24h
-    # stale. Falls back to the stub only on cold-boot (BUG-LIFEFORCE-INPUT-STUBS).
-    anchor_freshness = (
-        float(anchor_freshness) if anchor_freshness is not None
-        else _STUB_ANCHOR_FRESHNESS)
+    anchor_freshness = _STUB_ANCHOR_FRESHNESS  # follow-up rFP target
 
     hormonal_vitality = 0.5
     if neural_nervous_system is not None:

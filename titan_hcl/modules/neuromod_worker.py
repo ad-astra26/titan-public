@@ -386,12 +386,7 @@ def _apply_external_nudge_payload(neuromod_system, payload: dict) -> bool:
 # Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
 # Flipped True after NeuromodulatorSystem init + DNA cache load complete.
 # Gates SHM-slot heartbeat so titan_hcl's 1Hz poll sees real liveness.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 @with_error_envelope(module_name="neuromod_module", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -411,9 +406,8 @@ def neuromod_worker_main(
             and the microkernel.shm_neuromod_enabled flag.
     """
     # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -554,7 +548,7 @@ def neuromod_worker_main(
             except Exception:
                 pass
             # Phase 11 §11.I.5 — SHM-slot heartbeat sidecar.
-            if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+            if _state_writer is not None and _WORKER_READY:
                 try:
                     _state_writer.heartbeat()
                 except Exception:  # noqa: BLE001

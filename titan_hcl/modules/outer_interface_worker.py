@@ -81,12 +81,7 @@ MODULE_NAME = "outer_interface_worker"
 # Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
 # mirrored to per-process SHM slot via ModuleStateWriter. Set False at
 # import; flipped True after OuterInterface init + publisher start.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 # Cadence + lifecycle constants (defaults — per-titan overridable via [outer_interface]).
 HEARTBEAT_INTERVAL_S = 10.0           # SPEC §10.B MODULE_HEARTBEAT_INTERVAL_S
@@ -162,7 +157,7 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
-    if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+    if state_writer is not None and _WORKER_READY:
         try:
             state_writer.heartbeat()
         except Exception:  # noqa: BLE001 — never crash heartbeat
@@ -315,9 +310,8 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
         logger.debug("[OuterInterfaceWorker] pdeathsig install skipped: %s", _err)
 
     # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel.
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # Canonical titan_id resolution (per feedback_titan_id_canonical_resolve.md
     # — SPEC §23.17 R-PORT-1; T2/T3 deployments may have missing

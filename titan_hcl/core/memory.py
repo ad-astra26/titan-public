@@ -173,6 +173,13 @@ class TieredMemoryGraph:
                 if node.get("status") == "pruned":
                     continue
                 node["type"] = "MemoryNode"  # DuckDB doesn't store type column
+                # EEL A1: `tags` persists as a JSON string → decode back to a list.
+                _tg = node.get("tags")
+                if isinstance(_tg, str):
+                    try:
+                        node["tags"] = json.loads(_tg)
+                    except Exception:
+                        node["tags"] = []
                 node_id = node["id"]
                 self._node_store[node_id] = node
                 if node_id >= self._next_id:
@@ -805,6 +812,7 @@ class TieredMemoryGraph:
     async def add_to_mempool(
         self, user_prompt: str, agent_response: str, user_identifier: str = "Anonymous",
         neuromod_context: dict = None,
+        tags: Optional[List[str]] = None, source: Optional[str] = None,
     ) -> None:
         """
         Add a fresh node to the mempool with sigmoid decay tracking.
@@ -839,6 +847,21 @@ class TieredMemoryGraph:
             # Append the new response context to the existing node
             existing = self._node_store[similar_id]
             existing["agent_response"] = f"{existing.get('agent_response', '')} | {agent_response}"
+            # EEL A1 (INV-EEL-6): a research answer that dedups into an existing
+            # node still carries its provenance — merge the tag(s) + stamp source.
+            if tags:
+                _et = existing.get("tags") or []
+                if isinstance(_et, str):
+                    try:
+                        _et = json.loads(_et)
+                    except Exception:
+                        _et = []
+                for _t in tags:
+                    if _t not in _et:
+                        _et.append(_t)
+                existing["tags"] = _et
+            if source and not existing.get("acquired_source"):
+                existing["acquired_source"] = source
             # Re-index with updated content
             self._index_mempool_node(existing)
             self._persist_node(existing)
@@ -866,6 +889,8 @@ class TieredMemoryGraph:
             "mempool_weight": 1.0,
             "effective_weight": 1.0,
             "neuromod_context": neuromod_context,  # felt-at-lived-time (§7.C)
+            "tags": list(tags) if tags else [],     # EEL A1 (INV-EEL-6) provenance
+            "acquired_source": source,               # e.g. "searxng:<query>"
         }
         self._node_store[node_id] = node
         self._next_id += 1

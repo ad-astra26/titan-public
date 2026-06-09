@@ -50,12 +50,7 @@ logger = logging.getLogger(__name__)
 # Under `l0_rust_enabled=true` body_worker runs as a SHADOW providing
 # sensor_cache_inner_body.bin input — the SHM slot tracks the Python
 # shadow lifecycle, not the Rust daemon's.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 # Module-level state writer — populated at entry; consulted by the
 # inline heartbeat helper so it can publish state_writer.heartbeat() on
@@ -148,9 +143,8 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     # Phase 11 §11.I.5 — reset module-level readiness flags (fork inherits
     # parent's True; spawn gets fresh False; explicit reset covers both).
-    global _WORKER_READY, _BOOT_DEADLINE, _state_writer
+    global _WORKER_READY, _state_writer
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
     _state_writer = None
 
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -908,7 +902,7 @@ def _send_heartbeat(send_queue, name: str) -> None:
     except Exception:
         rss_mb = 0
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})
-    if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+    if _state_writer is not None and _WORKER_READY:
         try:
             _state_writer.heartbeat()
         except Exception:  # noqa: BLE001 — never crash the heartbeat

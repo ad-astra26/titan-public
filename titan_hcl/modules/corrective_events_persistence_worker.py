@@ -37,12 +37,7 @@ _POLL_INTERVAL_S = 0.2
 
 # Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
 # mirrored to per-process SHM slot via ModuleStateWriter.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 _CORRECTIVE_PERSISTENCE_SUBSCRIBE_TOPICS: list[str] = [
     bus.EXTREME_IMBALANCE_DETECTED,
@@ -75,7 +70,7 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
-    if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+    if state_writer is not None and _WORKER_READY:
         try:
             state_writer.heartbeat()
         except Exception:  # noqa: BLE001 — never crash heartbeat
@@ -162,9 +157,8 @@ def corrective_events_persistence_worker_main(recv_queue, send_queue, name: str,
         logger.debug("[CorrectiveEventsPersistence] pdeathsig skipped: %s", _err)
 
     # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel.
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (

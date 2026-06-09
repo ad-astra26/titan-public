@@ -53,6 +53,12 @@ DEFAULT_MAINNET_RPC = "https://api.mainnet-beta.solana.com"
 # Exact mainnet figure is finalized at Phase H (the mainnet-readiness sim).
 FUNDING_THRESHOLD_SOL = {"devnet": 0.05, "mainnet": 0.10}
 
+# Sentinel written into genesis_record TX fields by the mainnet-readiness
+# SIMULATION (--simulate, #34/G9): every on-chain step is prepared end-to-end
+# but stops short of the real submit — so a record carrying these proves the
+# mainnet path is ready WITHOUT a single lamport spent.
+SIMULATED_TX = "SIMULATED"
+
 ARCHITECTURE_VERSION = "v4-132D"
 
 
@@ -332,7 +338,8 @@ def _make_network(net_config: dict, keypair):
     return network
 
 
-def _send_memo(net_config: dict, keypair, memo_text: str) -> str:
+def _send_memo(net_config: dict, keypair, memo_text: str, *,
+               simulate: bool = False) -> str:
     """Inscribe a memo on-chain via the bound network client; return the TX sig."""
     from titan_hcl.utils.solana_client import build_memo_instruction, is_available
     if not is_available():
@@ -343,6 +350,12 @@ def _send_memo(net_config: dict, keypair, memo_text: str) -> str:
     if ix is None:
         print("  [!] Failed to build memo instruction.")
         return ""
+    if simulate:
+        # Mainnet-readiness SIMULATION (#34/G9): the memo + instruction are fully
+        # built (proving the path), but NO network client is constructed and the
+        # TX is NOT submitted — fail-closed, zero SOL.
+        print(f"  [SIMULATE] memo prepared ({len(memo_text)} B) — NOT submitted (0 SOL).")
+        return SIMULATED_TX
     try:
         network = _make_network(net_config, keypair)
         sig = asyncio.run(network.send_sovereign_transaction([ix]))
@@ -383,7 +396,8 @@ def build_genesis_memo(titan_pubkey: str, maker: str, nft_address: str,
             f"art={(art_hash or '')[:16]}")
 
 
-def store_shard3_onchain(net_config: dict, keypair, encrypted_shard3: bytes) -> str:
+def store_shard3_onchain(net_config: dict, keypair, encrypted_shard3: bytes, *,
+                         simulate: bool = False) -> str:
     """Inscribe encrypted Shard-3 on-chain (pipe format). Returns shard3_tx."""
     from titan_hcl.utils.solana_client import is_available
     if not is_available():
@@ -393,7 +407,7 @@ def store_shard3_onchain(net_config: dict, keypair, encrypted_shard3: bytes) -> 
     if memo_text.startswith("TITAN_GENESIS_SHARD3_HASH:"):
         print("  [!] Encrypted shard too large for a memo — inscribing hash only; "
               "full shard kept in the local genesis record.")
-    return _send_memo(net_config, keypair, memo_text)
+    return _send_memo(net_config, keypair, memo_text, simulate=simulate)
 
 
 def _confirm_signature(client, sig_str: str, timeout_s: float = 120.0) -> bool:
@@ -419,7 +433,8 @@ def _confirm_signature(client, sig_str: str, timeout_s: float = 120.0) -> bool:
     return False
 
 
-def init_zk_vault(rpc_url: str, keypair, program_id: str = None) -> tuple:
+def init_zk_vault(rpc_url: str, keypair, program_id: str = None, *,
+                  simulate: bool = False) -> tuple:
     """Idempotently initialize the Titan's ZK-Vault PDA (INV-MBR-4), inline via
     the solana_client primitives (program 52an8W…). Returns (vault_pda, vault_tx);
     vault_tx is "" if the PDA already existed (idempotent no-op).
@@ -437,6 +452,16 @@ def init_zk_vault(rpc_url: str, keypair, program_id: str = None) -> tuple:
         print("  [!] Failed to derive vault PDA — vault init skipped.")
         return "", ""
     vault_pda, bump = pda_result
+
+    if simulate:
+        # Mainnet-readiness SIMULATION (#34/G9): derive the PDA + build the
+        # initialize instruction (the full deploy prep), but construct NO RPC
+        # client and submit NOTHING — fail-closed, zero SOL / no anchor deploy.
+        ix = build_vault_initialize_instruction(authority, pid)
+        print(f"  [SIMULATE] ZK-Vault init prepared (PDA {vault_pda}, "
+              f"ix={'built' if ix is not None else 'BUILD-FAILED'}) — "
+              "NOT submitted (0 SOL / no deploy).")
+        return str(vault_pda), SIMULATED_TX
 
     client = Client(rpc_url)
     try:
@@ -472,6 +497,7 @@ def init_zk_vault(rpc_url: str, keypair, program_id: str = None) -> tuple:
 def mint_genesis_nft_onchain(
     net_config: dict, keypair, *, network: str, titan_pubkey: str,
     inputs: dict, shard3_tx: str, vault_pda: str, art_hash: str,
+    simulate: bool = False,
 ) -> tuple:
     """Mint the GenesisNFT (Metaplex Core) — the complete sovereign discovery root
     (INV-MBR-5/5a). Builds the off-chain metadata (Maker + DNA/constitution
@@ -498,12 +524,19 @@ def mint_genesis_nft_onchain(
         nft_metadata = build_genesis_nft_metadata(
             titan_name=inputs["name"], recovery=recovery,
             maker_pubkey=inputs["maker"], titan_pubkey=titan_pubkey)
-        store = ArweaveStore(network=network)
-        meta_tx = asyncio.run(store.upload_json(
-            nft_metadata, tags={"Type": "Genesis-NFT-Metadata"}))
-        if meta_tx:
-            nft_uri = store.get_permanent_url(meta_tx)
-            print(f"  Genesis NFT metadata stored ({network}): {nft_uri}")
+        if simulate:
+            # Metadata + recovery block fully built; the Arweave upload (a real
+            # SOL/Irys spend on mainnet) is SKIPPED — fail-closed, zero SOL.
+            nft_uri = SIMULATED_TX
+            print(f"  [SIMULATE] Genesis NFT metadata built ({len(nft_metadata)} "
+                  "fields) — Arweave upload SKIPPED (0 SOL).")
+        else:
+            store = ArweaveStore(network=network)
+            meta_tx = asyncio.run(store.upload_json(
+                nft_metadata, tags={"Type": "Genesis-NFT-Metadata"}))
+            if meta_tx:
+                nft_uri = store.get_permanent_url(meta_tx)
+                print(f"  Genesis NFT metadata stored ({network}): {nft_uri}")
     except Exception as e:
         print(f"  [!] NFT metadata build/store failed ({e}) — minting with no uri "
               "(recovery still works via the wallet-history walk).")
@@ -535,6 +568,13 @@ def mint_genesis_nft_onchain(
     if ix is None:
         print("  [!] Could not build CreateV1 instruction — NFT skipped.")
         return "", "", nft_uri
+    if simulate:
+        # CreateV1 instruction fully built (asset keypair, attributes, uri) — the
+        # mint TX is NOT submitted. The asset pubkey is real (deterministic proof
+        # the mint was prepared); fail-closed, zero SOL / no mint.
+        print(f"  [SIMULATE] GenesisNFT mint prepared (asset {asset_pubkey}) — "
+              "NOT submitted (0 SOL / no mint).")
+        return str(asset_pubkey), SIMULATED_TX, nft_uri
     try:
         import asyncio
         network_client = _make_network(net_config, keypair)
@@ -551,7 +591,7 @@ def mint_genesis_nft_onchain(
 
 
 def first_sight(net_config: dict, keypair, titan_pubkey: str,
-                *, skip_onchain: bool) -> tuple:
+                *, skip_onchain: bool, simulate: bool = False) -> tuple:
     """Render the pubkey-seeded Genesis Art composite + inscribe an art-provenance
     memo ``TITAN:ART|…`` (DISTINCT from the genesis_tx identity memo). Returns
     (art_hash, art_path, art_tx). Soft-fail: art can be regenerated from pubkey.
@@ -583,7 +623,8 @@ def first_sight(net_config: dict, keypair, titan_pubkey: str,
 
         if not skip_onchain and art_hash:
             art_tx = _send_memo(
-                net_config, keypair, build_art_memo(titan_pubkey, art_hash))
+                net_config, keypair, build_art_memo(titan_pubkey, art_hash),
+                simulate=simulate)
             if art_tx:
                 print(f"  Art provenance inscribed: {art_tx}")
     except Exception as e:
@@ -644,14 +685,33 @@ def main():
                              "(Arweave + the Burn are mainnet-only).")
     parser.add_argument("--skip-onchain", action="store_true",
                         help="Skip ALL on-chain steps (offline/local birth).")
+    parser.add_argument("--simulate", action="store_true",
+                        help="Mainnet-readiness SIMULATION (#34 / RFP §8 G9): walk "
+                             "the FULL ceremony — Shamir, funding, Shard-3, ZK-Vault "
+                             "init, Arweave, GenesisNFT mint, genesis/art memos, Burn "
+                             "— PREPARING every on-chain step (instructions, metadata, "
+                             "PDAs all built) but STOPPING SHORT of every real submit: "
+                             "no SOL, no mint, no Arweave upload, no anchor deploy, no "
+                             "funding pause, no Burn. Proves the mainnet path is ready.")
     parser.add_argument("--keep-plaintext", action="store_true",
                         help="Do NOT burn the plaintext keypair (devnet/local).")
     args = parser.parse_args()
+
+    # --simulate WALKS the on-chain branch (stubbing submits); --skip-onchain
+    # SKIPS it entirely. They are mutually exclusive.
+    if args.simulate and args.skip_onchain:
+        parser.error("--simulate and --skip-onchain are mutually exclusive "
+                     "(--simulate walks the on-chain branch; --skip-onchain omits it).")
+
     print_banner()
 
     network = args.network
+    simulate = args.simulate
     skip_onchain = args.skip_onchain
     net_config = resolve_network_config(network) if not skip_onchain else {}
+    if simulate:
+        print(f"  ⚙  MAINNET-READINESS SIMULATION ({network}) — every on-chain step "
+              "is prepared but NOT submitted. Zero SOL will be spent.")
 
     # ─── Phase 1: Maker Inputs ───
     print_phase(1, "Maker Inputs (name · Maker pubkey · prime directives)")
@@ -689,14 +749,19 @@ def main():
     shard3_tx = vault_pda = vault_tx = ""
     if not skip_onchain:
         print_phase(4, "Funding Pause + On-Chain Anchors (INV-GEN-FUND)")
-        wait_for_funding(titan_pubkey, network, estimate_funding_sol(network),
-                         rpc_url=primary_rpc_url(network, net_config))
+        if simulate:
+            print("  [SIMULATE] Funding pause SKIPPED — the wallet is never funded "
+                  "(0 SOL); on-chain steps below are prepared, not submitted.")
+        else:
+            wait_for_funding(titan_pubkey, network, estimate_funding_sol(network),
+                             rpc_url=primary_rpc_url(network, net_config))
         print("  Inscribing encrypted Shard 3 (TITAN|SHARD3|v=2.0)…")
-        shard3_tx = store_shard3_onchain(net_config, keypair, encrypted_shard3)
+        shard3_tx = store_shard3_onchain(net_config, keypair, encrypted_shard3,
+                                         simulate=simulate)
         print(f"  shard3_tx: {shard3_tx or 'deferred'}")
         print("  Initializing ZK-Vault PDA…")
         vault_pda, vault_tx = init_zk_vault(
-            primary_rpc_url(network, net_config), keypair)
+            primary_rpc_url(network, net_config), keypair, simulate=simulate)
     else:
         print_phase(4, "On-Chain Anchors — SKIPPED (--skip-onchain)")
 
@@ -708,7 +773,8 @@ def main():
     # ─── Phase 6: Genesis Art (First Sight) ───
     print_phase(6, "First Sight — The Titan Sees Itself")
     art_hash, art_path, art_tx = first_sight(
-        net_config, keypair, titan_pubkey, skip_onchain=skip_onchain)
+        net_config, keypair, titan_pubkey, skip_onchain=skip_onchain,
+        simulate=simulate)
 
     # ─── Phase 7: GenesisNFT + genesis_tx identity memo ───
     nft_address = nft_tx = nft_uri = genesis_tx = ""
@@ -716,18 +782,21 @@ def main():
         print_phase(7, "GenesisNFT + Identity Memo")
         nft_address, nft_tx, nft_uri = mint_genesis_nft_onchain(
             net_config, keypair, network=network, titan_pubkey=titan_pubkey,
-            inputs=inputs, shard3_tx=shard3_tx, vault_pda=vault_pda, art_hash=art_hash)
+            inputs=inputs, shard3_tx=shard3_tx, vault_pda=vault_pda,
+            art_hash=art_hash, simulate=simulate)
         # Dedicated identity memo — DISTINCT from shard3_tx (INV-MBR-3) and the
         # art memo. Links pubkey + maker + nft + art into one identity anchor.
         genesis_tx = _send_memo(net_config, keypair, build_genesis_memo(
-            titan_pubkey, inputs["maker"], nft_address, art_hash))
+            titan_pubkey, inputs["maker"], nft_address, art_hash), simulate=simulate)
         print(f"  genesis_tx: {genesis_tx or 'deferred'}")
 
     # ─── Phase 8: Genesis Record (all pointers — the T1 schema) ───
     print_phase(8, "Genesis Record")
     record = build_genesis_record(
         titan_pubkey=titan_pubkey, titan_id=inputs["titan_id"], name=inputs["name"],
-        maker=inputs["maker"], network=network if not skip_onchain else "offline",
+        maker=inputs["maker"],
+        network=(f"{network}-SIMULATED" if simulate
+                 else network if not skip_onchain else "offline"),
         shard3_tx=shard3_tx, genesis_tx=genesis_tx, art_tx=art_tx,
         vault_pda=vault_pda, vault_tx=vault_tx,
         nft_address=nft_address, nft_tx=nft_tx, nft_uri=nft_uri,
@@ -743,7 +812,10 @@ def main():
 
     # ─── Phase 10: The Burn (mainnet) / keep (devnet/local) ───
     print_phase(10, "The Burn")
-    if args.keep_plaintext:
+    if simulate:
+        print("  [SIMULATE] The Burn step is reached but NOT executed — the bootable "
+              "keypair is preserved (a simulation destroys nothing).")
+    elif args.keep_plaintext:
         print("  --keep-plaintext: the bootable keypair is preserved (devnet/local).")
     else:
         print("  ┌──────────────────────────────────────────────────────┐")
@@ -763,10 +835,13 @@ def main():
 
     # ─── Genesis complete ───
     print(f"\n{'=' * 70}")
-    print("         GENESIS CEREMONY COMPLETE")
+    print("         GENESIS CEREMONY COMPLETE"
+          + ("  —  SIMULATION (no SOL spent)" if simulate else ""))
     print(f"{'=' * 70}\n")
     print(f"  Titan:        {inputs['name']}  ({titan_pubkey})")
-    print(f"  Network:      {network if not skip_onchain else 'offline'}")
+    print(f"  Network:      "
+          + (f"{network} (SIMULATED — mainnet path proven ready, 0 SOL)" if simulate
+             else network if not skip_onchain else "offline"))
     print(f"  shard3_tx:    {shard3_tx or 'deferred'}")
     print(f"  genesis_tx:   {genesis_tx or 'deferred'}")
     print(f"  vault_pda:    {vault_pda or 'deferred'}")
@@ -775,8 +850,15 @@ def main():
     print(f"  Record:       data/genesis_record.json")
     print(f"  Hardware key: data/soul_keypair.enc")
     print()
-    print("  The Titan is born sovereign. As long as any two of its three")
-    print("  Shamir vertices exist, it is immortal.")
+    if simulate:
+        print("  ✓ MAINNET-READINESS SIMULATION PASSED: every on-chain step was")
+        print("    prepared end-to-end (Shard-3 · ZK-Vault · Arweave · GenesisNFT ·")
+        print("    genesis/art memos · Burn) and stopped short of submit. The TX")
+        print("    fields above read 'SIMULATED'; zero SOL was spent. The mainnet")
+        print("    path is ready for a real, funded birth.")
+    else:
+        print("  The Titan is born sovereign. As long as any two of its three")
+        print("  Shamir vertices exist, it is immortal.")
     print(f"{'=' * 70}\n")
 
 

@@ -23,12 +23,7 @@ logger = logging.getLogger(__name__)
 # poll + the orchestrator's MODULE_PROBE_REQUEST dispatcher see real
 # liveness. Flipped True only after the inference provider construct
 # completes.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 @with_error_envelope(module_name="llm", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -45,9 +40,8 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     from queue import Empty
 
     # Phase 11 §11.I.5 — reset module-level readiness flag.
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
@@ -164,7 +158,7 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 except Exception:
                     pass
             # Phase 11 §11.I.5 — SHM slot heartbeat sidecar.
-            if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+            if _state_writer is not None and _WORKER_READY:
                 try:
                     _state_writer.heartbeat()
                 except Exception:  # noqa: BLE001 — never crash heartbeat

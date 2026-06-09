@@ -48,12 +48,7 @@ logger = logging.getLogger("warning_monitor")
 
 # Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; SHM heartbeat
 # is suppressed until the worker has finished in-process scaffolding.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 # ── Config defaults (overridable via worker config dict) ─────────────
 DEFAULT_BRAIN_LOG_PATH = "/tmp/titan_brain.log"
@@ -127,9 +122,8 @@ def warning_monitor_worker_main(recv_queue, send_queue, name: str,
     """
     logger.info("[WarningMonitor] Starting (pid=%d)", os.getpid())
 
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
     _state_writer = None
@@ -358,7 +352,7 @@ def warning_monitor_worker_main(recv_queue, send_queue, name: str,
                 _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian",
                           {"keys": len(aggregated),
                            "recent_count": len(recent_events)})
-                if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+                if _state_writer is not None and _WORKER_READY:
                     try:
                         _state_writer.heartbeat()
                     except Exception:

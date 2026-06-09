@@ -41,12 +41,7 @@ _STATS_PUBLISH_INTERVAL_S = 60.0
 
 # Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; SHM heartbeat
 # is suppressed until the worker has finished in-process scaffolding.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 @with_error_envelope(module_name="output_verifier", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -79,9 +74,8 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
     logger.info("[OutputVerifierWorker] Booting — titan_id=%s, tc_dir=%s",
                 titan_id, tc_dir)
 
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
     # Created BEFORE the slow OutputVerifier init so the slot publishes
@@ -173,7 +167,7 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
                 })
             except Exception:
                 pass
-            if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+            if _state_writer is not None and _WORKER_READY:
                 try:
                     _state_writer.heartbeat()
                 except Exception:

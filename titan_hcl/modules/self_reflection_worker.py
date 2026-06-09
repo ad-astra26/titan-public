@@ -135,12 +135,7 @@ _SELF_REFLECTION_WORKER_SUBSCRIBE_TOPICS: list[str] = [
 # SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
 # the boot window so guardian_HCL's stale-heartbeat detector doesn't
 # kill a slow boot).
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict,
@@ -173,7 +168,7 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
-    if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+    if state_writer is not None and _WORKER_READY:
         try:
             state_writer.heartbeat()
         except Exception:  # noqa: BLE001 — never crash the heartbeat
@@ -453,9 +448,8 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
         logger.debug(
             "[SelfReflectionWorker] pdeathsig install skipped: %s", _err)
 
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # Canonical titan_id resolution.
     from titan_hcl.core.state_registry import resolve_titan_id

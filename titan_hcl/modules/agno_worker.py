@@ -87,13 +87,8 @@ SHM_REPUBLISH_INTERVAL_S = 1.0  # dual-trigger: on tick + on completion
 # 1Hz SHM poll + the orchestrator's MODULE_PROBE_REQUEST dispatcher see
 # real liveness rather than the boot-time "subscribed-but-not-warm" lie
 # that broke /chat on the T3 cascade 2026-05-27.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _AGENT_READY: bool = False
 _OVG_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 # ── ζ.5 per-tier model routing (D-SPEC-79, 2026-05-18) ─────────────
 # Agno's agent.arun() does NOT accept a per-call `model=` override — the
@@ -290,7 +285,7 @@ def _heartbeat_loop(send_queue, name: str,
             "last_chat_ts": stats_ref.get("last_chat_ts", 0.0),
             "in_flight": stats_ref.get("in_flight", 0),
         })
-        if state_writer is not None and shm_heartbeat_allowed(_AGENT_READY and _OVG_READY, _BOOT_DEADLINE):
+        if state_writer is not None and _AGENT_READY and _OVG_READY:
             try:
                 # heartbeat() republishes with state="running" — only
                 # valid once both sentinels are True. During the boot
@@ -1115,10 +1110,9 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     # Phase 11 §11.I.5 (Chunk 11N) — module-level readiness flags reset on
     # every entry (fork-mode re-entries inherit parent's True; spawn-mode
     # re-spawns get fresh False; explicit reset covers both).
-    global _AGENT_READY, _OVG_READY, _BOOT_DEADLINE
+    global _AGENT_READY, _OVG_READY
     _AGENT_READY = False
     _OVG_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     logger.info("[AgnoWorker] Boot")
     boot_start = time.time()

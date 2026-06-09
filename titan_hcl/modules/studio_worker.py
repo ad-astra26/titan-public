@@ -95,12 +95,7 @@ GALLERY_QUERY_TIMEOUT_S = 2.0  # work-RPC ≤2s per G19
 # Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
 # mirrored to the per-process SHM slot via ModuleStateWriter. Set False at
 # import time; flipped True after StudioCoordinator + publisher init.
-from titan_hcl.modules._heartbeat_grace import (
-    boot_deadline_from_now, shm_heartbeat_allowed,
-)
-
 _WORKER_READY: bool = False
-_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 # Valid render types per SPEC §8.7 STUDIO_RENDER_REQUEST schema.
@@ -157,7 +152,7 @@ def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
             "renders_failed": stats_ref.get("renders_failed", 0),
             "in_flight": stats_ref.get("in_flight", 0),
         })
-        if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
+        if state_writer is not None and _WORKER_READY:
             try:
                 state_writer.heartbeat()
             except Exception:  # noqa: BLE001 — never crash heartbeat
@@ -296,9 +291,8 @@ def studio_worker_main(recv_queue, send_queue, name: str,
            - MODULE_SHUTDOWN → graceful exit (wait in-flight ≤ grace, then kill)
     """
     # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel.
-    global _WORKER_READY, _BOOT_DEADLINE
+    global _WORKER_READY
     _WORKER_READY = False
-    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # Resolve titan_id (feedback_titan_id_canonical_resolve.md — SPEC §23.17 R-PORT-1)
     from titan_hcl.core.state_registry import resolve_titan_id

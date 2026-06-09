@@ -32,15 +32,6 @@ def _make_index_db(rows):
     conn.executemany(
         "INSERT INTO block_index VALUES "
         "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
-    # Chain-local fork NAME→id registry — RuleEvaluator._resolve_fork_id
-    # resolves FORK_READ targets against this table (INV-Syn-26), NEVER the
-    # static FORK_IDS map. Seed it to agree with the ids the rows use.
-    conn.execute(
-        "CREATE TABLE fork_registry ("
-        "fork_id INTEGER PRIMARY KEY, fork_name TEXT NOT NULL)")
-    conn.executemany(
-        "INSERT INTO fork_registry (fork_id, fork_name) VALUES (?, ?)",
-        [(fid, name) for name, fid in FORK_IDS.items()])
     conn.commit()
     return conn
 
