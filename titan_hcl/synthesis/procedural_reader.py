@@ -130,6 +130,10 @@ class ProceduralSkillReader:
             row = by_emb_id.get(emb_id)
             if row is None:
                 continue
+            # INV-EEL-5 polarity guard (defence-in-depth — read_for_match already
+            # returns positives only): never surface a [negative] cell as a recipe.
+            if row.get("polarity") == "negative":
+                continue
             # cosine surrogate from L2 distance on unit vectors
             cosine_surrogate = max(0.0, 1.0 - (float(dist) / FAISS_L2_NORMALIZER))
             name_lower = (row.get("name") or "").lower()
@@ -150,14 +154,19 @@ class ProceduralSkillReader:
         return [enriched for _, enriched in scored[:k]]
 
     def should_delegate(self, top: Optional[dict]) -> bool:
-        """Q6 delegate gate: utility_score ≥ utility_floor AND match_score ≥ match_floor
-        AND verified_at IS NOT NULL AND utility_score ≥ 0.0 (rejected skills excluded)."""
+        """Q6 delegate gate (EEL B1): match_score ≥ match_floor AND utility_score
+        (= the cell `time_cost` proficiency) ≥ utility_floor AND the outcome is
+        delegate-eligible — **promoted** (per-use oracle-verified → time_cost
+        crossed promote_floor, oracle-verified by construction — INV-EEL-2) OR
+        INV-Syn-20 first-invocation `verified_at`. **Polarity guard (INV-EEL-5):**
+        a `[negative]` cell is NEVER delegatable."""
         if not top:
+            return False
+        if top.get("polarity") == "negative":
             return False
         match_score = float(top.get("match_score") or 0.0)
         utility = float(top.get("utility_score") or 0.0)
-        verified_at = top.get("verified_at")
-        if verified_at is None:
+        if not (top.get("promoted") or top.get("verified_at") is not None):
             return False
         if utility < 0.0:
             return False

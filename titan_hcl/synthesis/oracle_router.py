@@ -220,6 +220,8 @@ class _CompanionEntry:
     parent_tool_call_tx: str
     verdict: OracleVerdict
     fork: str           # parent tool-call's fork — INV-Syn-12 routing
+    parent_goal: str = ""   # EEL B1 — the goal this tool-use served (→ goal_class)
+    tool_id: str = ""       # EEL B1 — the tool used (→ task_shape)
 
 
 @dataclass
@@ -285,6 +287,9 @@ class OracleRouter:
 
         # Companion-batch buffer for tool-call verdicts (INV-Syn-12).
         self._companions = _CompanionBuffer()
+        # EEL B1 (D-SPEC-153) — optional skill-score capture sink, fired per
+        # canonical companion verdict at flush. None = no capture (back-compat).
+        self._score_event_sink = None
 
     # ── registry ────────────────────────────────────────────────────────
 
@@ -317,6 +322,8 @@ class OracleRouter:
         *,
         parent_tool_call_tx: Optional[str] = None,
         parent_tool_call_fork: Optional[str] = None,
+        parent_goal: Optional[str] = None,
+        tool_id: Optional[str] = None,
     ) -> RouterResult:
         """Run a claim through gate + plug + verdict emission.
 
@@ -386,7 +393,9 @@ class OracleRouter:
 
         # ── 5. route + anchor per INV-Syn-12 ──
         if parent_tool_call_tx is not None:
-            return self._buffer_companion(verdict, parent_tool_call_tx, parent_tool_call_fork)
+            return self._buffer_companion(
+                verdict, parent_tool_call_tx, parent_tool_call_fork,
+                parent_goal=parent_goal or "", tool_id=tool_id or "")
         return self._anchor_standalone(verdict, claim)
 
     # ── routing helpers ─────────────────────────────────────────────────
@@ -447,6 +456,8 @@ class OracleRouter:
         verdict: OracleVerdict,
         parent_tool_call_tx: str,
         parent_tool_call_fork: Optional[str],
+        parent_goal: str = "",
+        tool_id: str = "",
     ) -> RouterResult:
         fork = parent_tool_call_fork or "procedural"
         with self._companions.lock:
@@ -455,6 +466,8 @@ class OracleRouter:
                     parent_tool_call_tx=parent_tool_call_tx,
                     verdict=verdict,
                     fork=fork,
+                    parent_goal=parent_goal or "",
+                    tool_id=tool_id or "",
                 )
             )
         decision = GateDecision(admit=True, reason="", admit_score=0.0, latency_ms=0)
@@ -471,6 +484,8 @@ class OracleRouter:
         latency_ms: int = 0,
         ts: Optional[float] = None,
         fork: Optional[str] = "procedural",
+        parent_goal: Optional[str] = None,
+        tool_id: Optional[str] = None,
     ) -> None:
         """Buffer a PRE-COMPUTED companion verdict (operator-closure C2 / W7).
 
@@ -490,7 +505,9 @@ class OracleRouter:
             latency_ms=int(latency_ms),
             ts=float(ts if ts is not None else self._now_fn()),
         )
-        self._buffer_companion(v, str(parent_tool_call_tx), fork or "procedural")
+        self._buffer_companion(
+            v, str(parent_tool_call_tx), fork or "procedural",
+            parent_goal=parent_goal or "", tool_id=tool_id or "")
 
     # ── companion batch flush (called at dream boundary) ────────────────
 
@@ -542,12 +559,35 @@ class OracleRouter:
                 "[OracleRouter] flushed companion batch fork=%s n=%d merkle=%s tx=%s",
                 fork, len(entries), merkle_root[:16], tx[:16],
             )
+            # EEL B1 (D-SPEC-153 / INV-Syn-28) — feed the off-hot-path skill-score
+            # queue: each CANONICAL companion verdict that names its (goal, tool)
+            # becomes a (outcome, task-shape) score event. Fired AFTER the batch
+            # anchors so only on-chain verdicts score (INV-EEL-2). The sink is set
+            # by the synthesis_worker → skill_store.enqueue_score_event (INV-Syn-19).
+            sink = self._score_event_sink
+            if sink is not None:
+                for e in entries:
+                    if not e.parent_goal:
+                        continue  # no goal → cannot form the outcome key — skip
+                    try:
+                        sink(oracle_id=e.verdict.oracle_id, verdict=e.verdict.verdict,
+                             parent_tool_call_tx=e.parent_tool_call_tx,
+                             parent_goal=e.parent_goal, tool_id=e.tool_id)
+                    except Exception:
+                        logger.debug("[OracleRouter] score_event_sink raised")
         return anchored
 
     def companion_buffer_size(self) -> int:
         """Total buffered companion entries across all forks (Observatory)."""
         with self._companions.lock:
             return sum(len(v) for v in self._companions.by_fork.values())
+
+    def set_score_event_sink(self, sink) -> None:
+        """EEL B1 (D-SPEC-153) — wire the skill-score capture. The synthesis_worker
+        sets this to a closure over `skill_store.enqueue_score_event`; at each
+        companion-batch flush, every canonical verdict naming its (goal, tool) is
+        forwarded as an off-hot-path score event. None (default) = no capture."""
+        self._score_event_sink = sink
 
 
 __all__ = (
