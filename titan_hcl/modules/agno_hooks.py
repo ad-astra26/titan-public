@@ -2219,15 +2219,6 @@ def create_pre_hook(plugin):
             if sage_findings:
                 injected += f"### Research Findings\n{sage_findings}\n\n"
                 plugin._last_research_sources = plugin._extract_sources_from_findings(sage_findings)
-                # EEL A1 (INV-EEL-6): flag this turn's persisted memory as
-                # acquired:research + source. Read-and-cleared synchronously in
-                # the PostHook persist (strictly per-turn → never stale).
-                _eel_srcs = plugin._last_research_sources
-                plugin._acquired_research_source = (
-                    "; ".join(str(s) for s in _eel_srcs)
-                    if isinstance(_eel_srcs, (list, tuple)) and _eel_srcs
-                    else (str(_eel_srcs) if _eel_srcs else "research")
-                )
                 plugin.memory.add_research_topic(prompt_text[:200])
 
         _ph_stage("after_mode_dispatch")
@@ -2721,22 +2712,14 @@ def create_post_hook(plugin):
         # → None (graceful; no felt for this thought).
         _felt_snapshot = dict(getattr(plugin, "_pre_chat_neuromods", {}) or {})
         _felt_snapshot = _felt_snapshot or None
-        # EEL A1 (INV-EEL-6): read-and-clear this turn's research-provenance flag
-        # (set in the STATE_NEED_RESEARCH PreHook branch). Captured synchronously
-        # here so the fire-and-forget task can't read a later turn's value.
-        _acq_source = getattr(plugin, "_acquired_research_source", None)
-        plugin._acquired_research_source = None
-        _acq_tags = ["acquired:research"] if _acq_source else None
 
         async def _log_to_mempool_bg(user_prompt_v, response_text_v, user_id_v,
-                                     neuromod_context_v=None,
-                                     tags_v=None, source_v=None):
+                                     neuromod_context_v=None):
             try:
                 await plugin.memory.add_to_mempool(
                     user_prompt_v, response_text_v,
                     user_identifier=user_id_v,
-                    neuromod_context=neuromod_context_v,
-                    tags=tags_v, source=source_v)
+                    neuromod_context=neuromod_context_v)
                 logger.info(
                     "[PostHook][bg] Memory logged: user=%s prompt=%s... (%d chars, "
                     "felt=%s)", user_id_v, user_prompt_v[:40], len(response_text_v),
@@ -2747,8 +2730,7 @@ def create_post_hook(plugin):
 
         try:
             asyncio.create_task(_log_to_mempool_bg(
-                user_prompt, response_text, user_id, _felt_snapshot,
-                tags_v=_acq_tags, source_v=_acq_source))
+                user_prompt, response_text, user_id, _felt_snapshot))
         except Exception as e:
             # asyncio.create_task can only fail if there's no running loop;
             # the post_hook is invoked from agent.arun's loop so this is

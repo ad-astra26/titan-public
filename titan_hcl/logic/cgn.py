@@ -1577,13 +1577,6 @@ class ConceptGroundingNetwork:
                 import json as _json
                 payload = dict(state.get("haov") or {})
                 payload["_consumer_freq"] = dict(state.get("consumer_freq") or {})
-                # Per-consumer causal-generator telemetry (transitions_observed,
-                # candidates_active/ready, promoted_total, below_threshold_skips)
-                # rides under the reserved "_causal_generator" key — the API
-                # reader pops it before iterating consumers. Splits HAOV-formation
-                # dormancy into producer-starvation vs uncalibrated-threshold
-                # (DEFERRED G1 / OBS-haov-efficacy-rewire-soak F3 diagnosis).
-                payload["_causal_generator"] = self.get_causal_generator_stats()
                 haov_path = os.path.join(self._state_dir, "haov_stats.json")
                 try:
                     with open(haov_path, "w") as _hf:

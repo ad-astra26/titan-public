@@ -3549,17 +3549,41 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
             from titan_hcl.logic.life_force_inputs_builder import (
                 compute_life_force_inputs,
             )
+            _lf_bank = state_refs.get("_shm_reader_bank")
             # sol_balance — real cached SOL from network_state.bin (kernel
             # balance-publisher loop; cheap G18 SHM read), replacing the 13.0
             # stub (BUG-LIFEFORCE-INPUT-STUBS, 2026-06-05).
             _lf_sol = None
             try:
-                _lf_bank = state_refs.get("_shm_reader_bank")
                 _lf_ns = _lf_bank.read_network_state() if _lf_bank is not None else None
                 if _lf_ns:
                     _lf_sol = _lf_ns.get("balance_sol")
             except Exception:
                 _lf_sol = None
+            # anchor_freshness — real linear-over-24h freshness from the cached
+            # on-chain anchor age (timechain_state.bin.recent_anchor_age_s; cheap
+            # G18 SHM read), replacing the 0.5 stub (BUG-LIFEFORCE-INPUT-STUBS).
+            _lf_anchor = None
+            try:
+                _lf_tc = _lf_bank.read_timechain_state() if _lf_bank is not None else None
+                if _lf_tc:
+                    _lf_age = _lf_tc.get("recent_anchor_age_s")
+                    if _lf_age is not None:
+                        _lf_anchor = 1.0 - min(float(_lf_age) / 86400.0, 1.0)
+            except Exception:
+                _lf_anchor = None
+            # sovereignty_index — the ONE synthesis sovereignty score S in basis
+            # points (int(S×10000)) via synthesis.sovereignty_readout (G18
+            # snapshot read, the same source backup consumes), replacing the 0
+            # stub (BUG-LIFEFORCE-INPUT-STUBS; "only one sovereignty score = S").
+            _lf_sov = None
+            try:
+                from titan_hcl.synthesis.sovereignty_readout import (
+                    rolling_sovereignty_bp,
+                )
+                _lf_sov = rolling_sovereignty_bp()
+            except Exception:
+                _lf_sov = None
             _lf_inputs = compute_life_force_inputs(
                 coordinator=coordinator,
                 pi_monitor=pi_monitor,
@@ -3569,6 +3593,8 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                 topology_snap=topology_snap,
                 expression_state_reader=state_refs.get("expression_state_reader"),
                 sol_balance=_lf_sol,
+                anchor_freshness=_lf_anchor,
+                sovereignty_index=_lf_sov,
             )
             _lf_inputs_publisher.publish(_lf_inputs)
         except Exception as _err:

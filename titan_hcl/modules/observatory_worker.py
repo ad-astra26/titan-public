@@ -94,7 +94,12 @@ DEFAULT_SNAPSHOT_INTERVAL_S = 60
 
 # Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; SHM heartbeat
 # is suppressed until the worker has finished in-process scaffolding.
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 # The broadcast event types this worker bridges to OBSERVATORY_EVENT. Kept as
 # a module constant so the ModuleSpec.broadcast_topics + the CI parity test
@@ -132,7 +137,7 @@ def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
     until the worker is actually serving."""
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
-        if state_writer is not None and _WORKER_READY:
+        if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
             try:
                 state_writer.heartbeat()
             except Exception:
@@ -360,8 +365,9 @@ def observatory_worker_main(recv_queue, send_queue, name: str,
         "(RFP_phase_c_titan_hcl_cleanup Phase A+B / §9.B)",
         titan_id, name, interval_s)
 
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
     _state_writer = None

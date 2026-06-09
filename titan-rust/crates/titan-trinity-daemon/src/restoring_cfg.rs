@@ -30,9 +30,11 @@
 //! spirit 0.3/0.7) is structural — fixed in [`homeostasis::gradient`], not in
 //! the TOML.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 use crate::homeostasis::{Layer, RestoringCfg};
 
@@ -59,9 +61,27 @@ const fn layer_offset(layer: Layer) -> usize {
 /// (`feedback_no_hardcoded_values_emergence_over_determinism` — config
 /// gains OK, defaults are a safe baseline, not a signal floor).
 pub fn load_for_layer(shm_dir: &Path, layer: Layer) -> RestoringCfg {
+    // Log-on-change cache (BUG-TRINITY-RESTORING-CFG-LOG-PER-RELOAD-SPAM-20260530):
+    // the trinity tick loops re-read this sidecar on a retry cadence to pick up
+    // Python L2 gain re-publishes without a restart. The read is intentional, but
+    // the gains almost never change between reads, so an unconditional INFO here
+    // spammed /var/log (~3300/20k syslog lines × 6 daemons). Remember the last
+    // value LOGGED per layer (thread-local — each daemon ticks on one thread) and
+    // emit INFO only when the effective cfg actually changes; otherwise trace!.
+    thread_local! {
+        static LAST_LOGGED: RefCell<HashMap<Layer, RestoringCfg>> =
+            RefCell::new(HashMap::new());
+    }
+
+    enum LoadOutcome {
+        Loaded { slice_offset: usize },
+        Fallback,
+        Absent { reason: String },
+    }
+
     let mut cfg = RestoringCfg::for_layer(layer);
     let path = shm_dir.join(TRINITY_RESTORING_SIDECAR);
-    match std::fs::read(&path) {
+    let outcome = match std::fs::read(&path) {
         Ok(bytes) if bytes.len() >= TRINITY_RESTORING_PAYLOAD_BYTES => {
             let off = layer_offset(layer);
             let mut g = [0.0_f32; 8];
@@ -81,22 +101,63 @@ pub fn load_for_layer(shm_dir: &Path, layer: Layer) -> RestoringCfg {
             cfg.a_mag = g[5];
             cfg.a_drift = g[6];
             cfg.a_dmag = g[7];
-            info!(
-                event = "TRINITY_RESTORING_CFG_LOADED",
-                layer = ?layer,
-                slice_offset = off,
-                k_drive = cfg.k_drive,
-                k_restore = cfg.k_restore,
-                k_damp = cfg.k_damp,
-                k_mom = cfg.k_mom,
-                k_dir = cfg.k_dir,
-                a_mag = cfg.a_mag,
-                a_drift = cfg.a_drift,
-                a_dmag = cfg.a_dmag,
-                source = "trinity_restoring.bin",
-            );
+            LoadOutcome::Loaded { slice_offset: off }
         }
-        Ok(_short) => {
+        Ok(_short) => LoadOutcome::Fallback,
+        Err(e) => LoadOutcome::Absent {
+            reason: format!("{e}"),
+        },
+    };
+
+    // Did the effective per-layer cfg change vs the last value we logged?
+    let changed = LAST_LOGGED.with(|m| m.borrow().get(&layer) != Some(&cfg));
+    match &outcome {
+        LoadOutcome::Loaded { slice_offset } => {
+            if changed {
+                info!(
+                    event = "TRINITY_RESTORING_CFG_LOADED",
+                    layer = ?layer,
+                    slice_offset = *slice_offset,
+                    k_drive = cfg.k_drive,
+                    k_restore = cfg.k_restore,
+                    k_damp = cfg.k_damp,
+                    k_mom = cfg.k_mom,
+                    k_dir = cfg.k_dir,
+                    a_mag = cfg.a_mag,
+                    a_drift = cfg.a_drift,
+                    a_dmag = cfg.a_dmag,
+                    source = "trinity_restoring.bin",
+                );
+            } else {
+                trace!(
+                    event = "TRINITY_RESTORING_CFG_UNCHANGED",
+                    layer = ?layer,
+                    source = "trinity_restoring.bin",
+                );
+            }
+        }
+        LoadOutcome::Absent { reason } => {
+            // Absence at boot is normal (Python sidecar may not have landed
+            // yet); not an error. INFO once, then quiet until it changes.
+            if changed {
+                info!(
+                    event = "TRINITY_RESTORING_CFG_DEFAULT",
+                    reason = %reason,
+                    path = %path.display(),
+                    layer = ?layer,
+                    "using crate-default §G5.2 gains until sidecar present"
+                );
+            } else {
+                trace!(
+                    event = "TRINITY_RESTORING_CFG_DEFAULT",
+                    layer = ?layer,
+                    "default gains unchanged"
+                );
+            }
+        }
+        LoadOutcome::Fallback => {
+            // A present-but-short sidecar is abnormal (and rare) — warn every
+            // read so a persistent truncation stays visible.
             warn!(
                 event = "TRINITY_RESTORING_CFG_FALLBACK",
                 reason = "sidecar payload < 96 bytes (D-SPEC-129 per-layer)",
@@ -105,18 +166,11 @@ pub fn load_for_layer(shm_dir: &Path, layer: Layer) -> RestoringCfg {
                 "falling back to crate-default §G5.2 gains"
             );
         }
-        Err(e) => {
-            // Absence at boot is normal (Python sidecar may not have
-            // landed yet); not an error. Log at info so operators can see
-            // the resolution path but it doesn't pollute warn-level.
-            info!(
-                event = "TRINITY_RESTORING_CFG_DEFAULT",
-                reason = format!("{e}"),
-                path = %path.display(),
-                layer = ?layer,
-                "using crate-default §G5.2 gains until sidecar present"
-            );
-        }
+    }
+    if changed {
+        LAST_LOGGED.with(|m| {
+            m.borrow_mut().insert(layer, cfg);
+        });
     }
     cfg
 }

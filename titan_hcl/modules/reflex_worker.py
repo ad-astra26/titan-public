@@ -57,7 +57,12 @@ _HEARTBEAT_INTERVAL_S = 30.0
 # poll + the orchestrator's MODULE_PROBE_REQUEST dispatcher see real
 # liveness. Flipped True only after the ReflexCollector aggregator is
 # constructed.
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 @with_error_envelope(module_name="reflex", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -71,8 +76,9 @@ def reflex_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         config: full config dict — used for titan_id + reflex params.
     """
     # Phase 11 §11.I.5 — reset module-level readiness flag.
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -161,7 +167,7 @@ def reflex_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             # Phase 11 §11.I.5 — SHM slot heartbeat sidecar (same cadence
             # as the legacy bus path so guardian_hcl's SHM-staleness
             # detector sees fresh data).
-            if _state_writer is not None and _WORKER_READY:
+            if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
                 try:
                     _state_writer.heartbeat()
                 except Exception:  # noqa: BLE001 — never crash heartbeat

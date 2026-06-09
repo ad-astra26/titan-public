@@ -92,7 +92,12 @@ _STATE_CHECKPOINT_INTERVAL_S = 300.0    # periodic disk checkpoint — survives 
 # Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel consumed by
 # this worker's heartbeat thread (SHM heartbeat is suppressed until the
 # worker has finished in-process scaffolding).
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 def _send(send_queue, msg_type: str, src: str, dst: str,
@@ -116,7 +121,7 @@ def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
     at state="starting"/"booted" until the worker is actually serving."""
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
-        if state_writer is not None and _WORKER_READY:
+        if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
             try:
                 state_writer.heartbeat()
             except Exception:
@@ -144,8 +149,9 @@ def sovereignty_worker_main(recv_queue, send_queue, name: str,
         "[SovereigntyWorker] booting — name=%s "
         "(SPEC v1.8.3 §9.B / D-SPEC-57 / rFP §4.L)", name)
 
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
     # Created BEFORE the slow init so the slot publishes state="starting"

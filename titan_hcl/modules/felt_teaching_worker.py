@@ -61,7 +61,12 @@ _SETPOINT_CENTRE = 0.5
 # Recurrence (count of distinct source Engrams an Object appears in) at which the
 # evidence reaches full confidence weight. Keeps a one-off Object's reward modest.
 _RECURRENCE_NORM = 3.0
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 # ── Reward (Q3 — felt_evidence_strength, v1 bootstrap) ──────────────────────
@@ -158,8 +163,9 @@ class _FeltTeachingStore:
 def felt_teaching_worker_main(recv_queue, send_queue, name: str,
                               config: dict) -> None:
     """Main loop for the felt-teaching consumer subprocess."""
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -255,7 +261,7 @@ def felt_teaching_worker_main(recv_queue, send_queue, name: str,
                                 "errors": errors}, "ts": now})
             except Exception:  # noqa: BLE001
                 pass
-            if _state_writer is not None and _WORKER_READY:
+            if _state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
                 try:
                     _state_writer.heartbeat()
                 except Exception:  # noqa: BLE001

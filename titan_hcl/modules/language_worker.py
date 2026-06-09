@@ -40,7 +40,12 @@ logger = logging.getLogger(__name__)
 # SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
 # the boot window so guardian_HCL's stale-heartbeat detector doesn't
 # kill a slow boot).
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 # ── Phase D.1 — META_LANGUAGE reward helpers ───────────────────────────
@@ -164,8 +169,9 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
     """
     from queue import Empty
 
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # Project root for imports
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -3468,7 +3474,7 @@ def _send_heartbeat(send_queue, name: str,
         rss_mb = 0
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian",
               {"rss_mb": round(rss_mb, 1)})
-    if state_writer is not None and _WORKER_READY:
+    if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
         try:
             state_writer.heartbeat()
         except Exception:  # noqa: BLE001 — never crash the heartbeat

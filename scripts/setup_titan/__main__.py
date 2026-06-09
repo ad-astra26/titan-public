@@ -1,7 +1,7 @@
 """CLI router for `python -m scripts.setup_titan`.
 
 Subcommands:
-    install      Run the wizard.   --default / --mode={mainnet,devnet,local} / --resume / --minimal / --skip-genesis / --directives-file / --dry-run
+    install      Run the wizard.   --default / --mode={mainnet,devnet,local} / --resume / --minimal / --skip-genesis / --dry-run
     config       TUI to browse + edit config.toml + titan_params.toml  (stubbed in v0.1-alpha)
     diagnostic   User-friendly live health report  (stubbed in v0.1-alpha)
     repair       Idempotent re-run / fix detected problems  (stubbed in v0.1-alpha)
@@ -185,8 +185,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     return run_phases(state=state, mode=mode, install_root=repo_root,
                       default=args.default, minimal=args.minimal, skip_genesis=args.skip_genesis,
                       tag=args.tag, build_rust=args.build_rust, prompter=prompter,
-                      toolchain_pins=toolchain.resolve_versions(args),
-                      directives_file=args.directives_file)
+                      toolchain_pins=toolchain.resolve_versions(args))
 
 
 # ── subcommands: stubs ─────────────────────────────────────────────────────
@@ -252,12 +251,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip optional research stack (Crawl4AI, Unstructured, Playwright).")
     pi.add_argument("--skip-genesis", action="store_true",
                     help="Skip the Genesis Ceremony.")
-    pi.add_argument("--directives-file", default=None,
-                    help="Path to a file with the Maker's Prime Directives, for a "
-                         "headless / non-tty / --default install (no $EDITOR). "
-                         "Env fallbacks: TITAN_DIRECTIVES_FILE (path) and "
-                         "TITAN_DIRECTIVES (literal text). The directives are "
-                         "MANDATORY for an on-chain (devnet/mainnet) birth.")
     pi.add_argument("--tag", default=None,
                     help="Release tag the binaries are fetched from (e.g. v0.0.1). "
                          "Forwarded by the bootstrap; needed unless --build-rust.")

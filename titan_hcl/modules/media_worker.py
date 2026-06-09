@@ -38,7 +38,12 @@ logger = logging.getLogger(__name__)
 # Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
 # mirrored to per-process SHM slot via ModuleStateWriter. Set False at
 # import; flipped True after the queue_dir bootstrap completes.
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 # Supported formats
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"}
@@ -80,8 +85,9 @@ def media_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         sys.path.insert(0, project_root)
 
     # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel.
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21) ──
     # Built BEFORE the queue_dir bootstrap so titan_hcl's 1Hz SHM poll
@@ -672,7 +678,7 @@ def _send_heartbeat(send_queue, name: str,
     except Exception:
         rss_mb = 0
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})
-    if state_writer is not None and _WORKER_READY:
+    if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
         try:
             state_writer.heartbeat()
         except Exception:  # noqa: BLE001 — never crash heartbeat

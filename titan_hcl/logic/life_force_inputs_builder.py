@@ -67,6 +67,8 @@ def compute_life_force_inputs(
     expression_state_reader: Any = None,
     vocab_db_path: str = "data/inner_memory.db",
     sol_balance: Optional[float] = None,
+    anchor_freshness: Optional[float] = None,
+    sovereignty_index: Optional[int] = None,
 ) -> dict[str, Any]:
     """Aggregate the 16 LifeForceEngine.evaluate inputs into a single dict.
 
@@ -92,7 +94,17 @@ def compute_life_force_inputs(
     developmental_age = (
         int(pi_monitor.developmental_age) if pi_monitor is not None else 0
     )
-    sovereignty_index = _STUB_SOVEREIGNTY_INDEX  # follow-up rFP target
+    # sovereignty_index — REAL: the ONE synthesis sovereignty score
+    # S = 0.7·E + 0.3·V in basis points (int(S×10000)), read by cognitive_worker
+    # via synthesis.sovereignty_readout (G18 snapshot file read, no recompute /
+    # no RPC — the same canonical source backup/meditation consume). life_force.py
+    # recovers S via its `sovereignty_index / 10000` normalization; the >=5000
+    # developmental-regime gate becomes S >= 0.5. There is only ONE sovereignty
+    # score (synthesis S, SDA INV-SDA-3); this input joins its consumers. Falls
+    # back to the stub only on cold-boot (BUG-LIFEFORCE-INPUT-STUBS).
+    sovereignty_index = (
+        int(sovereignty_index) if sovereignty_index is not None
+        else _STUB_SOVEREIGNTY_INDEX)
 
     spirit_coherence = 0.5
     if len(_sv) >= 130:
@@ -180,7 +192,13 @@ def compute_life_force_inputs(
     # Falls back to the stub ONLY on cold-boot before the first balance fetch.
     sol_balance = (
         float(sol_balance) if sol_balance is not None else _STUB_SOL_BALANCE)
-    anchor_freshness = _STUB_ANCHOR_FRESHNESS  # follow-up rFP target
+    # anchor_freshness — REAL: linear-over-24h freshness from the cached
+    # on-chain anchor age (timechain_state.bin.recent_anchor_age_s; a cheap G18
+    # SHM read passed by cognitive_worker). 1.0 = just anchored, 0.0 = ≥24h
+    # stale. Falls back to the stub only on cold-boot (BUG-LIFEFORCE-INPUT-STUBS).
+    anchor_freshness = (
+        float(anchor_freshness) if anchor_freshness is not None
+        else _STUB_ANCHOR_FRESHNESS)
 
     hormonal_vitality = 0.5
     if neural_nervous_system is not None:
