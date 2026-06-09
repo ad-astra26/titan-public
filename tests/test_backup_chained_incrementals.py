@@ -341,3 +341,90 @@ async def test_decrypting_fetch_roundtrips_mode_b(tmp_path):
     fetch = backup._build_decrypting_fetch(manifest)
     out = await fetch(tx)
     assert out == plaintext  # Mode-B decrypt via local keypair + manifest iv
+
+
+# ── R4 — weekly restore-test + self-heal halt ──────────────────────────────
+
+
+def test_halt_mechanism_and_force_baseline_marker(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # halt/marker paths are relative to data/backups/
+    backup = _PhaseBBackup(str(tmp_path / "mirror"), chained=True)
+
+    assert backup._is_backups_halted() is False
+    backup._set_backups_halt(reason="HALT_BROKEN_CHAIN", failed_event_id="evtX")
+    assert backup._is_backups_halted() is True
+    assert os.path.exists(backup._force_baseline_marker_path())
+
+    # A clear lifts the halt but LEAVES the force-baseline marker → resume rebases.
+    backup._clear_backups_halt()
+    assert backup._is_backups_halted() is False
+    assert os.path.exists(backup._force_baseline_marker_path())
+
+    # Marker is one-shot.
+    assert backup._take_force_baseline() is True
+    assert backup._take_force_baseline() is False
+
+
+@pytest.mark.asyncio
+async def test_precheck_forces_baseline_after_failed_restore_test(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    backup = _PhaseBBackup(str(tmp_path / "mirror"), chained=True)
+    backup._set_backups_halt(reason="restore_failed", failed_event_id="evtY")  # arms the marker
+    # Even a healthy-looking manifest must rebase: the chain is suspect post-FAIL.
+    force_et, force_trig, _ = await backup._precheck_diff_base(
+        _FakeManifest(latest_id="evtZ", rebase=False))
+    assert (force_et, force_trig) == ("baseline", "self_heal")
+    assert backup._take_force_baseline() is False  # consumed by the precheck (one-shot)
+
+
+@pytest.mark.asyncio
+async def test_restore_test_pass_on_green_chain(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    arweave, solana = _FakeArweave(), _FakeSolana()
+    manifest = UnifiedManifest("T1", base_dir="data")  # → tmp_path/data (chdir'd)
+    src = tmp_path / "src"
+    src.mkdir()
+    _write(src, {"config.txt": b"v=1\n", "timechain/chain_main.bin": b"BLOCK0" * 16})
+    r1 = await run_unified_event(
+        titan_id="T1", manifest=manifest,
+        personality_specs=_pspecs(src, ["config.txt"]),
+        timechain_specs=_tspecs(src, ["timechain/chain_main.bin"]),
+        baseline_resolver=None, arweave_uploader=arweave.upload,
+        zk_committer=solana.commit, scratch_dir=str(tmp_path / "s1"))
+    assert r1.status == "shipped"
+
+    backup = _PhaseBBackup(str(tmp_path / "mirror"), chained=True, store=arweave)
+    emitted: list = []
+    ok = await backup._run_weekly_restore_test(
+        memo_fetch=solana.fetch, bus_emit=lambda n, p: emitted.append((n, p)))
+    assert ok is True
+    assert backup._is_backups_halted() is False
+    assert any(n == "BACKUP_RESTORE_TEST_PASS" for n, _ in emitted)
+
+
+@pytest.mark.asyncio
+async def test_restore_test_fail_halts_backups(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    arweave, solana = _FakeArweave(), _FakeSolana()
+    manifest = UnifiedManifest("T1", base_dir="data")
+    src = tmp_path / "src"
+    src.mkdir()
+    _write(src, {"config.txt": b"v=1\n", "timechain/chain_main.bin": b"BLOCK0" * 16})
+    r1 = await run_unified_event(
+        titan_id="T1", manifest=manifest,
+        personality_specs=_pspecs(src, ["config.txt"]),
+        timechain_specs=_tspecs(src, ["timechain/chain_main.bin"]),
+        baseline_resolver=None, arweave_uploader=arweave.upload,
+        zk_committer=solana.commit, scratch_dir=str(tmp_path / "s1"))
+    assert r1.status == "shipped"
+
+    arweave._store.clear()  # tarballs gone → reconstruct fetch fails → restore FAILS
+    backup = _PhaseBBackup(str(tmp_path / "mirror"), chained=True, store=arweave)
+    emitted: list = []
+    ok = await backup._run_weekly_restore_test(
+        memo_fetch=solana.fetch, bus_emit=lambda n, p: emitted.append((n, p)))
+    assert ok is False
+    assert backup._is_backups_halted() is True                 # INV-BR-4 halt
+    assert os.path.exists(backup._force_baseline_marker_path())  # INV-BKP-5 recovery armed
+    assert backup.alerts, "a FAILED restore-test must maker_notify"
+    assert any(n == "BACKUP_RESTORE_TEST_FAIL" for n, _ in emitted)

@@ -2365,6 +2365,14 @@ class RebirthBackup:
         CHAINED (flag on): additionally merkle-verifies the rolling mirror vs the
         sidecar and runs the reconstruct ladder (incl. the Q2 flag-flip bridge)
         before falling back to a baseline."""
+        # R4 recovery (§24.12): a failed weekly restore-test armed a one-shot
+        # force-baseline marker → the chain is suspect, so the FIRST event after
+        # the halt is cleared rebases to a clean labeled baseline (INV-BKP-5),
+        # never an append to a possibly-broken chain. One-shot: consumed as it fires.
+        if self._take_force_baseline():
+            logger.warning("[Backup] §24.12 recovery — forcing a clean baseline "
+                           "after a failed weekly restore-test")
+            return ("baseline", "self_heal", set())
         # A baseline full-ships regardless — nothing to pre-check.
         should_rebase, _ = manifest.should_rebase()
         base_dir = self._baseline_working_dir()
@@ -2560,6 +2568,167 @@ class RebirthBackup:
                     "(%d files written/advanced)", (event_id or "?")[:8], written)
         return written
 
+    # ── Phase R4: weekly full-chain restore-test + self-heal halt (§24.12, 2026-06-09) ──
+
+    def _restore_test_halt_path(self) -> str:
+        return os.path.join("data", "backups",
+                            f".restore_test_halt_{self._titan_id}.json")
+
+    def _force_baseline_marker_path(self) -> str:
+        return os.path.join("data", "backups",
+                            f".force_baseline_{self._titan_id}")
+
+    def _is_backups_halted(self) -> bool:
+        """True if a failed weekly restore-test HALTED scheduled backups (INV-BR-4).
+        Fail-closed: an unreadable halt-flag is treated as halted."""
+        import json
+        p = self._restore_test_halt_path()
+        if not os.path.exists(p):
+            return False
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return bool(json.load(f).get("halted"))
+        except (OSError, ValueError):
+            return True
+
+    def _set_backups_halt(self, reason: str, failed_event_id) -> None:
+        """HALT scheduled backups + arm the one-shot force-baseline recovery marker.
+        The marker is a SEPARATE file so it survives a halt-clear → the first event
+        after the Maker investigates+clears rebases to a clean baseline."""
+        import json
+        p = self._restore_test_halt_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"halted": True, "reason": reason,
+                       "failed_event_id": failed_event_id, "ts": time.time()}, f)
+        os.replace(tmp, p)
+        try:
+            with open(self._force_baseline_marker_path(), "w", encoding="utf-8") as f:
+                f.write(str(failed_event_id or reason))
+        except OSError:
+            pass
+
+    def _clear_backups_halt(self) -> None:
+        """Lift the halt (a green restore-test auto-clears; or an investigated manual
+        clear). Leaves the force-baseline marker intact → the resume event is a baseline."""
+        p = self._restore_test_halt_path()
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def _take_force_baseline(self) -> bool:
+        """One-shot: consume the R4 recovery force-baseline marker if present."""
+        p = self._force_baseline_marker_path()
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            return True
+        return False
+
+    def _build_memo_fetch(self):
+        """Live memo_fetch (Solana sig → SPL-Memo text) for verify_zk_chain=True."""
+        async def _fetch(sig: str):
+            from titan_hcl.utils import solana_client
+            return await solana_client.get_memo_for_tx(sig)
+        return _fetch
+
+    async def _run_weekly_restore_test(self, *, memo_fetch=None,
+                                       bus_emit=None) -> bool:
+        """§24.12 — weekly FULL-chain restore-test. Reconstructs the ENTIRE live chain
+        into a SCRATCH dir via restore_full (Mode-B decrypting fetch + verify_zk_chain
+        =True → restore_full byte-verifies every link's tarball sha, each apply's
+        output merkle, AND the on-chain v=3 ZK memo per event). So result.status==
+        "success" IS the byte-for-byte + on-chain proof (§24.12).
+
+        PASS → emit BACKUP_RESTORE_TEST_PASS + clear any stale halt.
+        FAIL → logger.critical + maker_notify + HALT scheduled backups (INV-BR-4)
+               + arm the one-shot force-baseline recovery (INV-BKP-5).
+        Returns True on PASS. Read-only — scratch dir only; never touches live data/."""
+        import shutil
+        import tempfile
+        from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
+        from titan_hcl.logic.backup_restore import restore_full
+        from titan_hcl.logic.backup_upload_pipeline import (
+            EVENT_BACKUP_RESTORE_TEST_PASS, EVENT_BACKUP_RESTORE_TEST_FAIL)
+        started = time.time()
+        store = self._ensure_arweave_store_for_unified()
+        if store is None:
+            logger.warning("[Backup] §24.12 restore-test: no ArweaveStore — skipped")
+            return False
+        try:
+            manifest = UnifiedManifest.load(titan_id=self._titan_id, base_dir="data")
+        except ValueError as e:
+            logger.error("[Backup] §24.12 restore-test: manifest load failed: %s", e)
+            return False
+        if not manifest.events:
+            logger.info("[Backup] §24.12 restore-test: no events yet — skipped")
+            return False
+
+        scratch = tempfile.mkdtemp(prefix=f"titan_restore_test_{self._titan_id}_")
+        fetch = self._build_decrypting_fetch(manifest)
+        mfetch = memo_fetch or self._build_memo_fetch()
+
+        def _arc_to_scratch(component, arc_name):
+            return os.path.join(scratch, component, arc_name)
+
+        try:
+            result = await restore_full(
+                manifest=manifest, target_dir=scratch,
+                arweave_fetch=fetch, memo_fetch=mfetch,
+                arc_to_target=_arc_to_scratch, verify_zk_chain=True)
+            dur = time.time() - started
+            if result.status == "success":
+                logger.info("[Backup] §24.12 restore-test PASS — walked %d events, "
+                            "%d files verified, %.1fs",
+                            len(result.applied_events), result.restored_files, dur)
+                self._clear_backups_halt()
+                if bus_emit:
+                    bus_emit(EVENT_BACKUP_RESTORE_TEST_PASS, {
+                        "event": EVENT_BACKUP_RESTORE_TEST_PASS,
+                        "event_walked_to": result.target_event_id,
+                        "events": len(result.applied_events),
+                        "files_verified": result.restored_files,
+                        "duration_s": dur})
+                return True
+            # FAIL — the chain may be broken; halt + alarm loudly (Maker-confirmed:
+            # HALT + notify Maker + a CRITICAL journal log).
+            reason = getattr(result, "halt_reason", None) or "restore_failed"
+            fe = getattr(result, "halt_event_id", None)
+            logger.critical(
+                "[Backup] §24.12 WEEKLY RESTORE-TEST FAILED — scheduled Arweave "
+                "backups HALTED. halt_reason=%s halt_event=%s errors=%s. The "
+                "restore-from-Arweave chain may be BROKEN; investigate before "
+                "clearing the halt (INV-BR-4 / INV-BKP-5).",
+                reason, fe, result.errors)
+            self._set_backups_halt(reason=reason, failed_event_id=fe)
+            try:
+                self._send_telegram_alert(
+                    f"🛑 §24.12 WEEKLY RESTORE-TEST FAILED — reason={reason}, "
+                    f"event={str(fe)[:12]}. Scheduled Arweave backups are HALTED "
+                    f"until investigated; restore-from-Arweave may be at risk.")
+            except Exception:
+                pass
+            if bus_emit:
+                bus_emit(EVENT_BACKUP_RESTORE_TEST_FAIL, {
+                    "event": EVENT_BACKUP_RESTORE_TEST_FAIL,
+                    "halt_reason": reason, "halt_event_id": fe,
+                    "stage": result.status, "errors": result.errors,
+                    "duration_s": dur})
+            return False
+        except Exception as e:
+            logger.critical("[Backup] §24.12 restore-test raised: %s — HALTING "
+                            "backups (fail-closed)", e, exc_info=True)
+            self._set_backups_halt(reason=f"restore_test_exception: {e}",
+                                   failed_event_id=None)
+            return False
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
     def _cleanup_event_scratch(self, result) -> None:
         """rmtree the pipeline scratch dir(s) for a finished event — we run the
         pipeline with cleanup_scratch=False (to keep tarballs for the #3
@@ -2701,6 +2870,14 @@ class RebirthBackup:
             logger.debug(
                 "[Backup] §24 unified_v2: backup_arweave_enabled=false — skipping",
             )
+            return False
+
+        # §24.12 / INV-BR-4 — a failed weekly restore-test HALTS scheduled backups
+        # until investigated (recovery rebases to a clean baseline once cleared).
+        if self._is_backups_halted():
+            logger.warning(
+                "[Backup] §24.12 backups HALTED (failed restore-test) — skipping "
+                "scheduled event until the halt is cleared")
             return False
 
         store = self._ensure_arweave_store_for_unified()
@@ -2937,6 +3114,11 @@ class RebirthBackup:
         False on stale-baseline (caller rebuilds) / gate-off / failure."""
         from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
         from titan_hcl.logic.backup_upload_pipeline import ship_staged_event
+        # §24.12 / INV-BR-4 — halt scheduled backups after a failed restore-test.
+        if self._is_backups_halted():
+            logger.warning("[Backup] §24.12 backups HALTED (failed restore-test) — "
+                           "not shipping the staged event until the halt is cleared")
+            return False
         store = self._ensure_arweave_store_for_unified()
         if store is None:
             logger.warning("[Backup] §24 ship-stage: no ArweaveStore available")

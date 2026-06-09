@@ -464,6 +464,11 @@ def _maybe_build_stage(state: dict) -> None:
     returns None when backup_arweave is disabled.
     """
     backup = state["backup"]
+    # §24.12 / INV-BR-4 — a failed weekly restore-test halts scheduled backups.
+    if backup._is_backups_halted():
+        logger.warning("[BackupWorker] §24.12 backups HALTED (failed restore-test) "
+                       "— stager idle until the halt is cleared")
+        return
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cur = getattr(backup, "_staged_event", None)
     if cur is not None and cur.get("date") == today:
@@ -482,6 +487,38 @@ def _maybe_build_stage(state: dict) -> None:
         _record_stage_dry_run_result(staged)
 
 
+def _maybe_run_restore_test(state: dict) -> None:
+    """§24.12 (Phase R4) — on Sunday, once/day, run the weekly FULL-chain restore-test
+    OFF the recv loop (stager thread). Skips when already halted (awaiting Maker
+    investigation — a green test is the recovery, run only after a manual clear)."""
+    backup = state["backup"]
+    if backup._is_backups_halted():
+        return  # halted → wait for investigation; do not auto-clear
+    now = datetime.now(timezone.utc)
+    if now.weekday() != 6:  # Sunday only (§24.12)
+        return
+    today = now.strftime("%Y-%m-%d")
+    if getattr(backup, "_last_restore_test_date", None) == today:
+        return
+    backup._last_restore_test_date = today
+
+    def _bus_emit(name, payload):
+        try:
+            b = state.get("bus") or getattr(backup, "bus", None) \
+                or getattr(backup, "_bus", None)
+            if b is not None and hasattr(b, "emit"):
+                b.emit(name, payload)
+        except Exception:
+            pass
+
+    import asyncio as _aio
+    try:
+        _aio.run(backup._run_weekly_restore_test(bus_emit=_bus_emit))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[BackupWorker] §24.12 restore-test runner failed: %s",
+                       e, exc_info=True)
+
+
 def _start_stager(state: dict) -> None:
     """Start the Phase 2 background stager thread."""
     poll_s = 1200.0  # 20 min — cheap no-op when a fresh stage exists; catches
@@ -495,6 +532,11 @@ def _start_stager(state: dict) -> None:
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "[BackupWorker] stager cycle failed: %s", e, exc_info=True)
+            try:
+                _maybe_run_restore_test(state)   # §24.12 Sunday full-chain restore-test
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[BackupWorker] restore-test cycle failed: %s", e, exc_info=True)
             time.sleep(poll_s)
 
     threading.Thread(target=_loop, name="backup-stager", daemon=True).start()

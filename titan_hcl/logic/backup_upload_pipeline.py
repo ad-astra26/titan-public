@@ -68,6 +68,9 @@ logger = logging.getLogger(__name__)
 
 EVENT_BACKUP_EVENT_COMPLETE = "BACKUP_EVENT_COMPLETE"
 EVENT_BACKUP_EVENT_FAILED = "BACKUP_EVENT_FAILED"
+# §24.10 / §24.12 — weekly full-chain restore-test (Phase R4, 2026-06-09).
+EVENT_BACKUP_RESTORE_TEST_PASS = "BACKUP_RESTORE_TEST_PASS"
+EVENT_BACKUP_RESTORE_TEST_FAIL = "BACKUP_RESTORE_TEST_FAIL"
 
 
 # ── Injected dependencies ────────────────────────────────────────────────
