@@ -1,5 +1,5 @@
 """
-sovereignty_worker — Python L2 module owning the SovereigntyTracker
+sovereignty_worker — Python L2 module owning the GreatCycleTracker
 (M10 GREAT CYCLE convergence tracker) per `rFP_titan_hcl_l2_separation_strategy.md §4.L`.
 
 Phase C v1.8.3 (D-SPEC-57). Maker greenlit 2026-05-15 inline:
@@ -11,7 +11,7 @@ Phase C v1.8.3 (D-SPEC-57). Maker greenlit 2026-05-15 inline:
   ("we'll add both, but we need to diagnose it and make them work").
 
 What this worker owns:
-  1. SovereigntyTracker (logic/sovereignty.py, 222 LOC) — rolling neuromod
+  1. GreatCycleTracker (logic/sovereignty.py, 222 LOC) — rolling neuromod
      convergence windows (per-modulator deque maxlen=CONVERGENCE_WINDOW=5000),
      ENFORCING → ADVISORY transition criteria evaluation, 5-point test
      (great_cycle ≥1, dev_age >1000, no neuromod saturation/collapse,
@@ -77,7 +77,7 @@ from titan_hcl.bus import (
     SOVEREIGNTY_INCREMENT_GREAT_CYCLE,
     make_msg,
 )
-from titan_hcl.logic.sovereignty import SovereigntyTracker
+from titan_hcl.logic.sovereignty import GreatCycleTracker
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
 
@@ -135,7 +135,7 @@ def sovereignty_worker_main(recv_queue, send_queue, name: str,
     """L2 module entry — Guardian supervised.
 
     Boot sequence:
-      1. Instantiate SovereigntyTracker (loads data/sovereignty_state.json
+      1. Instantiate GreatCycleTracker (loads data/sovereignty_state.json
          if present; sub-µs cold-bootstrap if not)
       2. Start heartbeat thread (daemon, 30s cadence)
       3. Write SHM slot state=booted (Phase 11 §11.I.2 — MODULE_READY retired)
@@ -179,7 +179,7 @@ def sovereignty_worker_main(recv_queue, send_queue, name: str,
         daemon=True, name=f"sovereignty-hb-{name}")
     hb_thread.start()
 
-    tracker = SovereigntyTracker()
+    tracker = GreatCycleTracker()
     logger.info(
         "[SovereigntyWorker] tracker loaded — mode=%s great_cycle=%d "
         "great_pulses=%d dev_age=%d maker_confirmed=%s",

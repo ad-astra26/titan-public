@@ -1459,7 +1459,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # sovereignty_worker — extracted per rFP_titan_hcl_l2_separation_strategy
     # §4.L + D-SPEC-60 (v1.9.1, 2026-05-15; renumbered from v1.8.3/D-SPEC-57
     # at merge time due to collision with parallel §4.D meditation session).
-    # Owns SovereigntyTracker (M10 GREAT CYCLE convergence tracker — 222 LOC,
+    # Owns GreatCycleTracker (M10 GREAT CYCLE convergence tracker — 222 LOC,
     # logic/sovereignty.py) + data/sovereignty_state.json. Subscribes
     # SOVEREIGNTY_EPOCH + SOVEREIGNTY_CONFIRM_MAKER (api/webhook.py producer)
     # + SOVEREIGNTY_INCREMENT_GREAT_CYCLE (api/maker.py producer) — closes

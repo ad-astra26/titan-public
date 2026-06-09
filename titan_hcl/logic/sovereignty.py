@@ -31,7 +31,7 @@ COLLAPSE_THRESHOLD = 0.05
 VIOLATION_DURATION = 100  # consecutive epochs at extreme = violation
 
 
-class SovereigntyTracker:
+class GreatCycleTracker:
     """Track sovereignty transition criteria and convergence metrics."""
 
     def __init__(self):

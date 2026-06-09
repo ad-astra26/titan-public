@@ -71,7 +71,7 @@ def test_worker_module_exports():
 
 @pytest.fixture
 def tmp_state_file(tmp_path, monkeypatch):
-    """Redirect SovereigntyTracker PERSISTENCE_FILE to a per-test tmp path."""
+    """Redirect GreatCycleTracker PERSISTENCE_FILE to a per-test tmp path."""
     tmp_file = tmp_path / "sovereignty_state.json"
     monkeypatch.setattr(sov_module, "PERSISTENCE_FILE", str(tmp_file))
     return tmp_file

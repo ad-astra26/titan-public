@@ -393,7 +393,7 @@ SUPERVISION_DEPENDENCY_ACTIVATING = "SUPERVISION_DEPENDENCY_ACTIVATING"
 # polling-path restart via Guardian._module_lock).
 BUS_PEER_DIED = "BUS_PEER_DIED"
 
-# Mainnet Lifecycle Wiring rFP (2026-04-20): SovereigntyTracker wiring.
+# Mainnet Lifecycle Wiring rFP (2026-04-20): GreatCycleTracker wiring.
 # Spirit_worker publishes SOVEREIGNTY_EPOCH every 10 consciousness epochs
 # with current neuromod snapshot + dev_age + great_pulse_fired.
 # sovereignty_worker (SPEC v1.8.3 §9.B / D-SPEC-57) subscribes and calls

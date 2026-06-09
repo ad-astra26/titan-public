@@ -1499,7 +1499,7 @@ async def metabolism_gate_status(request: Request):
 
 
 async def sovereignty_status(request: Request):
-    """Mainnet Lifecycle Wiring rFP (2026-04-20) — SovereigntyTracker live state.
+    """Mainnet Lifecycle Wiring rFP (2026-04-20) — GreatCycleTracker live state.
 
     Returns get_stats() + check_transition_criteria() snapshot:
       - sovereignty_mode: ENFORCING | ADVISORY

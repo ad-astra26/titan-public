@@ -369,12 +369,12 @@ class TitanHCL:
         # ── V2 Subsystems (direct instances in Core) ──────────────────
         # _wire_metabolism/studio/social arrive in commit 4.
         # _wire_sovereignty RETIRED v1.8.3 §4.L (D-SPEC-57, 2026-05-15) —
-        # SovereigntyTracker now lives in sovereignty_worker subprocess.
+        # GreatCycleTracker now lives in sovereignty_worker subprocess.
         self._wire_metabolism()
         self._wire_meditation()  # §4.D v1.8.3 D-SPEC-57
         self._wire_life_force()  # §4.G v1.8.4 D-SPEC-58
         # _wire_sovereignty RETIRED v1.9.1 §4.L (D-SPEC-60, 2026-05-15) —
-        # SovereigntyTracker now lives in sovereignty_worker subprocess.
+        # GreatCycleTracker now lives in sovereignty_worker subprocess.
         self._wire_studio()
         self._wire_social()
 
@@ -468,7 +468,7 @@ class TitanHCL:
                 exc_info=True)
 
     # _wire_sovereignty RETIRED v1.9.1 §4.L (D-SPEC-60, 2026-05-15) —
-    # SovereigntyTracker now lives in titan_hcl/modules/sovereignty_worker.py
+    # GreatCycleTracker now lives in titan_hcl/modules/sovereignty_worker.py
     # as Guardian-supervised L2 subprocess.
 
     def _wire_studio(self) -> None:

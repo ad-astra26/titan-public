@@ -279,7 +279,7 @@ async def trigger_resurrection(request: Request):
             # `getattr(plugin, "sovereignty").increment_great_cycle()` to
             # fire-and-forget bus event. Pre-carve the direct call was
             # silently no-opping under Phase C api_subprocess (kernel_rpc
-            # cannot serialize the SovereigntyTracker class instance across
+            # cannot serialize the GreatCycleTracker class instance across
             # processes per api_subprocess.py:274-277 comment block). The bus
             # path reaches the new sovereignty_worker subprocess directly.
             try:

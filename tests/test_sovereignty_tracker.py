@@ -1,6 +1,6 @@
 """tests/test_sovereignty_tracker.py — Mainnet Lifecycle Wiring rFP (2026-04-20)
 
-Unit tests for SovereigntyTracker lifecycle: record_epoch, convergence
+Unit tests for GreatCycleTracker lifecycle: record_epoch, convergence
 bookkeeping, state save/load round-trip, confirm_maker, and
 increment_great_cycle.
 
@@ -17,7 +17,7 @@ import tempfile
 import pytest
 
 from titan_hcl.logic import sovereignty as sov_module
-from titan_hcl.logic.sovereignty import SovereigntyTracker
+from titan_hcl.logic.sovereignty import GreatCycleTracker
 
 
 @pytest.fixture
@@ -30,7 +30,7 @@ def tmp_state_file(tmp_path, monkeypatch):
 
 def test_initial_state(tmp_state_file):
     """Fresh tracker starts in ENFORCING mode with zeros."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     assert t._sovereignty_mode == "ENFORCING"
     assert t._great_cycle == 0
     assert t._total_great_pulses == 0
@@ -39,7 +39,7 @@ def test_initial_state(tmp_state_file):
 
 def test_record_epoch_accumulates_modulators(tmp_state_file):
     """record_epoch fills modulator deques and tracks violations."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     # Normal convergence epochs
     for i in range(50):
         t.record_epoch(i, {"DA": 0.6, "5HT": 0.55, "NE": 0.5}, developmental_age=i)
@@ -50,7 +50,7 @@ def test_record_epoch_accumulates_modulators(tmp_state_file):
 
 def test_record_epoch_flags_saturation(tmp_state_file):
     """High modulator levels (>0.95) increment saturation_violations."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     for i in range(20):
         t.record_epoch(i, {"DA": 0.97, "5HT": 0.5, "NE": 0.5})
     assert t._saturation_violations == 20
@@ -59,7 +59,7 @@ def test_record_epoch_flags_saturation(tmp_state_file):
 
 def test_record_epoch_flags_collapse(tmp_state_file):
     """Low modulator levels (<0.05) increment collapse_violations."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     for i in range(20):
         t.record_epoch(i, {"DA": 0.5, "5HT": 0.02, "NE": 0.5})
     assert t._collapse_violations == 20
@@ -68,7 +68,7 @@ def test_record_epoch_flags_collapse(tmp_state_file):
 
 def test_record_epoch_counts_great_pulses(tmp_state_file):
     """great_pulse_fired=True increments the total_great_pulses counter."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     for i in range(10):
         t.record_epoch(i, {"DA": 0.5}, great_pulse_fired=(i % 3 == 0))
     # Fires at i=0, 3, 6, 9 → 4 pulses
@@ -77,7 +77,7 @@ def test_record_epoch_counts_great_pulses(tmp_state_file):
 
 def test_check_transition_criteria_not_met_with_low_data(tmp_state_file):
     """Criteria evaluator reports all_met=False when data is insufficient."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     for i in range(10):
         t.record_epoch(i, {"DA": 0.5}, developmental_age=i)
     c = t.check_transition_criteria()
@@ -90,7 +90,7 @@ def test_check_transition_criteria_not_met_with_low_data(tmp_state_file):
 
 def test_confirm_maker_flips_flag(tmp_state_file):
     """confirm_maker() flips _maker_confirmed and persists state."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     assert t._maker_confirmed is False
     t.confirm_maker()
     assert t._maker_confirmed is True
@@ -100,7 +100,7 @@ def test_confirm_maker_flips_flag(tmp_state_file):
 
 def test_increment_great_cycle(tmp_state_file):
     """increment_great_cycle advances the counter and persists."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     assert t._great_cycle == 0
     t.increment_great_cycle()
     t.increment_great_cycle()
@@ -116,14 +116,14 @@ def test_state_save_load_round_trip(tmp_state_file):
     This test caught: (1) _maker_confirmed not persisted originally,
     (2) _developmental_age written with wrong attr name in _load_state.
     """
-    t1 = SovereigntyTracker()
+    t1 = GreatCycleTracker()
     t1.confirm_maker()
     t1.increment_great_cycle()
     for i in range(15):
         t1.record_epoch(i, {"DA": 0.5}, developmental_age=1234, great_pulse_fired=True)
     t1._save_state()
 
-    t2 = SovereigntyTracker()  # fresh instance, should _load_state
+    t2 = GreatCycleTracker()  # fresh instance, should _load_state
     assert t2._maker_confirmed is True
     assert t2._great_cycle == 1
     assert t2._total_great_pulses == 15
@@ -136,7 +136,7 @@ def test_state_save_load_round_trip(tmp_state_file):
 
 def test_transition_to_advisory_rejects_unmet_criteria(tmp_state_file):
     """transition_to_advisory returns False when criteria aren't met."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     ok = t.transition_to_advisory(epoch_id=1)
     assert ok is False
     assert t._sovereignty_mode == "ENFORCING"
@@ -144,7 +144,7 @@ def test_transition_to_advisory_rejects_unmet_criteria(tmp_state_file):
 
 def test_get_stats_shape(tmp_state_file):
     """get_stats() returns the shape expected by /v4/sovereignty/status."""
-    t = SovereigntyTracker()
+    t = GreatCycleTracker()
     stats = t.get_stats()
     for key in ("sovereignty_mode", "great_cycle", "total_great_pulses",
                 "developmental_age", "saturation_violations",

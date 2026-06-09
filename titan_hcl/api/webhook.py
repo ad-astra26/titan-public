@@ -144,7 +144,7 @@ async def _handle_maker_directive(plugin, tx, memo_data, signature, fee_payer) -
     # v1.8.3 §4.L (D-SPEC-57, 2026-05-15): switched from direct
     # `getattr(plugin, "sovereignty").confirm_maker()` to fire-and-forget bus
     # event. Pre-carve the direct call was silently no-opping under Phase C
-    # api_subprocess (kernel_rpc cannot serialize the SovereigntyTracker class
+    # api_subprocess (kernel_rpc cannot serialize the GreatCycleTracker class
     # instance across processes per api_subprocess.py:274-277 comment block).
     # The bus path reaches the new sovereignty_worker subprocess directly.
     try:

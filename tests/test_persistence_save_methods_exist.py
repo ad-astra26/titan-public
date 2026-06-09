@@ -29,9 +29,9 @@ def test_cgn_has_save_method():
 
 
 def test_sovereignty_tracker_has_save_method():
-    from titan_hcl.logic.sovereignty import SovereigntyTracker
+    from titan_hcl.logic.sovereignty import GreatCycleTracker
     # sovereignty_worker periodic checkpoint -> tracker._save_state()
-    assert hasattr(SovereigntyTracker, "_save_state")
+    assert hasattr(GreatCycleTracker, "_save_state")
 
 
 def test_social_pressure_meter_has_save_method():
