@@ -344,7 +344,7 @@ async def verify_event_zk_commit(
 
 
 def apply_event_components(
-    components: dict[str, bytes],
+    components: dict[str, "str | bytes"],
     target_dir: str,
     arc_to_target: Callable[[str, str], str],
     arweave_fetch_skipped_sync: Optional[Callable[[str], bytes]] = None,
@@ -386,8 +386,14 @@ def apply_event_components(
     result = {"restored_files": 0, "errors": [], "warnings": [], "skipped": [],
               "applied": []}
 
-    for component, tarball_bytes in components.items():
-        with unpack_event_tarball(tarball_bytes) as unpacked:
+    for component, tarball_source in components.items():
+        # tarball_source is a FILESYSTEM PATH (str) or raw compressed bytes.
+        # restore_full passes a PATH → unpack_event_tarball decompresses to a
+        # temp FILE on disk (random-access, low RSS) instead of a RAM BytesIO
+        # (which would materialize a multi-GB member uncompressed) — the
+        # 2026-06-09 fix keeping a baseline reconstruction within the live
+        # worker's memory budget. Bytes still work (other in-memory callers).
+        with unpack_event_tarball(tarball_source) as unpacked:
             for file_meta in unpacked.files:
                 arc_name = file_meta["arc_name"]
                 diff_mode = file_meta.get("diff_mode")
@@ -399,33 +405,42 @@ def apply_event_components(
                     # already wrote the current bytes for this arc_name.
                     continue
 
-                # Reconstruct the diff_dict (Phase 3 encoders consume it)
-                diff_dict = unpacked.diff_dict_for(
-                    arc_name, verify_hash=verify_patch_hash)
-
-                # Baseline path for tail / incremental diffs is the
-                # CURRENT contents of target_path (the prior event's
-                # result). For full diffs it's ignored.
-                #
-                # We MUST write through a scratch path then atomic-rename:
-                # tail + xdelta3 encoders open the output file in "wb" mode,
-                # which truncates it. If baseline_path == target_path (which
-                # is the common case during restore chain replay), the
-                # encoder would silently truncate the file it's trying to
-                # read from. Scratch-then-rename keeps the source intact
-                # until the apply succeeds.
-                baseline_path = (
-                    target_path if os.path.exists(target_path) else None
-                )
+                # Scratch-then-atomic-rename: tail + xdelta3 encoders open the
+                # output "wb" (truncate); if baseline_path == target_path (the
+                # common chain-replay case) the encoder would truncate the file
+                # it reads from. Scratch keeps the source intact until apply OK.
                 scratch_path = target_path + ".restoring"
 
                 try:
-                    diff_encoders.apply_diff(
-                        baseline_path=baseline_path,
-                        diff_dict=diff_dict,
-                        output_path=scratch_path,
-                        verify_output=verify_patch_hash,
-                    )
+                    if diff_mode == "full":
+                        # FULL-ship member IS the raw file content (a baseline
+                        # DB/FAISS, up to multi-GB). Stream member→scratch in
+                        # chunks (peak = chunk_size, NOT the file size) so the
+                        # chained flip-bridge reconstruction stays within the
+                        # live worker's RSS budget — 2026-06-09 fix. The prior
+                        # path went diff_dict_for → get_patch_bytes f.read(),
+                        # loading the whole 2.2 GB consciousness.db into RAM →
+                        # the 2.8 GB guardian RSS-kill loop. No diff_dict, no
+                        # in-RAM patch_bytes; sha256 verified on the fly.
+                        unpacked.stream_member_to(
+                            arc_name, scratch_path,
+                            verify_hash=verify_patch_hash)
+                    else:
+                        # tail / incremental — the patch is SMALL; load it and
+                        # apply against the prior event's bytes (target_path).
+                        # xdelta3/tail apply_diff streams source→output (file
+                        # I/O), so even a multi-GB baseline source is memory-safe.
+                        diff_dict = unpacked.diff_dict_for(
+                            arc_name, verify_hash=verify_patch_hash)
+                        baseline_path = (
+                            target_path if os.path.exists(target_path) else None
+                        )
+                        diff_encoders.apply_diff(
+                            baseline_path=baseline_path,
+                            diff_dict=diff_dict,
+                            output_path=scratch_path,
+                            verify_output=verify_patch_hash,
+                        )
                     os.replace(scratch_path, target_path)
                 except Exception as e:
                     if os.path.exists(scratch_path):
@@ -636,14 +651,15 @@ async def restore_full(
                     out.duration_s = time.time() - started
                     return out
 
-            # Step 9 — apply each staged component ONE AT A TIME (read → apply →
-            # free → delete), so peak stays at a single component during replay.
+            # Step 9 — apply each staged component ONE AT A TIME, passing the
+            # staged tarball PATH (not its bytes): unpack_event_tarball then
+            # decompresses to a temp FILE on disk and stream_member_to streams
+            # each member member→disk, so peak RSS stays at ~a chunk regardless
+            # of member size (a 2.2 GB baseline DB never materializes in RAM).
             for component, tmp in staged:
-                with open(tmp, "rb") as f:
-                    tarball_bytes = f.read()
                 try:
                     apply_result = apply_event_components(
-                        components={component: tarball_bytes},
+                        components={component: tmp},
                         target_dir=target_dir,
                         arc_to_target=arc_to_target,
                     )
@@ -653,8 +669,6 @@ async def restore_full(
                     out.errors.append(str(e))
                     out.duration_s = time.time() - started
                     return out
-                finally:
-                    tarball_bytes = None  # free before the next component
                 out.restored_files += apply_result["restored_files"]
                 out.warnings.extend(apply_result.get("warnings", []))
             out.applied_events.append(event_id)

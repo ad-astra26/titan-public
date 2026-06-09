@@ -434,6 +434,77 @@ class UnpackedEvent:
                     "on-chain-arc-verified; per-file hash is advisory.", msg)
         return data
 
+    def stream_member_to(self, arc_name: str, output_path: str,
+                         verify_hash: bool = True,
+                         chunk_size: int = 1 << 20) -> int:
+        """Stream a tarball member's bytes directly to `output_path` in chunks,
+        hashing on the fly — NEVER materializing the (possibly multi-GB) member
+        in a Python `bytes` object. Returns bytes written.
+
+        This is the memory-bounded sibling of `get_patch_bytes` for FULL-ship
+        files (where the member IS the raw file content — e.g. a 2.2 GB
+        `consciousness.db` baseline). `get_patch_bytes` does `f.read()` on the
+        whole member, which is fine for a rare out-of-band resurrection on a
+        dedicated box but blows the RSS budget when the chained flip-bridge runs
+        `restore_full` INSIDE the live BackupWorker (the 2026-06-09 2.8 GB
+        RSS-kill loop). Peak here is `chunk_size`, independent of file size.
+
+        sha256 is verified against the recorded `patch_bytes_sha256` exactly like
+        `get_patch_bytes` — `verify_hash=False` downgrades a mismatch to a WARNING
+        (only safe when the whole tarball was already on-chain-arc-authenticated;
+        see `get_patch_bytes` docstring)."""
+        meta = next(
+            (f for f in self.files if f.get("arc_name") == arc_name), None
+        )
+        if meta is None:
+            raise KeyError(
+                f"arc_name {arc_name!r} not in event {self.event_id} files index"
+            )
+        member_name = meta["member"]
+        try:
+            member = self._tar.getmember(member_name)
+        except KeyError:
+            raise KeyError(
+                f"tarball member {member_name!r} missing for arc_name "
+                f"{arc_name!r} in event {self.event_id}"
+            )
+        f = self._tar.extractfile(member)
+        if f is None:
+            raise ValueError(
+                f"tarball member {member_name!r} is not a regular file "
+                f"(corrupt tarball?)"
+            )
+        h = hashlib.sha256()
+        written = 0
+        parent = os.path.dirname(output_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        with open(output_path, "wb") as dst:
+            while True:
+                buf = f.read(chunk_size)
+                if not buf:
+                    break
+                dst.write(buf)
+                h.update(buf)
+                written += len(buf)
+        expected_hash = meta.get("patch_bytes_sha256")
+        if expected_hash:
+            actual = h.hexdigest()
+            if actual != expected_hash:
+                msg = (
+                    f"patch_bytes sha256 mismatch for {arc_name!r}: "
+                    f"expected {expected_hash}, got {actual} (tarball corruption)"
+                )
+                if verify_hash:
+                    try:
+                        os.unlink(output_path)
+                    except OSError:
+                        pass
+                    raise ValueError(msg)
+                logger.warning(
+                    "[event_tarball] %s — proceeding: tarball already "
+                    "on-chain-arc-verified; per-file hash is advisory.", msg)
+        return written
+
     def diff_dict_for(self, arc_name: str, verify_hash: bool = True) -> dict:
         """Reconstruct the diff_dict for `arc_name` (metadata + patch_bytes).
 

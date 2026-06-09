@@ -546,6 +546,62 @@ async def test_synthetic_5deep_full_restore_byte_identical(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_full_ship_member_is_streamed_not_loaded_whole(tmp_path):
+    """Regression for the 2026-06-09 chained-reconstruction RSS-blowup.
+
+    A FULL-ship member (a baseline DB/FAISS — the live `consciousness.db` is
+    2.2 GB) MUST be streamed member→disk in chunks during restore, NOT
+    `f.read()` into one bytes object. The old `diff_dict_for → get_patch_bytes`
+    path loaded the whole member, peaking the RSS-capped live BackupWorker at
+    2.8 GB on the flag-flip reconstruction → guardian kill-loop. We restore a
+    1-baseline event whose full-ship member is 48 MB of highly COMPRESSIBLE
+    bytes (tiny tarball, big uncompressed member) and assert restore_full's PEAK
+    PYTHON ALLOCATION stays a small fraction of the member size (streaming),
+    while the restored file is byte-identical.
+
+    This is the test that was MISSING — the prior fix's tests used byte-sized
+    files, so a whole-member load passed offline but blew up on live 2.2 GB data.
+    """
+    import tracemalloc
+
+    arweave = FakeArweave()
+    memos = FakeMemoStore()
+    manifest = UnifiedManifest("T1", base_dir=str(tmp_path))
+
+    big = b"TITAN\x00\x00\x00" * (6 * 1024 * 1024)  # 48 MB, highly compressible
+    e1 = _build_event(
+        titan_id="T1", event_id="e1", event_type="baseline",
+        prev_event_id=None, prev_event_merkle_root=None,
+        personality_files=[("big.db", _full(big))],
+        timechain_files=[("chain.bin", _full(b"tc-data"))],
+        soul_files=None,
+        arweave=arweave, memos=memos, tmp_path=tmp_path,
+        baseline_trigger="first_event",
+    )
+    manifest.append_event(e1)
+
+    target_dir = tmp_path / "restored"
+    tracemalloc.start()
+    result = await restore_full(
+        manifest=manifest, target_dir=str(target_dir),
+        arweave_fetch=arweave.download, memo_fetch=memos.fetch,
+        arc_to_target=_arc_to_target(str(target_dir)),
+    )
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert result.status == "success", f"{result.halt_reason} {result.errors}"
+    # byte-identical reconstruction through the streaming path
+    assert (target_dir / "personality" / "big.db").read_bytes() == big
+    # streaming proof: peak Python alloc must be FAR below the 48 MB member.
+    # The old whole-member f.read() path peaked >= 48 MB; streaming peaks at ~chunk.
+    assert peak < 16 * 1024 * 1024, (
+        f"restore_full peaked at {peak // 1024 // 1024} MB ≈ the 48 MB member — "
+        f"the full-ship member was loaded WHOLE, not streamed (RSS-blowup regression)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_restore_halts_on_tarball_hash_mismatch(tmp_path):
     """If a tarball's bytes don't match the manifest's recorded merkle_root,
     restore halts at HALT_TARBALL_HASH_MISMATCH on that event."""
