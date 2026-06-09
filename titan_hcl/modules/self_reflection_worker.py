@@ -1474,7 +1474,7 @@ def _drive_self_prediction_check(state_refs: dict, send_queue, name: str,
         reward = 0.5 if confirmed else -0.1
         # (1) self_model CGN_TRANSITION — the missing HAOV producer (rFP §1.3).
         _send_msg(send_queue, "CGN_TRANSITION", name, "cgn", {
-            "type": "outcome",
+            "type": "experience",  # (b) self-pred is simultaneous → record_experience → observe_for (DEFERRED G1)
             "consumer": "self_model",
             "concept_id": f"self_pred_{target}",
             "reward": reward,

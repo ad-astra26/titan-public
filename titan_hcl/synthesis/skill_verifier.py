@@ -63,12 +63,11 @@ class SkillVerifier:
         if skill is None:
             logger.debug("[SkillVerifier] skill %s not found — refuse", skill_id)
             return False
-        # Already verified — short-circuit
+        # Already verified — short-circuit. EEL B1: "pass" = a delegatable
+        # positive cell exists (utility_score = best-positive-cell time_cost > 0);
+        # a rejected skill has all cells negative → utility_score 0.0 → False.
         if skill.get("verified_at") is not None:
-            return float(skill.get("utility_score") or 0.0) >= 0.0
-        # Rejected skills carry utility_score=-1.0 + verified_at; the above
-        # branch handles them. If somehow verified_at is None AND utility=-1,
-        # treat as fresh + re-verify (defensive).
+            return float(skill.get("utility_score") or 0.0) > 0.0
         compiled_from = skill.get("compiled_from") or []
         if not compiled_from:
             return self._reject(skill_id, reason="empty_compiled_from")
@@ -107,14 +106,15 @@ class SkillVerifier:
         return self._accept(skill_id, compiled_from=compiled_from)
 
     def is_eligible(self, skill_id: str) -> bool:
-        """Convenience: True iff the skill has been verified AND not rejected
-        (utility_score >= 0)."""
+        """Convenience: True iff the skill has been verified AND has a delegatable
+        positive cell (EEL B1: utility_score = best-positive-cell time_cost > 0;
+        a rejected skill flips all cells negative → utility_score 0.0 → False)."""
         skill = self._store.read_skill(skill_id)
         if skill is None:
             return False
         if skill.get("verified_at") is None:
             return False
-        return float(skill.get("utility_score") or 0.0) >= 0.0
+        return float(skill.get("utility_score") or 0.0) > 0.0
 
     # ── Internals ─────────────────────────────────────────────────────
 

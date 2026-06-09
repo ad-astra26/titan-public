@@ -534,6 +534,45 @@ class ConceptGroundingNetwork:
         self._unmatched_outcome_attempts[consumer] = (
             self._unmatched_outcome_attempts.get(consumer, 0) + 1)
 
+    def record_experience(self, consumer: str, concept_id: str, reward: float,
+                          action: int = 0, state=None, action_params=None,
+                          outcome_context: dict = None) -> None:
+        """Record a single-shot COMPLETE transition (action + reward together).
+
+        For simultaneous-outcome consumers whose encounter and outcome coincide
+        (emotional / meta / self_model / reasoning_strategy / knowledge) — they
+        have no real action→outcome delay, so the two-phase pending→outcome split
+        record_outcome() expects locked them out of the causal observe_for() feed
+        (only language/social, with genuine delayed grounding, completed it). This
+        buffers the action as a pending (reward 0.0) transition and immediately
+        self-matches it via record_outcome(), so it runs the IDENTICAL Sigma
+        micro-update + concept-journey growth + causal observe_for() path. The
+        (b) central wake for the dormant consumers (SPEC §6.5 / DEFERRED G1).
+        """
+        if consumer not in self._consumers:
+            # Mirror record_outcome's unregistered-consumer accounting (it would
+            # no-op the match anyway) so silent-drop telemetry stays honest.
+            self._unregistered_outcome_attempts[consumer] = (
+                self._unregistered_outcome_attempts.get(consumer, 0) + 1)
+            return
+        pending = CGNTransition(
+            consumer=consumer,
+            concept_id=concept_id,
+            state=np.asarray(state if state is not None else [0.0] * 30,
+                             dtype=np.float32),
+            action=int(action),
+            action_params=np.asarray(
+                action_params if action_params is not None else [0.0] * 4,
+                dtype=np.float32),
+            reward=0.0,  # pending — record_outcome sets the real reward on match
+            timestamp=time.time(),
+        )
+        self._buffer.add(pending)
+        # Self-match: record_outcome finds this most-recent reward==0.0 pending
+        # for (consumer, concept_id), applies the reward, runs the full path.
+        self.record_outcome(consumer=consumer, concept_id=concept_id,
+                             reward=reward, outcome_context=outcome_context)
+
     def get_silent_drop_telemetry(self) -> dict:
         """Phase 0 observability accessor for BUG-CGN-SILENT-UNREGISTERED-CONSUMER.
 

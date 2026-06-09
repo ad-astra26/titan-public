@@ -1,35 +1,28 @@
-"""Phase 8 — ProceduralSkillStore unit tests (D-SPEC-PHASE8 / INV-Syn-19/20).
+"""Phase 8 / EEL B1 — ProceduralSkillStore unit tests (INV-Syn-19/20/28).
 
-Covers:
-- DDL idempotent + creates utility/last_used indices
-- persist_skill round-trips content + canonical-JSON dict/list fields
-- Re-persist preserves success_count/failure_count/verified_at
-- increment_success / increment_failure clamp + counter movement
-- Soft-retire callback fires when utility crosses floor
-- mark_verified sets verified_at
-- mark_rejected sets utility_score=-1.0 + verified_at
-- read_skill / read_for_match / list_all shapes
-- snapshot_export atomic write + payload shape
-- FAISS round-trip when embedder is provided
-- FAISS deferred (embedding_id=-1) when embedder is None
-- ValueError on empty skill_id / missing required fields / empty compiled_from
-- stats() surfaces all counters
+Re-pointed 2026-06-09 to the EEL B1 outcome × task-shape model (SPEC v0.29.0 /
+D-SPEC-153): a skill is the OUTCOME row `(oracle_id, goal_class)` (skill_id =
+sha256(oracle_id|goal_class)) × per-task-shape `skill_cells` carrying the §3.4
+triple; scoring is per oracle-verified use via the `skill_score_events` queue +
+`drain_score_events`. The end-to-end gates (single-success promote, polarity
+guard, legacy migration) live in `test_skill_cells_b1_20260609.py`; this file
+covers the store's other surfaces (outcome lifecycle, FAISS-per-outcome, soft-
+retire in [0,1], verify/reject, read_for_match / list_all / snapshot / stats).
 """
 from __future__ import annotations
 
 import json
 import os
-from typing import Optional
 
 import duckdb
 import numpy as np
 import pytest
 
 from titan_hcl.synthesis.skill_store import (
-    DEFAULT_UTILITY_SCORE,
+    DEFAULT_PROMOTE_FLOOR,
     EMBEDDING_DIM,
     ProceduralSkillStore,
-    UTILITY_DELTA,
+    compute_skill_id,
     _safe_json_load,
 )
 
@@ -38,19 +31,14 @@ from titan_hcl.synthesis.skill_store import (
 
 
 def _deterministic_embedder(seed_text_to_vec: dict | None = None):
-    """Return an embedder that maps text → 384D unit vector. For tests we
-    just hash text → seed numpy RNG → return a stable vector so FAISS index
-    rows are deterministic."""
     cache: dict[str, np.ndarray] = dict(seed_text_to_vec or {})
 
     def embed(text: str) -> np.ndarray:
         if text in cache:
             return cache[text]
-        # Use sha256 prefix as a deterministic seed for the test
         import hashlib
         h = hashlib.sha256(text.encode("utf-8")).digest()
-        seed = int.from_bytes(h[:4], "big")
-        rng = np.random.default_rng(seed)
+        rng = np.random.default_rng(int.from_bytes(h[:4], "big"))
         v = rng.standard_normal(EMBEDDING_DIM).astype(np.float32)
         norm = np.linalg.norm(v)
         if norm > 0:
@@ -83,18 +71,12 @@ def store_with_embed(tmp_path):
     )
 
 
-def _basic_skill_kwargs(**overrides):
-    base = dict(
-        skill_id="skill_test_001",
-        name="test_skill",
-        nl_description="Test skill description",
-        executable_spec={"steps": [{"tool": "x", "args": {}}]},
-        preconditions=["pre1"],
-        postconditions=["post1"],
-        compiled_from=["tx_aaa", "tx_bbb"],
-    )
-    base.update(overrides)
-    return base
+def _score(store, *, oracle_id, goal_class, task_shape, success, tx, ts=None):
+    """Enqueue one oracle-verified use + drain → upsert the cell."""
+    store.enqueue_score_event(
+        oracle_id=oracle_id, goal_class=goal_class, task_shape=task_shape,
+        success=success, parent_tool_call_tx=tx, ts=ts)
+    return store.drain_score_events()
 
 
 # ── DDL ────────────────────────────────────────────────────────────────
@@ -102,317 +84,254 @@ def _basic_skill_kwargs(**overrides):
 
 def test_schema_idempotent(tmp_path):
     conn = duckdb.connect(":memory:")
-    ProceduralSkillStore(
-        duckdb_conn=conn,
-        faiss_path=str(tmp_path / "f.faiss"),
-        snapshot_path=str(tmp_path / "s.json"),
-        embedder=None,
-    )
-    # Second construct on same connection must not raise
-    ProceduralSkillStore(
-        duckdb_conn=conn,
-        faiss_path=str(tmp_path / "f.faiss"),
-        snapshot_path=str(tmp_path / "s.json"),
-        embedder=None,
-    )
-    # Table exists
-    rows = conn.execute(
-        "SELECT table_name FROM duckdb_tables() WHERE table_name = 'procedural_skills'"
-    ).fetchall()
-    assert rows
+    kw = dict(faiss_path=str(tmp_path / "f.faiss"),
+              snapshot_path=str(tmp_path / "s.json"), embedder=None)
+    ProceduralSkillStore(duckdb_conn=conn, **kw)
+    ProceduralSkillStore(duckdb_conn=conn, **kw)  # second construct must not raise
+    tables = {r[0] for r in conn.execute(
+        "SELECT table_name FROM duckdb_tables()").fetchall()}
+    assert {"procedural_skills", "skill_cells", "skill_score_events"} <= tables
 
 
-def test_schema_has_expected_columns(store_no_embed):
-    skill = store_no_embed.read_skill("skill_test_001")
-    assert skill is None  # empty table
+def test_empty_table_read_skill_none(store_no_embed):
+    assert store_no_embed.read_skill(compute_skill_id("web_api_oracle", "defi-lookup")) is None
 
 
-# ── persist_skill ──────────────────────────────────────────────────────
+# ── outcome lifecycle (ensure_outcome) ──────────────────────────────────
 
 
-def test_persist_round_trip(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs())
-    row = store_no_embed.read_skill("skill_test_001")
-    assert row is not None
-    assert row["skill_id"] == "skill_test_001"
-    assert row["name"] == "test_skill"
-    assert row["nl_description"] == "Test skill description"
-    assert row["executable_spec"] == {"steps": [{"tool": "x", "args": {}}]}
-    assert row["preconditions"] == ["pre1"]
-    assert row["postconditions"] == ["post1"]
-    assert row["compiled_from"] == ["tx_aaa", "tx_bbb"]
-    assert row["success_count"] == 0
-    assert row["failure_count"] == 0
-    assert row["utility_score"] == DEFAULT_UTILITY_SCORE
-    assert row["verified_at"] is None
-    assert row["embedding_id"] == -1  # no embedder
+def test_ensure_outcome_round_trip(store_no_embed):
+    sid = store_no_embed.ensure_outcome(oracle_id="web_api_oracle", goal_class="defi-lookup")
+    assert sid == compute_skill_id("web_api_oracle", "defi-lookup")
+    sk = store_no_embed.read_skill(sid)
+    assert sk["oracle_id"] == "web_api_oracle" and sk["goal_class"] == "defi-lookup"
+    assert sk["promoted"] is False and sk["verified_at"] is None
+    assert sk["embedding_id"] == -1  # no embedder
 
 
-def test_persist_with_embedder_assigns_embedding_id(store_with_embed):
-    store_with_embed.persist_skill(**_basic_skill_kwargs())
-    row = store_with_embed.read_skill("skill_test_001")
-    assert row["embedding_id"] == 0  # first row in FAISS index
+def test_ensure_outcome_idempotent(store_no_embed):
+    a = store_no_embed.ensure_outcome(oracle_id="o", goal_class="g")
+    b = store_no_embed.ensure_outcome(oracle_id="o", goal_class="g", name="other")
+    assert a == b
+    n = store_no_embed._db.execute(
+        "SELECT COUNT(*) FROM procedural_skills WHERE skill_id = ?", [a]).fetchall()[0][0]
+    assert n == 1
 
 
-def test_re_persist_preserves_counters(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs())
-    store_no_embed.increment_success("skill_test_001")
-    store_no_embed.increment_success("skill_test_001")
-    store_no_embed.mark_verified("skill_test_001")
-    # Now re-persist (e.g. miner re-detects same recurrence)
-    store_no_embed.persist_skill(**_basic_skill_kwargs(nl_description="updated"))
-    row = store_no_embed.read_skill("skill_test_001")
-    assert row["nl_description"] == "updated"
-    assert row["success_count"] == 2
-    assert row["verified_at"] is not None
-
-
-def test_persist_requires_skill_id():
-    conn = duckdb.connect(":memory:")
-    store = ProceduralSkillStore(
-        duckdb_conn=conn, faiss_path="/tmp/_t.faiss", snapshot_path="/tmp/_t.json",
-        embedder=None,
-    )
-    with pytest.raises(ValueError, match="skill_id"):
-        store.persist_skill(**_basic_skill_kwargs(skill_id=""))
-
-
-def test_persist_requires_compiled_from(store_no_embed):
-    with pytest.raises(ValueError, match="compiled_from"):
-        store_no_embed.persist_skill(**_basic_skill_kwargs(compiled_from=[]))
-
-
-def test_persist_requires_name_and_desc(store_no_embed):
+def test_ensure_outcome_requires_keys(store_no_embed):
     with pytest.raises(ValueError):
-        store_no_embed.persist_skill(**_basic_skill_kwargs(name=""))
+        store_no_embed.ensure_outcome(oracle_id="", goal_class="g")
     with pytest.raises(ValueError):
-        store_no_embed.persist_skill(**_basic_skill_kwargs(nl_description=""))
+        store_no_embed.ensure_outcome(oracle_id="o", goal_class="")
 
 
-# ── increment_success / increment_failure ──────────────────────────────
+def test_enqueue_requires_fields(store_no_embed):
+    with pytest.raises(ValueError):
+        store_no_embed.enqueue_score_event(
+            oracle_id="", goal_class="g", task_shape="t", success=True)
+    with pytest.raises(ValueError):
+        store_no_embed.enqueue_score_event(
+            oracle_id="o", goal_class="g", task_shape="", success=True)
 
 
-def test_increment_success_moves_utility_up(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs())
-    store_no_embed.increment_success("skill_test_001")
-    row = store_no_embed.read_skill("skill_test_001")
-    assert row["success_count"] == 1
-    assert row["utility_score"] == pytest.approx(DEFAULT_UTILITY_SCORE + UTILITY_DELTA)
-    assert row["last_used"] is not None
+# ── cell scoring across drains ───────────────────────────────────────────
 
 
-def test_increment_failure_moves_utility_down(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs())
-    store_no_embed.increment_failure("skill_test_001")
-    row = store_no_embed.read_skill("skill_test_001")
-    assert row["failure_count"] == 1
-    assert row["utility_score"] == pytest.approx(DEFAULT_UTILITY_SCORE - UTILITY_DELTA)
+def test_cells_accumulate_across_drains(store_no_embed):
+    sid = compute_skill_id("web_api_oracle", "defi-lookup")
+    for i, tx in enumerate(("t1", "t2", "t3")):
+        _score(store_no_embed, oracle_id="web_api_oracle", goal_class="defi-lookup",
+               task_shape="informational|searxng|defi", success=True, tx=tx, ts=float(i))
+    cell = store_no_embed.read_skill(sid)["cells"][0]
+    assert cell["b_i"] == 3 and cell["success_count"] == 3 and cell["polarity"] == "positive"
 
 
-def test_utility_clamped_to_one(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs(utility_score=0.99))
-    for _ in range(10):
-        store_no_embed.increment_success("skill_test_001")
-    row = store_no_embed.read_skill("skill_test_001")
-    assert row["utility_score"] == pytest.approx(1.0)
+def test_failure_makes_negative_cell(store_no_embed):
+    sid = compute_skill_id("o", "market-lookup")
+    _score(store_no_embed, oracle_id="o", goal_class="market-lookup",
+           task_shape="informational|flaky|market", success=False, tx="tf")
+    cell = store_no_embed.read_skill(sid)["cells"][0]
+    assert cell["polarity"] == "negative" and cell["time_cost"] == 0.0
 
 
-def test_utility_clamped_to_negative_one(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs(utility_score=-0.99))
-    for _ in range(10):
-        store_no_embed.increment_failure("skill_test_001")
-    row = store_no_embed.read_skill("skill_test_001")
-    assert row["utility_score"] == pytest.approx(-1.0)
+# ── FAISS (per-outcome embedding) ────────────────────────────────────────
 
 
-def test_unknown_skill_id_logs_and_no_op(store_no_embed, caplog):
-    import logging
-    caplog.set_level(logging.WARNING)
-    store_no_embed.increment_success("does_not_exist")
-    assert any("does_not_exist" in r.message for r in caplog.records)
+def test_ensure_outcome_with_embedder_assigns_embedding_id(store_with_embed):
+    sid = store_with_embed.ensure_outcome(
+        oracle_id="o", goal_class="g", nl_description="cosmetic website setup")
+    assert store_with_embed.read_skill(sid)["embedding_id"] == 0  # first FAISS row
 
 
-# ── soft-retire callback ───────────────────────────────────────────────
+def test_faiss_search_returns_top_k(store_with_embed):
+    for gc, desc in (("defi-lookup", "solana defi tvl"),
+                     ("market-lookup", "token market price"),
+                     ("code-compute", "python hash compute")):
+        store_with_embed.ensure_outcome(oracle_id="o", goal_class=gc, nl_description=desc)
+    q = store_with_embed.embed_query("defi")
+    assert q is not None
+    hits = store_with_embed.faiss_search(q, top_k=3)
+    assert len(hits) == 3
+    for emb_id, dist in hits:
+        assert emb_id >= 0 and dist >= 0.0
+
+
+def test_faiss_persists_across_construct(tmp_path):
+    embedder = _deterministic_embedder()
+    conn1 = duckdb.connect(str(tmp_path / "synth.duckdb"))
+    s1 = ProceduralSkillStore(
+        duckdb_conn=conn1, faiss_path=str(tmp_path / "f.faiss"),
+        snapshot_path=str(tmp_path / "s.json"), embedder=embedder)
+    s1.ensure_outcome(oracle_id="o", goal_class="g", nl_description="hello world")
+    assert os.path.exists(str(tmp_path / "f.faiss"))
+    conn1.close()
+    conn2 = duckdb.connect(str(tmp_path / "synth.duckdb"))
+    s2 = ProceduralSkillStore(
+        duckdb_conn=conn2, faiss_path=str(tmp_path / "f.faiss"),
+        snapshot_path=str(tmp_path / "s.json"), embedder=embedder)
+    s2._ensure_faiss()
+    assert s2._faiss.ntotal == 1
+
+
+# ── soft-retire (time_cost crossing the floor downward, [0,1] space) ─────
 
 
 def test_soft_retire_callback_fires_when_crossing_floor(tmp_path):
     conn = duckdb.connect(":memory:")
     fired: list[tuple[str, float]] = []
     store = ProceduralSkillStore(
-        duckdb_conn=conn,
-        faiss_path=str(tmp_path / "f.faiss"),
-        snapshot_path=str(tmp_path / "s.json"),
-        embedder=None,
-        soft_retire_floor=-0.5,
-        on_soft_retire=lambda sid, u: fired.append((sid, u)),
-    )
-    store.persist_skill(**_basic_skill_kwargs(utility_score=-0.45))
-    # one decrement should cross -0.5 floor
-    store.increment_failure("skill_test_001")
-    assert len(fired) == 1
-    assert fired[0][0] == "skill_test_001"
-    assert fired[0][1] <= -0.5
+        duckdb_conn=conn, faiss_path=str(tmp_path / "f.faiss"),
+        snapshot_path=str(tmp_path / "s.json"), embedder=None,
+        soft_retire_floor=0.5,
+        on_soft_retire=lambda sid, tc: fired.append((sid, tc)))
+    sid = compute_skill_id("o", "g")
+    # success (time_cost 1.0) then failure (time_cost 0.25) — crosses 0.5 down.
+    store.enqueue_score_event(oracle_id="o", goal_class="g", task_shape="t",
+                              success=True, parent_tool_call_tx="s", ts=1.0)
+    store.enqueue_score_event(oracle_id="o", goal_class="g", task_shape="t",
+                              success=False, parent_tool_call_tx="f", ts=2.0)
+    store.drain_score_events()
+    assert len(fired) == 1 and fired[0][0] == sid and fired[0][1] <= 0.5
 
 
-def test_soft_retire_does_not_re_fire(tmp_path):
-    """Crossing the floor once should fire; subsequent decrements should NOT."""
-    conn = duckdb.connect(":memory:")
-    fired: list[tuple[str, float]] = []
-    store = ProceduralSkillStore(
-        duckdb_conn=conn,
-        faiss_path=str(tmp_path / "f.faiss"),
-        snapshot_path=str(tmp_path / "s.json"),
-        embedder=None,
-        soft_retire_floor=-0.5,
-        on_soft_retire=lambda sid, u: fired.append((sid, u)),
-    )
-    store.persist_skill(**_basic_skill_kwargs(utility_score=-0.45))
-    store.increment_failure("skill_test_001")  # crosses
-    store.increment_failure("skill_test_001")  # already past floor
-    assert len(fired) == 1
-
-
-# ── mark_verified / mark_rejected ──────────────────────────────────────
+# ── mark_verified / mark_rejected ────────────────────────────────────────
 
 
 def test_mark_verified_sets_verified_at(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs())
-    store_no_embed.mark_verified("skill_test_001")
-    row = store_no_embed.read_skill("skill_test_001")
-    assert row["verified_at"] is not None
-    assert row["utility_score"] == DEFAULT_UTILITY_SCORE  # unchanged
+    sid = store_no_embed.ensure_outcome(oracle_id="o", goal_class="g")
+    store_no_embed.mark_verified(sid)
+    assert store_no_embed.read_skill(sid)["verified_at"] is not None
 
 
-def test_mark_rejected_sets_utility_negative_one(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs())
-    store_no_embed.mark_rejected("skill_test_001", reason="content_hash_mismatch")
-    row = store_no_embed.read_skill("skill_test_001")
-    assert row["utility_score"] == pytest.approx(-1.0)
-    assert row["verified_at"] is not None
+def test_mark_rejected_flips_cells_negative(store_no_embed):
+    sid = compute_skill_id("o", "g")
+    _score(store_no_embed, oracle_id="o", goal_class="g", task_shape="t",
+           success=True, tx="s")  # makes a positive, promoted cell
+    assert sid in [r["skill_id"] for r in store_no_embed.read_for_match()]
+    store_no_embed.mark_rejected(sid, reason="content_hash_mismatch")
+    sk = store_no_embed.read_skill(sid)
+    assert sk["verified_at"] is not None and sk["promoted"] is False
+    assert all(c["polarity"] == "negative" for c in sk["cells"])
+    assert sid not in [r["skill_id"] for r in store_no_embed.read_for_match()]
 
 
-# ── read_for_match ─────────────────────────────────────────────────────
+# ── read_for_match (positives only — polarity guard at source) ───────────
 
 
-def test_read_for_match_filters_by_utility_floor(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs(skill_id="hi", utility_score=0.7))
-    store_no_embed.mark_verified("hi")
-    store_no_embed.persist_skill(**_basic_skill_kwargs(skill_id="lo", utility_score=0.2))
-    store_no_embed.mark_verified("lo")
-    result = store_no_embed.read_for_match(utility_floor=0.3, k=5)
-    ids = [r["skill_id"] for r in result]
-    assert "hi" in ids
-    assert "lo" not in ids
+def test_read_for_match_positives_only_and_floor(store_no_embed):
+    # a promoted positive (time_cost 1.0)
+    _score(store_no_embed, oracle_id="o", goal_class="hi", task_shape="t1",
+           success=True, tx="s")
+    # a negative (failure-dominant) — must be excluded
+    _score(store_no_embed, oracle_id="o", goal_class="lo", task_shape="t2",
+           success=False, tx="f")
+    ids = [r["skill_id"] for r in store_no_embed.read_for_match(utility_floor=0.3)]
+    assert compute_skill_id("o", "hi") in ids
+    assert compute_skill_id("o", "lo") not in ids
+    # a high floor excludes the positive too
+    assert store_no_embed.read_for_match(utility_floor=1.01) == []
 
 
-def test_read_for_match_filters_unverified(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs(skill_id="verified"))
-    store_no_embed.mark_verified("verified")
-    store_no_embed.persist_skill(**_basic_skill_kwargs(skill_id="fresh"))
-    result = store_no_embed.read_for_match(utility_floor=0.3, k=5, verified_only=True)
-    assert [r["skill_id"] for r in result] == ["verified"]
-    # verified_only=False should include both
-    result2 = store_no_embed.read_for_match(utility_floor=0.3, k=5, verified_only=False)
-    assert {r["skill_id"] for r in result2} == {"verified", "fresh"}
+def test_read_for_match_verified_only_accepts_promoted(store_no_embed):
+    # per-use-promoted (verified_at is None) is delegate-eligible by `promoted`.
+    sid = compute_skill_id("o", "g")
+    _score(store_no_embed, oracle_id="o", goal_class="g", task_shape="t",
+           success=True, tx="s")
+    assert store_no_embed.read_skill(sid)["verified_at"] is None
+    assert sid in [r["skill_id"] for r in store_no_embed.read_for_match(verified_only=True)]
 
 
-# ── list_all ────────────────────────────────────────────────────────────
+# ── list_all ──────────────────────────────────────────────────────────────
 
 
-def test_list_all_orders_by_utility(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs(skill_id="a", utility_score=0.3))
-    store_no_embed.persist_skill(**_basic_skill_kwargs(skill_id="b", utility_score=0.9))
-    store_no_embed.persist_skill(**_basic_skill_kwargs(skill_id="c", utility_score=0.5))
-    result = store_no_embed.list_all()
-    ids = [r["skill_id"] for r in result]
-    assert ids == ["b", "c", "a"]
+def test_list_all_orders_promoted_first(store_no_embed):
+    _score(store_no_embed, oracle_id="o", goal_class="promoted", task_shape="t",
+           success=True, tx="s")  # promoted
+    store_no_embed.ensure_outcome(oracle_id="o", goal_class="bare")  # no cells
+    ids = [r["skill_id"] for r in store_no_embed.list_all()]
+    assert ids[0] == compute_skill_id("o", "promoted")
+    assert compute_skill_id("o", "bare") in ids
 
 
-# ── FAISS round-trip ────────────────────────────────────────────────────
+# ── snapshot ──────────────────────────────────────────────────────────────
 
 
-def test_faiss_search_returns_top_k(store_with_embed):
-    store_with_embed.persist_skill(**_basic_skill_kwargs(skill_id="a", nl_description="cosmetic website setup"))
-    store_with_embed.persist_skill(**_basic_skill_kwargs(skill_id="b", nl_description="solana minting flow"))
-    store_with_embed.persist_skill(**_basic_skill_kwargs(skill_id="c", nl_description="cosmetic shop deploy"))
-    q = store_with_embed.embed_query("cosmetic")
-    assert q is not None
-    hits = store_with_embed.faiss_search(q, top_k=3)
-    assert len(hits) == 3
-    # Each hit is (embedding_id, distance)
-    for emb_id, dist in hits:
-        assert emb_id >= 0
-        assert dist >= 0.0
-
-
-def test_faiss_persists_across_construct(tmp_path):
-    """FAISS index is atomic-written; second construct loads existing index."""
-    embedder = _deterministic_embedder()
-    conn1 = duckdb.connect(str(tmp_path / "synth.duckdb"))
-    s1 = ProceduralSkillStore(
-        duckdb_conn=conn1,
-        faiss_path=str(tmp_path / "f.faiss"),
-        snapshot_path=str(tmp_path / "s.json"),
-        embedder=embedder,
-    )
-    s1.persist_skill(**_basic_skill_kwargs(skill_id="x", nl_description="hello world"))
-    assert os.path.exists(str(tmp_path / "f.faiss"))
-    conn1.close()
-    # Open second store
-    conn2 = duckdb.connect(str(tmp_path / "synth.duckdb"))
-    s2 = ProceduralSkillStore(
-        duckdb_conn=conn2,
-        faiss_path=str(tmp_path / "f.faiss"),
-        snapshot_path=str(tmp_path / "s.json"),
-        embedder=embedder,
-    )
-    s2._ensure_faiss()
-    assert s2._faiss.ntotal == 1
-
-
-# ── snapshot_export ────────────────────────────────────────────────────
-
-
-def test_snapshot_export_atomic(store_no_embed, tmp_path):
-    store_no_embed.persist_skill(**_basic_skill_kwargs())
+def test_snapshot_export_atomic_v2(store_no_embed):
+    _score(store_no_embed, oracle_id="web_api_oracle", goal_class="defi-lookup",
+           task_shape="informational|searxng|defi", success=True, tx="s")
     snap_path = store_no_embed._snapshot_path
-    assert os.path.exists(snap_path)
+    assert os.path.exists(snap_path) and not os.path.exists(snap_path + ".tmp")
     payload = json.loads(open(snap_path).read())
-    assert payload["version"] == 1
-    assert payload["count"] == 1
-    assert payload["persists_seen"] >= 1
-    assert payload["skills"][0]["skill_id"] == "skill_test_001"
-    # Tmp file removed
-    assert not os.path.exists(snap_path + ".tmp")
+    assert payload["version"] == 2 and payload["count"] == 1
+    assert payload["skills"][0]["goal_class"] == "defi-lookup"
 
 
-def test_snapshot_payload_orders_by_utility(store_no_embed):
-    store_no_embed.persist_skill(**_basic_skill_kwargs(skill_id="lo", utility_score=0.2))
-    store_no_embed.persist_skill(**_basic_skill_kwargs(skill_id="hi", utility_score=0.8))
-    snap_path = store_no_embed._snapshot_path
-    payload = json.loads(open(snap_path).read())
+def test_snapshot_orders_by_best_time_cost(store_no_embed):
+    _score(store_no_embed, oracle_id="o", goal_class="hi", task_shape="t1",
+           success=True, tx="s1")              # time_cost 1.0
+    # a present-but-weaker outcome: 1 success + 1 failure → time_cost 0.25
+    store_no_embed.enqueue_score_event(oracle_id="o", goal_class="lo",
+                                       task_shape="t2", success=True, parent_tool_call_tx="s2", ts=1.0)
+    store_no_embed.enqueue_score_event(oracle_id="o", goal_class="lo",
+                                       task_shape="t2", success=False, parent_tool_call_tx="f2", ts=2.0)
+    store_no_embed.drain_score_events()
+    payload = json.loads(open(store_no_embed._snapshot_path).read())
     ids = [s["skill_id"] for s in payload["skills"]]
-    assert ids == ["hi", "lo"]
+    assert ids[0] == compute_skill_id("o", "hi")
 
 
-# ── stats() ─────────────────────────────────────────────────────────────
+# ── stats ─────────────────────────────────────────────────────────────────
 
 
 def test_stats_surfaces_counters(store_with_embed):
     s = store_with_embed.stats()
-    assert s["persists_seen"] == 0
-    assert s["faiss_count"] == 0
-    store_with_embed.persist_skill(**_basic_skill_kwargs())
-    store_with_embed.increment_success("skill_test_001")
-    store_with_embed.mark_verified("skill_test_001")
+    assert s["events_enqueued"] == 0 and s["faiss_count"] == 0
+    _score(store_with_embed, oracle_id="o", goal_class="g",
+           task_shape="t", success=True, tx="s")
+    store_with_embed.mark_verified(compute_skill_id("o", "g"))
     s = store_with_embed.stats()
-    assert s["persists_seen"] == 1
-    assert s["utility_updates"] == 1
-    assert s["verifications_seen"] == 1
-    assert s["faiss_count"] == 1
+    assert s["events_enqueued"] == 1 and s["events_drained"] == 1
+    assert s["promotions_seen"] == 1 and s["verifications_seen"] == 1
+    assert s["faiss_count"] == 1  # one outcome embedded
 
 
-# ── _safe_json_load helper ──────────────────────────────────────────────
+# ── persist_negative_skill (miner surface) ──────────────────────────────
+
+
+def test_persist_negative_skill_never_matchable(store_no_embed):
+    sid = store_no_embed.persist_negative_skill(
+        oracle_id="miner_recurrence", goal_class="code-compute",
+        task_shape="procedural|sandbox|", name="[negative] x",
+        nl_description="failed", compiled_from=["t1"])
+    assert store_no_embed.read_skill(sid)["cells"][0]["polarity"] == "negative"
+    assert sid not in [r["skill_id"] for r in store_no_embed.read_for_match()]
+    with pytest.raises(ValueError):
+        store_no_embed.persist_negative_skill(
+            oracle_id="o", goal_class="g", task_shape="t", name="n",
+            nl_description="d", compiled_from=[])  # empty lineage gate
+
+
+# ── _safe_json_load helper (unchanged) ───────────────────────────────────
 
 
 def test_safe_json_load_handles_corrupt():

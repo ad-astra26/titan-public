@@ -1,7 +1,7 @@
 """CLI router for `python -m scripts.setup_titan`.
 
 Subcommands:
-    install      Run the wizard.   --default / --mode={mainnet,devnet,local} / --resume / --minimal / --skip-genesis / --directives-file / --dry-run
+    install      Run the wizard.   --default / --mode={mainnet,devnet,local} / --resume / --minimal / --skip-genesis / --directives-file / --inference-provider / --inference-key / --simulate / --dry-run
     config       TUI to browse + edit config.toml + titan_params.toml  (stubbed in v0.1-alpha)
     diagnostic   User-friendly live health report  (stubbed in v0.1-alpha)
     repair       Idempotent re-run / fix detected problems  (stubbed in v0.1-alpha)
@@ -163,6 +163,16 @@ def cmd_install(args: argparse.Namespace) -> int:
                "Resurrection is MAINNET-ONLY.",
                role="warning")
 
+    if getattr(args, "simulate", False):
+        if mode != Mode.MAINNET:
+            section("Result")
+            cprint("--simulate is a MAINNET-readiness rehearsal — re-run with --mode mainnet.",
+                   role="error", bold=True)
+            return 2
+        cprint("  --simulate: a 0-SOL mainnet-readiness REHEARSAL — it provisions the box and "
+               "walks the FULL birth ceremony, but mints nothing and spends nothing. Re-run "
+               "without --simulate to perform the real birth.", role="text_strong")
+
     fails = _render_preflight(run_preflight(repo_root, mode))
     if fails:
         section("Result")
@@ -186,7 +196,10 @@ def cmd_install(args: argparse.Namespace) -> int:
                       default=args.default, minimal=args.minimal, skip_genesis=args.skip_genesis,
                       tag=args.tag, build_rust=args.build_rust, prompter=prompter,
                       toolchain_pins=toolchain.resolve_versions(args),
-                      directives_file=args.directives_file)
+                      directives_file=args.directives_file,
+                      inference_provider=args.inference_provider,
+                      inference_key=args.inference_key,
+                      simulate=getattr(args, "simulate", False))
 
 
 # ── subcommands: stubs ─────────────────────────────────────────────────────
@@ -258,6 +271,19 @@ def build_parser() -> argparse.ArgumentParser:
                          "Env fallbacks: TITAN_DIRECTIVES_FILE (path) and "
                          "TITAN_DIRECTIVES (literal text). The directives are "
                          "MANDATORY for an on-chain (devnet/mainnet) birth.")
+    pi.add_argument("--inference-provider", default=None,
+                    choices=["ollama_local", "ollama_cloud", "openrouter"],
+                    help="Pick the inference provider non-interactively (headless / "
+                         "non-tty install). ollama_local needs no key; ollama_cloud / "
+                         "openrouter need --inference-key. Env fallback: "
+                         "TITAN_INFERENCE_PROVIDER.")
+    pi.add_argument("--inference-key", default=None,
+                    help="API key for the hosted --inference-provider (ollama_cloud / "
+                         "openrouter). Env fallback: TITAN_INFERENCE_KEY.")
+    pi.add_argument("--simulate", action="store_true",
+                    help="MAINNET-readiness rehearsal: provision the box and walk the FULL "
+                         "birth ceremony, but mint nothing and spend 0 SOL (every on-chain "
+                         "submit is stubbed). Requires --mode mainnet. Stops before boot.")
     pi.add_argument("--tag", default=None,
                     help="Release tag the binaries are fetched from (e.g. v0.0.1). "
                          "Forwarded by the bootstrap; needed unless --build-rust.")

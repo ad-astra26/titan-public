@@ -13,7 +13,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from setup_titan import genesis_inputs as gi   # noqa: E402
 from setup_titan.modes import Mode             # noqa: E402
-from setup_titan.prompts import StdinPrompter  # noqa: E402
+from setup_titan.prompts import StdinPrompter, ScriptedPrompter  # noqa: E402
 from setup_titan.config_model import parse_toml_with_comments  # noqa: E402
 
 DEPLOYER = "YOUR_DEPLOYER_PUBKEY"  # valid base58 pubkey
@@ -33,6 +33,33 @@ def _cfg_value(install_root, dotted):
         if e.dotted == dotted:
             return e.raw_value.strip().strip('"')
     return None
+
+
+# ── interactive name collection (the until()→line() fix; crashed devnet/mainnet) ──
+
+def test_collect_name_interactive_uses_line(tmp_path):
+    # Regression: _collect_name used prompter.until(default=...) which StdinPrompter
+    # doesn't accept (+ misses the required hint) → TypeError on every interactive
+    # devnet/mainnet install. It must use line() with a default.
+    root = _make_install_root(tmp_path)
+    r = gi._collect_name(root, {"titan_id": "T9"},
+                         ScriptedPrompter({"titan_name": "Atlas"}), interactive=True)
+    assert r.severity == "ok" and "Atlas" in r.detail
+    assert _cfg_value(root, "genesis.titan_name") == "Atlas"
+
+
+def test_collect_name_interactive_empty_falls_back_to_default(tmp_path):
+    root = _make_install_root(tmp_path)
+    r = gi._collect_name(root, {"titan_id": "T9"},
+                         ScriptedPrompter({"titan_name": ""}), interactive=True)
+    assert r.severity == "ok" and _cfg_value(root, "genesis.titan_name") == "T9"
+
+
+def test_collect_name_interactive_overlong_falls_back(tmp_path):
+    root = _make_install_root(tmp_path)
+    r = gi._collect_name(root, {"titan_id": "T9"},
+                         ScriptedPrompter({"titan_name": "X" * 40}), interactive=True)
+    assert _cfg_value(root, "genesis.titan_name") == "T9"
 
 
 # ── validation helpers ────────────────────────────────────────────────────────

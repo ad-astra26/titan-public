@@ -411,6 +411,37 @@ def test_integration_record_outcome_promotes_through_tracker(cgn_with_consumer):
         "Causal generator promotion didn't reach tracker.hypothesize")
 
 
+def test_record_experience_single_shot_feeds_observe_for(cgn_with_consumer):
+    """(b) DEFERRED-G1 wake: record_experience is a SINGLE-SHOT complete
+    transition (action+reward together, NO separate pending sent by the
+    caller). It must self-match via record_outcome → increment _consumer_freq
+    AND reach observe_for (the causal generator) — exactly the path the dormant
+    simultaneous-outcome consumers were locked out of by the two-phase split."""
+    cgn = cgn_with_consumer
+    tracker = cgn._haov_trackers["test_consumer"]
+    formed_before = tracker.get_stats()["formed"]
+    # 4 single-shot experiences, same action "a" — caller does NOT pre-buffer or
+    # call record_outcome; record_experience does both internally.
+    for i in range(4):
+        cgn.record_experience(
+            consumer="test_consumer", concept_id=f"xp_{i}",
+            reward=0.20, action=0,
+            outcome_context={"action_name": "a"})
+    # 1. self-match ran → record_outcome counted every call
+    assert cgn._consumer_freq.get("test_consumer", 0) == 4, (
+        "record_experience must self-match → record_outcome increments freq")
+    # 2. observe_for fired → a causal generator now exists for this consumer
+    cg = cgn.get_causal_generator_stats()
+    assert "test_consumer" in cg, "observe_for never created a generator"
+    assert cg["test_consumer"]["transitions_observed"] == 4
+    # 3. min_n=3 same-pattern reps → promotion reached tracker.hypothesize
+    assert tracker.get_stats()["formed"] > formed_before
+    # 4. unregistered consumer is a no-op (mirrors record_outcome)
+    cgn.record_experience(consumer="never_registered", concept_id="z",
+                          reward=0.5, action=0)
+    assert "never_registered" not in cgn._consumer_freq
+
+
 def test_integration_flag_default_false_means_no_promotion():
     """With enabled=False (the default), record_outcome must NOT promote."""
     from titan_hcl.logic.cgn import (

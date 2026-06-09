@@ -3625,19 +3625,35 @@ async def start_v3_module(module_name: str, request: Request):
 
 
 async def enable_v3_module(module_name: str, request: Request):
-    """Re-enable a disabled Guardian module, reset restart counters, and start it."""
-    titan_state = _get_plugin(request)
-    plugin = titan_state  # backward-compat alias for Category C callsites
+    """Re-enable a DISABLED Guardian module (clear DISABLED + reset counters + start).
+
+    Routes through the chat-bridge QUERY → parent `_handle_guardian_request`
+    (action="enable_module" → Guardian.enable) — the SAME working path
+    restart-module uses. The legacy `commands.guardian_start` call published an
+    ORPHAN GUARDIAN_START_REQUEST (no handler) AND, even if handled, start_module
+    is blocked by the DISABLED guard — so a flap-disabled module could NOT be
+    recovered via the API (structural, ALL modules; only a full Titan restart
+    cleared it). Fixed 2026-06-09 (backup-flap incident)."""
+    chat_bridge_bus = getattr(request.app.state, "chat_bridge_bus", None)
+    if chat_bridge_bus is None:
+        return _error("chat_bridge_bus not bound (api_subprocess required)")
     try:
-        if not hasattr(plugin, "guardian"):
-            return _error("Not running in V3 mode")
-        ok = titan_state.commands.guardian_start(module_name)
-        if ok:
-            return _ok({"enabled": module_name})
-        else:
-            return _error(f"Failed to enable '{module_name}' — check logs")
+        reply = await chat_bridge_bus.request_async(
+            "api", "guardian",
+            {"action": "enable_module", "payload": {"name": module_name}},
+            timeout=60.0,
+        )
     except Exception as e:
-        return _error(str(e))
+        return _error(f"guardian RPC failed: {e}")
+    if reply is None:
+        return _error("guardian RPC timeout (60s)")
+    _payload = reply.get("payload") if isinstance(reply, dict) else None
+    result_dict = _payload if isinstance(_payload, dict) else {"ok": bool(_payload)}
+    if result_dict.get("ok"):
+        return _ok({"enabled": module_name, **result_dict})
+    return _error(
+        f"Failed to enable '{module_name}': "
+        f"{result_dict.get('error') or 'see guardian logs'}")
 
 
 # ---------------------------------------------------------------------------

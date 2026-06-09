@@ -68,6 +68,9 @@ logger = logging.getLogger(__name__)
 
 EVENT_BACKUP_EVENT_COMPLETE = "BACKUP_EVENT_COMPLETE"
 EVENT_BACKUP_EVENT_FAILED = "BACKUP_EVENT_FAILED"
+# §24.10 / §24.12 — weekly full-chain restore-test (Phase R4, 2026-06-09).
+EVENT_BACKUP_RESTORE_TEST_PASS = "BACKUP_RESTORE_TEST_PASS"
+EVENT_BACKUP_RESTORE_TEST_FAIL = "BACKUP_RESTORE_TEST_FAIL"
 
 
 # ── Injected dependencies ────────────────────────────────────────────────
@@ -143,6 +146,19 @@ class EventShipResult:
 
 
 # ── per-tier pack logic ──────────────────────────────────────────────────
+
+
+class MissingDiffBaseError(RuntimeError):
+    """A KNOWN file's diff-base was unresolvable at incremental-build time
+    (RFP_backup_arweave_sustainability Phase B / INV-BR-9 / INV-BKP-2).
+
+    The graceful path is the pre-check in backup.py (`_precheck_diff_base`),
+    which forces a labeled `self_heal` baseline BEFORE building when a known
+    file's mirror bytes are missing/drifted. Reaching this raise during an
+    "incremental" is the FAIL-CLOSED backstop: we refuse to silently full-ship
+    a (possibly multi-hundred-MB) known file mislabeled "incremental" — the
+    06-03 ~500MB bug. NEW files (never shipped) are NOT this error — they take
+    the legitimate per-file full-ship at `_build_incremental_payload`."""
 
 
 def _build_full_payload(spec: TierFileSpec) -> dict:
@@ -396,6 +412,7 @@ async def run_unified_event(
     cleanup_scratch: bool = True,
     bus_emit: Optional[Callable[[str, dict], None]] = None,
     force_event_type: Optional[str] = None,
+    force_trigger: Optional[str] = None,
     encryptor: Optional[Callable[[bytes, str], tuple[bytes, str]]] = None,
 ) -> EventShipResult:
     """One meditation-event ship cycle.
@@ -433,7 +450,11 @@ async def run_unified_event(
         # doesn't redundantly re-baseline personality/timechain).
         if force_event_type in ("baseline", "incremental"):
             event_type = force_event_type
-            trigger = "forced" if event_type == "baseline" else None
+            # force_trigger must be a make_event-valid baseline trigger
+            # (self_heal for the Phase-B precheck rebase). Default self_heal
+            # rather than the old "forced" (which was ∉ the allowed enum →
+            # make_event raised — a latent bug; no live caller forced baseline).
+            trigger = (force_trigger or "self_heal") if event_type == "baseline" else None
         else:
             should_rebase, trigger = manifest.should_rebase()
             event_type = "baseline" if should_rebase else "incremental"
@@ -586,6 +607,10 @@ async def run_unified_event(
             "size_bytes": tier_results["personality"].tarball_size_bytes,
             "diff_mode": event_type,
             "skipped_files": [],  # could be enriched from per-file metadata
+            # §24.3 (2026-06-09): Mode-B GCM nonce — public (also on-chain in the
+            # v=3 memo), stored locally so an in-loop restore decrypts without a
+            # Solana RPC. None on Mode-A (plaintext). (Phase B reconstruct.)
+            "iv": tier_results["personality"].iv_b64,
         }
         timechain_sub = {
             "tx_id": tier_results["timechain"].tx_id,
@@ -593,6 +618,7 @@ async def run_unified_event(
             "size_bytes": tier_results["timechain"].tarball_size_bytes,
             "diff_mode": event_type,
             "block_ranges": tier_results["timechain"].block_ranges,
+            "iv": tier_results["timechain"].iv_b64,
         }
         soul_sub = None
         if soul_specs is not None:
@@ -601,6 +627,7 @@ async def run_unified_event(
                 "merkle_root": soul_sha,
                 "size_bytes": tier_results["soul"].tarball_size_bytes,
                 "diff_mode": event_type,
+                "iv": tier_results["soul"].iv_b64,
             }
         event = make_event(
             event_id=event_id, event_type=event_type,
@@ -686,6 +713,8 @@ def build_unified_event(
     soul_specs: Optional[Iterable[TierFileSpec]] = None,
     baseline_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
     scratch_dir: Optional[str] = None,
+    force_event_type: Optional[str] = None,
+    force_trigger: Optional[str] = None,
 ) -> StagedEvent:
     """Phase 2 — BUILD a unified event's tarballs WITHOUT uploading.
 
@@ -702,8 +731,12 @@ def build_unified_event(
     else:
         os.makedirs(scratch_dir, exist_ok=True)
 
-    should_rebase, trigger = manifest.should_rebase()
-    event_type = "baseline" if should_rebase else "incremental"
+    if force_event_type in ("baseline", "incremental"):
+        event_type = force_event_type
+        trigger = (force_trigger or "self_heal") if event_type == "baseline" else None
+    else:
+        should_rebase, trigger = manifest.should_rebase()
+        event_type = "baseline" if should_rebase else "incremental"
     event_id = new_event_id()
     prev_event = manifest.get_latest_event()
     prev_event_id = prev_event["event_id"] if prev_event else None
@@ -866,12 +899,16 @@ async def ship_staged_event(
             "merkle_root": pers_sha,
             "size_bytes": tier_results["personality"].tarball_size_bytes,
             "diff_mode": event_type, "skipped_files": [],
+            # §24.3 (2026-06-09): Mode-B GCM nonce, stored locally for in-loop
+            # decrypt (None on Mode-A). See run_unified_event finalize.
+            "iv": tier_results["personality"].iv_b64,
         }
         timechain_sub = {
             "tx_id": tier_results["timechain"].tx_id, "merkle_root": tc_sha,
             "size_bytes": tier_results["timechain"].tarball_size_bytes,
             "diff_mode": event_type,
             "block_ranges": tier_results["timechain"].block_ranges,
+            "iv": tier_results["timechain"].iv_b64,
         }
         soul_sub = None
         if staged.soul_present:
@@ -879,6 +916,7 @@ async def ship_staged_event(
                 "tx_id": tier_results["soul"].tx_id, "merkle_root": soul_sha,
                 "size_bytes": tier_results["soul"].tarball_size_bytes,
                 "diff_mode": event_type,
+                "iv": tier_results["soul"].iv_b64,
             }
         event = make_event(
             event_id=event_id, event_type=event_type,

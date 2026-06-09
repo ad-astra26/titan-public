@@ -81,8 +81,8 @@ fi
 # When run from a file we can show our own sha256 so it can be matched against
 # the value published in the GitHub Release notes. Piped via curl, $0 is bash,
 # so we print the verify recipe instead of a misleading hash.
-if [[ -f "${BASH_SOURCE[0]}" ]] && command -v sha256sum >/dev/null 2>&1; then
-    _haze "setup_titan.sh sha256: $(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
+if [[ -f "${BASH_SOURCE[0]:-}" ]] && command -v sha256sum >/dev/null 2>&1; then
+    _haze "setup_titan.sh sha256: $(sha256sum "${BASH_SOURCE[0]:-}" | cut -d' ' -f1)"
 else
     _haze "To verify this bootstrap before trusting it:"
     echo "  curl -fsSLO https://raw.githubusercontent.com/ad-astra26/titan-public/${REF}/setup_titan.sh"

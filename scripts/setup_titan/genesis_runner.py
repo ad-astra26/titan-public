@@ -133,15 +133,21 @@ def _materialize_bootable_identity(install_root: Path) -> list[Result]:
                    f"bootable identity materialized (titan_id={titan_id}) → {kp}")]
 
 
-def run_genesis_phase(install_root: Path, mode: Mode, *, venv_python: Path) -> list[Result]:
+def run_genesis_phase(install_root: Path, mode: Mode, *, venv_python: Path,
+                      simulate: bool = False) -> list[Result]:
     """Phase 6 body — returns a Result list.
 
     Idempotent on the BOOTABLE artifact (`data/titan_identity_keypair.json`),
     not `genesis_record.json` (which the ceremony writes early, before the burn
     — so a half-finished ceremony must NOT count as done).
+
+    ``simulate`` runs the ceremony's mainnet-readiness rehearsal (#34/G7): the
+    full on-chain ceremony is walked but every submit is stubbed (0 SOL, nothing
+    minted). It always re-runs (no bootable artifact is produced to short-circuit
+    on) and never materializes a boot identity.
     """
     kp = keypair_path(install_root)
-    if kp.exists():
+    if kp.exists() and not simulate:
         cprint(f"  Bootable identity already present at {kp} — skipping ceremony.",
                role="warning")
         cprint("  (To force re-birth, delete data/titan_identity_keypair.json + "
@@ -157,7 +163,11 @@ def run_genesis_phase(install_root: Path, mode: Mode, *, venv_python: Path) -> l
                        "Run Phase 3 (venv + deps) first.")]
 
     cmd = [str(venv_python), str(script), "--generate"]
-    if mode == Mode.LOCAL:
+    if simulate:
+        # Mainnet-readiness rehearsal (#34/G7): walk the FULL on-chain ceremony,
+        # stubbing every submit — 0 SOL, nothing minted. readiness targets mainnet.
+        cmd.extend(["--network", "mainnet" if mode == Mode.LOCAL else mode.value, "--simulate"])
+    elif mode == Mode.LOCAL:
         cmd.append("--skip-onchain")
     else:
         # devnet / mainnet — the ceremony's only behavioral switch (Arweave +
@@ -167,12 +177,16 @@ def run_genesis_phase(install_root: Path, mode: Mode, *, venv_python: Path) -> l
     # kernel needs it at data/titan_identity_keypair.json. --keep-plaintext also
     # skips the interactive 'SOVEREIGN' burn prompt → the ceremony runs cleanly
     # non-interactively. Only mainnet performs the Burn (→ Resurrection to boot).
-    keep_plaintext = mode in (Mode.LOCAL, Mode.DEVNET)
+    # A --simulate rehearsal mints/burns nothing, so it keeps no plaintext.
+    keep_plaintext = (not simulate) and mode in (Mode.LOCAL, Mode.DEVNET)
     if keep_plaintext:
         cmd.append("--keep-plaintext")
 
     cprint(f"  Invoking genesis ceremony: {' '.join(cmd)}", role="text_strong")
-    if not keep_plaintext:
+    if simulate:
+        cprint("  --simulate: rehearsing the FULL mainnet ceremony — 0 SOL, nothing minted.",
+               role="text_strong")
+    elif not keep_plaintext:
         cprint("  Genesis is interactive — Shard 1 will be displayed ONCE for you to record.",
                role="warning", bold=True)
 
@@ -184,6 +198,11 @@ def run_genesis_phase(install_root: Path, mode: Mode, *, venv_python: Path) -> l
     except subprocess.CalledProcessError as e:
         return [Result("genesis", "fail", f"ceremony exited {e.returncode}",
                        "Inspect the ceremony output above; re-run with --resume after fixing.")]
+
+    if simulate:
+        return [Result("genesis", "ok",
+                       "mainnet-readiness ceremony SIMULATED — every on-chain step prepared "
+                       "and stubbed at submit; 0 SOL spent, nothing minted.")]
 
     record = genesis_record_path(install_root)
     if not record.exists():

@@ -319,16 +319,17 @@ def test_abstract_cluster_returns_none_on_bad_proposer():
 
 
 def test_mine_pass_compiles_recurrent_sequence(store, tmp_path):
-    """3 occurrences of (read_buffer, write_buffer) sequence → 1 positive skill."""
+    """EEL B1: the miner is NEGATIVE-ONLY (positives now form per oracle-verified
+    use). 3 occurrences of a recurrent FAILURE sequence → 1 negative skill."""
     txs = []
     for i, parent in enumerate(["C1", "C2", "C3"]):
         ts_base = float(i * 10)
         txs.append(_make_tx(tool_id="read_buffer", args={"name": "goal"},
-                            success=True, scored_by="oracle",
+                            success=False, scored_by="oracle",
                             parent_chat_tx=parent, ts=ts_base,
                             tx_hash=f"tx_r_{i}"))
         txs.append(_make_tx(tool_id="write_buffer", args={"name": "retrieval", "content": "x"},
-                            success=True, scored_by="oracle",
+                            success=False, scored_by="oracle",
                             parent_chat_tx=parent, ts=ts_base + 1,
                             tx_hash=f"tx_w_{i}"))
 
@@ -344,7 +345,8 @@ def test_mine_pass_compiles_recurrent_sequence(store, tmp_path):
     summary = miner.mine_pass(dream_pass_id="dp_001")
     assert summary["txs_scanned"] == 6
     assert summary["clusters_recurrent"] >= 1
-    assert summary["positive_skills_compiled"] >= 1
+    assert summary["negative_skills_compiled"] >= 1
+    assert summary["positive_skills_compiled"] == 0  # miner no longer compiles positives
     assert any(ev == "META_SKILL_COMPILED" for ev, _ in emitted)
 
 
