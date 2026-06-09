@@ -203,18 +203,6 @@ TITAN_HCL_BROADCAST_TOPICS: tuple[str, ...] = (
     "NEUROMOD_STATS_UPDATED",           # full neuromod state → multiple dim formulas
     "CGN_STATS_UPDATED",                # CGN grounded_density → outer_mind
     "SOCIAL_PERCEPTION_STATS_UPDATED",  # social sentiment_ema → inner_mind
-    # REQUIRED (soul-diary daily reflection delivery) — RFP_titan_authored_soul_diary §7.P0.
-    # Closes BUG-CHRONICLE-WRITER-DEAD-DELIVERY: meditation_worker emits
-    # MEDITATION_COMPLETE dst="all" (meditation_worker.py:782), but the parent's
-    # `_meditation_chronicle_loop` (subscribe("core", types=[MEDITATION_COMPLETE]),
-    # plugin.py:1135) never received it — the broker only fans a dst="all" broadcast
-    # to the titan_HCL connection when the type ∈ this tuple. The L2 workers
-    # (timechain/backup/cognitive/life_force/memory) already get it via their own
-    # ModuleSpec.broadcast_topics; the parent needs this entry. Mirrors the
-    # IMPULSE/D-SPEC-92 delivery fix exactly. (The meditation_worker.py:764-773
-    # comment claiming the parent already receives it is correct ONLY for those L2
-    # workers — NOT the parent, which is gated by this tuple.)
-    "MEDITATION_COMPLETE",
 )
 
 # Kernel-side proxy reply-queue names that need broker-side fanout routing

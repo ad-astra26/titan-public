@@ -1355,6 +1355,33 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         boot_priority="post_boot",
     ))
 
+    # soul_diary_worker — the Narrative SELF daily diary (RFP_titan_authored_soul_diary
+    # §1.0 P1). Lean, self-contained L2: on the day's last MEDITATION_COMPLETE it
+    # authors a grounded, OVG-verified first-person reflection (its OWN LLM call —
+    # provider.complete + OutputVerifier; INV-SD-14) and persists it to
+    # titan_chronicles.md + the hash-chain ledger (soul-file single-writer INV-SD-6;
+    # ledger §24.4.B-backed INV-SD-12). Supersedes the retired parent chronicle loop.
+    # ENRICH→synthesis / SELF node / NFT / X are downstream phases (P2-P10). Writes
+    # are atomic-immediate (nothing buffered) → not a SAVE_NOW critical_data_writer.
+    from titan_hcl.modules.soul_diary_worker import soul_diary_worker_main
+    guardian.register(ModuleSpec(
+        name="soul_diary",
+        layer="L2",
+        entry_fn=soul_diary_worker_main,
+        config=config,
+        rss_limit_mb=300,    # lean orchestrator + one httpx LLM call/day
+        autostart=True,
+        lazy=False,
+        heartbeat_timeout=120.0,  # a daily compose can take ~30-90s
+        broadcast_topics=[
+            _bus_constants.MEDITATION_COMPLETE,
+            _bus_constants.MODULE_SHUTDOWN,
+        ],
+        start_method="spawn" if _spawn_grad else "fork",
+        critical_data_writer=False,  # writes are atomic-immediate; nothing to flush
+        boot_priority="post_boot",
+    ))
+
     # observatory_worker — extracted per RFP_phase_c_titan_hcl_cleanup
     # Phase A+B (Track 2, 2026-05-21). Maker-greenlit inline.
     # Owns the two residual Observatory-output PRODUCTION loops carved out
