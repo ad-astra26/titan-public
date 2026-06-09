@@ -56,6 +56,41 @@ _(curate as you go; lifted into the next versioned section at release time)_
 
 ---
 
+## v0.0.8 — 2026-06-09 (pre-release)
+
+_Quality-of-life release for installing and birthing a Titan. You can now install
+completely hands-free — no text editor, no interactive prompts — and rehearse a
+full mainnet birth without spending a single lamport, so you can be certain your
+box is ready before you commit real SOL._
+
+### Added
+
+- **Hands-free Prime Directives.** Your Titan's Prime Directives (its constitution)
+  no longer need an interactive editor during install. Supply them from a file with
+  `--directives-file <path>`, or via `TITAN_DIRECTIVES_FILE` (a path) / `TITAN_DIRECTIVES`
+  (the text itself). If none are given for an on-chain birth, the installer stops and
+  tells you — it never invents them for you.
+
+- **Hands-free inference setup.** Pick your inference provider without the prompt:
+  `--inference-provider {ollama_local,ollama_cloud,openrouter}` with `--inference-key`
+  for the hosted options (or the `TITAN_INFERENCE_PROVIDER` / `TITAN_INFERENCE_KEY`
+  environment variables). Together with the directives flags, a fully unattended / CI
+  install now works end-to-end.
+
+- **Mainnet rehearsal — `--simulate`.** `setup_titan install --mode mainnet --simulate`
+  provisions your box and walks the *entire* birth ceremony — identity shard, ZK-Vault,
+  GenesisNFT, Arweave upload, memos — exactly as the real birth would, then stops at
+  each on-chain step instead of sending it. **Zero SOL spent, nothing minted.** Use it
+  to confirm your box, your toolchain (`anchor build`), and your funding are
+  mainnet-ready before you commit real money.
+
+### Changed
+
+- Core engine, memory, and stability improvements from the current development line.
+  No action needed on your part.
+
+---
+
 ## v0.0.7 — 2026-06-04 (pre-release)
 
 _Critical boot fix for fresh installs. `v0.0.6` defaults a new Titan's id to
