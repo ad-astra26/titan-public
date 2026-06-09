@@ -622,6 +622,17 @@ BACKUP_RESTORE_TEST_CADENCE_DAYS: Final[int] = 7
 BACKUP_VERIFY_MERKLE_TIMEOUT_S: Final[float] = 30.0
 # Daily-incremental FAISS index ships full only when content_hash changes by >5% (signal of major retrain); otherwise FAISS ships only at weekly cadence per SPEC §24.5
 BACKUP_FAISS_FULL_SHIP_DELTA_THRESHOLD_PCT: Final[float] = 5.0
+# Chained-incremental Arweave diffs (RFP_backup_arweave_sustainability Phase B, 2026-06-09).
+#   False = legacy cumulative diffs (each incremental diffs vs the monthly baseline — re-uploads
+#           accumulated change daily; the cost the RFP targets).
+#   True  = chained day-over-day diffs (each incremental diffs vs the PREVIOUS event's reconstructed
+#           state, held in the rolling baseline-mirror + `.mirror_state.json` sidecar) → ~3-4x less
+#           Arweave/mo, restore-native (restore_full already replays forward).
+# Runtime-overridable via config.toml [backup].chained_incrementals (runtime config is gitignored, so
+# the committed default lives here). The no-silent-full-ship safety (a missing diff-base for a KNOWN
+# file → labeled self_heal baseline + alarm, never a silent full "incremental") is ALWAYS on,
+# flag-independent (INV-BR-9). NEW small files legitimately full-ship per-file.
+BACKUP_CHAINED_INCREMENTALS_ENABLED: Final[bool] = False
 
 
 # ── WORKER ────────────────────────────────────────────────────────────────

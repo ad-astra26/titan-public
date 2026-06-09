@@ -2225,6 +2225,334 @@ class RebirthBackup:
             written, len(tarball_paths))
         return written
 
+    # ── Phase B: chained-incremental diff-base (RFP_backup_arweave_sustainability, 2026-06-09) ──
+    #
+    # The baseline-mirror (`_baseline_working_dir`) becomes a ROLLING "last-shipped
+    # state" mirror: each incremental diffs vs the PREVIOUS event's reconstructed
+    # bytes (held in the mirror), not vs the monthly baseline → ~3-4x less Arweave.
+    # A `.mirror_state.json` sidecar records {event_id, arc→sha} so a cheap daily
+    # precheck can detect mirror drift; a missing diff-base for a KNOWN file forces
+    # a labeled `self_heal` baseline (never a silent full-ship — INV-BR-9). The flag
+    # gates the chained behaviour; the no-silent-full-ship safety is always on.
+
+    def _chained_incrementals_enabled(self) -> bool:
+        """Flag gate. Runtime config.toml [backup].chained_incrementals overrides
+        the committed default BACKUP_CHAINED_INCREMENTALS_ENABLED."""
+        from titan_hcl._phase_c_constants import BACKUP_CHAINED_INCREMENTALS_ENABLED
+        cfg = (self._full_config or {}).get("backup", {}) or {}
+        return bool(cfg.get("chained_incrementals",
+                            BACKUP_CHAINED_INCREMENTALS_ENABLED))
+
+    def _mirror_state_path(self) -> str:
+        return os.path.join(self._baseline_working_dir(), ".mirror_state.json")
+
+    def _load_mirror_state(self) -> Optional[dict]:
+        """Read the sidecar {"event_id": str, "arcs": {arc: sha}}. None if
+        absent/unreadable (→ precheck adopts the mirror or recovers, fail-closed).
+        A local, regenerable integrity cache — NOT part of the §24.3 on-chain
+        schema, so a loss only triggers recovery, never data loss."""
+        import json
+        p = self._mirror_state_path()
+        if not os.path.exists(p):
+            return None
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or not isinstance(data.get("arcs"), dict):
+                return None
+            return data
+        except (OSError, ValueError):
+            return None
+
+    def _write_mirror_state(self, event_id: str, arcs: dict) -> None:
+        """Atomically record the mirror's arc→sha map after an advance/recover."""
+        import json
+        p = self._mirror_state_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        payload = {"event_id": event_id,
+                   "chained": self._chained_incrementals_enabled(),
+                   "arcs": arcs, "ts": time.time()}
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, p)
+
+    def _hash_mirror_dir(self, base: str) -> dict:
+        """{arc(relpath): file_merkle_root} for every file in the mirror, EXCLUDING
+        the sidecar + transient scratch. This is the true mirror state."""
+        from titan_hcl.logic import diff_encoders
+        out: dict = {}
+        if not os.path.isdir(base):
+            return out
+        for root, _dirs, files in os.walk(base):
+            for fn in files:
+                full = os.path.join(root, fn)
+                arc = os.path.relpath(full, base)
+                if (arc == ".mirror_state.json" or arc.endswith(".tmp")
+                        or arc.endswith(".advancing")):
+                    continue
+                try:
+                    out[arc] = diff_encoders.file_merkle_root(full)
+                except OSError:
+                    continue
+        return out
+
+    def _alarm_self_heal_baseline(self, reason: str) -> None:
+        """maker_notify + WARN when a missing/drifted diff-base forces a labeled
+        self_heal baseline (INV-BR-9). The baseline preserves lineage (it is
+        prev_event_id-linked, not an orphan) — this is the LOUD, never-silent
+        recovery that replaces the 06-03 silent full-ship."""
+        msg = (f"⚠️ §24 backup self-heal: forcing a labeled baseline (diff-base "
+               f"recovery) — {reason}. Chain lineage preserved (prev-linked); the "
+               f"next backup is a full snapshot.")
+        logger.warning("[Backup] %s", msg)
+        try:
+            self._send_telegram_alert(msg)
+        except Exception:
+            pass
+
+    def _make_diff_base_resolver(self, base_dir: str, known_arcs):
+        """Build the baseline_resolver passed to the pipeline. Returns the mirror
+        path for a present arc; RAISES for a KNOWN arc whose bytes vanished (the
+        fail-closed backstop — the precheck must have forced a baseline first);
+        returns None for a NEW arc (never shipped) → legit per-file full-ship."""
+        from titan_hcl.logic.backup_upload_pipeline import MissingDiffBaseError
+
+        def _resolver(component, arc_name):
+            candidate = os.path.join(base_dir, arc_name)
+            if os.path.exists(candidate):
+                return candidate
+            if arc_name in known_arcs:
+                raise MissingDiffBaseError(
+                    f"diff-base for KNOWN arc {arc_name!r} missing under "
+                    f"{base_dir!r} — the precheck must force a baseline "
+                    f"(INV-BR-9); refusing a silent full-ship")
+            return None  # NEW file (never shipped) → legitimate per-file full-ship
+        return _resolver
+
+    def _mirror_verifies(self, base_dir: str, known_arcs, state, latest_id) -> bool:
+        """Chained-mode check: the sidecar tracks the LATEST event AND every known
+        arc's mirror bytes still hash to the recorded sha."""
+        from titan_hcl.logic import diff_encoders
+        if not state or state.get("event_id") != latest_id:
+            return False
+        recorded = state.get("arcs", {})
+        for arc in known_arcs:
+            p = os.path.join(base_dir, arc)
+            expected = recorded.get(arc)
+            if expected is None or not os.path.exists(p):
+                return False
+            try:
+                if diff_encoders.file_merkle_root(p) != expected:
+                    return False
+            except OSError:
+                return False
+        return True
+
+    async def _precheck_diff_base(self, manifest):
+        """RFP Phase B integrity precheck — runs BEFORE the tier build in BOTH ship
+        paths. Returns (force_event_type, force_trigger, known_arcs).
+
+        ALWAYS-ON (flag-independent): a KNOWN file whose mirror diff-base is gone →
+        a labeled self_heal baseline (never a silent full-ship — INV-BR-9).
+        CHAINED (flag on): additionally merkle-verifies the rolling mirror vs the
+        sidecar and runs the reconstruct ladder (incl. the Q2 flag-flip bridge)
+        before falling back to a baseline."""
+        # A baseline full-ships regardless — nothing to pre-check.
+        should_rebase, _ = manifest.should_rebase()
+        base_dir = self._baseline_working_dir()
+        if should_rebase:
+            return (None, None, set())
+
+        state = self._load_mirror_state()
+        chained = self._chained_incrementals_enabled()
+
+        if state is not None:
+            known_arcs = set(state.get("arcs", {}).keys())
+        else:
+            # Transitional (no sidecar): adopt the existing mirror as the known
+            # diff-base; an empty mirror despite a prior baseline = the 06-03
+            # infra failure → fail closed to a labeled baseline.
+            present = self._hash_mirror_dir(base_dir)
+            if not present:
+                self._alarm_self_heal_baseline(
+                    "no mirror-state sidecar AND empty baseline mirror "
+                    "(diff-base infrastructure missing)")
+                return ("baseline", "self_heal", set())
+            adopt_event = manifest.current_baseline_event_id or "adopted"
+            self._write_mirror_state(adopt_event, present)
+            state = {"event_id": adopt_event, "arcs": present}
+            known_arcs = set(present.keys())
+            logger.info("[Backup] §24 Phase B: adopted existing mirror as diff-base "
+                        "(%d arcs, no prior sidecar)", len(known_arcs))
+
+        missing_known = [a for a in known_arcs
+                         if not os.path.exists(os.path.join(base_dir, a))]
+
+        if not chained:
+            # FLAG OFF (R2 only): existence check on KNOWN arcs. Any gone → baseline.
+            if missing_known:
+                self._alarm_self_heal_baseline(
+                    f"{len(missing_known)} known diff-base file(s) missing from the "
+                    f"baseline mirror (cumulative mode)")
+                return ("baseline", "self_heal", known_arcs)
+            return (None, None, known_arcs)
+
+        # FLAG ON (chained): verify mirror == latest shipped state, reconstruct if not.
+        latest = manifest.get_latest_event()
+        latest_id = latest["event_id"] if latest else None
+        if self._mirror_verifies(base_dir, known_arcs, state, latest_id):
+            return (None, None, known_arcs)
+
+        # Reconstruct ladder — rebuild the mirror to the LATEST event's state from
+        # the chain (also performs the Q2 flag-flip BRIDGE when the mirror lags).
+        if latest_id and await self._recover_mirror_to_latest(manifest, latest_id):
+            state = self._load_mirror_state()
+            known_arcs = set(state.get("arcs", {}).keys()) if state else known_arcs
+            if self._mirror_verifies(base_dir, known_arcs, state, latest_id):
+                logger.info("[Backup] §24 Phase B: mirror recovered to latest %s — "
+                            "chained incremental", (latest_id or "?")[:8])
+                return (None, None, known_arcs)
+
+        # Unrecoverable → labeled baseline + alarm (lineage-preserving).
+        self._alarm_self_heal_baseline(
+            "chained mirror drift unrecoverable (reconstruct from chain failed)")
+        return ("baseline", "self_heal", known_arcs)
+
+    def _build_decrypting_fetch(self, manifest):
+        """An async arweave_fetch(tx_id)->PLAINTEXT bytes for restore_full that
+        transparently Mode-B decrypts using the LOCAL keypair + the manifest's
+        per-tx `iv` (no Solana RPC). Mode-A (iv None) → passthrough. Reuses the
+        audited backup_crypto helpers (same as the sovereign restore)."""
+        store = self._ensure_arweave_store_for_unified()
+        tx_meta: dict = {}
+        for ev in manifest.events:
+            for comp in ("personality", "timechain", "soul"):
+                sub = ev.get(comp)
+                if not isinstance(sub, dict):
+                    continue
+                tx = sub.get("tx_id")
+                if tx:
+                    tx_meta[tx] = {"iv": sub.get("iv"), "component": comp,
+                                   "arc": sub.get("merkle_root")}
+        cache: dict = {"master": None}
+
+        def _master_key():
+            if cache["master"] is None:
+                from titan_hcl.logic.backup_crypto import (
+                    load_keypair_bytes, derive_master_key)
+                cfg = (self._full_config or {}).get("backup", {}) or {}
+                kp_path = cfg.get("wallet_keypair_path",
+                                  "data/titan_identity_keypair.json")
+                kp_bytes, titan_pubkey = load_keypair_bytes(kp_path)
+                cache["master"] = derive_master_key(kp_bytes, titan_pubkey)
+            return cache["master"]
+
+        async def _fetch(tx_id: str) -> bytes:
+            data = await store.fetch(tx_id)
+            if not data:
+                raise RuntimeError(f"Arweave fetch returned no data for {tx_id}")
+            meta = tx_meta.get(tx_id)
+            if meta and meta.get("iv"):
+                from titan_hcl.logic.backup_crypto import decrypt_component_tarball
+                data = decrypt_component_tarball(
+                    bytes(data), meta["iv"], _master_key(),
+                    meta["component"], meta["arc"])
+            return bytes(data)
+        return _fetch
+
+    async def _recover_mirror_to_latest(self, manifest, latest_id) -> bool:
+        """Reconstruct the rolling mirror to the LATEST shipped event's state via
+        the chain-aware restore_full (decrypting fetch for Mode-B). Small per-link
+        patches, NO new full upload. Also performs the Q2 flag-flip bridge. True on
+        success."""
+        base_dir = self._baseline_working_dir()
+        store = self._ensure_arweave_store_for_unified()
+        if store is None:
+            logger.warning("[Backup] §24 Phase B recover: no ArweaveStore")
+            return False
+        try:
+            from titan_hcl.logic.backup_restore import restore_full
+            os.makedirs(base_dir, exist_ok=True)
+            fetch = self._build_decrypting_fetch(manifest)
+
+            async def _memo_noop(_sig):
+                return ""
+
+            def _arc_to_mirror(component, arc_name):
+                return os.path.join(base_dir, arc_name)
+
+            result = await restore_full(
+                manifest=manifest, target_dir=base_dir,
+                arweave_fetch=fetch, memo_fetch=_memo_noop,
+                arc_to_target=_arc_to_mirror, target_event_id=latest_id,
+                # bytes are sha-verified vs the manifest; the weekly §24.12 test
+                # does the full on-chain ZK walk (R4).
+                verify_zk_chain=False)
+            if result.status != "success":
+                logger.warning("[Backup] §24 Phase B recover: restore_full "
+                               "status=%s halt=%s", result.status,
+                               getattr(result, "halt_reason", None))
+                return False
+            self._write_mirror_state(latest_id, self._hash_mirror_dir(base_dir))
+            logger.info("[Backup] §24 Phase B: mirror RECONSTRUCTED to latest %s "
+                        "(%d files)", (latest_id or "?")[:8], result.restored_files)
+            return True
+        except Exception as e:
+            logger.warning("[Backup] §24 Phase B recover: reconstruct raised: %s", e)
+            return False
+
+    def _advance_mirror_from_tarballs(self, tarball_paths, event_id) -> int:
+        """RFP Phase B mirror ADVANCE — make the rolling mirror equal the just-shipped
+        event's reconstructed state (the next event's chained diff-base), from the
+        shipped TARBALLS (canonical bytes; never a torn live-sqlite re-read), per arc
+        by diff_mode: full→write bytes · incremental→apply_diff onto the mirror ·
+        skipped→no-op. Then write the .mirror_state.json sidecar atomically. Returns
+        the count of files written/advanced. (Superset of
+        _refresh_baseline_dir_from_tarballs — also handles incremental + the sidecar.)"""
+        from titan_hcl.logic.backup_event_tarball import unpack_event_tarball
+        from titan_hcl.logic import diff_encoders
+        base = self._baseline_working_dir()
+        os.makedirs(base, exist_ok=True)
+        written = 0
+        for tp in tarball_paths:
+            if not tp or not os.path.exists(tp):
+                continue
+            with open(tp, "rb") as f:
+                data = f.read()
+            with unpack_event_tarball(data) as unpacked:
+                for fm in unpacked.files:
+                    arc = fm.get("arc_name")
+                    if not arc:
+                        continue
+                    mode = fm.get("diff_mode")
+                    if mode == "skipped":
+                        continue  # mirror already holds the correct bytes
+                    dst = os.path.join(base, arc)
+                    parent = os.path.dirname(dst)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+                    if mode == "full":
+                        payload = unpacked.get_patch_bytes(arc)  # full bytes (sha-verified)
+                        tmp = dst + ".tmp"
+                        with open(tmp, "wb") as out:
+                            out.write(payload)
+                        os.replace(tmp, dst)
+                    else:
+                        # incremental diff — apply onto the mirror's prior bytes.
+                        diff_dict = unpacked.diff_dict_for(arc, verify_hash=True)
+                        baseline_path = dst if os.path.exists(dst) else None
+                        scratch = dst + ".advancing"
+                        diff_encoders.apply_diff(
+                            baseline_path=baseline_path, diff_dict=diff_dict,
+                            output_path=scratch, verify_output=True)
+                        os.replace(scratch, dst)
+                    written += 1
+        self._write_mirror_state(event_id, self._hash_mirror_dir(base))
+        logger.info("[Backup] §24 Phase B: mirror ADVANCED to event %s "
+                    "(%d files written/advanced)", (event_id or "?")[:8], written)
+        return written
+
     def _cleanup_event_scratch(self, result) -> None:
         """rmtree the pipeline scratch dir(s) for a finished event — we run the
         pipeline with cleanup_scratch=False (to keep tarballs for the #3
@@ -2405,15 +2733,15 @@ class RebirthBackup:
             if (weekday == 6 or _should_rebase) else None
         )
 
-        # Baseline resolver — for incremental events, point at the
-        # baseline working dir (refreshed after each baseline ship). For
-        # the first event after enabling unified_v2 the working dir may
-        # be empty; the pipeline falls back to full-ship in that case.
+        # Phase B (RFP_backup_arweave_sustainability) — integrity precheck BEFORE
+        # the build: verify the rolling diff-base mirror (reconstruct from the
+        # chain when chained + drifted) and decide whether this event must be
+        # forced to a labeled self_heal baseline (a missing KNOWN diff-base — never
+        # a silent full-ship, INV-BR-9). The resolver raises for a KNOWN-missing
+        # arc and returns None (legit per-file full-ship) for a NEW arc.
         base_dir = self._baseline_working_dir()
-
-        def _baseline_resolver(component, arc_name):
-            candidate = os.path.join(base_dir, arc_name)
-            return candidate if os.path.exists(candidate) else None
+        _force_et, _force_trig, _known_arcs = await self._precheck_diff_base(manifest)
+        _baseline_resolver = self._make_diff_base_resolver(base_dir, _known_arcs)
 
         # Arweave uploader — wraps store.upload_file with a temp file
         async def _arweave_upload(data: bytes, tags: dict) -> str:
@@ -2469,6 +2797,7 @@ class RebirthBackup:
             soul_specs=s_specs, baseline_resolver=_baseline_resolver,
             arweave_uploader=_arweave_upload, zk_committer=_v3_chain_commit,
             bus_emit=_bus_emit, cleanup_scratch=False,
+            force_event_type=_force_et, force_trigger=_force_trig,
             encryptor=self._build_v3_encryptor(),
         )
 
@@ -2480,23 +2809,25 @@ class RebirthBackup:
                 )
                 return False
 
-            # §24 #3: on baseline events refresh the working dir from the
-            # just-shipped tarballs (NOT a re-copy of live source — that drifts).
-            if result.event_type == "baseline":
+            # Phase B: ADVANCE the rolling mirror to this just-shipped event so it
+            # is the next event's chained diff-base. Chained → every event;
+            # cumulative → baseline only (== the legacy refresh, plus the sidecar).
+            if (self._chained_incrementals_enabled()
+                    or result.event_type == "baseline"):
                 try:
                     paths = [t.tarball_path for t in result.tiers.values()
                              if getattr(t, "tarball_path", None)]
-                    self._refresh_baseline_dir_from_tarballs(paths)
+                    self._advance_mirror_from_tarballs(paths, result.event_id)
                 except Exception as e:
                     logger.warning(
-                        "[Backup] §24 unified_v2: baseline-dir refresh-from-tarball "
+                        "[Backup] §24 unified_v2: mirror advance-from-tarball "
                         "failed: %s — falling back to source copy", e)
                     try:
                         self._refresh_baseline_working_dir()
                     except Exception as e2:
                         logger.warning(
                             "[Backup] §24 unified_v2: source-copy fallback also "
-                            "failed: %s (next incremental may full-ship)", e2)
+                            "failed: %s (next event may self-heal to a baseline)", e2)
             return True
         finally:
             self._cleanup_event_scratch(result)
@@ -2574,15 +2905,18 @@ class RebirthBackup:
         s_specs = (self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
                    if (weekday == 6 or _should_rebase) else None)
         base_dir = self._baseline_working_dir()
-
-        def _baseline_resolver(component, arc_name):
-            candidate = os.path.join(base_dir, arc_name)
-            return candidate if os.path.exists(candidate) else None
+        # Phase B integrity precheck (sync stager thread → asyncio.run the async
+        # precheck; the only async part is a rare chain-reconstruct). Decides
+        # force-baseline (missing KNOWN diff-base) + builds the new-vs-known resolver.
+        _force_et, _force_trig, _known_arcs = asyncio.run(
+            self._precheck_diff_base(manifest))
+        _baseline_resolver = self._make_diff_base_resolver(base_dir, _known_arcs)
 
         staged = build_unified_event(
             titan_id=self._titan_id, manifest=manifest,
             personality_specs=p_specs, timechain_specs=t_specs,
             soul_specs=s_specs, baseline_resolver=_baseline_resolver,
+            force_event_type=_force_et, force_trigger=_force_trig,
         )
         logger.info(
             "[Backup] §24 staged event BUILT: id=%s type=%s (off-loop; "
@@ -2662,22 +2996,24 @@ class RebirthBackup:
                     "[Backup] §24 staged ship NOT shipped: status=%s errors=%s",
                     result.status, result.errors)
                 return False
-            # §24 #3: refresh baseline dir from the just-shipped staged tarballs.
-            if result.event_type == "baseline":
+            # Phase B: ADVANCE the rolling mirror to this just-shipped event.
+            # Chained → every event; cumulative → baseline only.
+            if (self._chained_incrementals_enabled()
+                    or result.event_type == "baseline"):
                 try:
                     paths = [t.tarball_path for t in staged.tier_results.values()
                              if getattr(t, "tarball_path", None)]
-                    self._refresh_baseline_dir_from_tarballs(paths)
+                    self._advance_mirror_from_tarballs(paths, result.event_id)
                 except Exception as e:
                     logger.warning(
-                        "[Backup] §24 ship-stage: baseline-dir refresh-from-tarball "
+                        "[Backup] §24 ship-stage: mirror advance-from-tarball "
                         "failed: %s — falling back to source copy", e)
                     try:
                         self._refresh_baseline_working_dir()
                     except Exception as e2:
                         logger.warning(
                             "[Backup] §24 ship-stage: source-copy fallback also "
-                            "failed: %s (next incremental may full-ship)", e2)
+                            "failed: %s (next event may self-heal to a baseline)", e2)
             return True
         finally:
             import shutil
