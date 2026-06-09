@@ -149,3 +149,75 @@ def test_genesis_record_defaults_fill_missing_keys():
     assert rec["version"] == "3.0"
     assert rec["ceremony_timestamp"] == 0
     assert rec["nft_address"] == ""
+
+
+# ── mainnet-readiness SIMULATION (--simulate, #34 / §8 G9) ────────────────────
+# Each spend helper must PREPARE the step but STOP SHORT of any network submit —
+# fail-closed. We make every submit/network seam RAISE; if the helper is truly
+# fail-closed it never touches them, returns the SIMULATED sentinel, and the
+# `raise` is never triggered.
+
+DEPLOYER = "YOUR_DEPLOYER_PUBKEY"  # valid base58 pubkey
+
+
+def _boom(*a, **k):
+    raise AssertionError("network submit attempted during --simulate (NOT fail-closed)")
+
+
+def test_send_memo_simulate_prepares_but_never_submits(monkeypatch):
+    if not _sdk():
+        pytest.skip("solana SDK unavailable")
+    monkeypatch.setattr(gc, "_make_network", _boom)  # any submit path → boom
+    _, _, kp = gc.generate_keypair()
+    sig = gc._send_memo({}, kp, "TITAN:TEST|x", simulate=True)
+    assert sig == gc.SIMULATED_TX
+
+
+def test_store_shard3_simulate_prepares_but_never_submits(monkeypatch):
+    if not _sdk():
+        pytest.skip("solana SDK unavailable")
+    monkeypatch.setattr(gc, "_make_network", _boom)
+    _, pub, kp = gc.generate_keypair()
+    enc = encrypt_shard3(bytes(range(65)), pub)
+    assert gc.store_shard3_onchain({}, kp, enc, simulate=True) == gc.SIMULATED_TX
+
+
+def test_init_zk_vault_simulate_derives_pda_but_no_rpc(monkeypatch):
+    if not _sdk():
+        pytest.skip("solana SDK unavailable")
+    import solana.rpc.api as rpc_api
+    monkeypatch.setattr(rpc_api, "Client", _boom)  # constructing a client → boom
+    _, _, kp = gc.generate_keypair()
+    vault_pda, vault_tx = gc.init_zk_vault("http://unused", kp, simulate=True)
+    assert vault_tx == gc.SIMULATED_TX
+    assert vault_pda and len(vault_pda) >= 32  # the PDA was really derived
+
+
+def test_mint_simulate_no_arweave_upload_no_mint(monkeypatch):
+    if not _sdk():
+        pytest.skip("solana SDK unavailable")
+    monkeypatch.setattr(gc, "_make_network", _boom)  # mint submit → boom
+    import titan_hcl.utils.arweave_store as aw
+    monkeypatch.setattr(aw, "ArweaveStore", _boom)   # any Arweave upload → boom
+    _, pub, kp = gc.generate_keypair()
+    inputs = {"name": "Titan", "maker": DEPLOYER,
+              "constitution_sha": "c" * 64, "birth_dna_sha": "d" * 64}
+    asset, nft_tx, nft_uri = gc.mint_genesis_nft_onchain(
+        {}, kp, network="mainnet", titan_pubkey=pub, inputs=inputs,
+        shard3_tx=gc.SIMULATED_TX, vault_pda="VaultPDA111", art_hash="abc",
+        simulate=True)
+    assert nft_tx == gc.SIMULATED_TX          # mint not submitted
+    assert nft_uri == gc.SIMULATED_TX         # Arweave not uploaded
+    assert asset and len(asset) >= 32         # the mint ix (asset kp) was prepared
+
+
+def test_simulate_and_skip_onchain_are_mutually_exclusive(monkeypatch):
+    monkeypatch.setattr(sys, "argv",
+                        ["genesis_ceremony.py", "--generate", "--simulate", "--skip-onchain"])
+    with pytest.raises(SystemExit):  # argparse parser.error → exits before any ceremony work
+        gc.main()
+
+
+def _sdk() -> bool:
+    from titan_hcl.utils.solana_client import is_available
+    return is_available()
