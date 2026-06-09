@@ -11053,6 +11053,7 @@ async def get_v4_cgn_haov_stats(request: Request):
 
         haov_data = {}
         consumer_freq = {}
+        causal_generator = {}
         if os.path.exists(haov_json_path):
             with open(haov_json_path) as _hf:
                 haov_data = _json.load(_hf)
@@ -11060,6 +11061,9 @@ async def get_v4_cgn_haov_stats(request: Request):
             # pop before iterating so it isn't mistaken for a consumer
             # (BUG-CGN-CONSUMER-FREQ-INVISIBLE-VIA-API-SIDECAR-20260526).
             consumer_freq = haov_data.pop("_consumer_freq", {})
+            # Per-consumer causal-generator telemetry rides under a reserved key
+            # (pop before iterating consumers so it isn't read as one).
+            causal_generator = haov_data.pop("_causal_generator", {})
         elif os.path.exists(state_path):
             # Fallback: use pickle to read .pt file without importing torch
             import pickle
@@ -11112,7 +11116,8 @@ async def get_v4_cgn_haov_stats(request: Request):
                 ],
             }
 
-        return _ok({"consumers": result, "consumer_freq": dict(consumer_freq)})
+        return _ok({"consumers": result, "consumer_freq": dict(consumer_freq),
+                    "causal_generator": causal_generator})
     except Exception as e:
         logger.error("[Dashboard] /v4/cgn-haov-stats error: %s", e)
         return _error(str(e))

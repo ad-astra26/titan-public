@@ -61,7 +61,9 @@ class TitanDuckDB:
                 cognified BOOLEAN DEFAULT FALSE,
                 neuromod_context TEXT,
                 memory_type TEXT DEFAULT 'episodic',
-                timechain_tx_hash TEXT
+                timechain_tx_hash TEXT,
+                tags TEXT,
+                acquired_source TEXT
             )
         """)
         # Synthesis Engine Phase 1 / D-SPEC-123 — additive memory_type column
@@ -80,6 +82,16 @@ class TitanDuckDB:
         self._conn.execute(
             "ALTER TABLE memory_nodes "
             "ADD COLUMN IF NOT EXISTS timechain_tx_hash TEXT"
+        )
+        # EEL Pillar A / A1 (INV-EEL-6) — provenance for researched memories:
+        # `tags` (JSON list, e.g. ["acquired:research"]) + `acquired_source`
+        # (the research source). Additive + idempotent for existing installs;
+        # the CREATE TABLE above carries them for new ones.
+        self._conn.execute(
+            "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS tags TEXT"
+        )
+        self._conn.execute(
+            "ALTER TABLE memory_nodes ADD COLUMN IF NOT EXISTS acquired_source TEXT"
         )
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS identity_nodes (
@@ -106,13 +118,15 @@ class TitanDuckDB:
             "reinforcement_count", "emotional_intensity", "mempool_weight",
             "mempool_reinforcements", "effective_weight", "created_at",
             "last_accessed", "last_reinforced", "embedding_id", "cognified",
-            "neuromod_context",
+            "neuromod_context", "tags", "acquired_source",
         ]
         vals = []
         for c in cols:
             v = node.get(c)
             if c == "neuromod_context" and isinstance(v, dict):
                 v = json.dumps(v)
+            elif c == "tags" and isinstance(v, (list, tuple)):
+                v = json.dumps(list(v))
             vals.append(v)
         placeholders = ", ".join(["?"] * len(cols))
         col_str = ", ".join(cols)

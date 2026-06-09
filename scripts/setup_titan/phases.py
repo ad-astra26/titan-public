@@ -316,7 +316,8 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
                das_rpc_url: str | None = None,
                verify_only: bool = False, config_src: str | None = None,
                titan_pubkey: str | None = None,
-               toolchain_pins: dict[str, str] | None = None) -> int:
+               toolchain_pins: dict[str, str] | None = None,
+               directives_file: str | None = None) -> int:
     """Walk the install phases (Phase 1 already ran in preflight). Returns exit code.
 
     ``prompter`` injects the input source: the default :class:`StdinPrompter`
@@ -381,7 +382,8 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
          lambda: run_comms_phase(default=default, state=state, prompter=prompter)),
         (PhaseDef("phase_identity", "Genesis identity (name · Maker · directives)", "W1.f", None),
          lambda: run_genesis_inputs_phase(install_root, mode, state,
-                                          prompter=prompter, default=default)),
+                                          prompter=prompter, default=default,
+                                          directives_file=directives_file)),
         (PhaseDef("phase_6", "Genesis ceremony", "W1.b", None),
          lambda: ([Result("genesis", "warn", "--skip-genesis requested.")] if skip_genesis
                   else run_genesis_phase(install_root, mode, venv_python=venv_python(install_root)))),
