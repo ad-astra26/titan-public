@@ -1123,7 +1123,10 @@ mod tests {
         let body = project_outer_body_5d(&payload, last_body).unwrap();
         assert!((body[0] - 0.5).abs() < 1e-4);
         assert!((body[1] - 0.5).abs() < 1e-4);
-        assert!((body[2] - 0.35).abs() < 1e-4);
+        // [2] somatosensation P0.6-B re-ground (D-SPEC-104): stateless fallback
+        // 0.6·tx_lat(0.5) + 0.4·cpu_spikes(0.0) = 0.3 (was 0.35 under the retired
+        // self-referential decay formula).
+        assert!((body[2] - 0.3).abs() < 1e-4);
         assert!((body[3] - 0.0).abs() < 1e-4);
         assert!((body[4] - 0.0).abs() < 1e-4);
     }
@@ -1167,18 +1170,29 @@ mod tests {
     }
 
     #[test]
-    fn project_outer_body_dim2_decay_pulls_toward_neutral() {
-        // last_body[2] = 1.0 → decayed = 0.5 + (1.0 - 0.5) × 0.95 = 0.975
-        // Empty map → tx_lat=0.5, cpu_spikes=0.0
-        // dim[2] = 0.4·0.5 + 0.3·0.975 + 0.3·0.0 = 0.2 + 0.2925 = 0.4925
+    fn project_outer_body_dim2_reads_somatosensation_change() {
+        // P0.6-B re-grounding (Maker 2026-05-26, D-SPEC-104): somatosensation[2]
+        // reads ChangeBreathTracker's `somatosensation_change` (L2-computed) when
+        // present, with NO self-reference to last_body[2] — the legacy decay term
+        // was removed because the self-reference saturated the dim at ~0.5
+        // fleet-wide (audit 2026-05-25). Replaces the retired
+        // `project_outer_body_dim2_decay_pulls_toward_neutral` (the decay behaviour
+        // no longer exists).
         use rmpv::Value;
+        let map = Value::Map(vec![(
+            Value::String("outer_body_change".into()),
+            Value::Map(vec![(
+                Value::String("somatosensation_change".into()),
+                Value::F64(0.42),
+            )]),
+        )]);
         let mut payload = Vec::new();
-        rmpv::encode::write_value(&mut payload, &Value::Map(vec![])).unwrap();
-        let last_body = [0.0_f32, 0.0, 1.0, 0.0, 0.0];
-        let body = project_outer_body_5d(&payload, last_body).unwrap();
+        rmpv::encode::write_value(&mut payload, &map).unwrap();
+        // last_body[2] = 1.0 must NOT influence the result (decay term removed).
+        let body = project_outer_body_5d(&payload, [0.0_f32, 0.0, 1.0, 0.0, 0.0]).unwrap();
         assert!(
-            (body[2] - 0.4925).abs() < 1e-4,
-            "dim[2] with last_ob2=1.0 should be ~0.4925; got {}",
+            (body[2] - 0.42).abs() < 1e-3,
+            "dim[2] should read somatosensation_change=0.42 (last_body[2] ignored); got {}",
             body[2]
         );
     }
@@ -1269,18 +1283,18 @@ mod tests {
         ]);
         let mut bytes = Vec::new();
         rmpv::encode::write_value(&mut bytes, &payload).unwrap();
-        let last_body = [0.0_f32, 0.0, 0.6, 0.0, 0.0]; // dim[2] tracks
+        let last_body = [0.0_f32, 0.0, 0.6, 0.0, 0.0]; // last_body[2] no longer affects dim[2] (P0.6-B; decay term removed)
         let body = project_outer_body_5d(&bytes, last_body).unwrap();
 
-        // Hand-computed expected (D-SPEC-101 Phase-2):
-        //   d0 interoception = pi_heartbeat_hrv = 0.55
+        // Hand-computed expected:
+        //   d0 interoception = pi_heartbeat_hrv = 0.55                         (D-SPEC-101 Phase-2)
         //   helper_health = 2/3 ≈ 0.6667
-        //   d1 = 0.5·0.8 + 0.3·0.6667 + 0.2·0.6 = 0.72
-        //   ob2_decayed = 0.5 + (0.6 - 0.5)*0.95 = 0.595
-        //   d2 = 0.4·0.4 + 0.3·0.595 + 0.3·0.2 = 0.3985
-        //   d3 entropy = outer_body_change.entropy_change = 0.33
+        //   d1 proprioception (no change field → composite fallback) = 0.5·0.8 + 0.3·0.6667 + 0.2·0.6 = 0.72
+        //   d2 somatosensation (P0.6-B / D-SPEC-104, no change field → stateless fallback, no last_body):
+        //        0.6·tx_lat(0.4) + 0.4·cpu_spikes(0.2) = 0.32
+        //   d3 entropy = outer_body_change.entropy_change = 0.33               (D-SPEC-101 Phase-2 breath)
         //   d4 thermal = outer_body_change.thermal_change = 0.66
-        let expected = [0.55_f32, 0.72_f32, 0.3985_f32, 0.33_f32, 0.66_f32];
+        let expected = [0.55_f32, 0.72_f32, 0.32_f32, 0.33_f32, 0.66_f32];
         for i in 0..5 {
             assert!(
                 (body[i] - expected[i]).abs() < 1e-3,
