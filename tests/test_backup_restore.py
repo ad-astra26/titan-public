@@ -673,6 +673,42 @@ async def test_restore_full_streaming_fetch_to_file_path(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_restore_full_forwards_verify_patch_hash(tmp_path):
+    """restore_full forwards verify_patch_hash → apply_event_components. The
+    chained in-loop mirror rebuild (`_recover_mirror_to_latest`) passes False:
+    once each component tarball's sha256 is verified vs the manifest merkle_root
+    (INV-MBR-4), a stale pre-ed5f4d0c per-file `patch_bytes_sha256` is a
+    false-positive and must NOT hard-halt the rebuild (same ratified handling as
+    the sovereign restore, mainnet §R4 v0.4.6). Happy-path: the flag is accepted
+    and the restore is byte-identical."""
+    arweave = FakeArweave()
+    memos = FakeMemoStore()
+    manifest = UnifiedManifest("T1", base_dir=str(tmp_path))
+    p1 = b'{"epoch": 0, "mood": "neutral"}'
+    t1 = b"BLOCK0" * 8
+    e1 = _build_event(
+        titan_id="T1", event_id="e1", event_type="baseline",
+        prev_event_id=None, prev_event_merkle_root=None,
+        personality_files=[("state.json", _full(p1))],
+        timechain_files=[("chain.bin", _full(t1))],
+        soul_files=None,
+        arweave=arweave, memos=memos, tmp_path=tmp_path,
+        baseline_trigger="first_event",
+    )
+    manifest.append_event(e1)
+    target_dir = tmp_path / "restored"
+    result = await restore_full(
+        manifest=manifest, target_dir=str(target_dir),
+        arweave_fetch=arweave.download, memo_fetch=memos.fetch,
+        arc_to_target=_arc_to_target(str(target_dir)),
+        verify_patch_hash=False,  # the chained-reconstruction setting
+    )
+    assert result.status == "success", f"{result.halt_reason} {result.errors}"
+    assert (target_dir / "personality" / "state.json").read_bytes() == p1
+    assert (target_dir / "timechain" / "chain.bin").read_bytes() == t1
+
+
+@pytest.mark.asyncio
 async def test_restore_halts_on_tarball_hash_mismatch(tmp_path):
     """If a tarball's bytes don't match the manifest's recorded merkle_root,
     restore halts at HALT_TARBALL_HASH_MISMATCH on that event."""

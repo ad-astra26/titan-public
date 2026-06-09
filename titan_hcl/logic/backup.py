@@ -2582,7 +2582,18 @@ class RebirthBackup:
                 # handle; bytes are sha-verified vs the manifest, and the weekly
                 # §24.12 test does the full on-chain ZK walk (R4).
                 arweave_fetch_to_file=self._build_fetch_to_file(manifest),
-                verify_zk_chain=False)
+                verify_zk_chain=False,
+                # T1's baseline (560d, packed 2026-05-29) predates the ed5f4d0c
+                # copy-snapshot truncation-race fix (2026-05-31), so some per-file
+                # patch_bytes_sha256 / post-apply merkle values are STALE — the data
+                # is intact (the component tarball's sha256 IS verified above vs the
+                # manifest merkle_root, INV-MBR-4), but the per-file hash is a
+                # false-positive. Same situation the sovereign restore handles
+                # (mainnet §R4/INV-MBR-12, v0.4.6): downgrade per-file/post-apply
+                # mismatches to advisory once the component arc is verified. The
+                # xdelta3 baseline_merkle_root check STAYS strict (wrong source =
+                # garbage) — only the redundant per-file hashes go advisory.
+                verify_patch_hash=False)
             if result.status != "success":
                 logger.warning("[Backup] §24 Phase B recover: restore_full "
                                "status=%s halt=%s", result.status,

@@ -491,6 +491,7 @@ async def restore_full(
     *,
     target_event_id: Optional[str] = None,
     verify_zk_chain: bool = True,
+    verify_patch_hash: bool = True,
     progress_callback: Optional[Callable[[dict], None]] = None,
     arweave_fetch_to_file: Optional[Callable[[str, str], "Awaitable[bool]"]] = None,
 ) -> RestoreResult:
@@ -718,6 +719,7 @@ async def restore_full(
                         components={component: tmp},
                         target_dir=target_dir,
                         arc_to_target=arc_to_target,
+                        verify_patch_hash=verify_patch_hash,
                     )
                 except ValueError as e:
                     out.halt_reason = HALT_APPLY_FAILED
