@@ -4325,7 +4325,7 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                                 # closure scope-tight.
                                 _send_msg(
                                     send_queue, "CGN_TRANSITION", name, "cgn", {
-                                        "type": "outcome",
+                                        "type": "experience",  # (b) complete transition → record_experience → observe_for (DEFERRED G1)
                                         "consumer": "reasoning_strategy",
                                         "concept_id": _cgn_concept,
                                         "reward": float(_cgn_payload.get(

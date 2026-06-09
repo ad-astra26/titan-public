@@ -1517,7 +1517,9 @@ class MetaCGNConsumer:
         try:
             action_idx = PRIMITIVE_INDEX.get(primitive_id, 0)
             payload = {
+                "type": "experience",  # (b) complete transition → record_experience → observe_for (DEFERRED G1)
                 "consumer": CONSUMER_NAME,
+                "concept_id": primitive_id,  # meta grounds its primitive usage (stable concept_id for match + journey)
                 "state": state_vec.tolist() if isinstance(state_vec, np.ndarray)
                          else list(state_vec),
                 "action": int(action_idx),
