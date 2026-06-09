@@ -1059,6 +1059,19 @@ class TitanHCL:
                 ok = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: self.guardian.start(name))
                 result = {"ok": bool(ok), "module": name, "error": None}
+            elif action == "enable_module":
+                # Re-enable a DISABLED module (after a max_restarts escalation):
+                # Guardian.enable() clears the DISABLED state, resets the restart
+                # counters, and starts it. start_module/restart_module are BLOCKED
+                # by the DISABLED guard ("is disabled, not starting"), so a
+                # flap-disabled module was previously UN-recoverable via the API
+                # for ALL modules — only a full Titan restart cleared it. Closes
+                # the structural recovery gap (BUG-GUARDIAN-CONTROL-COMMANDS-ORPHAN
+                # family; 2026-06-09, surfaced by the backup flap incident).
+                name = inner.get("name")
+                ok = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.guardian.enable(name))
+                result = {"ok": bool(ok), "module": name, "error": None}
             elif action == "stop_module":
                 name = inner.get("name")
                 reason = inner.get("reason", "bus request")
