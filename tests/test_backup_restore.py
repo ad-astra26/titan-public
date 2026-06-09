@@ -530,6 +530,13 @@ async def test_synthetic_5deep_full_restore_byte_identical(tmp_path):
     assert (target_dir / "personality" / "state.json").read_bytes() == p5_state
     assert (target_dir / "timechain" / "chain.bin").read_bytes() == t5_chain
 
+    # ── Memory-bounded staging is cleaned up (2026-06-09 RSS-blowup fix):
+    #    each event stages its components to a sibling .restore_staging dir
+    #    one at a time, then deletes them — no scratch tarballs leak. ──────
+    assert not os.path.exists(str(target_dir) + ".restore_staging"), (
+        "restore_full leaked its per-event staging dir on success"
+    )
+
     # ── progress callback fired for each phase ──────────────────────
     phases = [p["phase"] for p in progress]
     assert phases[0] == "chain_selected"
@@ -572,6 +579,10 @@ async def test_restore_halts_on_tarball_hash_mismatch(tmp_path):
     assert result.halt_reason == HALT_TARBALL_HASH_MISMATCH
     assert result.halt_event_id == "e1"
     assert any(HALT_TARBALL_HASH_MISMATCH in err for err in result.errors)
+    # A halt mid-event must still reclaim the staging scratch (finally-cleanup).
+    assert not os.path.exists(str(target_dir) + ".restore_staging"), (
+        "restore_full leaked its staging dir on halt"
+    )
 
 
 @pytest.mark.asyncio

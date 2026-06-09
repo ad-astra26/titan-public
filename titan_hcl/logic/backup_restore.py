@@ -532,86 +532,147 @@ async def restore_full(
                 "total": len(chain),
             })
 
-        # Step 7 — fetch baseline+incrementals from Arweave
+        # Steps 7-9 — MEMORY-BOUNDED reconstruction (2026-06-09 RSS-blowup fix).
+        # The old path fetched ALL of an event's component tarballs into one dict
+        # at once, and the decrypting fetch made 2-3 copies of each — for the
+        # large components (DuckDB/FAISS baseline + the ~600MB salvage events)
+        # that peaked RSS at ~2.8GB inside the RSS-capped live BackupWorker → the
+        # guardian kill-loop that disabled chained reconstruction. We now stage
+        # each component to a temp file ONE AT A TIME (peak RSS ≈ a single
+        # component, not the whole event × copies), then apply from the staged
+        # files. verify-before-apply is preserved: per-component sha256 on the
+        # way in, event-Merkle + ZK on the manifest roots before any apply.
+        staging_dir = target_dir.rstrip(os.sep) + ".restore_staging"
+        os.makedirs(staging_dir, exist_ok=True)
+        staged: list[tuple[str, str]] = []  # (component, temp_path)
         try:
-            components = await fetch_event_components(arweave_fetch, event)
-        except RuntimeError as e:
-            out.halt_reason = HALT_TARBALL_FETCH_FAILED
-            out.halt_event_id = event_id
-            out.errors.append(str(e))
-            out.duration_s = time.time() - started
-            return out
+            # Step 7+8.a — fetch each component, sha-verify, stage to disk, free.
+            for component in ("personality", "timechain", "soul"):
+                sub = event.get(component)
+                if sub is None:
+                    continue
+                tx_id = sub.get("tx_id")
+                if not tx_id:
+                    out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                    out.halt_event_id = event_id
+                    out.errors.append(
+                        f"event {event_id!r} {component}.tx_id missing")
+                    out.duration_s = time.time() - started
+                    return out
+                try:
+                    data = await arweave_fetch(tx_id)
+                except Exception as e:
+                    out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                    out.halt_event_id = event_id
+                    out.errors.append(
+                        f"Arweave fetch failed for event {event_id!r} "
+                        f"{component} tx_id={tx_id!r}: {e}")
+                    out.duration_s = time.time() - started
+                    return out
+                if not isinstance(data, (bytes, bytearray)):
+                    out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                    out.halt_event_id = event_id
+                    out.errors.append(
+                        f"Arweave fetch for tx_id={tx_id!r} returned "
+                        f"{type(data).__name__}, expected bytes")
+                    out.duration_s = time.time() - started
+                    return out
+                data = bytes(data)
+                out.bytes_fetched += len(data)
+                # per-component sha256 vs the manifest (on the way in)
+                try:
+                    verify_component_merkle(event, component, data)
+                except ValueError as e:
+                    out.halt_reason = HALT_TARBALL_HASH_MISMATCH
+                    out.halt_event_id = event_id
+                    out.errors.append(str(e))
+                    out.duration_s = time.time() - started
+                    return out
+                tmp = os.path.join(staging_dir, f"{event_id}.{component}.tar")
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                staged.append((component, tmp))
+                del data  # free before fetching the next component (the bound)
 
-        out.bytes_fetched += sum(len(b) for b in components.values())
-
-        # Step 8.a — verify per-component sha256 against manifest
-        try:
-            for component, data in components.items():
-                verify_component_merkle(event, component, data)
-        except ValueError as e:
-            out.halt_reason = HALT_TARBALL_HASH_MISMATCH
-            out.halt_event_id = event_id
-            out.errors.append(str(e))
-            out.duration_s = time.time() - started
-            return out
-
-        # Step 8.b — recompose event_merkle_root from per-component hashes
-        try:
-            recomposed_root = verify_event_merkle(event, components)
-        except ValueError as e:
-            out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
-            out.halt_event_id = event_id
-            out.errors.append(str(e))
-            out.duration_s = time.time() - started
-            return out
-
-        # Step 8.c — verify the on-chain ZK memo matches the recomposed
-        # event_merkle_root + prev linkage
-        if verify_zk_chain:
+            # Step 8.b — recompose event_merkle_root. verify_event_merkle reads
+            # event[*].merkle_root (the manifest roots, already byte-verified
+            # above), NOT the tarball bytes — so an empty dict is correct here
+            # (each root is present, else verify_component_merkle had raised).
             try:
-                await verify_event_zk_commit(
-                    event=event,
-                    recomposed_event_merkle_root=recomposed_root,
-                    memo_fetch=memo_fetch,
-                    prev_event_merkle_root_for_check=prev_event_merkle_root,
-                )
-            except RuntimeError as e:
-                out.halt_reason = HALT_ZK_DISCONNECT
+                recomposed_root = verify_event_merkle(event, {})
+            except ValueError as e:
+                out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
                 out.halt_event_id = event_id
                 out.errors.append(str(e))
                 out.duration_s = time.time() - started
                 return out
-            except ValueError as e:
-                # Differentiate ZK_MEMO_MISMATCH vs EVENT_MERKLE_MISMATCH
-                # so the caller's bus event is precise.
-                msg = str(e)
-                if HALT_EVENT_MERKLE_MISMATCH in msg:
-                    out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
-                else:
-                    out.halt_reason = HALT_ZK_MEMO_MISMATCH
-                out.halt_event_id = event_id
-                out.errors.append(msg)
-                out.duration_s = time.time() - started
-                return out
 
-        # Step 9 — apply baseline / replay incrementals into target_dir
-        try:
-            apply_result = apply_event_components(
-                components=components,
-                target_dir=target_dir,
-                arc_to_target=arc_to_target,
-            )
-        except ValueError as e:
-            out.halt_reason = HALT_APPLY_FAILED
-            out.halt_event_id = event_id
-            out.errors.append(str(e))
-            out.duration_s = time.time() - started
-            return out
-        out.restored_files += apply_result["restored_files"]
-        out.warnings.extend(apply_result.get("warnings", []))
-        out.applied_events.append(event_id)
+            # Step 8.c — verify the on-chain ZK memo matches the recomposed
+            # event_merkle_root + prev linkage (BEFORE any apply).
+            if verify_zk_chain:
+                try:
+                    await verify_event_zk_commit(
+                        event=event,
+                        recomposed_event_merkle_root=recomposed_root,
+                        memo_fetch=memo_fetch,
+                        prev_event_merkle_root_for_check=prev_event_merkle_root,
+                    )
+                except RuntimeError as e:
+                    out.halt_reason = HALT_ZK_DISCONNECT
+                    out.halt_event_id = event_id
+                    out.errors.append(str(e))
+                    out.duration_s = time.time() - started
+                    return out
+                except ValueError as e:
+                    # Differentiate ZK_MEMO_MISMATCH vs EVENT_MERKLE_MISMATCH
+                    # so the caller's bus event is precise.
+                    msg = str(e)
+                    if HALT_EVENT_MERKLE_MISMATCH in msg:
+                        out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
+                    else:
+                        out.halt_reason = HALT_ZK_MEMO_MISMATCH
+                    out.halt_event_id = event_id
+                    out.errors.append(msg)
+                    out.duration_s = time.time() - started
+                    return out
 
-        prev_event_merkle_root = recomposed_root
+            # Step 9 — apply each staged component ONE AT A TIME (read → apply →
+            # free → delete), so peak stays at a single component during replay.
+            for component, tmp in staged:
+                with open(tmp, "rb") as f:
+                    tarball_bytes = f.read()
+                try:
+                    apply_result = apply_event_components(
+                        components={component: tarball_bytes},
+                        target_dir=target_dir,
+                        arc_to_target=arc_to_target,
+                    )
+                except ValueError as e:
+                    out.halt_reason = HALT_APPLY_FAILED
+                    out.halt_event_id = event_id
+                    out.errors.append(str(e))
+                    out.duration_s = time.time() - started
+                    return out
+                finally:
+                    tarball_bytes = None  # free before the next component
+                out.restored_files += apply_result["restored_files"]
+                out.warnings.extend(apply_result.get("warnings", []))
+            out.applied_events.append(event_id)
+
+            prev_event_merkle_root = recomposed_root
+        finally:
+            # Always reclaim the staged temp files (and the dir) — a halt mid-event
+            # must not leak hundreds of MB of scratch tarballs onto disk.
+            for _, tmp in staged:
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(staging_dir)
+            except OSError:
+                pass
 
         if progress_callback:
             progress_callback({
