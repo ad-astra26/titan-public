@@ -81,6 +81,92 @@ def regenerate_soul_md(
         return False
 
 
+def append_chronicle_entry(
+    entry_text: str,
+    *,
+    timestamp: Optional[str] = None,
+    title: str = "Soul Diary",
+    chronicle_path: str = CHRONICLE_PATH,
+    archive_path: Optional[str] = None,
+    max_entries: int = 50,
+    regenerate: bool = True,
+) -> None:
+    """Append one authored entry to ``titan_chronicles.md`` (the soul-spine).
+
+    Keeps a rolling window of ``max_entries`` (oldest archived to
+    ``data/history/soul_archive.md``), atomic-writes (tmp + fsync + os.replace,
+    SPEC §11.H.2 — the chronicle is critical identity data), then regenerates
+    ``titan.md`` from constitution + chronicle.
+
+    The authored ``entry_text`` replaces the retired band-string template
+    (``RFP_titan_authored_soul_diary`` §1.0 ④ / INV-SD-1). Ported from the
+    deleted ``plugin._append_to_chronicle``; the legacy split-on-``"\\n["``
+    double-counted the first entry's ``"["`` (a latent bug, never triggered
+    while delivery was dead) — normalized here. Sole caller = the
+    ``soul_diary_worker`` (the soul-file single-writer, INV-SD-6).
+    """
+    import os
+    import time
+
+    if timestamp is None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
+    if archive_path is None:
+        archive_path = os.path.join("data", "history", "soul_archive.md")
+    os.makedirs(os.path.dirname(archive_path) or ".", exist_ok=True)
+
+    new_block = f"[{timestamp}] {title}\n{entry_text.strip()}"
+
+    separator = "## The Scholar's Chronicle"
+    try:
+        with open(chronicle_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        content = "# Titan Chronicles\n"
+    if separator not in content:
+        content += f"\n\n{separator}\n"
+
+    header, chronicle = content.split(separator, 1)
+    chronicle = chronicle.strip()
+
+    # Parse existing entries into normalized blocks (each starts with one "[").
+    entries: list[str] = []
+    if chronicle:
+        for i, seg in enumerate(chronicle.split("\n[")):
+            seg = seg.strip()
+            if not seg:
+                continue
+            entries.append(seg if seg.startswith("[") else "[" + seg)
+
+    # Rolling window — archive the oldest beyond max_entries.
+    while len(entries) >= max_entries:
+        if not os.path.exists(archive_path):
+            with open(archive_path, "w", encoding="utf-8") as af:
+                af.write(
+                    "# Titan Soul Archive\n## Historical Records of the "
+                    "Sage's Growth\nArchived reflections moved from "
+                    "titan_chronicles.md to preserve cognitive efficiency.\n\n")
+        with open(archive_path, "a", encoding="utf-8") as af:
+            af.write(entries[0] + "\n\n")
+        entries = entries[1:]
+
+    entries.append(new_block)
+    rebuilt = "\n\n".join(entries)
+    new_content = f"{header.rstrip()}\n\n{separator}\n\n{rebuilt}\n"
+
+    tmp = chronicle_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, chronicle_path)
+
+    if regenerate:
+        regenerate_soul_md(chronicle_path=chronicle_path)
+    logger.info("[Soul] Appended chronicle entry '%s' (%d chars)%s",
+                title, len(entry_text),
+                " + regenerated titan.md" if regenerate else "")
+
+
 class SovereignSoul:
     """
     Manages the agent's digital identity and lineage through Metaplex Core NFTs.
