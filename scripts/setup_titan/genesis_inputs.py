@@ -106,12 +106,16 @@ def _collect_name(install_root: Path, state: dict, prompter: Prompter,
     else:
         default_name = (state.get("titan_id") or "Titan")
     if interactive:
-        name = prompter.until(
+        # `line` (not `until`) — it supports a default (Enter ⇒ default_name) and
+        # has no required `hint`. Post-validate: an empty / over-long entry falls
+        # back to the default (the name is ≤32 chars, anchored in the GenesisNFT).
+        name = prompter.line(
             "titan_name",
             f"Titan's name (≤{MAX_NAME_LEN} chars — anchored in the GenesisNFT)",
-            validate=lambda v: bool(v.strip()) and len(v.strip()) <= MAX_NAME_LEN,
             default=default_name,
         ).strip()
+        if not name or len(name) > MAX_NAME_LEN:
+            name = default_name
     else:
         name = default_name
     if not name or name == "YOUR_TITAN_NAME":
