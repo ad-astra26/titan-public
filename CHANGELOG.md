@@ -56,6 +56,25 @@ _(curate as you go; lifted into the next versioned section at release time)_
 
 ---
 
+## v0.0.9 — 2026-06-09 (pre-release)
+
+_Two install fixes found by running the real one-liner end-to-end on a bare box.
+Both blocked fresh installs and were masked in earlier testing (which bypassed the
+bootstrap or used non-interactive defaults)._
+
+### Fixed
+
+- **The `curl | bash` one-liner now works.** The bootstrap aborted immediately
+  (`BASH_SOURCE[0]: unbound variable`) when run the documented way — piped through
+  `curl` under shell strict-mode — before it could install anything. The headline
+  install command now runs end-to-end from a bare box.
+
+- **Interactive install no longer crashes at the "Titan's name" step.** Choosing a
+  name during a devnet/mainnet install (without `--default`) raised a `TypeError`.
+  Fixed — you can name your Titan interactively, with a sensible default.
+
+---
+
 ## v0.0.8 — 2026-06-09 (pre-release)
 
 _Quality-of-life release for installing and birthing a Titan. You can now install
