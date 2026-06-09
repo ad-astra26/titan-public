@@ -92,7 +92,12 @@ MODULE_NAME = "life_force"
 # mirrored to per-process SHM slot via ModuleStateWriter. Heartbeat
 # publishes to the SHM slot only once True so slot stays at
 # "starting"/"booted" during boot window.
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 # Cadence + lifecycle constants.
 _HEARTBEAT_INTERVAL_S = 10.0            # SPEC §10.B MODULE_HEARTBEAT_INTERVAL_S
@@ -157,7 +162,7 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
-    if state_writer is not None and _WORKER_READY:
+    if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
         try:
             state_writer.heartbeat()
         except Exception:  # noqa: BLE001 — never crash heartbeat
@@ -321,8 +326,9 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
 
     # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel
     # on every entry.
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     from titan_hcl.core.state_registry import (
         StateRegistryReader, ensure_shm_root, resolve_titan_id,

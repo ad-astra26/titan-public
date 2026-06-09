@@ -362,7 +362,12 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
 # dispatcher see real liveness rather than a boot-time "subscribed-but-
 # not-warm" lie. Flipped True only after plugin discovery + state load
 # complete.
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed,
+)
+
 _WORKER_READY: bool = False
+_BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 def _heartbeat_loop(send_queue, name: str,
@@ -380,7 +385,7 @@ def _heartbeat_loop(send_queue, name: str,
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian",
               {"ts": time.time()})
-        if state_writer is not None and _WORKER_READY:
+        if state_writer is not None and shm_heartbeat_allowed(_WORKER_READY, _BOOT_DEADLINE):
             try:
                 state_writer.heartbeat()
             except Exception:  # noqa: BLE001 — never crash the heartbeat
@@ -560,8 +565,9 @@ def health_monitor_worker_main(recv_queue, send_queue, name: str,
     """
     # Phase 11 §11.I.5 — reset module-level readiness sentinel for both
     # fork-mode (parent's True is inherited) and spawn-mode (fresh False).
-    global _WORKER_READY
+    global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
 
     # === BOILERPLATE: spawn-mode sys.path bootstrap ===
     project_root = os.path.normpath(
