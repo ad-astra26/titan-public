@@ -28,6 +28,13 @@ OLLAMA_DEFAULT_HOST = "http://localhost:11434"
 OPENROUTER_KEY_PREFIX = "sk-or-"
 SECRETS_PATH = Path.home() / ".titan" / "secrets.toml"
 
+# Headless supply (sibling to --directives-file): a scripted / CI / non-TTY
+# install can pick the provider + key without the interactive prompt.
+ENV_INFERENCE_PROVIDER = "TITAN_INFERENCE_PROVIDER"   # ollama_local|ollama_cloud|openrouter
+ENV_INFERENCE_KEY = "TITAN_INFERENCE_KEY"             # the hosted-provider API key
+HOSTED_PROVIDERS = ("ollama_cloud", "openrouter")
+INFERENCE_PROVIDERS = ("ollama_local",) + HOSTED_PROVIDERS
+
 
 # ── Ollama liveness / model probe ───────────────────────────────────────────
 
@@ -246,9 +253,51 @@ def _wire_cloud_key(install_root: Path, provider: str, key: str,
     return res
 
 
+def _resolve_inference_source(provider: str | None,
+                              key: str | None) -> tuple[str | None, str | None, str]:
+    """Resolve an explicitly-supplied (headless) inference provider + key.
+
+    Priority: the ``--inference-provider``/``--inference-key`` flags, then the
+    ``$TITAN_INFERENCE_PROVIDER``/``$TITAN_INFERENCE_KEY`` env. Returns
+    ``(provider, key, error)``:
+      - ``(provider, key, "")``  — a provider was supplied (key may be None for
+        ``ollama_local``); caller wires it non-interactively.
+      - ``(None, None, msg)``    — supplied but invalid; ``msg`` is the reason.
+      - ``(None, None, "")``     — nothing supplied (fall through to the prompt).
+    """
+    import os
+    prov = (provider or os.environ.get(ENV_INFERENCE_PROVIDER) or "").strip().lower()
+    k = key if key is not None else os.environ.get(ENV_INFERENCE_KEY)
+    if not prov:
+        return None, None, ""
+    if prov not in INFERENCE_PROVIDERS:
+        return None, None, (f"unknown inference provider {prov!r} "
+                            f"(expected one of {', '.join(INFERENCE_PROVIDERS)})")
+    if prov in HOSTED_PROVIDERS and not (k and k.strip()):
+        return None, None, (f"inference provider {prov!r} needs a key — pass "
+                            f"--inference-key or ${ENV_INFERENCE_KEY}.")
+    return prov, (k.strip() if k else None), ""
+
+
+def _wire_inference_noninteractive(install_root: Path, provider: str,
+                                   key: str | None, secrets_path: Path) -> list[Result]:
+    """Wire a headlessly-supplied provider (no prompt). ``ollama_local`` needs no
+    key; the hosted providers persist ``key`` to secrets.toml [inference]."""
+    if provider == "ollama_local":
+        res = _wire_local_ollama(install_root)
+        if not ollama_alive():
+            res.append(Result("inference_local", "warn",
+                              f"--inference-provider ollama_local set but no Ollama answered at "
+                              f"{OLLAMA_DEFAULT_HOST} — start it before the Titan needs to chat."))
+        return res
+    return _wire_cloud_key(install_root, provider, key, secrets_path)
+
+
 def run_inference_phase(*, default: bool, install_root: Path,
                         secrets_path: Path = SECRETS_PATH,
-                        prompter: Prompter | None = None) -> list[Result]:
+                        prompter: Prompter | None = None,
+                        provider: str | None = None,
+                        key: str | None = None) -> list[Result]:
     """Phase 4 — pick provider; secret keys → secrets.toml [inference], the
     (non-secret) provider/base_url/model selection → config.toml [inference].
 
@@ -265,6 +314,14 @@ def run_inference_phase(*, default: bool, install_root: Path,
     ``ollama_cloud_key`` (until).
     """
     prompter = prompter or StdinPrompter()
+
+    # ── headless supply: --inference-provider/--inference-key | env (authoritative) ──
+    prov, k, src_err = _resolve_inference_source(provider, key)
+    if src_err:
+        return [Result("inference", "fail", src_err)]
+    if prov:
+        return _wire_inference_noninteractive(install_root, prov, k, secrets_path)
+
     alive = ollama_alive()
     if alive:
         use_local = default or prompter.confirm(
