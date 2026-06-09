@@ -1692,12 +1692,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",  # Microkernel v2 §A.5 — L2 higher cognition (Language Teacher)
         entry_fn=language_worker_main,
         config=language_config,
-        # TEMPORARY WORKAROUND 2026-04-08: was 500MB, raised to 700MB to
-        # unblock T2/T3 boot which was hitting 516-530MB during init.
-        # Real fix needed — investigate WHY language worker grew past
-        # 500MB (vocab/embedding cache growth? leak? inefficient load?).
-        # See deferred task list in session log. REVERT after root-cause fix.
-        rss_limit_mb=700,
+        # 2026-06-09 (DEFERRED I-006 closed): reverted 700→500MB. The
+        # 2026-04-08 workaround raised it because T2/T3 boot hit 516-530MB
+        # during init; root cause was eager torch import, fixed by lazy-load
+        # (commit b351965, -178MB at language boot). Live steady-state
+        # language RSS = ~29MB (T1 verified 2026-06-09) ⟹ 500MB is the
+        # documented pre-workaround baseline with ample headroom.
+        rss_limit_mb=500,
         autostart=True,   # Language must be ready for SPEAK_REQUEST
         lazy=False,
         heartbeat_timeout=120.0,  # Teacher LLM calls can take 30s+
