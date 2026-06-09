@@ -512,9 +512,12 @@ def _drive_evaluate_all(
                     "[ExpressionWorker] strong_composition catalyst raised: "
                     "%s", _caterr)
 
-            # 5) Info log for non-SPEAK fires (matches legacy semantics).
+            # 5) Per-fire log for non-SPEAK fires. DEBUG, not INFO: this is a
+            # normal high-frequency operational event — at INFO it was a top
+            # /var/log filler on the shared box
+            # (BUG-EXPRESSION-OUTER-INFO-LOG-VERBOSITY-20260530).
             if composite_name != "SPEAK":
-                logger.info(
+                logger.debug(
                     "[EXPRESSION.%s] FIRED — urge=%.3f, helper=%s, "
                     "intensity=%.3f",
                     composite_name, urge, tf.get("action_helper", ""),
