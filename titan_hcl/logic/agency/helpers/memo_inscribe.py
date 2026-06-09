@@ -23,7 +23,7 @@ class MemoInscribeHelper:
     """Inscribe Titan's consciousness state on Solana blockchain."""
 
     def __init__(self, rpc_url: str = None, keypair_path: str = None,
-                 metabolism=None):
+                 metabolism=None, shm_reader_bank=None):
         # Read from merged config (config.toml + ~/.titan/secrets.toml) if not explicitly provided
         if rpc_url is None or keypair_path is None:
             try:
@@ -44,6 +44,11 @@ class MemoInscribeHelper:
         # memo gate + governance reserve protection. Optional (fail-open when
         # not injected, keeping helper independently testable).
         self._metabolism = metabolism
+        # shm_reader_bank — source the REAL current consciousness epoch
+        # (EPOCH_COUNTER SHM) when an action dispatch omits epoch_id, instead of
+        # defaulting to 0 (BUG-ANCHOR-STATE-MULTIWRITER-EPOCH-ZERO). Optional
+        # (fail-open → keeps the helper independently testable).
+        self._shm_reader_bank = shm_reader_bank
 
     @property
     def name(self) -> str:
@@ -127,7 +132,20 @@ class MemoInscribeHelper:
                 }
 
             # Build memo text
-            epoch_id = params.get("epoch_id", 0)
+            # epoch_id — the action dispatch (action_decoder / action_narrator /
+            # self_exploration_advisor) omits it, which left every live
+            # anchor_state.json at last_epoch_id=0
+            # (BUG-ANCHOR-STATE-MULTIWRITER-EPOCH-ZERO). Source the REAL current
+            # consciousness epoch from the EPOCH_COUNTER SHM slot (cheap G18 read,
+            # never raises) when the caller doesn't supply one.
+            epoch_id = int(params.get("epoch_id") or 0)
+            if not epoch_id and self._shm_reader_bank is not None:
+                try:
+                    _ep = self._shm_reader_bank.read_epoch()
+                    if _ep and _ep.get("epoch"):
+                        epoch_id = int(_ep["epoch"])
+                except Exception:
+                    pass
             state_hash = params.get("state_hash", "")
             if not state_hash and params.get("trinity_state"):
                 state_hash = hashlib.sha256(

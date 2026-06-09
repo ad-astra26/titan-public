@@ -880,7 +880,8 @@ class TitanHCL:
             # Mainnet Lifecycle Wiring rFP: inject metabolism for memo gate
             # + governance reserve guard.
             registry.register(MemoInscribeHelper(
-                metabolism=self._proxies.get("metabolism")))
+                metabolism=self._proxies.get("metabolism"),
+                shm_reader_bank=self._shm_reader_bank))
         except Exception as e:
             logger.warning("[TitanHCL] MemoInscribe helper failed: %s", e)
 
