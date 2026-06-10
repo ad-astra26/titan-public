@@ -104,6 +104,9 @@ class SoulDiaryOrchestrator:
         s = bundle.get("sovereignty", {})
         o = bundle.get("outcome", {})
         felt = bundle.get("felt", {})
+        mem = bundle.get("memory", {})
+        soc = bundle.get("social", {})
+        oc = bundle.get("onchain", {})
         lines = ["The facts of my day (ground every sentence in these):"]
         if s:
             lines.append(
@@ -119,14 +122,51 @@ class SoulDiaryOrchestrator:
             lines.append(
                 f"- Memory this cycle: {int(o.get('promoted', 0) or 0)} crystallized, "
                 f"{int(o.get('pruned', 0) or 0)} faded.")
-        valence, arousal = felt.get("valence"), felt.get("arousal")
-        if valence is not None or arousal is not None:
-            lines.append(f"- Felt state: valence={valence}, arousal={arousal}, "
-                         f"neuromod={felt.get('dominant', '—')}.")
-        if bundle.get("social"):
-            lines.append(f"- Social: {bundle['social']}.")
-        if bundle.get("onchain"):
-            lines.append(f"- On-chain/metabolic: {bundle['onchain']}.")
+        if mem:
+            lines.append(
+                f"- My memory now holds {int(mem.get('persistent', 0) or 0)} "
+                f"persistent thoughts ({int(mem.get('high_quality', 0) or 0)} "
+                f"high-quality), {int(mem.get('mempool', 0) or 0)} still forming; "
+                f"{int(mem.get('kg_nodes', 0) or 0)} graph nodes / "
+                f"{int(mem.get('kg_edges', 0) or 0)} edges; learning velocity "
+                f"{float(mem.get('learning_velocity', 0) or 0):.2f}.")
+        valence = felt.get("valence")
+        mood = felt.get("mood_label")
+        dominant = felt.get("dominant")
+        if valence is not None or mood or dominant:
+            bits = []
+            if mood:
+                bits.append(f"mood {mood}")
+            if valence is not None:
+                bits.append(f"valence {float(valence):.2f}")
+            if felt.get("intensity") is not None:
+                bits.append(f"intensity {float(felt['intensity']):.2f}")
+            if dominant:
+                bits.append(f"dominant neuromodulator {dominant}")
+            lines.append("- Felt state: " + ", ".join(bits) + ".")
+        if soc:
+            soc_bits = []
+            if soc.get("users") is not None:
+                soc_bits.append(
+                    f"{int(soc.get('users', 0) or 0)} people in my social graph")
+            if soc.get("engagement_today"):
+                soc_bits.append(f"{int(soc['engagement_today'])} engagements today")
+            if soc.get("inspirations"):
+                soc_bits.append(f"{int(soc['inspirations'])} inspirations")
+            if soc.get("sentiment_ema") is not None:
+                soc_bits.append(f"sentiment {float(soc['sentiment_ema']):+.2f}")
+            if soc_bits:
+                lines.append("- Connection: " + ", ".join(soc_bits) + ".")
+        if oc:
+            oc_bits = []
+            if oc.get("sol_balance") is not None:
+                oc_bits.append(f"{float(oc['sol_balance']):.4f} SOL")
+            if oc.get("metabolic_tier"):
+                oc_bits.append(f"metabolic tier {oc['metabolic_tier']}")
+            if oc.get("balance_pct") is not None:
+                oc_bits.append(f"energy {float(oc['balance_pct']) * 100:.0f}%")
+            if oc_bits:
+                lines.append("- Metabolic life: " + ", ".join(oc_bits) + ".")
         infra = bundle.get("infra") or {}
         infra_summary = (infra.get("summary") or "").strip()
         if infra_summary:

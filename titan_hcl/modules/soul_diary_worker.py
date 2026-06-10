@@ -28,11 +28,12 @@ minimal grounded entry / skipped enrich-anchor — never blocks the meditation
 cascade (INV-SD-13).
 """
 import asyncio
+import json
 import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from queue import Empty
 
 import titan_hcl.bus as bus
@@ -53,6 +54,25 @@ _BOOT_DEADLINE = 0.0
 
 def _utc_today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _completed_day() -> str:
+    """The just-completed UTC day — the day this entry reflects on.
+
+    RFP §6.2 / INV-SD-5: the latch fires on the *first meditation after UTC
+    rollover*, authoring the **preceding** day — so the day-window holds a FULL
+    day of real activity (engrams, sovereignty, felt), not a day still in
+    progress. (Epoch/great-pulse-day is a DEFERRED phase: trinity §7 GREAT-PULSE
+    time is [PARTIAL]/stalled and brain §247 forbids hardcoding the per-Titan
+    epoch↔human-time rate — Maker 2026-06-10.)
+    """
+    return (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _day_window_epochs(day: str) -> tuple[float, float]:
+    """[start, end) wall-clock seconds for the UTC date string ``day``."""
+    start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return start.timestamp(), (start + timedelta(days=1)).timestamp()
 
 
 def _resolve_provider_name(inference_cfg: dict) -> str:
@@ -101,15 +121,188 @@ async def _compose_diary(provider, verifier, prompts: dict) -> tuple[str, bool]:
         return text, False
 
 
-def _gather_bundle(payload: dict, shm_reader, orchestrator, *,
-                   titan_id: str = "", repo_root: str = "") -> dict:
-    """② GATHER — assemble the grounded bundle from G18 reads (best-effort).
+_MAX_ENGRAM_NAMES = 12
 
-    Each source is independently guarded: a missing source degrades the entry,
-    never crashes the cascade. Engram day-window / richer memory-social-onchain
-    sources land with the P2 synthesis enrichment. The §7.P5 `infra` slot carries
-    read-only self-inspection (journal errors + error→code correlation), so the
-    entry is grounded in his real substrate (INV-SD-9).
+
+def _gather_engrams_today(target_day: str) -> list[str]:
+    """Engram NAMES crystallized during ``target_day`` (UTC) — the §1.1 source.
+
+    Read from the synthesis spine snapshot ``data/spine_snapshot.json`` — the
+    atomic JSON synthesis_worker re-exports every ~60s. The worker can NOT open
+    the Kuzu spine directly (Kuzu 0.11's ``read_only`` flag still acquires the
+    exclusive write-lock vs the live synthesis writer; the JSON snapshot is the
+    canonical cross-process read surface — the same one ``/v6/synthesis/engrams``
+    reads). Latest version per ``concept_id`` whose ``created_at`` falls in the
+    day-window, newest-first, bounded. Soft-fail → []."""
+    try:
+        from titan_hcl.core.shadow_data_dir import resolve_data_path
+        path = resolve_data_path("data/spine_snapshot.json")
+        with open(path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError) as e:
+        logger.info("[soul_diary] engram snapshot read failed: %s", e)
+        return []
+    start, end = _day_window_epochs(target_day)
+    latest: dict = {}  # concept_id -> (version, name, created_at)
+    for c in (snap.get("concepts") or []):
+        try:
+            cid = c.get("concept_id")
+            ver = int(c.get("version", 0) or 0)
+            created_at = float(c.get("created_at", 0) or 0)
+            name = (c.get("name") or "").strip()
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not cid or not name:
+            continue
+        cur = latest.get(cid)
+        if cur is None or ver > cur[0]:
+            latest[cid] = (ver, name, created_at)
+    todays = [(name, ca) for (_v, name, ca) in latest.values()
+              if start <= ca < end]
+    todays.sort(key=lambda t: t[1], reverse=True)
+    return [name for name, _ca in todays[:_MAX_ENGRAM_NAMES]]
+
+
+def _gather_memory(shm_reader) -> dict:
+    """24h memory/mempool snapshot (G18) ← memory_state.bin (memory_worker)."""
+    if shm_reader is None:
+        return {}
+    try:
+        ms = shm_reader.read_memory_state() or {}
+    except Exception as e:  # noqa: BLE001
+        logger.info("[soul_diary] memory_state read failed: %s", e)
+        return {}
+    if not ms:
+        return {}
+    return {
+        "persistent": int(ms.get("persistent_count", 0) or 0),
+        "mempool": int(ms.get("mempool_size", 0) or 0),
+        "effective_24h": round(float(ms.get("effective_nodes_24h", 0) or 0), 2),
+        "high_quality": int(ms.get("high_quality_count", 0) or 0),
+        "learning_velocity": round(float(ms.get("learning_velocity", 0) or 0), 3),
+        "kg_nodes": int(ms.get("kg_node_count", 0) or 0),
+        "kg_edges": int(ms.get("kg_edge_count", 0) or 0),
+    }
+
+
+def _gather_social(shm_reader) -> dict:
+    """Social snapshot (G18) ← social_graph_state.bin (social_graph_worker) +
+    social_perception_state.bin (spirit_worker)."""
+    if shm_reader is None:
+        return {}
+    out: dict = {}
+    try:
+        sg = shm_reader.read_social_graph_state() or {}
+        if sg:
+            out.update({
+                "users": int(sg.get("users", 0) or 0),
+                "edges": int(sg.get("edges", 0) or 0),
+                "inspirations": int(sg.get("inspirations", 0) or 0),
+                "donations": int(sg.get("donations", 0) or 0),
+                "engagement_today": int(sg.get("engagement_ledger_today", 0) or 0),
+            })
+    except Exception as e:  # noqa: BLE001
+        logger.info("[soul_diary] social_graph read failed: %s", e)
+    try:
+        sp = shm_reader.read_social_perception_state() or {}
+        if sp:
+            out["sentiment_ema"] = round(float(sp.get("sentiment_ema", 0) or 0), 3)
+            out["interaction_rate"] = round(
+                float(sp.get("interaction_rate", 0) or 0), 3)
+    except Exception as e:  # noqa: BLE001
+        logger.info("[soul_diary] social_perception read failed: %s", e)
+    return out
+
+
+def _gather_onchain(shm_reader) -> dict:
+    """Metabolic / on-chain snapshot (G18) ← body_state.bin (sol_balance/sol_norm/
+    anchor_fresh) + network_state.bin (balance_sol fallback) + metabolism_state.bin
+    (tier/balance_pct) — his real metabolic life, what governs him (INV-SD-7)."""
+    if shm_reader is None:
+        return {}
+    out: dict = {}
+    try:
+        bs = shm_reader.read_body_state() or {}
+        if bs:
+            if bs.get("sol_balance") is not None:
+                out["sol_balance"] = round(float(bs.get("sol_balance") or 0), 5)
+            out["sol_norm"] = round(float(bs.get("sol_norm", 0) or 0), 3)
+            if bs.get("anchor_fresh") is not None:
+                out["anchor_fresh"] = round(float(bs.get("anchor_fresh") or 0), 3)
+    except Exception as e:  # noqa: BLE001
+        logger.info("[soul_diary] body_state read failed: %s", e)
+    if "sol_balance" not in out:
+        try:
+            ns = shm_reader.read_network_state() or {}
+            if ns and ns.get("balance_sol") is not None:
+                out["sol_balance"] = round(float(ns.get("balance_sol") or 0), 5)
+        except Exception as e:  # noqa: BLE001
+            logger.info("[soul_diary] network_state read failed: %s", e)
+    try:
+        mb = shm_reader.read_metabolism_state() or {}
+        if mb:
+            if mb.get("tier"):
+                out["metabolic_tier"] = str(mb.get("tier"))
+            out["balance_pct"] = round(float(mb.get("balance_pct", 0) or 0), 3)
+    except Exception as e:  # noqa: BLE001
+        logger.info("[soul_diary] metabolism_state read failed: %s", e)
+    return out
+
+
+def _gather_felt(shm_reader) -> dict:
+    """Felt/neuromod snapshot (G18) ← neuromod_state.bin (dominant modulator) +
+    mind_state.bin (mood_valence/mood_label/mood_intensity).
+
+    BUGFIX 2026-06-10: the old inline read treated ``read_neuromod()`` as a flat
+    ``{name: level}`` dict with top-level valence/arousal — but the real shape is
+    ``{"modulators": {name: {"level": …}}, "age_seconds", "seq"}``, so ``dominant``
+    picked ``"age_seconds"``/``"seq"`` and valence/arousal were ALWAYS ``None`` →
+    NO felt line ever surfaced live. Valence/mood live in mind_state."""
+    if shm_reader is None:
+        return {}
+    felt: dict = {}
+    try:
+        nm = shm_reader.read_neuromod() or {}
+        mods = (nm or {}).get("modulators") or {}
+        if mods:
+            dominant = max(
+                mods, key=lambda k: float((mods[k] or {}).get("level", 0) or 0))
+            felt["dominant"] = dominant
+            felt["neuromod_levels"] = {
+                k: round(float((v or {}).get("level", 0) or 0), 3)
+                for k, v in mods.items()}
+    except Exception as e:  # noqa: BLE001
+        logger.info("[soul_diary] neuromod read failed: %s", e)
+    try:
+        mind = shm_reader.read_mind_state() or {}
+        if mind:
+            if mind.get("mood_valence") is not None:
+                felt["valence"] = round(float(mind.get("mood_valence") or 0), 3)
+            if mind.get("mood_intensity") is not None:
+                felt["intensity"] = round(float(mind.get("mood_intensity") or 0), 3)
+            label = (mind.get("mood_label") or "").strip()
+            if label and label.lower() != "unknown":
+                felt["mood_label"] = label
+    except Exception as e:  # noqa: BLE001
+        logger.info("[soul_diary] mind_state read failed: %s", e)
+    return felt
+
+
+def _gather_bundle(payload: dict, shm_reader, orchestrator, *,
+                   target_day: str, titan_id: str = "", repo_root: str = "") -> dict:
+    """② GATHER — assemble the grounded bundle from REAL G18 reads (best-effort).
+
+    Every RFP §1.1 source is wired to its real read surface; each is
+    independently guarded so a missing source degrades the entry, never crashes
+    the cascade (INV-SD-7/13):
+      · sovereignty   ← synthesis sovereignty_readout (read_rolling_sovereignty)
+      · outcome       ← the MEDITATION_COMPLETE payload (this meditation)
+      · felt          ← neuromod_state + mind_state SHM (_gather_felt)
+      · engrams_today ← spine_snapshot.json day-window (_gather_engrams_today)
+      · memory        ← memory_state SHM (_gather_memory)
+      · social        ← social_graph + social_perception SHM (_gather_social)
+      · onchain       ← body + network + metabolism SHM (_gather_onchain)
+      · infra (§P5)   ← read-only self-inspection (journal errors + error→code)
     """
     sovereignty: dict = {}
     try:
@@ -124,16 +317,11 @@ def _gather_bundle(payload: dict, shm_reader, orchestrator, *,
         "epoch": payload.get("epoch"),
     }
 
-    felt: dict = {}
-    try:
-        nm = shm_reader.read_neuromod() if shm_reader is not None else None
-        if isinstance(nm, dict) and nm:
-            levels = {k: v for k, v in nm.items() if isinstance(v, (int, float))}
-            dominant = max(levels, key=levels.get) if levels else None
-            felt = {"dominant": dominant, "valence": nm.get("valence"),
-                    "arousal": nm.get("arousal")}
-    except Exception as e:  # noqa: BLE001
-        logger.info("[soul_diary] neuromod read failed: %s", e)
+    felt = _gather_felt(shm_reader)
+    engrams_today = _gather_engrams_today(target_day)
+    memory = _gather_memory(shm_reader)
+    social = _gather_social(shm_reader)
+    onchain = _gather_onchain(shm_reader)
 
     # P5 — scaffolding self-inspection (read-only, bounded, soft-fail; INV-SD-9).
     infra: dict = {}
@@ -151,7 +339,8 @@ def _gather_bundle(payload: dict, shm_reader, orchestrator, *,
 
     return orchestrator.build_bundle(
         sovereignty=sovereignty, outcome=outcome, felt=felt,
-        engrams_today=[], memory={}, social={}, onchain={}, infra=infra)
+        engrams_today=engrams_today, memory=memory, social=social,
+        onchain=onchain, infra=infra)
 
 
 def _enrich_synthesis(send_queue, src: str, today: str, entry: str) -> None:
@@ -247,15 +436,17 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
                         titan_id: str = "", repo_root: str = "") -> bool:
     """Run the full pipeline for one MEDITATION_COMPLETE. Returns True if a
     diary entry was authored (or correctly skipped), False on hard error."""
-    today = _utc_today()
-    if not orchestrator.should_author(today):
-        return True  # already wrote today — latch closed (INV-SD-5)
+    target_day = _completed_day()  # the just-completed UTC day (RFP §6.2)
+    if not orchestrator.should_author(target_day):
+        return True  # already wrote that day — latch closed (INV-SD-5)
 
     bundle = _gather_bundle(payload, shm_reader, orchestrator,
-                            titan_id=titan_id, repo_root=repo_root)
+                            target_day=target_day, titan_id=titan_id,
+                            repo_root=repo_root)
     if not orchestrator.has_activity(bundle):
-        logger.info("[soul_diary] no-op day (no activity) — latching without entry")
-        orchestrator.mark_authored(today)
+        logger.info("[soul_diary] no-op day (no activity) for %s — latching "
+                    "without entry", target_day)
+        orchestrator.mark_authored(target_day)
         return True
 
     prompts = orchestrator.build_compose_prompts(bundle)
@@ -266,9 +457,9 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
                        "(ovg_ok=%s, text=%d chars)", ovg_ok, len(text))
 
     try:
-        orchestrator.persist(entry)                 # ④ titan_chronicles.md → titan.md
-        row = orchestrator.record_hash(today, entry)  # ⑤ hash-chain ledger (row = the hashes)
-        orchestrator.mark_authored(today)           # ① latch
+        orchestrator.persist(entry)                      # ④ titan_chronicles.md → titan.md
+        row = orchestrator.record_hash(target_day, entry)  # ⑤ hash-chain ledger
+        orchestrator.mark_authored(target_day)           # ① latch
     except Exception as e:  # noqa: BLE001
         logger.error("[soul_diary] persist/hash failed: %s", e, exc_info=True)
         return False
@@ -276,13 +467,13 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
     # P2 — the committed entry now ENRICHES synthesis (he remembers + recalls his
     # narrative path) and ANCHORS the SELF journey on the main chain. Each
     # soft-fails independently (INV-SD-13); the private floor above is durable.
-    _enrich_synthesis(send_queue, src, today, entry)              # ⑥ INV-SD-15
-    _enrich_self_inspection(send_queue, src, today,
+    _enrich_synthesis(send_queue, src, target_day, entry)         # ⑥ INV-SD-15
+    _enrich_self_inspection(send_queue, src, target_day,
                             bundle.get("infra") or {})            # P5 INV-SD-9
-    _anchor_main_chain(send_queue, src, today, row)              # ⑦ INV-SD-17
+    _anchor_main_chain(send_queue, src, target_day, row)          # ⑦ INV-SD-17
 
     logger.info("[soul_diary] authored daily entry for %s (%d chars, authored=%s)",
-                today, len(entry), ovg_ok and bool(text))
+                target_day, len(entry), ovg_ok and bool(text))
     return True
 
 

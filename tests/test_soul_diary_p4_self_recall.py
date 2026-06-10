@@ -60,8 +60,9 @@ def self_graph():
 # ── gating ──────────────────────────────────────────────────────────
 
 def test_self_granularity_without_kuzu_reader_returns_none():
-    """No kuzu_reader → caller falls back (same contract as concept granularity;
-    the agno chat path has kuzu_reader=None today)."""
+    """No kuzu_reader → caller falls back (same contract as concept granularity).
+    The agno chat path now wires a SnapshotSpineReader (P4 chat-exposure) — see
+    tests/test_spine_snapshot_reader.py for the chat-path proof."""
     assert _engine(None).recall("who am i", granularity="self") is None
 
 
