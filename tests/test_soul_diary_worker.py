@@ -40,6 +40,20 @@ def _verifier(passed):
 _PROMPTS = {"system_prompt": "s", "user_prompt": "u"}
 
 
+def test_resolve_provider_name_reads_canonical_key():
+    # BUGFIX 2026-06-10: the canonical config key is `inference_provider`; reading
+    # `provider` (the old bug) always fell back to 402-dead venice → minimal entries.
+    assert sdw._resolve_provider_name(
+        {"inference_provider": "ollama_cloud"}) == "ollama_cloud"
+    # inference_provider wins over a legacy `provider` alias.
+    assert sdw._resolve_provider_name(
+        {"inference_provider": "ollama_cloud", "provider": "venice"}) == "ollama_cloud"
+    # legacy alias still honored when canonical absent.
+    assert sdw._resolve_provider_name({"provider": "custom"}) == "custom"
+    # last-resort default.
+    assert sdw._resolve_provider_name({}) == "venice"
+
+
 def test_compose_pass():
     text, ok = asyncio.run(sdw._compose_diary(_FakeProvider("authored entry"),
                                               _verifier(True), _PROMPTS))

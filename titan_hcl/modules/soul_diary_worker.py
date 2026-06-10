@@ -55,6 +55,20 @@ def _utc_today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _resolve_provider_name(inference_cfg: dict) -> str:
+    """The configured inference provider for the worker's own LLM call.
+
+    Canonical config key = ``inference_provider`` (``config.toml [inference]``);
+    ``provider`` accepted as a legacy alias; ``"venice"`` last-resort.
+    BUGFIX 2026-06-10: previously read only ``provider`` (the WRONG key), so it
+    always fell back to ``"venice"`` — which is 402-dead on the fleet — and every
+    diary entry soft-fell to the minimal grounded template instead of an authored
+    reflection. Reading the real key lets the diary use the live provider
+    (e.g. ``ollama_cloud``)."""
+    return (inference_cfg.get("inference_provider")
+            or inference_cfg.get("provider") or "venice")
+
+
 async def _compose_diary(provider, verifier, prompts: dict) -> tuple[str, bool]:
     """The worker's OWN grounded-compose + OVG (§1.0 ③, self-contained).
 
@@ -309,7 +323,7 @@ def soul_diary_worker_main(recv_queue, send_queue, name: str,
     provider = None
     try:
         inference_cfg = full_config.get("inference", {}) or {}
-        provider_name = inference_cfg.get("provider", "venice")
+        provider_name = _resolve_provider_name(inference_cfg)
         from titan_hcl.inference import get_provider
         provider = get_provider(provider_name, inference_cfg)
         logger.info("[soul_diary] inference provider=%s", provider_name)
