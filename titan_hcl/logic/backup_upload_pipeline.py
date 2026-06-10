@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Iterable, Optional
 
 from titan_hcl.logic import diff_encoders
+from titan_hcl.logic.backup_sqlite_snapshot import prepare_sqlite_snapshot
 from titan_hcl.logic.backup_event_tarball import (
     FileDiffSpec,
     pack_event_tarball,
@@ -161,19 +162,54 @@ class MissingDiffBaseError(RuntimeError):
     the legitimate per-file full-ship at `_build_incremental_payload`."""
 
 
+def _settle_source_snapshot(snap: Optional[str], dd: dict) -> None:
+    """Resolve the lifecycle of a SQLite source snapshot relative to the encode
+    result (§24.5.a). The consistent image is either:
+      • the full-ship PAYLOAD itself (`patch_path == snap`, e.g. a baseline `.db`
+        or the no-baseline fallback) → mark `patch_owned` so pack unlinks it; or
+      • a transient diff INPUT (xdelta3 read it to make a `.vcdiff`,
+        `patch_path != snap`) → unlink it now (the `.vcdiff` is what gets packed).
+    """
+    if snap is None:
+        return
+    if dd.get("patch_path") == snap:
+        dd["patch_owned"] = True
+    else:
+        try:
+            os.unlink(snap)
+        except OSError:
+            pass
+
+
 def _build_full_payload(spec: TierFileSpec) -> dict:
     """For baseline events: full-ship every in-scope file as its raw bytes.
 
     The encoder dispatch decides which module's encode_diff actually runs;
     diff_encoders.encode_diff with baseline_path=None produces a full
     payload using the appropriate encoder.
+
+    §24.5.a / INV-BR-11: a live SQLite source is first captured as a
+    transactionally-consistent online-backup image (`prepare_sqlite_snapshot`);
+    the encode + Merkle then run over that image, never the live DB.
     """
     if not os.path.exists(spec.source_path):
         return None
-    return diff_encoders.encode_diff(
-        current_path=spec.source_path, baseline_path=None,
-        format_hint=spec.format_hint,
-    )
+    snap = prepare_sqlite_snapshot(spec.source_path)
+    src = snap or spec.source_path
+    try:
+        dd = diff_encoders.encode_diff(
+            current_path=src, baseline_path=None,
+            format_hint=spec.format_hint,
+        )
+    except Exception:
+        if snap is not None:
+            try:
+                os.unlink(snap)
+            except OSError:
+                pass
+        raise
+    _settle_source_snapshot(snap, dd)
+    return dd
 
 
 def _build_incremental_payload(spec: TierFileSpec,
@@ -188,42 +224,66 @@ def _build_incremental_payload(spec: TierFileSpec,
     """
     if not os.path.exists(spec.source_path):
         return None
-    if baseline_file_path is None or not os.path.exists(baseline_file_path):
-        # No baseline available — full-ship as fallback (will produce
-        # diff_mode="full" inside the encoder)
-        return diff_encoders.encode_diff(
-            current_path=spec.source_path, baseline_path=None,
+    # §24.5.a / INV-BR-11: capture a live SQLite source as a consistent
+    # online-backup image FIRST, so the skip-hash, the encode, and the Merkle
+    # all read the SAME transactionally-consistent bytes (no TOCTOU between the
+    # §24.6 hash and the packed bytes). `src` is the image when SQLite, else the
+    # live source (unchanged behaviour for .json/.bin/.faiss).
+    snap = prepare_sqlite_snapshot(spec.source_path)
+    src = snap or spec.source_path
+    try:
+        if baseline_file_path is None or not os.path.exists(baseline_file_path):
+            # No baseline available — full-ship as fallback (will produce
+            # diff_mode="full" inside the encoder)
+            dd = diff_encoders.encode_diff(
+                current_path=src, baseline_path=None,
+                format_hint=spec.format_hint,
+            )
+            _settle_source_snapshot(snap, dd)
+            return dd
+        # Cheap content-hash check: skip if unchanged
+        cur_hash = diff_encoders.file_merkle_root(src)
+        base_hash = diff_encoders.file_merkle_root(baseline_file_path)
+        if cur_hash == base_hash:
+            # Phase 5 (2026-05-19) — STREAMING refactor: "skipped" diff_dicts
+            # carry an empty patch via patch_path pointing at /dev/null-equivalent
+            # (we just use a 0-byte temp file so pack_event_tarball treats it
+            # uniformly). The metadata schema records diff_mode="skipped" +
+            # merkle_root so restore can detect the skip and walk back to the
+            # most recent event that DID ship the file.
+            import tempfile as _tf
+            size = os.path.getsize(src)
+            with _tf.NamedTemporaryFile(
+                suffix=".skip.bin", delete=False
+            ) as _f:
+                empty_path = _f.name
+            if snap is not None:
+                try:
+                    os.unlink(snap)  # unchanged → the consistent image isn't needed
+                except OSError:
+                    pass
+            return {
+                "diff_mode": "skipped",
+                "patch_path": empty_path,
+                "patch_owned": True,
+                "patch_size_bytes": 0,
+                "merkle_root": cur_hash,
+                "size_bytes": size,
+                "encoder": (spec.format_hint or "full_ship"),
+            }
+        dd = diff_encoders.encode_diff(
+            current_path=src, baseline_path=baseline_file_path,
             format_hint=spec.format_hint,
         )
-    # Cheap content-hash check: skip if unchanged
-    cur_hash = diff_encoders.file_merkle_root(spec.source_path)
-    base_hash = diff_encoders.file_merkle_root(baseline_file_path)
-    if cur_hash == base_hash:
-        # Phase 5 (2026-05-19) — STREAMING refactor: "skipped" diff_dicts
-        # carry an empty patch via patch_path pointing at /dev/null-equivalent
-        # (we just use a 0-byte temp file so pack_event_tarball treats it
-        # uniformly). The metadata schema records diff_mode="skipped" +
-        # merkle_root so restore can detect the skip and walk back to the
-        # most recent event that DID ship the file.
-        import tempfile as _tf
-        size = os.path.getsize(spec.source_path)
-        with _tf.NamedTemporaryFile(
-            suffix=".skip.bin", delete=False
-        ) as _f:
-            empty_path = _f.name
-        return {
-            "diff_mode": "skipped",
-            "patch_path": empty_path,
-            "patch_owned": True,
-            "patch_size_bytes": 0,
-            "merkle_root": cur_hash,
-            "size_bytes": size,
-            "encoder": (spec.format_hint or "full_ship"),
-        }
-    return diff_encoders.encode_diff(
-        current_path=spec.source_path, baseline_path=baseline_file_path,
-        format_hint=spec.format_hint,
-    )
+        _settle_source_snapshot(snap, dd)
+        return dd
+    except Exception:
+        if snap is not None:
+            try:
+                os.unlink(snap)
+            except OSError:
+                pass
+        raise
 
 
 def _extract_block_ranges(file_diffs: list[tuple[str, dict]]) -> dict:

@@ -524,6 +524,47 @@ class InnerMemoryWriterClient:
         while self._pending and time.time() < deadline:
             time.sleep(0.05)
 
+    async def asnapshot(self, dest_path: str, *, timeout: float = 300.0) -> bool:
+        """Ask the IMW daemon to write a consistent SQLite online backup of its
+        owned DB to `dest_path` (RFP_backup_redesign_spine A.0 — the backup
+        DiffEngine's snapshot path for IMW-owned DBs: the single writer owns the
+        consistent image; self-written DBs use the engine's own read-only conn).
+
+        Returns True on success. Returns False when this client has no live IMW
+        daemon (disabled / direct mode) — the caller must then fall back to a
+        direct read-conn backup. Raises WriterError on a daemon NAK.
+
+        `_submit_and_wait` is a blocking cross-loop call (it schedules onto the
+        client's dedicated loop via run_coroutine_threadsafe); run it off the
+        CALLER's event loop with to_thread, exactly like `awrite` does for the
+        IMW route, so the async DiffEngine is never blocked on sync IPC.
+        """
+        if self._closed:
+            raise WriterError("client closed")
+        if not self._cfg.enabled or self._cfg.mode == "disabled":
+            return False
+        req = WriteRequest.new_snapshot(caller=self._caller, dest_path=dest_path)
+        resp = await asyncio.to_thread(self._submit_and_wait, req, timeout)
+        if not resp.ok:
+            raise WriterError(f"IMW snapshot failed: {resp.error}")
+        return True
+
+    def snapshot(self, dest_path: str, *, timeout: float = 300.0) -> bool:
+        """Sync variant of `asnapshot` (the live sync build path — `build_tier`
+        and the god-class run snapshot on the stager thread, not an event loop).
+        Mirrors `ping`: a direct `_submit_and_wait` (itself thread-safe — it
+        schedules onto the client's dedicated loop). Returns False when there is
+        no live IMW daemon; raises WriterError on a daemon NAK."""
+        if self._closed:
+            raise WriterError("client closed")
+        if not self._cfg.enabled or self._cfg.mode == "disabled":
+            return False
+        req = WriteRequest.new_snapshot(caller=self._caller, dest_path=dest_path)
+        resp = self._submit_and_wait(req, timeout=timeout)
+        if not resp.ok:
+            raise WriterError(f"IMW snapshot failed: {resp.error}")
+        return True
+
     # ── direct path (legacy / fallback) ──────────────────────────────
 
     def _route_direct(self, sql: str, params: Any) -> WriteResult:
