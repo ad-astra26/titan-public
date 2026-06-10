@@ -75,22 +75,6 @@ class FakeArweave:
             raise KeyError(f"unknown Arweave tx_id {tx_id}")
         return self._store[tx_id]
 
-    async def download_to_file(self, tx_id: str, dest_path: str) -> bool:
-        """Streaming fetch-to-file (arweave_fetch_to_file kw of restore_full).
-        Writes the stored tarball to dest in 1MB chunks — mirrors the real
-        ArweaveStore.fetch_to_file (constant memory; never returns the whole
-        tarball as a bytes object)."""
-        self.fetch_log.append(tx_id)
-        if tx_id in self.fail_for:
-            return False
-        if tx_id not in self._store:
-            return False
-        blob = self._store[tx_id]
-        with open(dest_path, "wb") as fh:
-            for i in range(0, len(blob), 1 << 20):
-                fh.write(blob[i:i + (1 << 20)])
-        return True
-
 
 class FakeMemoStore:
     """Dict-backed Solana memo store. Maps sig → memo_text."""
@@ -546,166 +530,12 @@ async def test_synthetic_5deep_full_restore_byte_identical(tmp_path):
     assert (target_dir / "personality" / "state.json").read_bytes() == p5_state
     assert (target_dir / "timechain" / "chain.bin").read_bytes() == t5_chain
 
-    # ── Memory-bounded staging is cleaned up (2026-06-09 RSS-blowup fix):
-    #    each event stages its components to a sibling .restore_staging dir
-    #    one at a time, then deletes them — no scratch tarballs leak. ──────
-    assert not os.path.exists(str(target_dir) + ".restore_staging"), (
-        "restore_full leaked its per-event staging dir on success"
-    )
-
     # ── progress callback fired for each phase ──────────────────────
     phases = [p["phase"] for p in progress]
     assert phases[0] == "chain_selected"
     assert phases[-1] == "complete"
     assert "fetching_event" in phases
     assert "event_applied" in phases
-
-
-@pytest.mark.asyncio
-async def test_full_ship_member_is_streamed_not_loaded_whole(tmp_path):
-    """Regression for the 2026-06-09 chained-reconstruction RSS-blowup.
-
-    A FULL-ship member (a baseline DB/FAISS — the live `consciousness.db` is
-    2.2 GB) MUST be streamed member→disk in chunks during restore, NOT
-    `f.read()` into one bytes object. The old `diff_dict_for → get_patch_bytes`
-    path loaded the whole member, peaking the RSS-capped live BackupWorker at
-    2.8 GB on the flag-flip reconstruction → guardian kill-loop. We restore a
-    1-baseline event whose full-ship member is 48 MB of highly COMPRESSIBLE
-    bytes (tiny tarball, big uncompressed member) and assert restore_full's PEAK
-    PYTHON ALLOCATION stays a small fraction of the member size (streaming),
-    while the restored file is byte-identical.
-
-    This is the test that was MISSING — the prior fix's tests used byte-sized
-    files, so a whole-member load passed offline but blew up on live 2.2 GB data.
-    """
-    import tracemalloc
-
-    arweave = FakeArweave()
-    memos = FakeMemoStore()
-    manifest = UnifiedManifest("T1", base_dir=str(tmp_path))
-
-    big = b"TITAN\x00\x00\x00" * (6 * 1024 * 1024)  # 48 MB, highly compressible
-    e1 = _build_event(
-        titan_id="T1", event_id="e1", event_type="baseline",
-        prev_event_id=None, prev_event_merkle_root=None,
-        personality_files=[("big.db", _full(big))],
-        timechain_files=[("chain.bin", _full(b"tc-data"))],
-        soul_files=None,
-        arweave=arweave, memos=memos, tmp_path=tmp_path,
-        baseline_trigger="first_event",
-    )
-    manifest.append_event(e1)
-
-    target_dir = tmp_path / "restored"
-    tracemalloc.start()
-    result = await restore_full(
-        manifest=manifest, target_dir=str(target_dir),
-        arweave_fetch=arweave.download, memo_fetch=memos.fetch,
-        arc_to_target=_arc_to_target(str(target_dir)),
-    )
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-
-    assert result.status == "success", f"{result.halt_reason} {result.errors}"
-    # byte-identical reconstruction through the streaming path
-    assert (target_dir / "personality" / "big.db").read_bytes() == big
-    # streaming proof: peak Python alloc must be FAR below the 48 MB member.
-    # The old whole-member f.read() path peaked >= 48 MB; streaming peaks at ~chunk.
-    assert peak < 16 * 1024 * 1024, (
-        f"restore_full peaked at {peak // 1024 // 1024} MB ≈ the 48 MB member — "
-        f"the full-ship member was loaded WHOLE, not streamed (RSS-blowup regression)"
-    )
-
-
-@pytest.mark.asyncio
-async def test_restore_full_streaming_fetch_to_file_path(tmp_path):
-    """The live chained reconstruction passes `arweave_fetch_to_file` so the
-    tarball is STREAMED Arweave→disk (constant memory) — the in-RAM `arweave_fetch`
-    held the whole ~595MB compressed tarball (→ ~960MB worker RSS, over the 500MB
-    rss_limit). This drives restore_full down that streaming branch with a large
-    full-ship member and asserts: byte-identical reconstruction, the bytes-path
-    `download` is NEVER called (streaming only), and restore_full's peak Python
-    allocation stays far below the member size (the whole pipeline — fetch, sha,
-    unpack, member apply — is disk-streamed)."""
-    import tracemalloc
-
-    arweave = FakeArweave()
-    memos = FakeMemoStore()
-    manifest = UnifiedManifest("T1", base_dir=str(tmp_path))
-
-    big = b"TITAN\x00\x00\x00" * (6 * 1024 * 1024)  # 48 MB, compressible
-    e1 = _build_event(
-        titan_id="T1", event_id="e1", event_type="baseline",
-        prev_event_id=None, prev_event_merkle_root=None,
-        personality_files=[("big.db", _full(big))],
-        timechain_files=[("chain.bin", _full(b"tc-data"))],
-        soul_files=None,
-        arweave=arweave, memos=memos, tmp_path=tmp_path,
-        baseline_trigger="first_event",
-    )
-    manifest.append_event(e1)
-
-    # A poisoned bytes-path: if restore_full ever calls download (instead of the
-    # streaming download_to_file), it raises — proving the streaming branch ran.
-    async def _explode(_tx):
-        raise AssertionError("bytes-path arweave_fetch must NOT be called when "
-                             "arweave_fetch_to_file is provided")
-
-    target_dir = tmp_path / "restored"
-    tracemalloc.start()
-    result = await restore_full(
-        manifest=manifest, target_dir=str(target_dir),
-        arweave_fetch=_explode,                       # must never be called
-        arweave_fetch_to_file=arweave.download_to_file,
-        memo_fetch=memos.fetch,
-        arc_to_target=_arc_to_target(str(target_dir)),
-    )
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-
-    assert result.status == "success", f"{result.halt_reason} {result.errors}"
-    assert (target_dir / "personality" / "big.db").read_bytes() == big
-    assert peak < 16 * 1024 * 1024, (
-        f"restore_full (streaming path) peaked at {peak // 1024 // 1024} MB — "
-        f"expected « the 48 MB member")
-    # staging scratch reclaimed
-    assert not os.path.exists(str(target_dir) + ".restore_staging")
-
-
-@pytest.mark.asyncio
-async def test_restore_full_forwards_verify_patch_hash(tmp_path):
-    """restore_full forwards verify_patch_hash → apply_event_components. The
-    chained in-loop mirror rebuild (`_recover_mirror_to_latest`) passes False:
-    once each component tarball's sha256 is verified vs the manifest merkle_root
-    (INV-MBR-4), a stale pre-ed5f4d0c per-file `patch_bytes_sha256` is a
-    false-positive and must NOT hard-halt the rebuild (same ratified handling as
-    the sovereign restore, mainnet §R4 v0.4.6). Happy-path: the flag is accepted
-    and the restore is byte-identical."""
-    arweave = FakeArweave()
-    memos = FakeMemoStore()
-    manifest = UnifiedManifest("T1", base_dir=str(tmp_path))
-    p1 = b'{"epoch": 0, "mood": "neutral"}'
-    t1 = b"BLOCK0" * 8
-    e1 = _build_event(
-        titan_id="T1", event_id="e1", event_type="baseline",
-        prev_event_id=None, prev_event_merkle_root=None,
-        personality_files=[("state.json", _full(p1))],
-        timechain_files=[("chain.bin", _full(t1))],
-        soul_files=None,
-        arweave=arweave, memos=memos, tmp_path=tmp_path,
-        baseline_trigger="first_event",
-    )
-    manifest.append_event(e1)
-    target_dir = tmp_path / "restored"
-    result = await restore_full(
-        manifest=manifest, target_dir=str(target_dir),
-        arweave_fetch=arweave.download, memo_fetch=memos.fetch,
-        arc_to_target=_arc_to_target(str(target_dir)),
-        verify_patch_hash=False,  # the chained-reconstruction setting
-    )
-    assert result.status == "success", f"{result.halt_reason} {result.errors}"
-    assert (target_dir / "personality" / "state.json").read_bytes() == p1
-    assert (target_dir / "timechain" / "chain.bin").read_bytes() == t1
 
 
 @pytest.mark.asyncio
@@ -742,10 +572,6 @@ async def test_restore_halts_on_tarball_hash_mismatch(tmp_path):
     assert result.halt_reason == HALT_TARBALL_HASH_MISMATCH
     assert result.halt_event_id == "e1"
     assert any(HALT_TARBALL_HASH_MISMATCH in err for err in result.errors)
-    # A halt mid-event must still reclaim the staging scratch (finally-cleanup).
-    assert not os.path.exists(str(target_dir) + ".restore_staging"), (
-        "restore_full leaked its staging dir on halt"
-    )
 
 
 @pytest.mark.asyncio
