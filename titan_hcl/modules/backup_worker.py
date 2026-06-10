@@ -317,6 +317,8 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     }
 
     last_heartbeat = time.time()
+    last_runway_check = 0.0
+    runway_check_interval = 3600.0  # once per hour (rFP I6 is separate daily cron; this is in-loop light check)
 
     # ── Main loop ──────────────────────────────────────────────────────
     # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
@@ -340,12 +342,12 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             if time.time() - last_heartbeat > 10.0:
                 _send_heartbeat(send_queue, name, state_writer=_state_writer)
                 last_heartbeat = time.time()
-            # RFP_chain_provider Phase C tail — the recv-loop runway check is
-            # DELETED (AUDIT worker bug C1: it ran a 30s `node …balance`
-            # subprocess INSIDE `except Empty:`, the exact no-periodic-work-in-
-            # except-Empty trap → could stall the recv loop 30s → BrokenPipe →
-            # shm_pid_dead). Runway/funding now belongs to the ChainProvider
-            # (`balance`/`fund`) driven off-loop; the orchestrator owns the alert.
+            # Periodic in-loop runway check (I6 also writes daily telemetry via cron)
+            if (mode == "mainnet_arweave"
+                    and time.time() - last_runway_check > runway_check_interval):
+                with suppress(Exception):
+                    _check_runway(state)
+                last_runway_check = time.time()
             continue
         except (KeyboardInterrupt, SystemExit):
             break

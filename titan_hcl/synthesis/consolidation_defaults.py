@@ -83,13 +83,23 @@ _DOMAIN_BACKFILL_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("coding", "sandbox", "code verification", "compiler", "programming"),
      "coding"),
     (("sociolog",), "sociology"),
-    # The dominant introspective / interpersonal / social bucket — matches how
-    # the live LLM labeled this content ("Seaside Philosophical Dialogue",
-    # "Interpersonal Dialogue Fragments", "User Interpersonal Dynamics" → self).
-    (("interpersonal", "social", "dialogue", "human", "self", "introspect",
-      "reflection", "presence", "stillness", "contemplation", "resonance",
+    # Titan-about-himself — the narrative-SELF partition (INV-SD-16). His daily
+    # soul-diary, self-inspection and introspective reflection on his OWN path
+    # land here, kept clean of interpersonal/social content. Most-specific, so it
+    # wins (first-match) when a name carries a self marker — "Daily Self-
+    # Reflection" → self, while bare "Seaside Reflection" → social below.
+    # (Split 2026-06-10, RFP_titan_authored_soul_diary §7.P2 — `self` was lumped
+    # with the interpersonal/social bucket; that conflation is now separated.)
+    (("self", "soul_diary", "soul-diary", "diary", "introspect",
+      "sovereignty", "self-refactor", "self-inspection"), "self"),
+    # Interpersonal / social — dialogue, bonds, the people he speaks with. This
+    # is where the formerly-"self"-labeled interpersonal content now routes
+    # ("Seaside Philosophical Dialogue", "Interpersonal Dialogue Fragments",
+    # "User Interpersonal Dynamics").
+    (("interpersonal", "social", "dialogue", "human", "reflection",
+      "presence", "stillness", "contemplation", "resonance",
       "bond", "emotional", "musician", "seaside", "wisdom",
-      "dream consolidation", "interaction"), "self"),
+      "dream consolidation", "interaction"), "social"),
     # Remaining philosophical content with no social/dialogue/reflection cue.
     (("philosoph", "metaphysic", "epistemolog", "ontolog"), "philosophy"),
 )

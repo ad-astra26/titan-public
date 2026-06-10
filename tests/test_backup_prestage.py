@@ -189,28 +189,31 @@ def test_manifest_truth_gate(monkeypatch):
     assert b._todays_backup_already_landed() is False
 
 
-@pytest.mark.asyncio
-async def test_auto_fund_via_chain_provider(tmp_path, monkeypatch):
-    """RFP_chain_provider Phase C tail: the unified_v2 auto-fund hook now uses the
-    ChainProvider (balance + bounded fund), gated by [chain.fund].enabled — the
-    BackupCascade subprocess path is gone. Enabled + low runway → chain.fund
-    fires; disabled → no-op."""
-    monkeypatch.chdir(tmp_path)
+def test_auto_fund_rehome_wired_to_unified_v2(monkeypatch):
+    """Re-home guard (2026-05-31): the unified_v2 path must invoke the Irys
+    auto-fund hook (it was orphaned in the legacy BackupCascade.run after the
+    migration). Enabled → calls auto_fund_irys_if_needed; disabled → no-op."""
     from titan_hcl.logic.backup import RebirthBackup
-    from titan_hcl.chain import FakeChainProvider
+    from titan_hcl.logic import backup_cascade
 
-    # enabled + low Irys deposit → low runway → chain.fund fires (bounded)
-    fake = FakeChainProvider()
-    fake._balance_sol = 0.05            # ~1.2d runway at the default burn → < min 3d
-    b_on = RebirthBackup(network_client=None, titan_id="T1", chain_provider=fake,
-                         full_config={"chain": {"fund": {"enabled": True}}})
-    await b_on._auto_fund_irys_before_upload()
-    assert len(fake.fund_log) == 1 and fake.fund_log[0] > 0
+    calls = []
 
-    # disabled → no-op (no fund)
-    fake2 = FakeChainProvider()
-    fake2._balance_sol = 0.05
-    b_off = RebirthBackup(network_client=None, titan_id="T1", chain_provider=fake2,
-                          full_config={"chain": {"fund": {"enabled": False}}})
-    await b_off._auto_fund_irys_before_upload()
-    assert fake2.fund_log == []
+    def _fake_af(self, size_mb, notifier=None):
+        calls.append(size_mb)
+        return {"action": "no_action", "reason": "test"}
+
+    monkeypatch.setattr(
+        backup_cascade.BackupCascade, "auto_fund_irys_if_needed", _fake_af)
+
+    # auto_fund_enabled=True → the hook fires (with a positive size estimate)
+    b_on = RebirthBackup(network_client=None, titan_id="T1",
+                         full_config={"backup": {"auto_fund_enabled": True}})
+    b_on._auto_fund_irys_before_upload()
+    assert len(calls) == 1 and calls[0] > 0
+
+    # auto_fund_enabled=False → no-op (no cascade call)
+    calls.clear()
+    b_off = RebirthBackup(network_client=None, titan_id="T1",
+                          full_config={"backup": {"auto_fund_enabled": False}})
+    b_off._auto_fund_irys_before_upload()
+    assert calls == []

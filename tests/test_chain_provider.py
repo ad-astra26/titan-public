@@ -75,90 +75,18 @@ async def test_get_to_file_missing_returns_false(tmp_path):
 # ── ABC contract: trust/funding not yet implemented (Phase B/C) ────────────
 
 @pytest.mark.asyncio
-async def test_real_provider_commit_needs_signer():
-    """The real provider's commit_memo (Phase B) REQUIRES a network_client
-    (signer) — without one it raises a clear RuntimeError, never a silent no-op."""
-    cp = ArweaveChainProvider(keypair_path="/nonexistent", network="devnet")  # no network_client
-    with pytest.raises(RuntimeError):
-        await cp.commit_memo("memo")
-    with pytest.raises(RuntimeError):                       # head-bundle path also needs the signer
-        await cp.commit_memo("memo", state_root="deadbeef" * 8)
-
-
-@pytest.mark.asyncio
-async def test_real_provider_funding_devnet_is_noop():
-    """Phase C: on devnet there is no real Irys deposit — balance() is +inf
-    (treated as unlimited by runway logic) and fund() is a no-op (no spend)."""
+async def test_dataplane_only_provider_defers_trust_and_funding():
+    """ArweaveChainProvider implements the Phase-A data plane; the trust +
+    funding verbs raise NotImplementedError until Phases B/C (the ABC default)."""
     cp = ArweaveChainProvider(keypair_path="/nonexistent", network="devnet")
-    assert await cp.balance() == float("inf")
-    assert await cp.fund(0.01) is None
-    assert await cp.fund(0.01, daily_cap_sol=0.05) is None
-
-
-# ── Phase B — trust plane (Fake-backed) ─────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_commit_read_memo_roundtrip():
-    """commit_memo → a sig; read_memo(sig) returns the memo text. The per-event
-    contract: a HEAD commit (state_root set) and a TAIL commit (no state_root)
-    both produce readable memos."""
-    cp = FakeChainProvider()
-    head_sig = await cp.commit_memo("v=3;e1;PT;url=tx_p", state_root="ab" * 32,
-                                    sovereignty_bp=7000)
-    tail_sig = await cp.commit_memo("v=3;e1;TC;url=tx_t")
-    assert head_sig and tail_sig and head_sig != tail_sig
-    assert await cp.read_memo(head_sig) == "v=3;e1;PT;url=tx_p"
-    assert await cp.read_memo(tail_sig) == "v=3;e1;TC;url=tx_t"
-    assert await cp.read_memo("fakesig_unknown") is None
-
-
-@pytest.mark.asyncio
-async def test_list_memos_newest_first():
-    """list_memos returns sigs newest→oldest (the resurrection-walk order), capped
-    at limit — mirroring getSignaturesForAddress."""
-    cp = FakeChainProvider()
-    sigs = [await cp.commit_memo(f"v=3;e{i}") for i in range(5)]
-    listed = await cp.list_memos("Titan_pubkey", limit=3)
-    assert listed == list(reversed(sigs))[:3]    # newest 3, newest-first
-
-
-@pytest.mark.asyncio
-async def test_commit_memo_state_root_changes_sig():
-    """The head-bundle (state_root) is part of the committed tx — the Fake's sig
-    reflects it, so a head commit is distinguishable from the same memo as a tail."""
-    cp = FakeChainProvider()
-    s_head = await cp.commit_memo("same-memo", state_root="cd" * 32)
-    s_tail = await cp.commit_memo("same-memo")
-    assert s_head != s_tail
-
-
-# ── Phase C — funding plane ─────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_fake_balance_fund_roundtrip():
-    cp = FakeChainProvider()
-    assert await cp.balance() == 1.0
-    sig = await cp.fund(0.05)
-    assert sig and sig.startswith("fakefund_")
-    assert await cp.balance() == pytest.approx(1.05)
-    assert cp.fund_log == [0.05]
-
-
-def test_provider_fund_accumulator_atomic(tmp_path, monkeypatch):
-    """Phase C INV-CP-5: the daily-fund accumulator records atomically (date +
-    total_sol + tx_count) and appends an audit row — the bounded state the daily
-    cap reads to trim `fund()`. (The daemon spend itself is a live gate.)"""
-    monkeypatch.chdir(tmp_path)
-    cp = ArweaveChainProvider(keypair_path="/nonexistent", network="mainnet")
-    cp._record_fund(0.03, "tx1")
-    _t, total, n = cp._fund_today_total()
-    assert total == pytest.approx(0.03) and n == 1
-    cp._record_fund(0.01, "tx2")
-    _t2, total2, n2 = cp._fund_today_total()
-    assert total2 == pytest.approx(0.04) and n2 == 2
-    # the remaining-cap math fund() uses to trim a top-up
-    assert max(0.0, 0.05 - total2) == pytest.approx(0.01)
-    assert os.path.exists(os.path.join("data", "backups", "auto_fund_audit.jsonl"))
+    with pytest.raises(NotImplementedError):
+        await cp.commit_memo("memo")
+    with pytest.raises(NotImplementedError):
+        await cp.read_memo("sig")
+    with pytest.raises(NotImplementedError):
+        await cp.balance()
+    with pytest.raises(NotImplementedError):
+        await cp.fund(0.01)
 
 
 def test_chain_provider_is_abstract():
@@ -167,33 +95,6 @@ def test_chain_provider_is_abstract():
 
 
 # ── real provider, devnet path (no network) ────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_rebirthbackup_fetch_routes_through_chain_provider(tmp_path):
-    """Phase A tail: RebirthBackup's restore-fetch (`_build_fetch_to_file`) routes
-    through the injected ChainProvider's `get_to_file` (not ArweaveStore). Inject
-    a FakeChainProvider, point a manifest event at a tx in it, and confirm the
-    built fetcher streams that tarball back byte-identical."""
-    from titan_hcl.logic.backup import RebirthBackup
-
-    fake = FakeChainProvider()
-    backup = RebirthBackup(network_client=None, config={}, titan_id="T1",
-                           chain_provider=fake, full_config={})
-    assert backup._ensure_chain() is fake          # injection wins over lazy build
-
-    tarball = b"component-tarball-bytes" * 4096     # ~90 KB
-    tx = await fake.put(tarball)
-
-    class _Manifest:
-        events = [{"personality": {"tx_id": tx, "iv": None,
-                                   "merkle_root": "deadbeef"}}]
-
-    fetch = backup._build_fetch_to_file(_Manifest())
-    dest = tmp_path / "fetched.tar"
-    ok = await fetch(tx, str(dest))                 # Mode-A → chain.get_to_file
-    assert ok and dest.read_bytes() == tarball
-    assert tx in fake._store                        # came from the provider, not a store
-
 
 @pytest.mark.asyncio
 async def test_arweave_provider_devnet_roundtrip(tmp_path, monkeypatch):

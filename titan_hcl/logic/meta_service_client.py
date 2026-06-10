@@ -236,8 +236,6 @@ def send_meta_outcome(
     context: str = "",
     send_queue=None,
     src: str = "",
-    primitive_sequence: Optional[list] = None,
-    sub_modes: Optional[list] = None,
 ) -> None:
     """Emit META_REASON_OUTCOME via the consumer's send_queue.
 
@@ -247,13 +245,6 @@ def send_meta_outcome(
         +1.0 = advice clearly right
          0.0 = advice didn't help (null)
         -1.0 = advice clearly wrong  ← teaches meta what NOT to do
-
-    ``primitive_sequence`` (RFP_cgn_loop_closure §7.A): the full ordered list
-    of primitives the chain walked. When present, the accumulator applies the
-    outcome to EVERY (consumer, primitive, sub_mode) tuple in the chain
-    (record_outcome — the multi-step credit assignment) instead of the single
-    actual_primitive_used. ``sub_modes`` optionally aligns 1:1; defaults to
-    "_all" per primitive. Both default None → back-compatible single-step.
 
     Raises ValueError on out-of-range outcome_reward.
     """
@@ -279,11 +270,6 @@ def send_meta_outcome(
         "actual_primitive_used": actual_primitive_used,
         "context": str(context)[:256],
     }
-    # RFP_cgn_loop_closure §7.A — carry the full chain for multi-step credit.
-    if primitive_sequence:
-        payload["primitive_sequence"] = [str(p) for p in primitive_sequence]
-        if sub_modes:
-            payload["sub_modes"] = [str(m) for m in sub_modes]
     msg = {
         "type": MSG_META_REASON_OUTCOME,
         "src": src or consumer_id,

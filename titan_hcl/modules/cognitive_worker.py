@@ -5370,7 +5370,6 @@ def _persist_engine_state(state_refs: dict) -> None:
     coordinator = state_refs.get("coordinator")
     intuition_convergence = state_refs.get("intuition_convergence")
     msl = state_refs.get("msl")
-    meta_service = state_refs.get("_meta_service")
 
     for engine, name_, method in (
         # AUDIT §C fix (rFP §P2): was "save_state" — ReasoningEngine only has
@@ -5387,11 +5386,6 @@ def _persist_engine_state(state_refs: dict) -> None:
         # MSL loaded at boot via msl.load_all() but was absent from this persist
         # list → its mutations were lost on respawn (AUDIT §C secondary). Added.
         (msl, "msl", "save_all"),
-        # INV-PERSIST (RFP_cgn_loop_closure §7.A / G10) — the emergent-reward
-        # accumulator (DynamicRewardAccumulator) lives in MetaService, not the
-        # engine; without this its outcome tuples + α outcome-count reset every
-        # restart → emergent reward never leaves cold-start. save_all delegates.
-        (meta_service, "_meta_service", "save_all"),
     ):
         if engine is None:
             continue
