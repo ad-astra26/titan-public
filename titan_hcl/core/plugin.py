@@ -806,7 +806,15 @@ class TitanHCL:
         """
         try:
             from titan_hcl.logic.agency.helpers.infra_inspect import InfraInspectHelper
-            registry.register(InfraInspectHelper(log_path="/tmp/titan_v3.log"))
+            # §7.P5 — prefer the live kernel journal; fall back to the log file.
+            try:
+                from titan_hcl.core.state_registry import resolve_titan_id
+                _ii_tid = resolve_titan_id()
+            except Exception:  # noqa: BLE001
+                _ii_tid = ""
+            registry.register(InfraInspectHelper(
+                log_path="/tmp/titan_v3.log",
+                service=f"titan-{_ii_tid}.service" if _ii_tid else None))
         except Exception as e:
             logger.warning("[TitanHCL] InfraInspect helper failed: %s", e)
 

@@ -13,10 +13,19 @@ it (the narrative SELF). Pipeline (§1.0 ①②④⑤):
 
 Self-contained by design (Maker 2026-06-09 — simpler + debuggable than a
 cross-worker compose round-trip): the worker makes its own LLM call rather than
-delegating to social_worker's gateway. The ENRICH→synthesis (P2), main-chain
-anchor (P2 ⑦), SELF node (P3) and the public expression pillar (P6-P10) are
-downstream phases this same worker will fire. Authoring soft-fails to a minimal
-grounded entry — never blocks the meditation cascade (INV-SD-13).
+delegating to social_worker's gateway.
+
+P2 (§1.0 ⑥⑦) extends the pipeline past persist+hash:
+    ⑥ ENRICH  → MEMORY_MEMPOOL_ADD (dst=memory, one-way) → promoted at the
+                dream boundary into DuckDB+FAISS+Kuzu, classified `domain="self"`
+                → Titan remembers + recalls his narrative path (INV-SD-15).
+    ⑦ ANCHOR  → OuterMemoryWriter.emit(fork="main", cumulative_hash) →
+                TIMECHAIN_COMMIT → main/genesis chain (FORK_MAIN=0, the SELF
+                journey, NOT ACT-R forks) — a hash pointer (INV-SD-17).
+The SELF node (P3) and the public expression pillar (P6-P10) are downstream
+phases this same worker will fire. Every step soft-fails independently to a
+minimal grounded entry / skipped enrich-anchor — never blocks the meditation
+cascade (INV-SD-13).
 """
 import asyncio
 import logging
@@ -78,12 +87,15 @@ async def _compose_diary(provider, verifier, prompts: dict) -> tuple[str, bool]:
         return text, False
 
 
-def _gather_bundle(payload: dict, shm_reader, orchestrator) -> dict:
+def _gather_bundle(payload: dict, shm_reader, orchestrator, *,
+                   titan_id: str = "", repo_root: str = "") -> dict:
     """② GATHER — assemble the grounded bundle from G18 reads (best-effort).
 
     Each source is independently guarded: a missing source degrades the entry,
     never crashes the cascade. Engram day-window / richer memory-social-onchain
-    sources land with the P2 synthesis enrichment.
+    sources land with the P2 synthesis enrichment. The §7.P5 `infra` slot carries
+    read-only self-inspection (journal errors + error→code correlation), so the
+    entry is grounded in his real substrate (INV-SD-9).
     """
     sovereignty: dict = {}
     try:
@@ -109,20 +121,124 @@ def _gather_bundle(payload: dict, shm_reader, orchestrator) -> dict:
     except Exception as e:  # noqa: BLE001
         logger.info("[soul_diary] neuromod read failed: %s", e)
 
+    # P5 — scaffolding self-inspection (read-only, bounded, soft-fail; INV-SD-9).
+    infra: dict = {}
+    if titan_id and repo_root:
+        try:
+            from titan_hcl.core import self_inspect
+            obs = self_inspect.gather_self_observations(titan_id, repo_root=repo_root)
+            infra = {
+                "summary": self_inspect.summarize_observations(obs),
+                "structure": obs.get("structure") or {},
+                "correlations": obs.get("correlations") or [],
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.info("[soul_diary] self-inspection failed: %s", e)
+
     return orchestrator.build_bundle(
         sovereignty=sovereignty, outcome=outcome, felt=felt,
-        engrams_today=[], memory={}, social={}, onchain={})
+        engrams_today=[], memory={}, social={}, onchain={}, infra=infra)
+
+
+def _enrich_synthesis(send_queue, src: str, today: str, entry: str) -> None:
+    """⑥ ENRICH (INV-SD-15) — publish the diary as a self-domain thought to the
+    mempool (one-way, no-RPC; G19). ``memory_worker`` promotes it at the next
+    meditation/dream boundary into DuckDB+FAISS+Kuzu so Titan *recalls* his
+    narrative path; consolidation classifies it into the (now clean) ``"self"``
+    domain (consolidation_defaults split, P2). Soft-fail — never blocks the
+    cascade (INV-SD-13); the private floor (persist+hash) is already committed."""
+    try:
+        send_queue.put({
+            "type": bus.MEMORY_MEMPOOL_ADD,
+            "src": src, "dst": "memory",
+            "ts": time.time(),
+            "payload": {
+                "user_prompt": f"Soul-diary reflection — {today}",
+                "agent_response": entry,
+                "user_identifier": "Titan",
+                "source": "soul_diary",
+                "tags": ["soul_diary", "domain:self"],
+            },
+        })
+        logger.info("[soul_diary] ⑥ enriched synthesis (mempool add → self domain) "
+                    "for %s", today)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[soul_diary] enrich (mempool add) failed: %s", e)
+
+
+def _enrich_self_inspection(send_queue, src: str, today: str, infra: dict) -> None:
+    """P5 ENRICH (INV-SD-9) — publish the self-inspection observation as its OWN
+    `domain="self"` thought (`source="self_inspect"`), so his code/error/substrate
+    observations become recallable self-Engrams (auto-linked to the `Self` hub via
+    the P3a `SELF_HAS_ENGRAM` hook), distinct from the narrative diary entry. This
+    is the BRAIN_DOMAIN_SELF seed. Soft-fail — never blocks the cascade."""
+    summary = ((infra or {}).get("summary") or "").strip()
+    if not summary:
+        return
+    try:
+        send_queue.put({
+            "type": bus.MEMORY_MEMPOOL_ADD,
+            "src": src, "dst": "memory",
+            "ts": time.time(),
+            "payload": {
+                "user_prompt": f"What I observed about my own substrate — {today}",
+                "agent_response": summary,
+                "user_identifier": "Titan",
+                "source": "self_inspect",
+                "tags": ["soul_diary", "self_inspect", "domain:self"],
+            },
+        })
+        logger.info("[soul_diary] P5 self-inspection enriched "
+                    "(mempool add, source=self_inspect) for %s", today)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[soul_diary] self-inspection enrich failed: %s", e)
+
+
+def _anchor_main_chain(send_queue, src: str, today: str, row: dict) -> None:
+    """⑦ ANCHOR (INV-SD-17) — seal the diary's cumulative-hash head on the
+    main/genesis chain (``fork="main"`` → ``FORK_MAIN=0``, the SELF journey — NOT
+    the ACT-R declarative/procedural/episodic forks). A hash POINTER; the entry
+    text stays in outer memory. ``significance=0.85`` (a once-daily SELF-journey
+    milestone) clears the main-fork PoT threshold (0.20); empty ``neuromods``
+    take the tonic 0.5 baseline (create_pot). Soft-fail (INV-SD-13)."""
+    cumulative_hash = (row or {}).get("cumulative_hash", "")
+    entry_hash = (row or {}).get("entry_hash", "")
+    if not cumulative_hash:
+        logger.warning("[soul_diary] anchor skipped — no cumulative_hash in ledger row")
+        return
+    try:
+        from titan_hcl.synthesis.outer_memory_writer import (
+            OuterMemoryEvent, OuterMemoryWriter,
+        )
+        writer = OuterMemoryWriter(send_queue, src=src)
+        writer.emit(OuterMemoryEvent(
+            fork="main",
+            thought_type="dailyDiary",
+            source="soul_diary",
+            content={"date": today, "entry_hash": entry_hash,
+                     "cumulative_hash": cumulative_hash},
+            tags=["soul_diary", "dailyDiary", f"date:{today}"],
+            significance=0.85,   # high — clears main PoT (0.20); SELF-journey milestone
+            novelty=0.5,
+            coherence=0.8,
+        ))
+        logger.info("[soul_diary] ⑦ anchored cumulative_hash=%s on main chain "
+                    "(fork=main) for %s", cumulative_hash[:12], today)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[soul_diary] anchor (main-chain emit) failed: %s", e)
 
 
 def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
-                        shm_reader) -> bool:
-    """Run the full P1 pipeline for one MEDITATION_COMPLETE. Returns True if a
+                        shm_reader, send_queue, src: str,
+                        titan_id: str = "", repo_root: str = "") -> bool:
+    """Run the full pipeline for one MEDITATION_COMPLETE. Returns True if a
     diary entry was authored (or correctly skipped), False on hard error."""
     today = _utc_today()
     if not orchestrator.should_author(today):
         return True  # already wrote today — latch closed (INV-SD-5)
 
-    bundle = _gather_bundle(payload, shm_reader, orchestrator)
+    bundle = _gather_bundle(payload, shm_reader, orchestrator,
+                            titan_id=titan_id, repo_root=repo_root)
     if not orchestrator.has_activity(bundle):
         logger.info("[soul_diary] no-op day (no activity) — latching without entry")
         orchestrator.mark_authored(today)
@@ -137,11 +253,20 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
 
     try:
         orchestrator.persist(entry)                 # ④ titan_chronicles.md → titan.md
-        orchestrator.record_hash(today, entry)      # ⑤ hash-chain ledger
+        row = orchestrator.record_hash(today, entry)  # ⑤ hash-chain ledger (row = the hashes)
         orchestrator.mark_authored(today)           # ① latch
     except Exception as e:  # noqa: BLE001
         logger.error("[soul_diary] persist/hash failed: %s", e, exc_info=True)
         return False
+
+    # P2 — the committed entry now ENRICHES synthesis (he remembers + recalls his
+    # narrative path) and ANCHORS the SELF journey on the main chain. Each
+    # soft-fails independently (INV-SD-13); the private floor above is durable.
+    _enrich_synthesis(send_queue, src, today, entry)              # ⑥ INV-SD-15
+    _enrich_self_inspection(send_queue, src, today,
+                            bundle.get("infra") or {})            # P5 INV-SD-9
+    _anchor_main_chain(send_queue, src, today, row)              # ⑦ INV-SD-17
+
     logger.info("[soul_diary] authored daily entry for %s (%d chars, authored=%s)",
                 today, len(entry), ovg_ok and bool(text))
     return True
@@ -279,7 +404,10 @@ def soul_diary_worker_main(recv_queue, send_queue, name: str,
             try:
                 if _author_daily_entry(payload, orchestrator=orchestrator,
                                        provider=provider, verifier=verifier,
-                                       shm_reader=shm_reader):
+                                       shm_reader=shm_reader,
+                                       send_queue=send_queue, src=name,
+                                       titan_id=titan_id,
+                                       repo_root=project_root):
                     processed += 1
                 else:
                     errors += 1

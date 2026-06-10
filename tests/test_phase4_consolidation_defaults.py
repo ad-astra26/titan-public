@@ -19,9 +19,34 @@ from titan_hcl.synthesis.consolidation_defaults import (
     _build_cluster_prompt,
     _parse_llm_response,
     default_mine_recent_thoughts,
+    derive_domain_hint,
     make_default_llm_propose,
 )
 from titan_hcl.synthesis.thought_sidecar import ThoughtSidecar
+
+
+# ── domain split: self (Titan-about-himself) vs social (interpersonal) ──
+# RFP_titan_authored_soul_diary §7.P2 — `self` was lumped with social; split
+# 2026-06-10 so the narrative-SELF partition stays clean (INV-SD-16).
+
+
+def test_domain_self_for_titan_about_himself():
+    assert derive_domain_hint("Daily Soul-Diary Reflection") == "self"
+    assert derive_domain_hint("Titan Sovereignty Journey") == "self"
+    assert derive_domain_hint("Self-Refactor Patterns") == "self"
+    assert derive_domain_hint("Introspective Self-Inspection") == "self"
+
+
+def test_domain_social_for_interpersonal_content():
+    # The formerly-"self"-mislabeled interpersonal content now routes to social.
+    assert derive_domain_hint("Seaside Philosophical Dialogue") == "social"
+    assert derive_domain_hint("Interpersonal Dialogue Fragments") == "social"
+    assert derive_domain_hint("User Interpersonal Dynamics") == "social"
+
+
+def test_domain_self_wins_over_social_first_match():
+    # A name carrying BOTH a self marker and a social cue → self (most-specific).
+    assert derive_domain_hint("Self-Reflection on a Dialogue") == "self"
 
 
 # ── LLM-response parser ─────────────────────────────────────────────

@@ -6,6 +6,8 @@ Always available (reads local system — no external dependencies).
 """
 import logging
 import os
+import subprocess
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -13,8 +15,13 @@ logger = logging.getLogger(__name__)
 class InfraInspectHelper:
     """Infrastructure inspection: system stats, logs, process info."""
 
-    def __init__(self, log_path: str = "/tmp/titan_agent.log"):
+    def __init__(self, log_path: str = "/tmp/titan_agent.log",
+                 service: Optional[str] = None):
         self._log_path = log_path
+        # systemd unit (e.g. "titan-T1.service"); when set, `_inspect_logs`
+        # reads the LIVE kernel journal instead of the stale log file
+        # (RFP_titan_authored_soul_diary §7.P5).
+        self._service = service
 
     @property
     def name(self) -> str:
@@ -100,7 +107,16 @@ class InfraInspectHelper:
                     "error": "psutil not installed"}
 
     def _inspect_logs(self, lines: int = 20) -> dict:
-        """Read recent log lines."""
+        """Read recent log lines — PREFER the live kernel journal (§7.P5: re-point
+        off the stale /tmp file), fall back to the log file. Truncation widened
+        500→2000 so an error + a little context survives."""
+        # Live kernel journal first when a systemd unit is configured.
+        if self._service:
+            journal = self._read_journal(lines)
+            if journal is not None:
+                return {"success": True, "result": journal[:2000],
+                        "enrichment_data": {}, "error": None}
+
         if not os.path.exists(self._log_path):
             return {"success": False, "result": "", "enrichment_data": {},
                     "error": f"Log file not found: {self._log_path}"}
@@ -110,11 +126,25 @@ class InfraInspectHelper:
                 all_lines = f.readlines()
             recent = all_lines[-lines:] if len(all_lines) > lines else all_lines
             result = "".join(recent)
-            return {"success": True, "result": result[:500], "enrichment_data": {},
+            return {"success": True, "result": result[:2000], "enrichment_data": {},
                     "error": None}
         except Exception as e:
             return {"success": False, "result": "", "enrichment_data": {},
                     "error": str(e)}
+
+    def _read_journal(self, lines: int) -> Optional[str]:
+        """`journalctl` tail for the configured unit; None if unavailable
+        (not systemd / journalctl missing / nonzero / timeout)."""
+        try:
+            proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+                ["journalctl", "-u", self._service, "-n", str(int(lines)),
+                 "--no-pager", "--output", "cat"],
+                capture_output=True, text=True, timeout=5.0, check=False)
+            if proc.returncode != 0:
+                return None
+            return proc.stdout or ""
+        except Exception:  # noqa: BLE001
+            return None
 
     def _inspect_processes(self) -> dict:
         """List Titan-related processes."""
