@@ -1942,36 +1942,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     )
     try:
         from titan_hcl.synthesis.buffer_store import ActrBufferStore
-
-        def _actr_degraded(*, avg_ms, max_ms, samples):
-            # D-SPEC-154 early-warning: actr_buffers persist latency is creeping —
-            # the DuckDB ART-index-churn signature that precedes the FATAL
-            # crash-loop by days. Surface on the SPEC error cascade (INV-SDA-12)
-            # → MODULE_ERROR → kernel journal, so a recurrence is VISIBLE long
-            # before the next Abort (the Abort itself is an uncatchable C++
-            # terminate; this is the catchable precursor).
-            logger.warning(
-                "[synthesis_worker] actr_buffers DEGRADED — persist avg=%.1fms "
-                "max=%.1fms over %d samples (DuckDB ART-index churn re-accruing? "
-                "— INV-Syn-30 / D-SPEC-154)", avg_ms, max_ms, samples)
-            try:
-                publish_module_error(send_queue, ModuleError(
-                    module_name=name, subsystem="actr_buffers",
-                    error_code=ModuleErrorCode.STORAGE_DEGRADED,
-                    severity=_phase11_sev.WARN,
-                    message="actr_buffers persist latency degraded — possible DuckDB ART-index churn re-accruing",
-                    detail=(f"rolling persist avg={avg_ms:.1f}ms max={max_ms:.1f}ms over {samples} samples "
-                            f"(healthy is sub-ms). A full Titan restart self-heals any stray secondary "
-                            f"index (INV-Syn-30); if it persists, inspect synthesis.duckdb::actr_buffers."),
-                    suggested_remediation="full Titan restart (self-heals secondary ART indexes)"))
-            except Exception:
-                pass
-
         actr_buffer_store = ActrBufferStore(
             duckdb_conn=store._conn,           # share synthesis.duckdb (INV-Syn-3)
             snapshot_path=buffers_snapshot_path,
             writer=db_writer,                  # single-writer-thread (Option C)
-            on_degraded=_actr_degraded,        # D-SPEC-154 degradation → MODULE_ERROR cascade
         )
         # Initial export so the snapshot file exists from boot — agno's
         # BufferCache.hydrate + Observatory routes get a real (possibly
