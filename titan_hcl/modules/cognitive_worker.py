@@ -2242,10 +2242,13 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
                     "[CognitiveWorker] MSL.load_all warned: %s", _msl_load_err)
             if coordinator is not None:
                 coordinator._msl = msl
-            # Phase A.4 gap-7 closure — store msl in state_refs so the
-            # MSLStatePublisher tick path (in _drive_one_epoch) gets the
-            # live engine instance instead of None (cold-boot stub).
-            state_refs["msl"] = msl
+            # Phase A.4 gap-7 closure — msl reaches the MSLStatePublisher tick
+            # path (_drive_one_epoch) as state_refs["msl"] via this function's
+            # RETURN LITERAL ("msl": msl, ~line 2429). The prior `state_refs["msl"]
+            # = msl` here raised `NameError: name 'state_refs' is not defined`
+            # (state_refs is THIS function's return value, not in scope inside it)
+            # → the except swallowed it as "MSL init failed", aborting MSL boot.
+            # Removed; the return literal is the sole, correct path. (ff3583b4 bug.)
             logger.info(
                 "[CognitiveWorker] MSL booted: input=%dD, output=%dD, "
                 "buffer=%d frames, updates=%d, I-confidence=%.3f, "
