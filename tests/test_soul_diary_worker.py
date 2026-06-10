@@ -82,7 +82,7 @@ def test_author_persists_authored_text(tmp_path, monkeypatch):
     orch = _orch(tmp_path)
     seen = {}
     monkeypatch.setattr(orch, "persist", lambda text, **kw: seen.update(text=text))
-    monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o: o.build_bundle(
+    monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o, **kw: o.build_bundle(
         sovereignty={"s": 0.58, "replies": 22}, outcome={"promoted": 7, "pruned": 2},
         felt={}, engrams_today=["Glacier"], memory={}, social={}, onchain={}))
     ok = sdw._author_daily_entry({"promoted": 7}, orchestrator=orch,
@@ -99,7 +99,7 @@ def test_author_softfails_to_minimal_on_ovg_block(tmp_path, monkeypatch):
     orch = _orch(tmp_path)
     seen = {}
     monkeypatch.setattr(orch, "persist", lambda text, **kw: seen.update(text=text))
-    monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o: o.build_bundle(
+    monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o, **kw: o.build_bundle(
         sovereignty={"s": 0.5, "replies": 1}, outcome={"promoted": 3, "pruned": 0},
         felt={}, engrams_today=[], memory={}, social={}, onchain={}))
     ok = sdw._author_daily_entry({}, orchestrator=orch,
@@ -127,7 +127,7 @@ def test_author_noop_day_latches_without_entry(tmp_path, monkeypatch):
     orch = _orch(tmp_path)
     called = {"persist": False}
     monkeypatch.setattr(orch, "persist", lambda *a, **k: called.update(persist=True))
-    monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o: o.build_bundle(
+    monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o, **kw: o.build_bundle(
         sovereignty={"replies": 0}, outcome={"promoted": 0, "pruned": 0},
         felt={}, engrams_today=[], memory={}, social={}, onchain={}))
     ok = sdw._author_daily_entry({}, orchestrator=orch, provider=_FakeProvider("x"),
@@ -146,7 +146,7 @@ def test_p2_enrich_and_anchor_emitted(tmp_path, monkeypatch):
     publishes whose shape matches the consuming workers (§1.0 ⑥⑦)."""
     orch = _orch(tmp_path)
     monkeypatch.setattr(orch, "persist", lambda text, **kw: None)
-    monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o: o.build_bundle(
+    monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o, **kw: o.build_bundle(
         sovereignty={"s": 0.58, "replies": 22}, outcome={"promoted": 7, "pruned": 2},
         felt={}, engrams_today=["Glacier"], memory={}, social={}, onchain={}))
     q = _FakeQueue()

@@ -87,12 +87,15 @@ async def _compose_diary(provider, verifier, prompts: dict) -> tuple[str, bool]:
         return text, False
 
 
-def _gather_bundle(payload: dict, shm_reader, orchestrator) -> dict:
+def _gather_bundle(payload: dict, shm_reader, orchestrator, *,
+                   titan_id: str = "", repo_root: str = "") -> dict:
     """② GATHER — assemble the grounded bundle from G18 reads (best-effort).
 
     Each source is independently guarded: a missing source degrades the entry,
     never crashes the cascade. Engram day-window / richer memory-social-onchain
-    sources land with the P2 synthesis enrichment.
+    sources land with the P2 synthesis enrichment. The §7.P5 `infra` slot carries
+    read-only self-inspection (journal errors + error→code correlation), so the
+    entry is grounded in his real substrate (INV-SD-9).
     """
     sovereignty: dict = {}
     try:
@@ -118,9 +121,23 @@ def _gather_bundle(payload: dict, shm_reader, orchestrator) -> dict:
     except Exception as e:  # noqa: BLE001
         logger.info("[soul_diary] neuromod read failed: %s", e)
 
+    # P5 — scaffolding self-inspection (read-only, bounded, soft-fail; INV-SD-9).
+    infra: dict = {}
+    if titan_id and repo_root:
+        try:
+            from titan_hcl.core import self_inspect
+            obs = self_inspect.gather_self_observations(titan_id, repo_root=repo_root)
+            infra = {
+                "summary": self_inspect.summarize_observations(obs),
+                "structure": obs.get("structure") or {},
+                "correlations": obs.get("correlations") or [],
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.info("[soul_diary] self-inspection failed: %s", e)
+
     return orchestrator.build_bundle(
         sovereignty=sovereignty, outcome=outcome, felt=felt,
-        engrams_today=[], memory={}, social={}, onchain={})
+        engrams_today=[], memory={}, social={}, onchain={}, infra=infra)
 
 
 def _enrich_synthesis(send_queue, src: str, today: str, entry: str) -> None:
@@ -147,6 +164,34 @@ def _enrich_synthesis(send_queue, src: str, today: str, entry: str) -> None:
                     "for %s", today)
     except Exception as e:  # noqa: BLE001
         logger.warning("[soul_diary] enrich (mempool add) failed: %s", e)
+
+
+def _enrich_self_inspection(send_queue, src: str, today: str, infra: dict) -> None:
+    """P5 ENRICH (INV-SD-9) — publish the self-inspection observation as its OWN
+    `domain="self"` thought (`source="self_inspect"`), so his code/error/substrate
+    observations become recallable self-Engrams (auto-linked to the `Self` hub via
+    the P3a `SELF_HAS_ENGRAM` hook), distinct from the narrative diary entry. This
+    is the BRAIN_DOMAIN_SELF seed. Soft-fail — never blocks the cascade."""
+    summary = ((infra or {}).get("summary") or "").strip()
+    if not summary:
+        return
+    try:
+        send_queue.put({
+            "type": bus.MEMORY_MEMPOOL_ADD,
+            "src": src, "dst": "memory",
+            "ts": time.time(),
+            "payload": {
+                "user_prompt": f"What I observed about my own substrate — {today}",
+                "agent_response": summary,
+                "user_identifier": "Titan",
+                "source": "self_inspect",
+                "tags": ["soul_diary", "self_inspect", "domain:self"],
+            },
+        })
+        logger.info("[soul_diary] P5 self-inspection enriched "
+                    "(mempool add, source=self_inspect) for %s", today)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[soul_diary] self-inspection enrich failed: %s", e)
 
 
 def _anchor_main_chain(send_queue, src: str, today: str, row: dict) -> None:
@@ -184,14 +229,16 @@ def _anchor_main_chain(send_queue, src: str, today: str, row: dict) -> None:
 
 
 def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
-                        shm_reader, send_queue, src: str) -> bool:
+                        shm_reader, send_queue, src: str,
+                        titan_id: str = "", repo_root: str = "") -> bool:
     """Run the full pipeline for one MEDITATION_COMPLETE. Returns True if a
     diary entry was authored (or correctly skipped), False on hard error."""
     today = _utc_today()
     if not orchestrator.should_author(today):
         return True  # already wrote today — latch closed (INV-SD-5)
 
-    bundle = _gather_bundle(payload, shm_reader, orchestrator)
+    bundle = _gather_bundle(payload, shm_reader, orchestrator,
+                            titan_id=titan_id, repo_root=repo_root)
     if not orchestrator.has_activity(bundle):
         logger.info("[soul_diary] no-op day (no activity) — latching without entry")
         orchestrator.mark_authored(today)
@@ -215,8 +262,10 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
     # P2 — the committed entry now ENRICHES synthesis (he remembers + recalls his
     # narrative path) and ANCHORS the SELF journey on the main chain. Each
     # soft-fails independently (INV-SD-13); the private floor above is durable.
-    _enrich_synthesis(send_queue, src, today, entry)   # ⑥ INV-SD-15
-    _anchor_main_chain(send_queue, src, today, row)    # ⑦ INV-SD-17
+    _enrich_synthesis(send_queue, src, today, entry)              # ⑥ INV-SD-15
+    _enrich_self_inspection(send_queue, src, today,
+                            bundle.get("infra") or {})            # P5 INV-SD-9
+    _anchor_main_chain(send_queue, src, today, row)              # ⑦ INV-SD-17
 
     logger.info("[soul_diary] authored daily entry for %s (%d chars, authored=%s)",
                 today, len(entry), ovg_ok and bool(text))
@@ -356,7 +405,9 @@ def soul_diary_worker_main(recv_queue, send_queue, name: str,
                 if _author_daily_entry(payload, orchestrator=orchestrator,
                                        provider=provider, verifier=verifier,
                                        shm_reader=shm_reader,
-                                       send_queue=send_queue, src=name):
+                                       send_queue=send_queue, src=name,
+                                       titan_id=titan_id,
+                                       repo_root=project_root):
                     processed += 1
                 else:
                     errors += 1
