@@ -110,11 +110,23 @@ def _get_router(plugin: Any, cfg: dict) -> Optional[ToolRouter]:
         return None
 
 
-def _invoke_sandbox(plug: Any, code: str):
+def _invoke_sandbox(plug: Any, code: str, parent_goal: Optional[str] = None):
     """Run the coding_sandbox ToolPlug synchronously (called via to_thread).
-    The plug's invoke() anchors the tool_call_tx with scored_by='oracle'."""
+    The plug's invoke() anchors the tool_call_tx with scored_by='oracle'.
+
+    EEL B1 (D-SPEC-153 / INV-Syn-29) — `parent_goal` names the goal this
+    AUTONOMOUS tool-use serves so the oracle-verified verdict forms an
+    OUTCOME-keyed (oracle_id, goal_class) skill. WITHOUT it the companion
+    verdict carries parent_goal=None and the OracleRouter flush DROPS it
+    (`if not e.parent_goal: continue`, oracle_router.py:570) → no positive
+    skill ever forms from the backstop path (the dominant autonomous path;
+    the 2026-06-09 soak found 0 promoted despite oracle coverage=1.0). The
+    agent-explicit agno tool (agno_tools.py) already threads this from the
+    `goal` buffer; the backstop sources it from the turn's prompt — the
+    same user request, so both paths key the same goal_class."""
     from titan_hcl.synthesis.plugs import ToolCall
-    return plug.invoke(ToolCall(tool_id="coding_sandbox", args={"code": code}))
+    return plug.invoke(ToolCall(tool_id="coding_sandbox", args={"code": code},
+                                parent_goal=parent_goal))
 
 
 async def run_tool_backstop(
@@ -173,8 +185,12 @@ async def run_tool_backstop(
                        "cannot execute (phase=%s)", phase)
         return BackstopResult(fired=True, executed=False, reason="plug_not_wired",
                               code=code)
+    # EEL B1 — the goal this autonomous tool-use serves (→ goal_class). The
+    # prompt IS the user's request; falls back to the response text only if the
+    # prompt is empty (post-phase salvage). None → unchanged drop behaviour.
+    parent_goal = (prompt or "").strip() or (response or "").strip() or None
     try:
-        result = await asyncio.to_thread(_invoke_sandbox, plug, code)
+        result = await asyncio.to_thread(_invoke_sandbox, plug, code, parent_goal)
     except Exception as e:  # noqa: BLE001
         logger.warning("[ToolBackstop] sandbox invoke failed (soft): %s", e)
         return BackstopResult(fired=True, executed=False, reason=f"exec_error:{e}",

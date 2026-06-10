@@ -89,9 +89,11 @@ class _StubPlug:
     contains the marker (so we can assert honest pass/fail without a sandbox)."""
     def __init__(self):
         self.invoked_with = None
+        self.parent_goal = "__unset__"   # capture the EEL-B1 goal threading
 
     def invoke(self, call):
         self.invoked_with = call.args.get("code", "")
+        self.parent_goal = getattr(call, "parent_goal", None)
         ok = "FAIL" not in self.invoked_with
         return _StubResult(ok, "stub-output")
 
@@ -181,6 +183,42 @@ def test_backstop_disabled():
         p, prompt="compute 9*9 in your sandbox", phase="pre"))
     assert res.fired is False and res.reason == "disabled"
     assert plug.invoked_with is None
+
+
+# ── EEL B1 — autonomous tool-use threads parent_goal (the dominant path) ────
+# RFP_synthesis_self_learning_meta_reasoning §7.A: the backstop builds the
+# ToolCall WITH parent_goal so the oracle verdict survives the score-event
+# flush (oracle_router.py:570 `if not e.parent_goal: continue`). WITHOUT this
+# the autonomous path forms 0 skills despite oracle coverage=1.0.
+def test_backstop_threads_parent_goal_from_prompt():
+    plug = _StubPlug()
+    p = _Plugin(plug=plug, provider=_StubProvider(code="print(2+3)"))
+    prompt = "compute 2+3 in your sandbox"
+    res = _run(run_tool_backstop(p, prompt=prompt, phase="pre"))
+    assert res.executed and res.success
+    # the ToolCall must carry the goal (the prompt) — NOT None (the old drop).
+    assert plug.parent_goal == prompt
+
+
+def test_backstop_parent_goal_falls_back_to_response():
+    # post-phase salvage: prompt empty, response carries the text → use it.
+    plug = _StubPlug()
+    p = _Plugin(plug=plug, provider=_StubProvider(code="print(2+3)"))
+    res = _run(run_tool_backstop(
+        p, prompt="", response="let me compute 2+3 in the sandbox", phase="post"))
+    assert res.executed
+    assert plug.parent_goal == "let me compute 2+3 in the sandbox"
+
+
+def test_backstop_parent_goal_never_none_on_real_fire():
+    # whatever fires the backstop, the verdict must carry a non-empty goal so
+    # it is not skipped at oracle_router.py:570.
+    plug = _StubPlug()
+    p = _Plugin(plug=plug, provider=_StubProvider(code="print(7*7)"))
+    res = _run(run_tool_backstop(
+        p, prompt="verify 7*7 in your sandbox", phase="pre"))
+    assert res.executed
+    assert plug.parent_goal and plug.parent_goal.strip()
 
 
 def test_backstop_router_declines_no_response():
