@@ -2987,18 +2987,28 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 # (the tool executed); decision+outcome travel together so no
                 # cross-process join is needed.
                 _decision_feats = payload.get("features")
-                _decision_action = payload.get("action")
-                if _decision_feats is not None and _decision_action is not None:
+                if _decision_feats is not None:
                     try:
                         from titan_hcl.synthesis.goal_class import goal_class as _goal_class_fn
+                        from titan_hcl.synthesis.outer_meta_policy import OUTER_ACTIONS
                         _gc = _goal_class_fn(str(payload.get("parent_goal", "") or ""))
                         _reward = 1.0 if str(payload.get("verdict", "")) == "true" else -1.0
+                        # OFF-POLICY attribution: a coding_sandbox verdict evaluates the
+                        # TOOL action — so we train `tool` (not whatever the policy
+                        # happened to pick) with the decision FEATURES as context. This
+                        # is how the RFP's "learned from prior verifiable wins"
+                        # bootstraps: every oracle-verified tool-use (regex- OR
+                        # policy-fired) teaches the policy that tool succeeds in this
+                        # context, breaking the cold-start deadlock where a cold policy
+                        # never tries the tool on a live (exploit-only) turn.
+                        _tool_action = OUTER_ACTIONS.index("tool")
                         _send(send_queue, SELF_LEARN_REWARD, name, "self_learning", {
                             "features": list(_decision_feats),
-                            "action": int(_decision_action),
+                            "action": _tool_action,
                             "reward": _reward,
                             "goal_class": _gc,
                             "oracle_id": str(payload.get("oracle_id", "") or ""),
+                            "policy_action": payload.get("action"),  # what the policy chose (telemetry)
                             "parent_tool_call_tx": _ptx,
                         })
                     except Exception as _sl_err:
