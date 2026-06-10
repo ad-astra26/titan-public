@@ -1610,8 +1610,6 @@ def _handle_mempool_add(msg: dict, ctx: WorkerContext) -> None:
     agent_response = payload.get("agent_response", "")
     user_identifier = payload.get("user_identifier", "Anonymous")
     neuromod_context = payload.get("neuromod_context")  # felt-at-lived-time (§7.C)
-    source = payload.get("source")        # provenance (e.g. "soul_diary"; INV-SD-15)
-    tags = payload.get("tags")            # advisory tags carried onto the node
     if not user_prompt and not agent_response:
         logger.debug("[MemoryWorker] MEMORY_MEMPOOL_ADD ignored (empty)")
         return
@@ -1623,7 +1621,6 @@ def _handle_mempool_add(msg: dict, ctx: WorkerContext) -> None:
                     user_prompt, agent_response,
                     user_identifier=user_identifier,
                     neuromod_context=neuromod_context,
-                    tags=tags, source=source,
                 )
             )
         logger.info(

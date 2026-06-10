@@ -1,9 +1,9 @@
 """Phase 4 — Kuzu Engram-spine DDL tests (P4.A; spine node renamed Concept→Engram, RFP §7.B).
 
 Covers ARCHITECTURE_synthesis_engine.md §6.1/§6.2 + PLAN_synthesis_engine_Phase4.md §P4.A:
-- All 5 node tables (Engram / Production / ActionChain / HypothesisFork / Self) exist.
-- All 7 rel tables (COMPOSED_FROM / COMPOSED_INTO / USES_SKILL / COMPILED_FROM
-  / EXPLORES / SELF_HAS_ENGRAM / SELF_HAS_SKILL) exist.
+- All 4 node tables (Engram / Production / ActionChain / HypothesisFork) exist.
+- All 5 rel tables (COMPOSED_FROM / COMPOSED_INTO / USES_SKILL / COMPILED_FROM
+  / EXPLORES) exist.
 - Bootstrap is idempotent.
 - Composite PRIMARY KEY(concept_id, version) allows two rows with same
   concept_id but different versions.
@@ -42,7 +42,7 @@ def graph():
 # ─── Schema presence ────────────────────────────────────────────────
 
 def test_all_spine_node_tables_exist_after_init(graph):
-    """All 5 spine node tables present after TitanKnowledgeGraph init."""
+    """All 4 spine node tables present after TitanKnowledgeGraph init."""
     for table_name, _ in _NODE_TABLES:
         assert _table_exists(graph._conn, table_name), (
             f"node table {table_name!r} not created by TitanKnowledgeGraph init"
@@ -50,7 +50,7 @@ def test_all_spine_node_tables_exist_after_init(graph):
 
 
 def test_all_spine_rel_tables_exist_after_init(graph):
-    """All 7 spine rel tables present after TitanKnowledgeGraph init."""
+    """All 5 spine rel tables present after TitanKnowledgeGraph init."""
     for rel_name, _, _ in _REL_TABLES:
         assert _table_exists(graph._conn, rel_name), (
             f"rel table {rel_name!r} not created by TitanKnowledgeGraph init"

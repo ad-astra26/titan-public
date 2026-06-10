@@ -69,9 +69,8 @@ class SoulDiaryOrchestrator:
     @staticmethod
     def build_bundle(*, sovereignty: dict, outcome: dict, felt: dict,
                      engrams_today: list, memory: dict, social: dict,
-                     onchain: dict, infra: Optional[dict] = None) -> dict:
-        """Normalize the raw GATHER inputs into the grounded bundle (G18 reads).
-        `infra` = the §7.P5 self-inspection observations ({summary, structure})."""
+                     onchain: dict) -> dict:
+        """Normalize the raw GATHER inputs into the grounded bundle (G18 reads)."""
         return {
             "sovereignty": sovereignty or {},
             "outcome": outcome or {},
@@ -80,7 +79,6 @@ class SoulDiaryOrchestrator:
             "memory": memory or {},
             "social": social or {},
             "onchain": onchain or {},
-            "infra": infra or {},
         }
 
     @staticmethod
@@ -127,16 +125,6 @@ class SoulDiaryOrchestrator:
             lines.append(f"- Social: {bundle['social']}.")
         if bundle.get("onchain"):
             lines.append(f"- On-chain/metabolic: {bundle['onchain']}.")
-        infra = bundle.get("infra") or {}
-        infra_summary = (infra.get("summary") or "").strip()
-        if infra_summary:
-            lines.append(f"- Looking at my own substrate (§P5 self-inspection): "
-                         f"{infra_summary}.")
-        struct = infra.get("structure") or {}
-        if struct.get("py_files"):
-            lines.append(
-                f"- My own shape: {int(struct.get('py_files'))} source files "
-                f"across {len(struct.get('subsystems') or [])} subsystems.")
         return "\n".join(lines)
 
     # ── soft-fail minimal entry (INV-SD-13) ──────────────────────────

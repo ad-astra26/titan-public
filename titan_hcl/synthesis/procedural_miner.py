@@ -239,6 +239,39 @@ class ProceduralMiner:
             "compiled_from": compiled_from,
         }
 
+    def prepare_cluster(self, cluster: dict, members: list[list[dict]],
+                        kind: str) -> Optional[dict]:
+        """Deterministic enqueue payload for the off-hot-path abstraction queue —
+        everything `abstract_cluster` does EXCEPT the LLM call (dream-hardening
+        2026-06-10: the LLM call moves to the abstraction daemon so it never blocks
+        the dream). Returns {cluster_id, sequence, occurrence_count, kind,
+        members_summary, compiled_from} or None. `cluster_id` = sha256(sequence|kind)
+        → idempotent across re-mines."""
+        if not members:
+            return None
+        seq = list(cluster.get("sequence") or [])
+        # compiled_from = unique source tx_hashes across all member sequences
+        compiled_from: list[str] = []
+        seen: set[str] = set()
+        for s in members:
+            for tx in s:
+                h = tx.get("tx_hash") or tx.get("hash") or (tx.get("content") or {}).get("tx_hash")
+                if h and h not in seen:
+                    seen.add(h)
+                    compiled_from.append(h)
+        if not compiled_from:
+            return None   # no lineage → can't persist later (persist_negative_skill gate)
+        cluster_id = "absc_" + hashlib.sha256(
+            (json.dumps(seq, sort_keys=True) + "|" + kind).encode("utf-8")).hexdigest()[:16]
+        return {
+            "cluster_id": cluster_id,
+            "sequence": seq,
+            "occurrence_count": len(members),
+            "kind": kind,
+            "members_summary": _members_summary(members),
+            "compiled_from": compiled_from,
+        }
+
     # ── mine_pass (the one-call surface) ───────────────────────────────
 
     def mine_pass(self, *, dream_pass_id: Optional[str] = None) -> dict:
@@ -272,82 +305,35 @@ class ProceduralMiner:
             "recurrent=%d (each recurrent cluster → up to 2 LLM abstractions)",
             len(txs), len(groups), len(clusters_all), len(recurrent))
 
-        positive_compiled = 0
-        negative_compiled = 0
-        llm_calls = 0
-        llm_failures = 0
-        compiled_ids: list[str] = []
-        total_skills_compiled = 0
+        enqueued = 0   # recurrent clusters NEWLY enqueued for off-hot-path abstraction
 
         for cluster in recurrent:
-            if total_skills_compiled >= self._max_skills_per_pass:
+            if enqueued >= self._max_skills_per_pass:
                 break
             split = self.split_success_failure(cluster)
             # EEL B1 (D-SPEC-153) — the miner is NEGATIVE-ONLY: positive skills now
             # form per oracle-verified use (the skill_score_events queue), so the
             # miner only compiles recurrent FAILURE shapes (INV-5 / B2 replay fuel).
             for kind in ("negative",):
-                if total_skills_compiled >= self._max_skills_per_pass:
+                if enqueued >= self._max_skills_per_pass:
                     break
                 members = split[kind]
                 if len(members) < self._min_occurrences:
                     continue
-                llm_calls += 1
-                logger.info(
-                    "[ProceduralMiner] abstracting cluster (seq_len=%d, %s, "
-                    "members=%d) — LLM call %d",
-                    len(cluster["sequence"]), kind, len(members), llm_calls)
-                abstracted = self.abstract_cluster(cluster, members, kind)
-                if not abstracted:
-                    llm_failures += 1
+                # Dream-hardening (2026-06-10): ENQUEUE the recurrent failure cluster
+                # for the off-hot-path abstraction daemon (fast, NO LLM here). The
+                # daemon makes the LLM call off the dream/writer thread + persists the
+                # negative skill WITH RETRY — so a slow/timed-out LLM never blocks the
+                # dream and the work is never lost (durable queue, resumes on restart).
+                prepared = self.prepare_cluster(cluster, members, kind)
+                if not prepared:
                     continue
-                # EEL B1 — a recurrent failure shape → a NEGATIVE cell on an
-                # outcome derived from the abstraction (goal_class) + the recurrent
-                # tool-path (task_shape). Never delegated (INV-EEL-5 polarity guard);
-                # serves avoidance + the B2 replay queue. oracle_id sentinel marks
-                # the recurrence origin (distinct from the per-use oracle outcomes).
-                from titan_hcl.synthesis.goal_class import (
-                    goal_class as _derive_goal_class,
-                    make_task_shape as _derive_task_shape,
-                )
-                base_name = abstracted["nl_description"].split(".")[0][:64] or "compiled_skill"
-                full_name = f"[negative] {base_name}"
-                _gclass = _derive_goal_class(abstracted["nl_description"])
-                _seq = cluster.get("sequence")
-                _tool_sig = ("+".join(str(s) for s in _seq)
-                             if isinstance(_seq, (list, tuple)) else str(_seq))
-                _task_shape = _derive_task_shape("procedural", _tool_sig[:80], "")
                 try:
-                    skill_id = self._skill_store.persist_negative_skill(
-                        oracle_id="miner_recurrence",
-                        goal_class=_gclass,
-                        task_shape=_task_shape,
-                        name=full_name,
-                        nl_description=abstracted["nl_description"],
-                        compiled_from=abstracted["compiled_from"],
-                        executable_spec=abstracted["executable_spec"],
-                        preconditions=abstracted["preconditions"],
-                        postconditions=abstracted["postconditions"],
-                        ts=now,
-                    )
+                    if self._skill_store.enqueue_abstraction(prepared, ts=now):
+                        enqueued += 1
                 except Exception as e:
                     logger.warning(
-                        "[ProceduralMiner] persist_negative_skill failed: %s", e)
-                    llm_failures += 1
-                    continue
-                compiled_ids.append(skill_id)
-                total_skills_compiled += 1
-                if kind == "positive":
-                    positive_compiled += 1
-                else:
-                    negative_compiled += 1
-                self._emit("META_SKILL_COMPILED", {
-                    "skill_id": skill_id,
-                    "kind": kind,
-                    "sequence_len": len(cluster["sequence"]),
-                    "occurrence_count": len(members),
-                    "ts": now,
-                })
+                        "[ProceduralMiner] enqueue_abstraction failed: %s", e)
 
         summary = {
             "dream_pass_id": dream_pass_id,
@@ -356,11 +342,7 @@ class ProceduralMiner:
             "groups_built": len(groups),
             "clusters_total": len(clusters_all),
             "clusters_recurrent": len(recurrent),
-            "positive_skills_compiled": positive_compiled,
-            "negative_skills_compiled": negative_compiled,
-            "llm_calls": llm_calls,
-            "llm_failures": llm_failures,
-            "compiled_ids": compiled_ids,
+            "clusters_enqueued": enqueued,
         }
 
         self._anchor_mining_pass(summary)

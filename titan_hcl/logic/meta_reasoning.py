@@ -155,6 +155,15 @@ META_POLICY_INPUT_DIM = 80
 SUB_MODE_INPUT_DIM = 30
 
 
+def _softmax(x: "np.ndarray", temperature: float = 1.0) -> "np.ndarray":
+    """Numerically-stable softmax over a 1-D logit vector (temperature ≥ 0.1).
+    Shared by the Phase-B Option-β grounded-V selection blend."""
+    t = max(0.1, float(temperature))
+    z = np.asarray(x, dtype=np.float32) / t
+    e = np.exp(z - z.max())
+    return e / (e.sum() + 1e-8)
+
+
 # ── Meta-Chain State ──────────────────────────────────────────────
 
 @dataclass
@@ -235,6 +244,14 @@ class MetaChainState:
     grounding_concept: str = ""
     grounding_consumer: str = ""
     entry_primitive: str = ""
+    # RFP_cgn_loop_closure §7.A (ARC-4) — the originating request's id +
+    # question_type, carried so _conclude_chain can emit a META_REASON_OUTCOME
+    # back to the emergent-reward accumulator (handle_outcome REQUIRES a
+    # request_id). Empty for the mechanical experience_pressure/periodic
+    # chains, which therefore emit no outcome (only concept-seeded Level-A
+    # chains feed the loop).
+    grounding_request_id: str = ""
+    grounding_question_type: str = ""
     # ── Phase G (RFP_cgn_enhancements §9.3) — teacher-binding outcome tracking ──
     # The strongest ReasoningBinding that matched this chain's context (highest
     # sim×conf), plus whether the chain CHOSE its recommended primitive
@@ -779,6 +796,19 @@ class MetaReasoningEngine:
         self._teacher_binding_topk = int(cfg.get("teacher_binding_topk", 3))
         self._teacher_binding_sim_floor = float(cfg.get("teacher_binding_sim_floor", 0.6))
         self._teacher_bias_fires_count = 0
+        # ── RFP_cgn_loop_closure §7.B (Q1 Option-β) — grounded V drives per-step
+        # primitive SELECTION. When on, the blend
+        #   final[i] = conf[i]·softmax(composed_V)[i] + (1−conf[i])·softmax(policy)[i]
+        # replaces the compound-reward selection bias; repeat_bias +
+        # diversity_pressure (the §12.3/INV-EMERGENCE hardcoded mono crutches)
+        # are NOT applied and ε-greedy is capped to a minimal floor. Flag-gated
+        # so the arc is independently revertable (§5 rollback). _g_sel_fires
+        # counts how often the blend actually drove the pick (live G6 signal).
+        self._grounded_v_selection_enabled = bool(
+            cfg.get("grounded_v_selection_enabled", True))
+        self._grounded_v_epsilon_floor = float(
+            cfg.get("grounded_v_epsilon_floor", 0.05))
+        self._g_sel_fires = 0
         try:
             from titan_hcl.logic.reasoning_binding import ReasoningBindingStore
             _rb_dir = os.path.join(
@@ -1112,6 +1142,12 @@ class MetaReasoningEngine:
         self._total_meta_steps = 0
         self._total_wisdom_saved = 0
         self._total_eurekas = 0
+        # RFP_cgn_loop_closure §7.A — ARC-4 outcome-emit counter (G3/G4 live
+        # check) + last-chain audit fields (G5; surfaced in get_audit_stats →
+        # meta_reasoning_state.bin so the SHM readout carries real values).
+        self._meta_outcomes_emitted = 0
+        self._last_chain_reason = ""
+        self._last_chain_succeeded = False
         # META-CGN Producer #4 — pending eureka events queue.
         # _fire_eureka appends here (decoupled from bus/send_queue); spirit_worker
         # drains after each meta_engine.tick() and emits via emit_meta_cgn_signal.
@@ -1223,6 +1259,35 @@ class MetaReasoningEngine:
             swallow_warn('[META] teacher binding bias failed', _tb_err,
                          key='logic.meta_reasoning.teacher_bias', throttle=100)
         return bias, top
+
+    def _grounded_primitive_vectors(self):
+        """RFP_cgn_loop_closure §7.B (Q1 Option-β) — build (composed_V, conf)
+        9-vectors aligned to META_PRIMITIVES from meta_cgn's grounded
+        per-primitive Beta posteriors.
+
+        composed_V[i] = primitive.V  (grounded value [0,1], = beta_mean(α,β))
+        conf[i]       = primitive.confidence  (= _posterior_confidence(α,β),
+                        n_eff/(n_eff+500) → 1 as evidence accumulates)
+
+        conf[i] is the per-primitive λ: a well-grounded primitive competes at
+        full authority while an unproven one defers to the policy. Returns
+        (None, None) when meta_cgn is absent/empty (cold) so the caller falls
+        back to the raw policy — grounded V only takes over once it exists.
+        """
+        mcgn = self._meta_cgn
+        if mcgn is None:
+            return None, None
+        prims = getattr(mcgn, "_primitives", None)
+        if not prims:
+            return None, None
+        composed_V = np.full(NUM_META_ACTIONS, 0.5, dtype=np.float32)
+        conf = np.zeros(NUM_META_ACTIONS, dtype=np.float32)
+        for i, pname in enumerate(META_PRIMITIVES):
+            pc = prims.get(pname)
+            if pc is not None:
+                composed_V[i] = float(pc.V)
+                conf[i] = float(pc.confidence)
+        return composed_V, conf
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -1348,10 +1413,40 @@ class MetaReasoningEngine:
         _teacher_bias, _g_binding = self._compute_teacher_bias()
 
         _unbiased_argmax = -1
+        # ── RFP_cgn_loop_closure §7.B (Q1 Option-β) — grounded V drives the
+        # per-step primitive SELECTION (THE crux). When the grounded matrix has
+        # any confidence, blend per-primitive BEFORE the pick:
+        #   final[i] = conf[i]·softmax(composed_V)[i] + (1−conf[i])·softmax(policy)[i]
+        # entry_bias (Path#0 first-step, INV-LOOP-1) + teacher_bias (Phase G
+        # LEARNED) ride the policy logits; repeat_bias + diversity_pressure (the
+        # §12.3/INV-EMERGENCE hardcoded mono crutches) are NOT applied — diversity
+        # now EMERGES from the grounded distribution + its sampling. Sampling
+        # final (not argmax) is the organic exploration that replaces ε-as-primary
+        # (§12.4). Flag-gated for independent revertability (§5 rollback).
+        _g_composed_V, _g_conf = (
+            self._grounded_primitive_vectors()
+            if self._grounded_v_selection_enabled else (None, None))
+        _g_sel_active = (_g_composed_V is not None and _g_conf is not None
+                         and bool(np.any(_g_conf > 1e-6)))
         _has_bias = ((self._diversity_pressure_remaining > 0 and np.any(self._primitive_bias))
                      or np.any(_repeat_bias) or np.any(_entry_bias)
                      or np.any(_teacher_bias))
-        if _has_bias:
+        if _g_sel_active:
+            try:
+                _scores = self.meta_policy.forward(np.array(meta_input, dtype=np.float32))
+                _unbiased_argmax = int(np.argmax(_scores))
+                _policy_logits = _scores + _entry_bias + _teacher_bias
+                _final = (_g_conf * _softmax(_g_composed_V)
+                          + (1.0 - _g_conf) * _softmax(_policy_logits, temperature))
+                _final = _final / (_final.sum() + 1e-8)
+                prim_idx = int(np.random.choice(NUM_META_ACTIONS, p=_final))
+                self._g_sel_fires += 1
+            except Exception as _gv_err:
+                logger.warning("[META] grounded-V (Option-β) selection failed: "
+                               "%s — falling back to policy", _gv_err)
+                _g_sel_active = False
+                prim_idx = self.meta_policy.select_action(meta_input, temperature)
+        elif _has_bias:
             try:
                 _scores = self.meta_policy.forward(np.array(meta_input, dtype=np.float32))
                 _unbiased_argmax = int(np.argmax(_scores))
@@ -1372,6 +1467,14 @@ class MetaReasoningEngine:
         # Adaptive epsilon-greedy: force exploration when policy is collapsed.
         # Self-decays as diversity recovers (no manual disable needed).
         self._adaptive_epsilon = self._compute_adaptive_epsilon()
+        # RFP_cgn_loop_closure §7.B.4 — when grounded-V drives selection, the
+        # adaptive ε-ramp (up to 0.25 = 77.8% FORMULATE noise, §12.4) would
+        # actively DILUTE the grounded signal. Cap ε to a minimal floor: the
+        # blend's own sampling is now the organic exploration. A small floor
+        # stays as the §5 rollback backstop until B is soak-proven (then ε
+        # retires fully per INV-LOOP-4).
+        if _g_sel_active and self._adaptive_epsilon > self._grounded_v_epsilon_floor:
+            self._adaptive_epsilon = self._grounded_v_epsilon_floor
         _epsilon_picked_introspect = False
         _epsilon_overrode = False
         if self._adaptive_epsilon > 0 and np.random.random() < self._adaptive_epsilon:
@@ -1417,7 +1520,15 @@ class MetaReasoningEngine:
         # _suggested_template ever becomes a numpy array (same class
         # of bug as BUG-META-STATS-PERSISTENCE; see
         # memory/feedback_numpy_truthy_persistence.md).
-        if (self._chain_iql is not None
+        # RFP_cgn_loop_closure §7.B — the β-rerank "re-adds FORMULATE" (§5.6:
+        # 74%→81%) HERE: a FORMULATE-biased template (chain_iql Q trained on the
+        # FORMULATE-biased compound) overrides the per-step pick. When grounded-V
+        # drives selection, SUPPRESS this override so the template path can't
+        # re-add FORMULATE over the grounded-V choice (the β-rerank itself stays
+        # composed_V-ranked + Phase A keeps primitive_V fresh, fixing the §5.6
+        # stale-V root cause). Skipped entirely under the grounded-V regime.
+        if (not _g_sel_active
+                and self._chain_iql is not None
                 and self._suggested_template is not None
                 and float(self._suggested_template_q or 0.0) > 0.5):
             try:
@@ -2073,6 +2184,27 @@ class MetaReasoningEngine:
         }
 
         return {
+            # ── RFP_cgn_loop_closure §7.A telemetry fix (G5) ──
+            # The publisher (meta_reasoning_state_publisher.py:167) reads these
+            # straight from get_audit_stats() but they were NEVER provided here
+            # (the lifetime counter lives only in get_stats() as "total_chains")
+            # → the SHM slot, hence /v6/cognition/meta-reasoning, has reported 0
+            # since the slot was created (cd755d197), the exact stale-0 the RFP
+            # §0.1 flags. Surface them from the live engine counters so the
+            # readout stops lying. (Schema field total_meta_chains already
+            # reserved in meta_reasoning_state.bin v2 / D-SPEC-91 — no SPEC bump.)
+            "total_meta_chains": int(self._total_meta_chains),
+            "last_chain_id": int(self.get_last_chain_id()),
+            "last_chain_reason": str(getattr(self, "_last_chain_reason", "") or ""),
+            "last_chain_succeeded": bool(
+                getattr(self, "_last_chain_succeeded", False)),
+            "meta_outcomes_emitted": int(
+                getattr(self, "_meta_outcomes_emitted", 0)),
+            # RFP_cgn_loop_closure §7.B (G6) — grounded-V Option-β selection:
+            # whether it's enabled + how many times it actually drove the pick.
+            "grounded_v_selection_enabled": bool(
+                getattr(self, "_grounded_v_selection_enabled", False)),
+            "grounded_v_selection_fires": int(getattr(self, "_g_sel_fires", 0)),
             "diversity": {
                 "unique_prims_ema_50chains": round(float(unique_ema), 3),
                 "unique_prims_per_chain_recent": recent_uniques[-20:],
@@ -2275,6 +2407,13 @@ class MetaReasoningEngine:
             self.state.grounding_concept = str(_g.get("concept_id", ""))
             self.state.grounding_consumer = str(_g.get("consumer", ""))
             self.state.entry_primitive = str(_g.get("entry_primitive", ""))
+            # RFP_cgn_loop_closure §7.A (ARC-4) — keep the request id +
+            # question_type so _conclude_chain can emit the outcome that
+            # feeds the emergent-reward accumulator (the half that was missing
+            # → α-ramp starved). The grounding payload carries both
+            # (meta_service.handle_request:949).
+            self.state.grounding_request_id = str(_g.get("request_id", ""))
+            self.state.grounding_question_type = str(_g.get("question_type", ""))
             if self.state.grounding_concept:
                 self.state.entity_refs["current_topic"] = self.state.grounding_concept
             self._active_grounding = None  # consume once
@@ -3012,6 +3151,43 @@ class MetaReasoningEngine:
         self.buffer.record(
             [0.0] * META_POLICY_INPUT_DIM, 0, 0, terminal_reward, done=True)
 
+        # ── RFP_cgn_loop_closure §7.A telemetry (G5) — last-chain audit ──
+        # Surfaced via get_audit_stats → meta_reasoning_state.bin so the SHM
+        # readout stops lying (the endpoint reported last_chain_*=empty).
+        self._last_chain_reason = str(self.state.trigger_reason or "")
+        self._last_chain_succeeded = True
+
+        # ── RFP_cgn_loop_closure §7.A (ARC-4) — emit META_REASON_OUTCOME ──
+        # THE root-cause fix: concept-seeded Level-A chains concluded but emitted
+        # NO outcome (grep-confirmed 0 emissions), so the emergent-reward
+        # accumulator was never fed by the loop → α-ramp starved forever. Emit
+        # the chain's terminal_reward (the §1.3 worked-example value, signed
+        # [-1,+1]) tagged with the full primitive_sequence for multi-step credit
+        # (record_outcome). ONLY concept-seeded chains carry a request_id (the
+        # mechanical experience_pressure/periodic chains don't, and handle_outcome
+        # requires one) — so this fires exactly for the Level-A loop, by design.
+        if self.state.grounding_request_id and self.state.grounding_consumer:
+            try:
+                from titan_hcl.logic.meta_service_client import send_meta_outcome
+                send_meta_outcome(
+                    request_id=self.state.grounding_request_id,
+                    consumer_id=self.state.grounding_consumer,
+                    outcome_reward=max(-1.0, min(1.0, float(terminal_reward))),
+                    actual_primitive_used=(
+                        prims_in_chain[0] if prims_in_chain else None),
+                    primitive_sequence=list(prims_in_chain),
+                    context=(f"chain{self.state.chain_id}:"
+                             f"{self.state.grounding_concept}")[:256],
+                    send_queue=self._send_queue,
+                    src="cognitive_worker",
+                )
+                self._meta_outcomes_emitted += 1
+            except Exception as _oc_err:
+                swallow_warn(
+                    '[logic.meta_reasoning] _conclude_chain: META_REASON_OUTCOME emit',
+                    _oc_err,
+                    key='logic.meta_reasoning.conclude.outcome_emit', throttle=100)
+
         # ── TUNING-012 v2 Sub-phase B: record chain outcome for IQL training ──
         # Refine the task embedding with the actual final domain (was "pending"
         # at chain start since FORMULATE.define hadn't run yet).
@@ -3158,6 +3334,9 @@ class MetaReasoningEngine:
                     dominant=dominant_primitive,
                     terminal_reward=task_success_mcgn,
                     domain=final_domain_mcgn,
+                    # RFP_cgn_loop_closure §7.A — make G5/G11 checkable from jsonl
+                    trigger_reason=self.state.trigger_reason,
+                    grounding_concept=self.state.grounding_concept,
                 )
                 self._meta_cgn.evaluate_graduation()
                 self._meta_cgn.check_impasse()

@@ -91,16 +91,23 @@ class TimeChainBackup:
 
     def __init__(self, data_dir: str = "data/timechain",
                  titan_id: str = "T1",
-                 arweave_store=None):
+                 arweave_store=None,
+                 chain_provider=None):
         """
         Args:
             data_dir: Path to TimeChain data directory
             titan_id: T1/T2/T3
-            arweave_store: ArweaveStore instance (from titan_hcl.utils.arweave_store)
+            arweave_store: legacy ArweaveStore — drives the WRITE path (upload
+                cascade) until that path's redesign; also the restore-read
+                fallback when no chain_provider is injected.
+            chain_provider: ChainProvider for restore READS — the one sanctioned
+                chain-read path (RFP_chain_provider). Preferred over arweave_store
+                for fetches when set.
         """
         self._data_dir = Path(data_dir)
         self._titan_id = titan_id
         self._arweave = arweave_store
+        self._chain_provider = chain_provider
         self._manifest = self._load_manifest()
 
     # ── Manifest ──────────────────────────────────────────────────────
@@ -390,15 +397,20 @@ class TimeChainBackup:
         Returns:
             True if restoration succeeded and chain verifies.
         """
-        if not self._arweave:
-            logger.error("[TimeChainBackup] No ArweaveStore configured")
+        if not self._chain_provider and not self._arweave:
+            logger.error("[TimeChainBackup] No chain reader configured "
+                         "(chain_provider or arweave_store)")
             return False
 
         target = Path(target_dir) if target_dir else self._data_dir
 
         try:
-            # Fetch from Arweave
-            data = await self._arweave.fetch(tx_id)
+            # Fetch via the ChainProvider (the sanctioned read path); fall back to
+            # the legacy ArweaveStore only when no provider was injected.
+            if self._chain_provider is not None:
+                data = await self._chain_provider.get_bytes(tx_id)
+            else:
+                data = await self._arweave.fetch(tx_id)
             if data is None:
                 logger.error("[TimeChainBackup] Failed to fetch tx=%s", tx_id)
                 return False

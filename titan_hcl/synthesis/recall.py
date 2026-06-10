@@ -89,10 +89,6 @@ GRANULARITY_SESSION = "session"
 # autobiographical → RECALL.autobiographical_relevant → FORK_READ(main genesis) + DIFF
 GRANULARITY_ARCHIVE = "archive"
 GRANULARITY_AUTOBIOGRAPHICAL = "autobiographical"
-# RFP_titan_authored_soul_diary §7.P4 — self-recall: traverse the Kuzu `Self`
-# hub (SELF_HAS_ENGRAM diary+self-engrams, SELF_HAS_SKILL skills), per-spine like
-# "concept"/"procedural" (NOT a FORK_READ mode). Requires kuzu_reader.
-GRANULARITY_SELF = "self"
 _VALID_GRANULARITIES = frozenset(
     {GRANULARITY_TURN, GRANULARITY_TOPIC, GRANULARITY_SESSION})
 # Default recency windows (hours) for the FORK_READ-based modes.
@@ -288,18 +284,6 @@ class EngineRecall:
         # Phase 5+); kuzu_reader IS required.
         if granularity == "concept":
             results = self._concept_granularity_recall(
-                query_text=query_text, k=k,
-            )
-            if results is None:
-                self._total_fallbacks += 1
-            else:
-                self._total_contract_hits += 1
-            return results
-
-        # §7.P4 — self-recall: traverse the Kuzu `Self` hub (per-spine, like
-        # concept; bypasses the contract pipeline). kuzu_reader-gated.
-        if granularity == GRANULARITY_SELF:
-            results = self._self_granularity_recall(
                 query_text=query_text, k=k,
             )
             if results is None:
@@ -709,81 +693,6 @@ class EngineRecall:
                 importance=float(row.get("groundedness", 0.0) or 0.0),
             ))
         return results
-
-    def _self_granularity_recall(
-        self,
-        *,
-        query_text: str,
-        k: int,
-    ) -> Optional[list[RecallResult]]:
-        """RECALL.self — the focused self-recall (RFP_titan_authored_soul_diary
-        §7.P4, decided mechanic): traverse the `Self` hub
-        (`TitanKnowledgeGraph.spine_self_recall`, built P3a) — SELF_HAS_ENGRAM
-        (diary + self-engrams) + SELF_HAS_SKILL (skills) — to surface his path +
-        abilities in ONE hop, WITHOUT scanning whole memory. Ranks by
-        groundedness/utility × (1 + name-match boost); a small floor keeps a
-        fresh (groundedness-0) diary engram surfacing on a self-query (the hub
-        traversal already ordered engrams newest-first).
-
-        Returned RecallResult shape — uniform with per-TX recall:
-          engram → tx_hash=anchor_tx, fork="self_hub",  source="synthesis_self_recall"
-          skill  → tx_hash=skill_id,  fork="self_skill", source="synthesis_self_skill"
-
-        Returns None if no kuzu_reader is wired / it lacks `spine_self_recall`
-        (caller falls back to per-TX recall), or the hub is empty.
-        """
-        reader = self._kuzu_reader
-        if reader is None or not hasattr(reader, "spine_self_recall"):
-            logger.debug(
-                "[EngineRecall] self granularity requested but no kuzu_reader "
-                "with spine_self_recall — caller falls back",
-            )
-            return None
-        try:
-            hub = reader.spine_self_recall() or {}
-        except Exception as e:
-            logger.warning(
-                "[EngineRecall] spine_self_recall failed: %s — fallback", e,
-            )
-            return None
-
-        engrams = hub.get("engrams") or []
-        skills = hub.get("skills") or []
-        if not engrams and not skills:
-            return None
-
-        query_tokens = {
-            t.lower() for t in (query_text or "").split() if len(t) >= 3
-        }
-
-        def _boost(name: str) -> float:
-            nlc = name.lower()
-            return 0.5 if any(t in nlc for t in query_tokens) else 0.0
-
-        scored: list[tuple[float, RecallResult]] = []
-        for row in engrams:
-            g = float(row.get("groundedness", 0.0) or 0.0)
-            name = str(row.get("name", "") or "")
-            score = max(g, 0.05) * (1.0 + _boost(name))
-            scored.append((score, RecallResult(
-                tx_hash=str(row.get("anchor_tx", "") or ""),
-                score=score, fork="self_hub", source="synthesis_self_recall",
-                summary=name, cosine=0.0, base_level=0.0, norm_base_level=0.0,
-                importance=g,
-            )))
-        for row in skills:
-            u = float(row.get("utility_score", 0.0) or 0.0)
-            name = str(row.get("name", "") or "")
-            score = max(u, 0.05) * (1.0 + _boost(name))
-            scored.append((score, RecallResult(
-                tx_hash=str(row.get("skill_id", "") or ""),
-                score=score, fork="self_skill", source="synthesis_self_skill",
-                summary=name, cosine=0.0, base_level=0.0, norm_base_level=0.0,
-                importance=u,
-            )))
-
-        scored.sort(key=lambda kv: kv[0], reverse=True)
-        return [rr for _, rr in scored[:k]]
 
     # ── stats ─────────────────────────────────────────────────────────
 
