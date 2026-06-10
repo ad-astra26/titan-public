@@ -4705,6 +4705,7 @@ _RESTART_MODULE_ALLOWLIST = {
     "self_reflection_worker",  # reload_ok — durable JSON+SQLite, atomic, shutdown+SAVE_NOW+300s; ephemeral caches only
     "social_graph",         # reload_ok — SQLite WAL, _route_write commits, WAL checkpoint post-loop + SAVE_NOW
     "studio",               # reload_ok — stateless; artifact counts re-derived from disk
+    "soul_diary",           # reload_ok — atomic soul_diary_state.json (daily latch) + soul_diary_chain.json (ledger), tmp+fsync+replace; event-driven, no buffered critical state; re-reads both on boot (RFP_titan_authored_soul_diary, 2026-06-10)
     # ── §P1 promotions — audit kill_respawn_only (fresh-boot is the clean path) ─
     "metabolism",           # kill_respawn_only — in-memory ring buffers by G19-strict design; fresh boot correct
     "sovereignty",          # kill_respawn_only — scalars persist (atomic JSON+300s+shutdown); _modulator_history deques reconstruct over time
@@ -4881,6 +4882,8 @@ _RELOAD_MODULE_ALLOWLIST = {
     # §P1 promotions — audit reload_ok (light, persistence-verified):
     "dream_state", "interface_advisor", "life_force", "llm", "reflex",
     "self_reflection_worker", "social_graph", "studio",
+    # soul_diary — atomic state.json + ledger; event-driven, no buffered critical state (2026-06-10)
+    "soul_diary",
     # REMOVED 2026-06-02 (§11.H.9 + D-SPEC-146): "api" — kernel-rs peer, not an
     #   orchestrator worker; deliberate api reload is the future kernel
     #   zero-downtime mechanism (rFP_kernel_zero_downtime_api_reload). Not reloadable here.
