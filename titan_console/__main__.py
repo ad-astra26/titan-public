@@ -43,6 +43,8 @@ def main(argv: list | None = None) -> int:
                     help="Seconds between health polls for Telegram alerts (default 60).")
     ap.add_argument("--no-alerts", action="store_true",
                     help="Disable the degraded-health Telegram pusher.")
+    ap.add_argument("--dev", action="store_true",
+                    help="Enable dev-only endpoints (/dev/latest.apk, /console/dev/log).")
     args = ap.parse_args(argv)
 
     install_root = Path(args.install_root).resolve()
@@ -50,7 +52,8 @@ def main(argv: list | None = None) -> int:
     dist = Path(args.dist_dir).resolve() if args.dist_dir else None
 
     ctx = Context(install_root=install_root, titan_id=titan_id,
-                  api_base=args.api_base, token=_read_token(), dist_dir=dist)
+                  api_base=args.api_base, token=_read_token(), dist_dir=dist,
+                  dev_enabled=args.dev)
     # Owner chat auth (X-Titan-Internal-Key → pitch_chat owner bypass): load the
     # api internal_key so the owner can chat with their Titan without Privy/wallet.
     ctx.internal_key = resolve_internal_key(ctx)

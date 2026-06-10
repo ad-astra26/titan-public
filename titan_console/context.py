@@ -57,6 +57,7 @@ class Context:
     token: Optional[str] = None            # console mutation auth (None = open on localhost)
     dist_dir: Optional[Path] = None        # built SPA bundle
     secrets_path: Optional[Path] = None    # ~/.titan/secrets.toml override (tests)
+    dev_enabled: bool = False              # gate for dev-only endpoints (--dev)
     run: Runner = default_runner
     http: HttpFn = default_http
 

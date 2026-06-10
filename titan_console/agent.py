@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import __version__, backup_config, config_api, ops, proxy
+from . import __version__, backup_config, config_api, dev_endpoints, ops, proxy
 from .context import Context
 from .host import read_host_resources
 from .titan_status import titan_status
@@ -116,6 +116,8 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             return proxy.proxy_readout(ctx, v6)
         if path == "/console" or path.startswith("/console/"):
             return 404, {"error": f"no such console route: {path}"}
+        if ctx.dev_enabled and path == "/dev/latest.apk":
+            return dev_endpoints.serve_apk(ctx)
         # static SPA
         return _serve_static(ctx, path)
 
@@ -137,6 +139,8 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
         if path == "/console/backup/config":
             res = backup_config.set_backup_config(ctx, data)
             return (200 if res.get("ok") else 400), res
+        if ctx.dev_enabled and path == "/console/dev/log":
+            return dev_endpoints.ingest_log(ctx, body)
         return 404, {"error": f"no such console route: {path}"}
 
     return 405, {"error": f"method not allowed: {method}"}
