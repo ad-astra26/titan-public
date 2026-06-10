@@ -88,6 +88,9 @@ class ModuleErrorCode(str, enum.Enum):
     OVG_TIMECHAIN_OPEN_FAILED = "OVG_TIMECHAIN_OPEN_FAILED"
     OVG_WARMUP_FAILED = "OVG_WARMUP_FAILED"
     TIMECHAIN_SCAN_TIMEOUT = "TIMECHAIN_SCAN_TIMEOUT"
+    # Storage health — a DuckDB store degrading (e.g. ART-index churn slowdown,
+    # the early-warning precursor to the actr_buffers FATAL crash-loop, D-SPEC-154).
+    STORAGE_DEGRADED = "STORAGE_DEGRADED"
 
 
 def _truncate(s: str, limit: int) -> str:

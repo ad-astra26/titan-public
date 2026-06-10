@@ -158,6 +158,18 @@ def select_restore_chain(
 ArweaveFetcher = Callable[[str], "Awaitable[bytes]"]
 
 
+def _sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
+    """Streamed sha256 of a file — constant memory regardless of size (used to
+    verify a stream-fetched tarball against its manifest merkle_root without
+    materializing the multi-hundred-MB tarball in RAM)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 async def fetch_event_components(
     arweave_fetch: ArweaveFetcher,
     event: dict,
@@ -344,7 +356,7 @@ async def verify_event_zk_commit(
 
 
 def apply_event_components(
-    components: dict[str, bytes],
+    components: dict[str, "str | bytes"],
     target_dir: str,
     arc_to_target: Callable[[str, str], str],
     arweave_fetch_skipped_sync: Optional[Callable[[str], bytes]] = None,
@@ -386,8 +398,14 @@ def apply_event_components(
     result = {"restored_files": 0, "errors": [], "warnings": [], "skipped": [],
               "applied": []}
 
-    for component, tarball_bytes in components.items():
-        with unpack_event_tarball(tarball_bytes) as unpacked:
+    for component, tarball_source in components.items():
+        # tarball_source is a FILESYSTEM PATH (str) or raw compressed bytes.
+        # restore_full passes a PATH → unpack_event_tarball decompresses to a
+        # temp FILE on disk (random-access, low RSS) instead of a RAM BytesIO
+        # (which would materialize a multi-GB member uncompressed) — the
+        # 2026-06-09 fix keeping a baseline reconstruction within the live
+        # worker's memory budget. Bytes still work (other in-memory callers).
+        with unpack_event_tarball(tarball_source) as unpacked:
             for file_meta in unpacked.files:
                 arc_name = file_meta["arc_name"]
                 diff_mode = file_meta.get("diff_mode")
@@ -399,33 +417,42 @@ def apply_event_components(
                     # already wrote the current bytes for this arc_name.
                     continue
 
-                # Reconstruct the diff_dict (Phase 3 encoders consume it)
-                diff_dict = unpacked.diff_dict_for(
-                    arc_name, verify_hash=verify_patch_hash)
-
-                # Baseline path for tail / incremental diffs is the
-                # CURRENT contents of target_path (the prior event's
-                # result). For full diffs it's ignored.
-                #
-                # We MUST write through a scratch path then atomic-rename:
-                # tail + xdelta3 encoders open the output file in "wb" mode,
-                # which truncates it. If baseline_path == target_path (which
-                # is the common case during restore chain replay), the
-                # encoder would silently truncate the file it's trying to
-                # read from. Scratch-then-rename keeps the source intact
-                # until the apply succeeds.
-                baseline_path = (
-                    target_path if os.path.exists(target_path) else None
-                )
+                # Scratch-then-atomic-rename: tail + xdelta3 encoders open the
+                # output "wb" (truncate); if baseline_path == target_path (the
+                # common chain-replay case) the encoder would truncate the file
+                # it reads from. Scratch keeps the source intact until apply OK.
                 scratch_path = target_path + ".restoring"
 
                 try:
-                    diff_encoders.apply_diff(
-                        baseline_path=baseline_path,
-                        diff_dict=diff_dict,
-                        output_path=scratch_path,
-                        verify_output=verify_patch_hash,
-                    )
+                    if diff_mode == "full":
+                        # FULL-ship member IS the raw file content (a baseline
+                        # DB/FAISS, up to multi-GB). Stream member→scratch in
+                        # chunks (peak = chunk_size, NOT the file size) so the
+                        # chained flip-bridge reconstruction stays within the
+                        # live worker's RSS budget — 2026-06-09 fix. The prior
+                        # path went diff_dict_for → get_patch_bytes f.read(),
+                        # loading the whole 2.2 GB consciousness.db into RAM →
+                        # the 2.8 GB guardian RSS-kill loop. No diff_dict, no
+                        # in-RAM patch_bytes; sha256 verified on the fly.
+                        unpacked.stream_member_to(
+                            arc_name, scratch_path,
+                            verify_hash=verify_patch_hash)
+                    else:
+                        # tail / incremental — the patch is SMALL; load it and
+                        # apply against the prior event's bytes (target_path).
+                        # xdelta3/tail apply_diff streams source→output (file
+                        # I/O), so even a multi-GB baseline source is memory-safe.
+                        diff_dict = unpacked.diff_dict_for(
+                            arc_name, verify_hash=verify_patch_hash)
+                        baseline_path = (
+                            target_path if os.path.exists(target_path) else None
+                        )
+                        diff_encoders.apply_diff(
+                            baseline_path=baseline_path,
+                            diff_dict=diff_dict,
+                            output_path=scratch_path,
+                            verify_output=verify_patch_hash,
+                        )
                     os.replace(scratch_path, target_path)
                 except Exception as e:
                     if os.path.exists(scratch_path):
@@ -464,7 +491,9 @@ async def restore_full(
     *,
     target_event_id: Optional[str] = None,
     verify_zk_chain: bool = True,
+    verify_patch_hash: bool = True,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    arweave_fetch_to_file: Optional[Callable[[str, str], "Awaitable[bool]"]] = None,
 ) -> RestoreResult:
     """rFP §3.1 — full crash-recovery restore protocol (steps 5-10).
 
@@ -532,86 +561,190 @@ async def restore_full(
                 "total": len(chain),
             })
 
-        # Step 7 — fetch baseline+incrementals from Arweave
+        # Steps 7-9 — MEMORY-BOUNDED reconstruction (2026-06-09 RSS-blowup fix).
+        # The old path fetched ALL of an event's component tarballs into one dict
+        # at once, and the decrypting fetch made 2-3 copies of each — for the
+        # large components (DuckDB/FAISS baseline + the ~600MB salvage events)
+        # that peaked RSS at ~2.8GB inside the RSS-capped live BackupWorker → the
+        # guardian kill-loop that disabled chained reconstruction. We now stage
+        # each component to a temp file ONE AT A TIME (peak RSS ≈ a single
+        # component, not the whole event × copies), then apply from the staged
+        # files. verify-before-apply is preserved: per-component sha256 on the
+        # way in, event-Merkle + ZK on the manifest roots before any apply.
+        staging_dir = target_dir.rstrip(os.sep) + ".restore_staging"
+        os.makedirs(staging_dir, exist_ok=True)
+        staged: list[tuple[str, str]] = []  # (component, temp_path)
         try:
-            components = await fetch_event_components(arweave_fetch, event)
-        except RuntimeError as e:
-            out.halt_reason = HALT_TARBALL_FETCH_FAILED
-            out.halt_event_id = event_id
-            out.errors.append(str(e))
-            out.duration_s = time.time() - started
-            return out
+            # Step 7+8.a — fetch each component, sha-verify, stage to disk, free.
+            for component in ("personality", "timechain", "soul"):
+                sub = event.get(component)
+                if sub is None:
+                    continue
+                tx_id = sub.get("tx_id")
+                if not tx_id:
+                    out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                    out.halt_event_id = event_id
+                    out.errors.append(
+                        f"event {event_id!r} {component}.tx_id missing")
+                    out.duration_s = time.time() - started
+                    return out
+                tmp = os.path.join(staging_dir, f"{event_id}.{component}.tar")
+                if arweave_fetch_to_file is not None:
+                    # STREAMING path (the live reconstruction) — fetch the
+                    # tarball straight to disk in fixed chunks, constant memory
+                    # regardless of tarball size. The prior in-RAM `arweave_fetch`
+                    # held the whole 595MB compressed salvage tarball → ~960MB
+                    # peak, over backup's 500MB rss_limit. Streaming → <100MB.
+                    # The callable yields a PLAINTEXT tarball at `tmp` (Mode-B
+                    # decryption, if any, handled inside it), so the staged file's
+                    # streamed sha256 must equal the component merkle_root.
+                    try:
+                        ok = await arweave_fetch_to_file(tx_id, tmp)
+                    except Exception as e:
+                        out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                        out.halt_event_id = event_id
+                        out.errors.append(
+                            f"Arweave stream-fetch failed for event {event_id!r} "
+                            f"{component} tx_id={tx_id!r}: {e}")
+                        out.duration_s = time.time() - started
+                        return out
+                    if not ok or not os.path.exists(tmp):
+                        out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                        out.halt_event_id = event_id
+                        out.errors.append(
+                            f"Arweave stream-fetch returned no data for event "
+                            f"{event_id!r} {component} tx_id={tx_id!r}")
+                        out.duration_s = time.time() - started
+                        return out
+                    expected = sub.get("merkle_root") or ""
+                    if expected:
+                        actual = _sha256_file(tmp)
+                        if actual != expected:
+                            out.halt_reason = HALT_TARBALL_HASH_MISMATCH
+                            out.halt_event_id = event_id
+                            out.errors.append(
+                                f"{HALT_TARBALL_HASH_MISMATCH}: event {event_id!r} "
+                                f"{component} staged tarball sha256 mismatch: "
+                                f"expected {expected}, got {actual}")
+                            out.duration_s = time.time() - started
+                            return out
+                    out.bytes_fetched += os.path.getsize(tmp)
+                    staged.append((component, tmp))
+                    continue
+                # In-memory bytes path (hermetic tests + non-streaming callers).
+                try:
+                    data = await arweave_fetch(tx_id)
+                except Exception as e:
+                    out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                    out.halt_event_id = event_id
+                    out.errors.append(
+                        f"Arweave fetch failed for event {event_id!r} "
+                        f"{component} tx_id={tx_id!r}: {e}")
+                    out.duration_s = time.time() - started
+                    return out
+                if not isinstance(data, (bytes, bytearray)):
+                    out.halt_reason = HALT_TARBALL_FETCH_FAILED
+                    out.halt_event_id = event_id
+                    out.errors.append(
+                        f"Arweave fetch for tx_id={tx_id!r} returned "
+                        f"{type(data).__name__}, expected bytes")
+                    out.duration_s = time.time() - started
+                    return out
+                data = bytes(data)
+                out.bytes_fetched += len(data)
+                # per-component sha256 vs the manifest (on the way in)
+                try:
+                    verify_component_merkle(event, component, data)
+                except ValueError as e:
+                    out.halt_reason = HALT_TARBALL_HASH_MISMATCH
+                    out.halt_event_id = event_id
+                    out.errors.append(str(e))
+                    out.duration_s = time.time() - started
+                    return out
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                staged.append((component, tmp))
+                del data  # free before fetching the next component (the bound)
 
-        out.bytes_fetched += sum(len(b) for b in components.values())
-
-        # Step 8.a — verify per-component sha256 against manifest
-        try:
-            for component, data in components.items():
-                verify_component_merkle(event, component, data)
-        except ValueError as e:
-            out.halt_reason = HALT_TARBALL_HASH_MISMATCH
-            out.halt_event_id = event_id
-            out.errors.append(str(e))
-            out.duration_s = time.time() - started
-            return out
-
-        # Step 8.b — recompose event_merkle_root from per-component hashes
-        try:
-            recomposed_root = verify_event_merkle(event, components)
-        except ValueError as e:
-            out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
-            out.halt_event_id = event_id
-            out.errors.append(str(e))
-            out.duration_s = time.time() - started
-            return out
-
-        # Step 8.c — verify the on-chain ZK memo matches the recomposed
-        # event_merkle_root + prev linkage
-        if verify_zk_chain:
+            # Step 8.b — recompose event_merkle_root. verify_event_merkle reads
+            # event[*].merkle_root (the manifest roots, already byte-verified
+            # above), NOT the tarball bytes — so an empty dict is correct here
+            # (each root is present, else verify_component_merkle had raised).
             try:
-                await verify_event_zk_commit(
-                    event=event,
-                    recomposed_event_merkle_root=recomposed_root,
-                    memo_fetch=memo_fetch,
-                    prev_event_merkle_root_for_check=prev_event_merkle_root,
-                )
-            except RuntimeError as e:
-                out.halt_reason = HALT_ZK_DISCONNECT
+                recomposed_root = verify_event_merkle(event, {})
+            except ValueError as e:
+                out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
                 out.halt_event_id = event_id
                 out.errors.append(str(e))
                 out.duration_s = time.time() - started
                 return out
-            except ValueError as e:
-                # Differentiate ZK_MEMO_MISMATCH vs EVENT_MERKLE_MISMATCH
-                # so the caller's bus event is precise.
-                msg = str(e)
-                if HALT_EVENT_MERKLE_MISMATCH in msg:
-                    out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
-                else:
-                    out.halt_reason = HALT_ZK_MEMO_MISMATCH
-                out.halt_event_id = event_id
-                out.errors.append(msg)
-                out.duration_s = time.time() - started
-                return out
 
-        # Step 9 — apply baseline / replay incrementals into target_dir
-        try:
-            apply_result = apply_event_components(
-                components=components,
-                target_dir=target_dir,
-                arc_to_target=arc_to_target,
-            )
-        except ValueError as e:
-            out.halt_reason = HALT_APPLY_FAILED
-            out.halt_event_id = event_id
-            out.errors.append(str(e))
-            out.duration_s = time.time() - started
-            return out
-        out.restored_files += apply_result["restored_files"]
-        out.warnings.extend(apply_result.get("warnings", []))
-        out.applied_events.append(event_id)
+            # Step 8.c — verify the on-chain ZK memo matches the recomposed
+            # event_merkle_root + prev linkage (BEFORE any apply).
+            if verify_zk_chain:
+                try:
+                    await verify_event_zk_commit(
+                        event=event,
+                        recomposed_event_merkle_root=recomposed_root,
+                        memo_fetch=memo_fetch,
+                        prev_event_merkle_root_for_check=prev_event_merkle_root,
+                    )
+                except RuntimeError as e:
+                    out.halt_reason = HALT_ZK_DISCONNECT
+                    out.halt_event_id = event_id
+                    out.errors.append(str(e))
+                    out.duration_s = time.time() - started
+                    return out
+                except ValueError as e:
+                    # Differentiate ZK_MEMO_MISMATCH vs EVENT_MERKLE_MISMATCH
+                    # so the caller's bus event is precise.
+                    msg = str(e)
+                    if HALT_EVENT_MERKLE_MISMATCH in msg:
+                        out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
+                    else:
+                        out.halt_reason = HALT_ZK_MEMO_MISMATCH
+                    out.halt_event_id = event_id
+                    out.errors.append(msg)
+                    out.duration_s = time.time() - started
+                    return out
 
-        prev_event_merkle_root = recomposed_root
+            # Step 9 — apply each staged component ONE AT A TIME, passing the
+            # staged tarball PATH (not its bytes): unpack_event_tarball then
+            # decompresses to a temp FILE on disk and stream_member_to streams
+            # each member member→disk, so peak RSS stays at ~a chunk regardless
+            # of member size (a 2.2 GB baseline DB never materializes in RAM).
+            for component, tmp in staged:
+                try:
+                    apply_result = apply_event_components(
+                        components={component: tmp},
+                        target_dir=target_dir,
+                        arc_to_target=arc_to_target,
+                        verify_patch_hash=verify_patch_hash,
+                    )
+                except ValueError as e:
+                    out.halt_reason = HALT_APPLY_FAILED
+                    out.halt_event_id = event_id
+                    out.errors.append(str(e))
+                    out.duration_s = time.time() - started
+                    return out
+                out.restored_files += apply_result["restored_files"]
+                out.warnings.extend(apply_result.get("warnings", []))
+            out.applied_events.append(event_id)
+
+            prev_event_merkle_root = recomposed_root
+        finally:
+            # Always reclaim the staged temp files (and the dir) — a halt mid-event
+            # must not leak hundreds of MB of scratch tarballs onto disk.
+            for _, tmp in staged:
+                try:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(staging_dir)
+            except OSError:
+                pass
 
         if progress_callback:
             progress_callback({

@@ -71,6 +71,12 @@ DEFAULT_SOFT_RETIRE_FLOOR: float = 0.1
 # Max events drained per pass (bounds the off-hot-path tick budget).
 DEFAULT_DRAIN_LIMIT: int = 500
 
+# Drained events are marked processed (so the idempotent enqueue can dedup a
+# replayed bus message) then PURGED once older than this window — bounding the
+# queue so a full `WHERE processed=FALSE` scan stays cheap with NO secondary
+# index (D-SPEC-154). Comfortably exceeds any realistic bus redelivery latency.
+PROCESSED_PURGE_WINDOW_S: float = 600.0
+
 
 def compute_skill_id(oracle_id: str, goal_class: str) -> str:
     """Deterministic skill_id from the OUTCOME `(oracle_id, goal_class)` (EEL B1).
@@ -229,22 +235,21 @@ class ProceduralSkillStore:
                 "  processed           BOOLEAN DEFAULT FALSE"
                 ")"
             )
-            self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_skill_cells_skill "
-                "ON skill_cells(skill_id)"
-            )
-            self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_skill_cells_time_cost "
-                "ON skill_cells(time_cost DESC)"
-            )
-            self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_skill_events_unprocessed "
-                "ON skill_score_events(processed)"
-            )
-            self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_procedural_skills_promoted "
-                "ON procedural_skills(promoted)"
-            )
+            # Root-cause fix (D-SPEC-154 / INV-Syn-30): NO secondary ART indexes
+            # on these high-churn UPSERT'd tables. DuckDB secondary indexes degrade
+            # pathologically under sustained UPSERT churn (reproduced 2026-06-09:
+            # ~2.5× slowdown over a 6000-cycle stress, while the PK-only path stays
+            # clean + fast) — the precursor to the actr_buffers-class FATAL
+            # crash-loop. These tables are small; the PK index covers every query
+            # (skill_id is the PK prefix; time_cost/promoted sort over dozens of
+            # rows; the events queue is purged-on-drain). DROP IF EXISTS self-heals
+            # fleet DBs that got the indexes from the initial B1 deploy.
+            for _idx in ("idx_skill_cells_skill", "idx_skill_cells_time_cost",
+                         "idx_skill_events_unprocessed", "idx_procedural_skills_promoted"):
+                try:
+                    self._db.execute(f"DROP INDEX IF EXISTS {_idx}")
+                except Exception:  # pragma: no cover — defensive
+                    pass
 
     def _migrate_legacy_if_needed(self) -> None:
         """If a pre-B1 `procedural_skills` (skill_id PK, no `oracle_id` column)
@@ -481,7 +486,9 @@ class ProceduralSkillStore:
             except Exception as e:
                 logger.warning(
                     "[ProceduralSkillStore] drain: event %s failed: %s", eid, e)
-        # Mark drained processed (only the ones that applied cleanly).
+        # Mark drained processed (only the ones that applied cleanly), then purge
+        # processed events older than the redelivery window — bounds the queue so
+        # the unindexed `WHERE processed=FALSE` scan stays cheap (D-SPEC-154).
         if drained_ids:
             with self._lock:
                 placeholders = ",".join("?" for _ in drained_ids)
@@ -491,6 +498,10 @@ class ProceduralSkillStore:
                     list(drained_ids),
                 )
                 self._events_drained += len(drained_ids)
+                self._db.execute(
+                    "DELETE FROM skill_score_events WHERE processed = TRUE AND ts < ?",
+                    [float(self._clock()) - PROCESSED_PURGE_WINDOW_S],
+                )
         promoted = 0
         for skill_id in outcomes_seen:
             if self._reconcile_promotion(skill_id):

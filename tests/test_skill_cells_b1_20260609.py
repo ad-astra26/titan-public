@@ -1,6 +1,7 @@
 """EEL Pillar B1 — skill_store re-key: outcome × task-shape cells + per-use
-scoring + polarity guard + legacy migration (RFP §7.B1 / SPEC §25.1 INV-Syn-28 /
-arch §8.1 v0.29.0).
+scoring + polarity guard + legacy migration (RFP §7.B1 / SPEC §25.1 INV-Syn-29 /
+arch §8.1 v0.29.0). Also asserts the D-SPEC-154 / INV-Syn-30 PK-only invariant
+(no secondary ART indexes on the B1 tables) + delete-on-drain queue bounding.
 
 Covers the gates: EEL-G2 (positive skill from a single oracle-verified success →
 promoted → delegatable) + EEL-G4 (a [negative] cell is never delegated).
@@ -24,7 +25,7 @@ def _store(tmp_path, conn=None):
     ), conn
 
 
-# ── skill_id identity (re-derived from the outcome — INV-Syn-28) ─────────────
+# ── skill_id identity (re-derived from the outcome — INV-Syn-29) ─────────────
 
 def test_skill_id_stable_and_outcome_keyed():
     a = compute_skill_id("web_api_oracle", "defi-lookup")
@@ -203,6 +204,88 @@ def test_fresh_install_no_legacy(tmp_path):
         "SELECT table_name FROM information_schema.tables "
         "WHERE table_name='procedural_skills_legacy'").fetchall()
     assert not legacy, "fresh install must not create a legacy table"
+
+
+# ── PK-only — no secondary ART indexes (INV-Syn-30 / D-SPEC-154) ─────────────
+
+def test_b1_tables_are_pk_only(tmp_path):
+    """The three B1 tables carry ONLY their PRIMARY KEY — no secondary ART
+    indexes (the runtime-corruption source behind the actr_buffers-class FATAL
+    crash-loop). `duckdb_indexes()` lists only explicit secondary indexes; the
+    PK index is implicit + unlisted → expect EMPTY for every table."""
+    store, conn = _store(tmp_path)
+    for table in ("procedural_skills", "skill_cells", "skill_score_events"):
+        rows = conn.execute(
+            "SELECT index_name FROM duckdb_indexes() WHERE table_name = ?",
+            [table]).fetchall()
+        names = {r[0] for r in rows}
+        assert names == set(), f"{table} must be PK-only, found secondary {names}"
+
+
+def test_b1_boot_self_heals_stray_secondary_indexes(tmp_path):
+    """A B1-shaped DB that picked up stray secondary indexes from the initial
+    deploy is self-healed on the next store boot (DROP IF EXISTS — no operator
+    script, D-SPEC-154)."""
+    conn = duckdb.connect(":memory:")
+    # First boot creates the B1 tables PK-only.
+    _store(tmp_path, conn=conn)
+    # Simulate a deploy that had created the now-banned secondary indexes.
+    conn.execute("CREATE INDEX idx_skill_cells_time_cost ON skill_cells(time_cost DESC)")
+    conn.execute("CREATE INDEX idx_skill_events_unprocessed ON skill_score_events(processed)")
+    before = {r[0] for r in conn.execute(
+        "SELECT index_name FROM duckdb_indexes() "
+        "WHERE table_name IN ('skill_cells','skill_score_events')").fetchall()}
+    assert before == {"idx_skill_cells_time_cost", "idx_skill_events_unprocessed"}
+    # Re-boot the store → self-heal drops them.
+    _store(tmp_path, conn=conn)
+    after = {r[0] for r in conn.execute(
+        "SELECT index_name FROM duckdb_indexes() "
+        "WHERE table_name IN ('skill_cells','skill_score_events')").fetchall()}
+    assert after == set(), f"self-heal must drop stray B1 secondary indexes, left {after}"
+
+
+# ── delete-on-drain — bound the queue (INV-Syn-30 / D-SPEC-154) ──────────────
+
+def test_drain_purges_processed_events_past_window(tmp_path):
+    """Processed score events older than PROCESSED_PURGE_WINDOW_S are DELETEd on
+    drain so the queue (which is intentionally unindexed) cannot grow unbounded
+    and re-introduce ART churn. A within-window processed row is retained for the
+    idempotent-enqueue dedup."""
+    from titan_hcl.synthesis.skill_store import PROCESSED_PURGE_WINDOW_S
+
+    now = [10_000.0]
+
+    def _clock():
+        return now[0]
+
+    conn = duckdb.connect(":memory:")
+    store = ProceduralSkillStore(
+        duckdb_conn=conn,
+        faiss_path=str(tmp_path / "skills.faiss"),
+        snapshot_path=str(tmp_path / "skills_snapshot.json"),
+        embedder=None,
+        clock=_clock,
+    )
+    # Event 1 at t0 → drain marks it processed (ts = t0).
+    store.enqueue_score_event(
+        oracle_id="web_api_oracle", goal_class="defi-lookup",
+        task_shape="informational|searxng-search|defi", success=True,
+        parent_tool_call_tx="tx1")
+    store.drain_score_events()
+    assert conn.execute("SELECT COUNT(*) FROM skill_score_events").fetchone()[0] == 1
+
+    # Advance the clock PAST the purge window, enqueue + drain a 2nd event.
+    # The 2nd drain purges the now-stale event 1 (processed AND ts < now-window)
+    # but keeps the freshly-processed event 2.
+    now[0] = 10_000.0 + PROCESSED_PURGE_WINDOW_S + 100.0
+    store.enqueue_score_event(
+        oracle_id="web_api_oracle", goal_class="market-lookup",
+        task_shape="informational|searxng-search|market", success=True,
+        parent_tool_call_tx="tx2")
+    store.drain_score_events()
+    remaining = conn.execute(
+        "SELECT parent_tool_call_tx FROM skill_score_events").fetchall()
+    assert remaining == [("tx2",)], f"stale processed event must be purged, got {remaining}"
 
 
 # ── snapshot shape (cross-process readers) ───────────────────────────────────

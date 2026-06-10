@@ -131,6 +131,20 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None,
         # 2026-04-27 worker-stability audit.
         if path.startswith("/v4/admin/"):
             return await call_next(request)
+        # /v6/admin/* + /v6/system/guardian/* — the MANUAL control plane
+        # (restart-module, reload-module, enable/disable a Guardian module).
+        # These are rare, hand-invoked ops, NOT fast cached-state reads, so the
+        # 3s "fast endpoint" budget doesn't apply (same rationale as /v4/admin/).
+        # enable-module especially: it clears a module's DISABLED flag then
+        # restarts it, and if the module's SHM slot is stale-"running" the
+        # guardian first does a save_first SAVE_NOW wait (~30s) before the clean
+        # start — legitimately slow. Without this exemption enable-module 504'd
+        # at 3s and a flap-DISABLED module could NOT be recovered via the API,
+        # only a full Titan restart (the structural recovery gap closed
+        # 2026-06-09; restart-module worked here only by being lucky-fast).
+        if (path.startswith("/v6/admin/")
+                or path.startswith("/v6/system/guardian/")):
+            return await call_next(request)
         # /chat + /chat/stream invoke the full agent pipeline (memory
         # recall + LLM inference + post-hooks) which legitimately takes
         # 5-30s. They're not "fast cached-state endpoints" — they're
