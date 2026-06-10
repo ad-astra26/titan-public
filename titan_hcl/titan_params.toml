@@ -1160,6 +1160,15 @@ gate_introspect_chains = 20         # meta-chains before INTROSPECT unlocks
 grounded_v_selection_enabled = true
 grounded_v_epsilon_floor = 0.05     # minimal ε backstop kept until B soak-proven
 
+# ── AUDIT_cgn_trigger_wiring_design_20260610 M3 (SPEC §5.4 matrix-seed) — when a
+# mechanical trigger (experience_pressure 89.7%) fires with no pending consumer-
+# grounding, seed the chain with a recent matured CGN-matrix concept
+# (_pending_concept_grounded, ≥2-consumer-grounded) so EVERY chain walks a real
+# concept (§1.3) instead of collapsing to FORMULATE.define (§5.3) — the fix for
+# the weeks-old monoculture (0/22495 chains carried a concept). Decouples
+# concept-walking from the sparse external producer trigger. §5 rollback switch.
+matrix_seed_enabled = true
+
 # ═══════════════════════════════════════════════════════════════════
 # META-REASONING DNA — Compound rewards from unique architectural sources
 #
