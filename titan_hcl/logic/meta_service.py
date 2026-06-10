@@ -448,11 +448,6 @@ class MetaService:
             _data_dir = cfg.get("dynamic_rewards_save_dir") or os.path.join(
                 os.environ.get("TITAN_DATA_DIR", "data"), "reasoning")
             _rewards_path = os.path.join(_data_dir, "meta_dynamic_rewards.json")
-            # AUDIT_cgn_trigger_wiring_design_20260610 M6 — disk-persist the
-            # request/loss counters so the producer→chain pipeline loss is
-            # measurable off-box (the /meta-service/* endpoints read the dead
-            # API-process copy). cgn_loop_soak.py reads this each checkpoint.
-            self._stats_save_path = os.path.join(_data_dir, "meta_service_stats.json")
             self._rewards = DynamicRewardAccumulator(
                 alpha_ramp_enabled=self._alpha_ramp_enabled,
                 phase_warmup_end=int(cfg.get("alpha_phase_warmup_end", 500)),
@@ -1179,58 +1174,13 @@ class MetaService:
         cognitive_worker._persist_engine_state (every 100 epochs + SAVE_NOW)
         so the CGN-loop learning state survives restart. No-op when the
         accumulator is disabled."""
-        ok = False
-        if self._rewards is not None:
-            try:
-                ok = bool(self._rewards.save_all())
-            except Exception as e:
-                logger.warning("[MetaService] rewards save_all failed: %s", e)
-        # AUDIT_cgn_trigger_wiring_design_20260610 M6 — persist the request/loss
-        # counters so the producer→chain pipeline loss is MEASURABLE (the
-        # /v6/.../meta-service/* endpoints read the dead API-process copy; these
-        # live counters were never observable → the loss hid for weeks).
+        if self._rewards is None:
+            return False
         try:
-            self._persist_stats()
+            return bool(self._rewards.save_all())
         except Exception as e:
-            logger.warning("[MetaService] stats persist failed: %s", e)
-        return ok
-
-    def _persist_stats(self) -> None:
-        """M6 — atomic-write the live request/outcome/loss counters so the
-        producer→chain loss is observable off-box (cgn_loop_soak.py reads it
-        via SSH each checkpoint)."""
-        import json as _json
-        path = getattr(self, "_stats_save_path", None)
-        if not path:
-            return
-        with self._lock:
-            st = self._stats
-            snap = {
-                "requests_received": int(st.get("requests_received", 0)),
-                "requests_failed": int(st.get("requests_failed", 0)),
-                "requests_completed": int(st.get("requests_completed", 0)),
-                "grounding_enqueued": int(st.get("grounding_enqueued", 0)),
-                "rate_limited": int(st.get("rate_limited", 0)),
-                "backpressure_events": int(st.get("backpressure_events", 0)),
-                "queue_overflows": int(st.get("queue_overflows", 0)),
-                "outcomes_received": int(st.get("outcomes_received", 0)),
-                "outcomes_invalid": int(st.get("outcomes_invalid", 0)),
-                "dispatches_scheduled": int(st.get("dispatches_scheduled", 0)),
-                "dispatches_timed_out": int(st.get("dispatches_timed_out", 0)),
-                "per_consumer_received": dict(st.get("per_consumer_received", {})),
-                "per_question_type_received": dict(
-                    st.get("per_question_type_received", {})),
-                "queue_depth": len(self._queue),
-                "pending_dispatch": len(self._pending),
-                "ts": time.time(),
-            }
-        tmp = path + ".tmp"
-        _dir = os.path.dirname(path)
-        if _dir:
-            os.makedirs(_dir, exist_ok=True)
-        with open(tmp, "w") as f:
-            _json.dump(snap, f)
-        os.replace(tmp, path)
+            logger.warning("[MetaService] rewards save_all failed: %s", e)
+            return False
 
     # ── Status export (for /v4/meta-service) ────────────────────────
 

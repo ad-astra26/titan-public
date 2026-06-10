@@ -34,14 +34,6 @@ from titan_hcl.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.imw.service")
 
-# RFP_backup_redesign_spine A.0 — "snapshot" op online-backup step size.
-# Stepped pages+sleep (NOT VACUUM INTO, per ARCHITECTURE_backup_restore §24.5.a):
-# a hot DB yields the source read lock between page batches so the commit loop
-# is never stalled. The online-backup API guarantees a consistent point-in-time
-# image even under concurrent writes (auto-restart on mid-copy source change).
-_SNAPSHOT_BACKUP_PAGES = 1024      # ~4 MB per step at the 4 KiB default page size
-_SNAPSHOT_BACKUP_SLEEP_S = 0.001   # 1 ms yield between page batches
-
 
 class _PendingRequest:
     __slots__ = ("req", "wal_offset", "ack_queue", "rowcount", "last_row_id", "err")
@@ -206,46 +198,6 @@ class IMWDaemon:
         conn.execute("PRAGMA cache_size=-16000")
         conn.execute("PRAGMA wal_autocheckpoint=1000")
         return conn
-
-    def _online_backup_to(self, dest_path: str) -> int:
-        """Write a transactionally-consistent SQLite online backup of the owned
-        (primary) DB to `dest_path` (RFP_backup_redesign_spine A.0).
-
-        Runs in a worker thread (via `asyncio.to_thread` in `_handle_request`)
-        on its OWN read-only `sqlite3` connection — NOT `self._conn` — so the
-        daemon's commit loop and write latency are unchanged (INV: IMW write
-        path untouched). Both connections are created, used, and closed inside
-        this one thread (no `check_same_thread` hazard). WAL mode lets this
-        reader run concurrently with the writer; the online-backup API yields
-        between page batches (`pages`+`sleep`) and guarantees a consistent
-        point-in-time image even under concurrent writes.
-
-        Returns the snapshot's size in bytes.
-        """
-        src_db = self._cfg.db_path
-        dest = Path(dest_path)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        # Fresh dest each time — a partial prior image must never survive.
-        for suffix in ("", "-wal", "-shm"):
-            p = Path(str(dest) + suffix)
-            if p.exists():
-                try:
-                    p.unlink()
-                except OSError as e:
-                    swallow_warn("[imw] snapshot dest unlink failed", e,
-                                 key="persistence.writer_service.snapshot_unlink", throttle=100)
-        src = sqlite3.connect(src_db, timeout=self._cfg.busy_timeout_sec)
-        try:
-            src.execute("PRAGMA query_only=1")  # read-only source connection
-            dst = sqlite3.connect(str(dest))
-            try:
-                src.backup(dst, pages=_SNAPSHOT_BACKUP_PAGES,
-                           sleep=_SNAPSHOT_BACKUP_SLEEP_S)
-            finally:
-                dst.close()
-        finally:
-            src.close()
-        return dest.stat().st_size if dest.exists() else 0
 
     # ── replay on boot ───────────────────────────────────────────────
 
@@ -414,31 +366,6 @@ class IMWDaemon:
             await ack_queue.put(WriteResponse(
                 req_id=req.req_id, ok=True, committed_at=time.time()
             ))
-            return
-        if req.op == "snapshot":
-            # RFP_backup_redesign_spine A.0 (ARCHITECTURE_backup_restore §24.5.a):
-            # write a transactionally-consistent online backup of the owned DB to
-            # req.dest_path. Runs OFF the event loop (to_thread) on a SEPARATE
-            # read-only connection so the commit loop / write latency are unchanged.
-            # NOT journaled (a snapshot must never be replayed on reconnect).
-            if not req.dest_path:
-                await ack_queue.put(WriteResponse(
-                    req_id=req.req_id, ok=False,
-                    error={"type": "BadRequest", "msg": "dest_path required for snapshot"}
-                ))
-                return
-            try:
-                nbytes = await asyncio.to_thread(self._online_backup_to, req.dest_path)
-                await ack_queue.put(WriteResponse(
-                    req_id=req.req_id, ok=True, rowcount=nbytes, committed_at=time.time()
-                ))
-            except Exception as e:
-                logger.error("[imw] snapshot to %s failed: %s", req.dest_path, e)
-                self._metrics.incr_errors(f"snapshot: {e}")
-                await ack_queue.put(WriteResponse(
-                    req_id=req.req_id, ok=False,
-                    error={"type": type(e).__name__, "msg": str(e)}
-                ))
             return
         if req.op not in ("write", "writemany"):
             await ack_queue.put(WriteResponse(

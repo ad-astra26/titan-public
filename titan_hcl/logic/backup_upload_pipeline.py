@@ -48,7 +48,6 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Iterable, Optional
 
 from titan_hcl.logic import diff_encoders
-from titan_hcl.logic.backup_sqlite_snapshot import prepare_sqlite_snapshot
 from titan_hcl.logic.backup_event_tarball import (
     FileDiffSpec,
     pack_event_tarball,
@@ -162,54 +161,19 @@ class MissingDiffBaseError(RuntimeError):
     the legitimate per-file full-ship at `_build_incremental_payload`."""
 
 
-def _settle_source_snapshot(snap: Optional[str], dd: dict) -> None:
-    """Resolve the lifecycle of a SQLite source snapshot relative to the encode
-    result (§24.5.a). The consistent image is either:
-      • the full-ship PAYLOAD itself (`patch_path == snap`, e.g. a baseline `.db`
-        or the no-baseline fallback) → mark `patch_owned` so pack unlinks it; or
-      • a transient diff INPUT (xdelta3 read it to make a `.vcdiff`,
-        `patch_path != snap`) → unlink it now (the `.vcdiff` is what gets packed).
-    """
-    if snap is None:
-        return
-    if dd.get("patch_path") == snap:
-        dd["patch_owned"] = True
-    else:
-        try:
-            os.unlink(snap)
-        except OSError:
-            pass
-
-
 def _build_full_payload(spec: TierFileSpec) -> dict:
     """For baseline events: full-ship every in-scope file as its raw bytes.
 
     The encoder dispatch decides which module's encode_diff actually runs;
     diff_encoders.encode_diff with baseline_path=None produces a full
     payload using the appropriate encoder.
-
-    §24.5.a / INV-BR-11: a live SQLite source is first captured as a
-    transactionally-consistent online-backup image (`prepare_sqlite_snapshot`);
-    the encode + Merkle then run over that image, never the live DB.
     """
     if not os.path.exists(spec.source_path):
         return None
-    snap = prepare_sqlite_snapshot(spec.source_path)
-    src = snap or spec.source_path
-    try:
-        dd = diff_encoders.encode_diff(
-            current_path=src, baseline_path=None,
-            format_hint=spec.format_hint,
-        )
-    except Exception:
-        if snap is not None:
-            try:
-                os.unlink(snap)
-            except OSError:
-                pass
-        raise
-    _settle_source_snapshot(snap, dd)
-    return dd
+    return diff_encoders.encode_diff(
+        current_path=spec.source_path, baseline_path=None,
+        format_hint=spec.format_hint,
+    )
 
 
 def _build_incremental_payload(spec: TierFileSpec,
@@ -224,66 +188,42 @@ def _build_incremental_payload(spec: TierFileSpec,
     """
     if not os.path.exists(spec.source_path):
         return None
-    # §24.5.a / INV-BR-11: capture a live SQLite source as a consistent
-    # online-backup image FIRST, so the skip-hash, the encode, and the Merkle
-    # all read the SAME transactionally-consistent bytes (no TOCTOU between the
-    # §24.6 hash and the packed bytes). `src` is the image when SQLite, else the
-    # live source (unchanged behaviour for .json/.bin/.faiss).
-    snap = prepare_sqlite_snapshot(spec.source_path)
-    src = snap or spec.source_path
-    try:
-        if baseline_file_path is None or not os.path.exists(baseline_file_path):
-            # No baseline available — full-ship as fallback (will produce
-            # diff_mode="full" inside the encoder)
-            dd = diff_encoders.encode_diff(
-                current_path=src, baseline_path=None,
-                format_hint=spec.format_hint,
-            )
-            _settle_source_snapshot(snap, dd)
-            return dd
-        # Cheap content-hash check: skip if unchanged
-        cur_hash = diff_encoders.file_merkle_root(src)
-        base_hash = diff_encoders.file_merkle_root(baseline_file_path)
-        if cur_hash == base_hash:
-            # Phase 5 (2026-05-19) — STREAMING refactor: "skipped" diff_dicts
-            # carry an empty patch via patch_path pointing at /dev/null-equivalent
-            # (we just use a 0-byte temp file so pack_event_tarball treats it
-            # uniformly). The metadata schema records diff_mode="skipped" +
-            # merkle_root so restore can detect the skip and walk back to the
-            # most recent event that DID ship the file.
-            import tempfile as _tf
-            size = os.path.getsize(src)
-            with _tf.NamedTemporaryFile(
-                suffix=".skip.bin", delete=False
-            ) as _f:
-                empty_path = _f.name
-            if snap is not None:
-                try:
-                    os.unlink(snap)  # unchanged → the consistent image isn't needed
-                except OSError:
-                    pass
-            return {
-                "diff_mode": "skipped",
-                "patch_path": empty_path,
-                "patch_owned": True,
-                "patch_size_bytes": 0,
-                "merkle_root": cur_hash,
-                "size_bytes": size,
-                "encoder": (spec.format_hint or "full_ship"),
-            }
-        dd = diff_encoders.encode_diff(
-            current_path=src, baseline_path=baseline_file_path,
+    if baseline_file_path is None or not os.path.exists(baseline_file_path):
+        # No baseline available — full-ship as fallback (will produce
+        # diff_mode="full" inside the encoder)
+        return diff_encoders.encode_diff(
+            current_path=spec.source_path, baseline_path=None,
             format_hint=spec.format_hint,
         )
-        _settle_source_snapshot(snap, dd)
-        return dd
-    except Exception:
-        if snap is not None:
-            try:
-                os.unlink(snap)
-            except OSError:
-                pass
-        raise
+    # Cheap content-hash check: skip if unchanged
+    cur_hash = diff_encoders.file_merkle_root(spec.source_path)
+    base_hash = diff_encoders.file_merkle_root(baseline_file_path)
+    if cur_hash == base_hash:
+        # Phase 5 (2026-05-19) — STREAMING refactor: "skipped" diff_dicts
+        # carry an empty patch via patch_path pointing at /dev/null-equivalent
+        # (we just use a 0-byte temp file so pack_event_tarball treats it
+        # uniformly). The metadata schema records diff_mode="skipped" +
+        # merkle_root so restore can detect the skip and walk back to the
+        # most recent event that DID ship the file.
+        import tempfile as _tf
+        size = os.path.getsize(spec.source_path)
+        with _tf.NamedTemporaryFile(
+            suffix=".skip.bin", delete=False
+        ) as _f:
+            empty_path = _f.name
+        return {
+            "diff_mode": "skipped",
+            "patch_path": empty_path,
+            "patch_owned": True,
+            "patch_size_bytes": 0,
+            "merkle_root": cur_hash,
+            "size_bytes": size,
+            "encoder": (spec.format_hint or "full_ship"),
+        }
+    return diff_encoders.encode_diff(
+        current_path=spec.source_path, baseline_path=baseline_file_path,
+        format_hint=spec.format_hint,
+    )
 
 
 def _extract_block_ranges(file_diffs: list[tuple[str, dict]]) -> dict:
@@ -381,7 +321,6 @@ async def upload_tier(
     event_id: str,
     event_type: str,
     encryptor: Optional[Callable[[bytes, str], tuple[bytes, str]]] = None,
-    path_uploader: Optional[Callable[[str, dict], "Awaitable[str]"]] = None,
 ) -> TierShipResult:
     """Upload a PRE-BUILT tier tarball (from build_tier) to Arweave + set tx_id.
 
@@ -393,17 +332,18 @@ async def upload_tier(
     is set; `tarball_sha256` (the memo arc) stays over the PLAINTEXT tarball so
     integrity verification + the per-backup key derivation (arc[:16]) are
     mode-independent. None ⇒ Mode A (plaintext uploaded).
-
-    `path_uploader` (RFP_backup_redesign_spine Phase B / B-2): a streamed
-    PATH→tx_id uploader (e.g. `ChainProvider.put(path)`). On **Mode-A** (no
-    encryptor) the plaintext tarball is uploaded **straight from disk** via this
-    — NO `f.read()` whole-tarball RAM load. Mode-B still buffers (the one-shot
-    AES-GCM encrypt is inherently whole-buffer, INV-MBR-13). None → legacy
-    bytes-`arweave_uploader` path (unchanged for existing callers/tests).
     """
     if result.tarball_path is None or not os.path.exists(result.tarball_path):
         result.error = f"{result.tier}: staged tarball missing at upload time"
         return result
+    with open(result.tarball_path, "rb") as f:
+        tarball_bytes = f.read()
+    if encryptor is not None:
+        try:
+            tarball_bytes, result.iv_b64 = encryptor(tarball_bytes, result.tier)
+        except Exception as e:
+            result.error = f"{result.tier}: Mode-B encryption failed: {e}"
+            return result
     tags = {
         "App-Name": "TitanBackupUnified",
         "Titan-Id": titan_id,
@@ -412,19 +352,7 @@ async def upload_tier(
         "Event-Type": event_type,
     }
     try:
-        if encryptor is None and path_uploader is not None:
-            # Mode-A streamed: upload the plaintext tarball straight from disk.
-            tx_id = await path_uploader(result.tarball_path, tags)
-        else:
-            with open(result.tarball_path, "rb") as f:
-                tarball_bytes = f.read()
-            if encryptor is not None:
-                try:
-                    tarball_bytes, result.iv_b64 = encryptor(tarball_bytes, result.tier)
-                except Exception as e:
-                    result.error = f"{result.tier}: Mode-B encryption failed: {e}"
-                    return result
-            tx_id = await arweave_uploader(tarball_bytes, tags)
+        tx_id = await arweave_uploader(tarball_bytes, tags)
     except Exception as e:
         result.error = f"Arweave upload failed: {e}"
         return result
@@ -850,7 +778,6 @@ async def ship_staged_event(
     bus_emit: Optional[Callable[[str, dict], None]] = None,
     cleanup_scratch: bool = True,
     encryptor: Optional[Callable[[bytes, str], tuple[bytes, str]]] = None,
-    path_uploader: Optional[Callable[[str, dict], "Awaitable[str]"]] = None,
 ) -> EventShipResult:
     """Phase 2 — SHIP a pre-built StagedEvent (fast, on meditation).
 
@@ -904,8 +831,7 @@ async def ship_staged_event(
                 return out
             await upload_tier(
                 r, arweave_uploader=arweave_uploader, titan_id=titan_id,
-                event_id=event_id, event_type=event_type, encryptor=encryptor,
-                path_uploader=path_uploader)
+                event_id=event_id, event_type=event_type, encryptor=encryptor)
             if r.error:
                 out.errors.append(f"{tier_name}: {r.error}")
         out.tiers = tier_results

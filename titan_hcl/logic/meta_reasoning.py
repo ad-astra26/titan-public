@@ -809,17 +809,6 @@ class MetaReasoningEngine:
         self._grounded_v_epsilon_floor = float(
             cfg.get("grounded_v_epsilon_floor", 0.05))
         self._g_sel_fires = 0
-        # ── AUDIT_cgn_trigger_wiring_design_20260610 M3 (SPEC §5.4 matrix-seed)
-        # — when a mechanical trigger fires with no pending consumer-grounding,
-        # seed the chain with a recent matured CGN-matrix concept so it walks a
-        # real concept (§1.3) instead of FORMULATE-collapsing (§5.3). Round-robin
-        # over _pending_concept_grounded for breadth. Flag-gated (§5 rollback);
-        # _matrix_seed_fires = live counter (surfaced in get_audit_stats).
-        self._matrix_seed_enabled = bool(cfg.get("matrix_seed_enabled", True))
-        self._matrix_seed_idx = 0
-        self._matrix_seed_fires = 0
-        if not hasattr(self, "_pending_concept_grounded"):
-            self._pending_concept_grounded = []
         try:
             from titan_hcl.logic.reasoning_binding import ReasoningBindingStore
             _rb_dir = os.path.join(
@@ -1351,34 +1340,6 @@ class MetaReasoningEngine:
             else:
                 should, reason = should_trigger_meta(
                     reasoning_engine, neuromods, chain_archive, self._config)
-                # ── AUDIT_cgn_trigger_wiring_design_20260610 M3 (SPEC §5.4
-                # matrix-seed / Path#0.5) — the dominant mechanical triggers
-                # (experience_pressure 89.7%) fire with NO concept → chains
-                # collapse to FORMULATE.define (§5.3) → the weeks-old monoculture.
-                # SEED them with a recent matured concept from the populated CGN
-                # matrix (_pending_concept_grounded = concepts grounded across ≥2
-                # consumers, live ~65/day) so EVERY chain walks a real concept
-                # (§1.3 "walk the populated matrix") — decoupled from the sparse
-                # external producer trigger. Round-robin for breadth. No
-                # request_id → no ARC-4 outcome emit (correct: no consumer
-                # request to attribute); entry RECALL = the §5.1 first stage
-                # ("recall the concept's neighborhood"). Flag-gated (§5 rollback).
-                if (should and self._matrix_seed_enabled
-                        and not self.state.is_active
-                        and self._pending_concept_grounded):
-                    _seed = self._pending_concept_grounded[
-                        self._matrix_seed_idx % len(self._pending_concept_grounded)]
-                    self._matrix_seed_idx += 1
-                    _seed_cid = str((_seed or {}).get("concept_id", ""))[:128]
-                    if _seed_cid:
-                        self._active_grounding = {
-                            "consumer": "",          # self-driven matrix walk
-                            "concept_id": _seed_cid,
-                            "entry_primitive": "RECALL",
-                            # no request_id/question_type → ARC-4 emit stays gated
-                        }
-                        self._matrix_seed_fires += 1
-                        reason = f"{reason}+matrix_seed({_seed_cid[:40]})"
             if not should:
                 return {"action": "IDLE"}
             self._start_chain(reason, sv)
@@ -2244,13 +2205,6 @@ class MetaReasoningEngine:
             "grounded_v_selection_enabled": bool(
                 getattr(self, "_grounded_v_selection_enabled", False)),
             "grounded_v_selection_fires": int(getattr(self, "_g_sel_fires", 0)),
-            # M3 (§5.4 matrix-seed) — how many chains were seeded with a matured
-            # matrix concept (vs starting contentless); the live G1/G11 driver.
-            "matrix_seed_enabled": bool(
-                getattr(self, "_matrix_seed_enabled", False)),
-            "matrix_seed_fires": int(getattr(self, "_matrix_seed_fires", 0)),
-            "concept_grounded_buffer": len(
-                getattr(self, "_pending_concept_grounded", []) or []),
             "diversity": {
                 "unique_prims_ema_50chains": round(float(unique_ema), 3),
                 "unique_prims_per_chain_recent": recent_uniques[-20:],

@@ -8,11 +8,10 @@ Request payload schema (v1):
         "v": 1,
         "req_id": str,         # uuid4 hex
         "caller": str,         # "<module_name>:<pid>"
-        "op": str,             # "write" | "writemany" | "ping" | "flush" | "snapshot"
+        "op": str,             # "write" | "writemany" | "ping" | "flush"
         "sql": str | None,
         "params": list | tuple | None,
         "sync": bool,          # caller awaits commit if True
-        "dest_path": str | None,  # "snapshot" op only — online-backup output path
         "ts": float,           # unix epoch seconds
     }
 
@@ -55,7 +54,6 @@ class WriteRequest:
     params: Any = None
     sync: bool = True
     target_db: str = "primary"  # "primary" | "shadow" — service routes by this
-    dest_path: Optional[str] = None  # "snapshot" op only — online-backup output path
     ts: float = field(default_factory=time.time)
 
     @classmethod
@@ -88,15 +86,6 @@ class WriteRequest:
     def new_ping(cls, caller: str) -> "WriteRequest":
         return cls(req_id=uuid.uuid4().hex, caller=caller, op="ping", sync=True)
 
-    @classmethod
-    def new_snapshot(cls, caller: str, dest_path: str) -> "WriteRequest":
-        """Ask the daemon to write a consistent SQLite online backup of its
-        owned DB to `dest_path` (RFP_backup_redesign_spine Phase A — A.0).
-        Single-writer-owned snapshot; runs off the commit loop, never journaled
-        (a snapshot must not be replayed on reconnect)."""
-        return cls(req_id=uuid.uuid4().hex, caller=caller, op="snapshot",
-                   sync=True, dest_path=dest_path)
-
     def to_msgpack(self) -> bytes:
         return msgpack.packb({
             "v": PROTOCOL_VERSION,
@@ -107,7 +96,6 @@ class WriteRequest:
             "params": self.params,
             "sync": self.sync,
             "target_db": self.target_db,
-            "dest_path": self.dest_path,
             "ts": self.ts,
         }, use_bin_type=True)
 
@@ -127,7 +115,6 @@ class WriteRequest:
             params=obj.get("params"),
             sync=bool(obj.get("sync", True)),
             target_db=str(obj.get("target_db", "primary")),
-            dest_path=obj.get("dest_path"),
             ts=float(obj.get("ts", time.time())),
         )
 
