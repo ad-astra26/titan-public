@@ -77,6 +77,14 @@ DEFAULT_DRAIN_LIMIT: int = 500
 # index (D-SPEC-154). Comfortably exceeds any realistic bus redelivery latency.
 PROCESSED_PURGE_WINDOW_S: float = 600.0
 
+# Boot-critical schema bootstrap timeout. _init_schema routes through the
+# SynthesisWriter (single-writer, INV-Syn-19), which at boot can be backed up
+# with the recompute + dream sequence (~30s+ of GIL-held compute). The 30s
+# `submit_sync` default TIMED OUT under load → ProceduralSkillStore construction
+# raised → B1 silently unwired (2026-06-10 soak finding). A generous budget lets
+# the trivial DDL through once the writer drains its boot backlog.
+SCHEMA_INIT_TIMEOUT_S: float = 180.0
+
 
 def compute_skill_id(oracle_id: str, goal_class: str) -> str:
     """Deterministic skill_id from the OUTCOME `(oracle_id, goal_class)` (EEL B1).
@@ -184,10 +192,19 @@ class ProceduralSkillStore:
 
     # ── Schema bootstrap + one-time migration ───────────────────────────
 
-    @on_writer
     def _init_schema(self) -> None:
-        """Migrate the pre-B1 table out of the way (never delete — §8.4/INV-3),
-        then CREATE the B1 tables (idempotent)."""
+        """Boot-critical schema bootstrap (migration + CREATE + index self-heal).
+        Routed through the writer with a GENEROUS timeout (SCHEMA_INIT_TIMEOUT_S):
+        at boot the SynthesisWriter can be backed up with the recompute/dream
+        sequence, and the 30s @on_writer default TIMED OUT under load → construction
+        raised → B1 silently unwired (2026-06-10 soak finding). submit_sync runs
+        inline if already on the writer thread (tests / InlineWriter)."""
+        self._writer.submit_sync(self._init_schema_body, timeout=SCHEMA_INIT_TIMEOUT_S)
+
+    def _init_schema_body(self) -> None:
+        """The actual DDL — ALWAYS runs on the writer thread (via _init_schema's
+        submit_sync). Migrate the pre-B1 table out of the way (never delete —
+        §8.4/INV-3), then CREATE the B1 tables (idempotent)."""
         with self._lock:
             self._migrate_legacy_if_needed()
             self._db.execute(
