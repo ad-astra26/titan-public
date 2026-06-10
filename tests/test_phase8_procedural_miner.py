@@ -345,9 +345,20 @@ def test_mine_pass_compiles_recurrent_sequence(store, tmp_path):
     summary = miner.mine_pass(dream_pass_id="dp_001")
     assert summary["txs_scanned"] == 6
     assert summary["clusters_recurrent"] >= 1
-    assert summary["negative_skills_compiled"] >= 1
-    assert summary["positive_skills_compiled"] == 0  # miner no longer compiles positives
-    assert any(ev == "META_SKILL_COMPILED" for ev, _ in emitted)
+    # Dream-hardening (2026-06-10): mine_pass now ENQUEUES (fast, no LLM); the
+    # off-hot-path abstraction daemon makes the LLM call + persists. Assert the
+    # enqueue, then SIMULATE the daemon (fetch → proposer → record).
+    assert summary["clusters_enqueued"] >= 1
+    pending = store.fetch_pending_abstractions(limit=100)
+    assert len(pending) >= 1
+    for entry in pending:
+        p = entry["payload"]
+        cluster_meta = {"sequence": p["sequence"], "occurrence_count": p["occurrence_count"],
+                        "kind": p["kind"], "members_summary": p["members_summary"]}
+        skill_id = store.record_abstraction_result(
+            entry["cluster_id"], _identity_proposer(cluster_meta, p["kind"]))
+        assert skill_id  # negative skill persisted off-hot-path
+    assert any(str(r.get("name", "")).startswith("[negative]") for r in store.list_all())
 
 
 def test_mine_pass_respects_max_skills_cap(store):
@@ -374,18 +385,20 @@ def test_mine_pass_respects_max_skills_cap(store):
         min_occurrences=3, min_seq_len=2, max_seq_len=2,
     )
     summary = miner.mine_pass()
-    total = summary["positive_skills_compiled"] + summary["negative_skills_compiled"]
-    assert total <= 2
+    # The per-pass cap now bounds ENQUEUES (the daemon compiles them off-hot-path).
+    assert summary["clusters_enqueued"] <= 2
 
 
 def test_mine_pass_idempotent(store):
     """Re-mining the same window produces the same skill_ids — no duplicates."""
+    # success=False → the negative-only miner enqueues these (success txs go to the
+    # positive split, which the miner no longer compiles — EEL B1).
     txs = []
     for i in range(3):
         parent = f"C_{i}"
-        txs.append(_make_tx(tool_id="a", args={}, success=True, scored_by="oracle",
+        txs.append(_make_tx(tool_id="a", args={}, success=False, scored_by="oracle",
                             parent_chat_tx=parent, ts=1.0, tx_hash=f"a_{i}"))
-        txs.append(_make_tx(tool_id="b", args={}, success=True, scored_by="oracle",
+        txs.append(_make_tx(tool_id="b", args={}, success=False, scored_by="oracle",
                             parent_chat_tx=parent, ts=2.0, tx_hash=f"b_{i}"))
     miner = ProceduralMiner(
         skill_store=store, tool_call_reader=lambda *_: txs,
@@ -394,11 +407,13 @@ def test_mine_pass_idempotent(store):
     )
     s1 = miner.mine_pass()
     s2 = miner.mine_pass()
-    # Both passes should emit the same skill_ids
-    assert sorted(s1["compiled_ids"]) == sorted(s2["compiled_ids"])
-    # Table count should be deterministic
-    rows = store.list_all()
-    assert len({r["skill_id"] for r in rows}) == len(s1["compiled_ids"])
+    # Re-mining the same window is idempotent: the abstraction queue is keyed on
+    # cluster_id (sha256(sequence|kind)) with ON CONFLICT DO NOTHING, so the 2nd
+    # pass enqueues 0 NEW clusters and the queue holds exactly s1's count.
+    assert s1["clusters_enqueued"] >= 1
+    assert s2["clusters_enqueued"] == 0
+    pending = store.fetch_pending_abstractions(limit=1000)
+    assert len(pending) == s1["clusters_enqueued"]
 
 
 def test_mine_pass_anchors_summary(store):
@@ -419,4 +434,4 @@ def test_mine_pass_empty_window_safe(store):
     )
     summary = miner.mine_pass()
     assert summary["txs_scanned"] == 0
-    assert summary["positive_skills_compiled"] == 0
+    assert summary["clusters_enqueued"] == 0

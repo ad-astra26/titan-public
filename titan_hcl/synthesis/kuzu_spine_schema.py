@@ -85,21 +85,7 @@ _NODE_TABLES: tuple[tuple[str, str], ...] = (
         "fork_id STRING, root_anchor STRING, activation DOUBLE, status STRING, "
         "PRIMARY KEY(fork_id)",
     ),
-    (
-        # Self — the self-knowledge HUB (RFP_titan_authored_soul_diary §7.P3a,
-        # INV-SD-16). A singleton per Titan (one Kuzu graph = one Titan) that
-        # LINKS all Titan-about-himself data so "what have I learned / what can
-        # I do?" resolves in one hop (SELF_HAS_ENGRAM + SELF_HAS_SKILL). The
-        # outward-expression rels (SELF_HAS_EXPRESSION) + the Persona node
-        # (SELF_HAS_PERSONA) are a DEFERRED later step (see the RFP §7.P3 +
-        # frontmatter scope_decisions — persona mechanic undesigned).
-        "Self",
-        "id STRING, created_at DOUBLE, PRIMARY KEY(id)",
-    ),
 )
-
-# Canonical id for the per-graph Self singleton (one Kuzu graph = one Titan).
-SELF_NODE_ID = "self"
 
 
 # (rel_name, from_table, to_table). No properties on these rels in P4 — the
@@ -111,9 +97,6 @@ _REL_TABLES: tuple[tuple[str, str, str], ...] = (
     ("USES_SKILL", "Engram", "Production"),
     ("COMPILED_FROM", "Production", "ActionChain"),  # does NOT touch the spine node
     ("EXPLORES", "HypothesisFork", "Engram"),
-    # SELF hub edges (§7.P3a, INV-SD-16): his self-knowledge in one hop.
-    ("SELF_HAS_ENGRAM", "Self", "Engram"),        # diary entries + self-about engrams
-    ("SELF_HAS_SKILL", "Self", "Production"),     # what he can do (forward-compat)
 )
 
 # The 4 rel tables that reference the spine node (Concept→Engram migration must
@@ -150,7 +133,7 @@ def _table_exists(conn, table_name: str) -> bool:
 # ── Bootstrap entry-point ───────────────────────────────────────────
 
 def bootstrap_spine_schema(graph: Any) -> dict:
-    """Create the 5 node tables + 7 rel tables on the given Kuzu graph.
+    """Create the 4 node tables + 5 rel tables on the given Kuzu graph.
 
     `graph` is a TitanKnowledgeGraph (or anything exposing `_conn` that runs
     Cypher). Idempotent: re-running is a no-op (each CREATE is wrapped in a

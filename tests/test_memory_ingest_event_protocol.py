@@ -411,9 +411,8 @@ async def test_add_to_mempool_neuromod_context_defaults_none(proxy, stub_bus):
 
 
 def test_handle_mempool_add_forwards_neuromod_context_to_core():
-    """memory_worker._handle_mempool_add forwards payload neuromod_context +
-    provenance (source/tags, INV-SD-15) to core add_to_mempool (the worker hop
-    of the felt chain + the soul-diary enrich provenance)."""
+    """memory_worker._handle_mempool_add forwards payload neuromod_context to core
+    add_to_mempool (the worker hop of the felt chain)."""
     import threading
     from types import SimpleNamespace
     from titan_hcl.modules.memory_worker import _handle_mempool_add
@@ -422,19 +421,14 @@ def test_handle_mempool_add_forwards_neuromod_context_to_core():
 
     class _Mem:
         async def add_to_mempool(self, user_prompt, agent_response,
-                                 user_identifier="Anonymous", neuromod_context=None,
-                                 tags=None, source=None):
-            captured.update(neuromod_context=neuromod_context, up=user_prompt,
-                            tags=tags, source=source)
+                                 user_identifier="Anonymous", neuromod_context=None):
+            captured.update(neuromod_context=neuromod_context, up=user_prompt)
 
     ctx = SimpleNamespace(memory=_Mem(), write_lock=threading.Lock(),
                           name="memory", send_queue=None)
     felt = {"DA": 0.7}
     _handle_mempool_add(
         {"payload": {"user_prompt": "u", "agent_response": "a",
-                     "user_identifier": "x", "neuromod_context": felt,
-                     "source": "soul_diary", "tags": ["domain:self"]}}, ctx)
+                     "user_identifier": "x", "neuromod_context": felt}}, ctx)
     assert captured["neuromod_context"] == felt
     assert captured["up"] == "u"
-    assert captured["source"] == "soul_diary"
-    assert captured["tags"] == ["domain:self"]

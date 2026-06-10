@@ -476,30 +476,32 @@ def restore_body_from_chain(
     scratch_container = scratch_dir or os.path.join(install_root, "data.resurrect")
     scratch_data = os.path.join(scratch_container, "data")
     os.makedirs(scratch_data, exist_ok=True)
-    from titan_hcl.utils.arweave_store import ArweaveStore
+    from titan_hcl.chain import ArweaveChainProvider
     from titan_hcl.logic.backup_restore import build_arc_to_target
 
-    store = ArweaveStore(network=network)
+    # All restore-side chain I/O through the ONE provider (RFP_chain_provider):
+    # signature walk (`list_memos`, limit=None ⇒ whole chain to genesis) + memo
+    # fetch (`read_memo`) + Arweave fetch (`get_to_file` streams large tarballs to
+    # disk at constant RAM; `get_bytes` is the test/fallback seam). Reads need no
+    # signer/keypair — construct read-only.
+    provider = ArweaveChainProvider(keypair_path="", network=network,
+                                    rpc_url=rpc_url or "")
     arc_to_target = build_arc_to_target(scratch_container)
 
     async def _sig_lister() -> list:
-        from titan_hcl.utils import solana_client as sc
-        if not hasattr(sc, "get_signatures_for_address"):
-            raise RuntimeError(
-                "solana_client.get_signatures_for_address is unwired — live "
-                "chain walk pending (5J-3 live wiring). The protocol engine + "
-                "mock-chain tests are proven; live RPC walk is the remaining seam.")
-        return await sc.get_signatures_for_address(titan_pubkey, rpc_url=rpc_url)
+        return await provider.list_memos(titan_pubkey, limit=None)
 
     async def _memo_fetcher(sig: str) -> Optional[str]:
-        from titan_hcl.utils import solana_client as sc
-        return await sc.get_memo_for_tx(sig, rpc_url=rpc_url)
+        return await provider.read_memo(sig)
 
     async def _arweave_fetch(tx_id: str) -> bytes:
-        return await store.fetch(tx_id)
+        data = await provider.get_bytes(tx_id)
+        if data is None:
+            raise RuntimeError(f"Arweave fetch returned no bytes for {tx_id[:16]}")
+        return data
 
     async def _arweave_fetch_to_file(tx_id: str, dest_path: str) -> bool:
-        return await store.fetch_to_file(tx_id, dest_path)
+        return await provider.get_to_file(tx_id, dest_path)
 
     result = asyncio.run(resurrect_from_chain(
         titan_id=titan_id, keypair_bytes=key_bytes, titan_pubkey=titan_pubkey,

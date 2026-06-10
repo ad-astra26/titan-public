@@ -2820,18 +2820,28 @@ cache_cosine_match_threshold = 0.85   # min context_vector similarity for hit
 alpha_ramp_enabled = true             # RFP_meta-reasoning_CGN_FIX.md Chunk D: ACTIVATED 2026-05-15
 # RFP §4.4 5-tier schedule (gentler entry than original 4-tier — α=0.10
 # warm-up prevents policy thrashing when policy is 100% FORMULATE-dominant).
-alpha_phase_warmup_end = 500          # 0–500    outcomes → α=0.10 (NEW)
-alpha_phase_0_end = 2000              # 500–2000  → α=0.25
-alpha_phase_1_end = 5000              # 2000–5000 → α=0.50
-alpha_phase_2_end = 10000             # 5000–10K  → α=0.75
-alpha_phase_3_end = 20000             # 10K–20K   → α=1.00 (steady)
+# ── RFP_cgn_loop_closure §7.A (2026-06-10): thresholds LOWERED ~20×. ──
+# Original 500→20000 assumed hundreds of outcomes/day, but Level-A outcomes
+# are EdgeDetector-gated + sparse (knowledge concept_grounded ~4/24h) → the
+# count-based ramp took MONTHS (RFP §6.1 A-3). The design intent was α 0→1
+# over ~2 weeks (TUNING_DATABASE §697 / rFP_meta_service_interface §10
+# "compressed to days"). These values realize that intent at the live Level-A
+# rate now that ARC-4 actually feeds outcomes; soak-tunable (the §8 gate is
+# the live observable, not the config — INV-EMERGENCE governs which primitive
+# wins, NOT ramp speed, so this is a permitted config tune per §7.A).
+alpha_phase_warmup_end = 30           # 0–30     outcomes → α=0.10  (~1 day)
+alpha_phase_0_end = 100               # 30–100   → α=0.25  (~3 days)
+alpha_phase_1_end = 250               # 100–250  → α=0.50  (~1 week)
+alpha_phase_2_end = 500               # 250–500  → α=0.75  (~1.5 weeks)
+alpha_phase_3_end = 1000              # 500–1000 → α=1.00  (steady, ~2-3 weeks)
 dynamic_cold_start_n = 10             # min observations before dynamic blend kicks in
 # RFP §4.4 time-escape hatch — if outcome rate stalls, force α += 0.10
-# every 7 days. Prevents stuck-at-low-α forever. Worst case: α reaches
-# 1.0 within ~9 weeks of activation regardless of rate. Tier promotion
+# every N days (lowered 7d→3d per RFP_cgn_loop_closure §6.1 A-3: the 7-day
+# step bounded the rate-independent backstop to ~9 weeks, too slow vs the
+# ~2-week intent; 3 days bounds the worst case to ~2.5 weeks). Tier promotion
 # (legitimate count-based) resets the timer.
 alpha_time_escape_enabled = true
-alpha_time_escape_seconds_per_step = 604800.0  # 7 days
+alpha_time_escape_seconds_per_step = 259200.0  # 3 days (was 7)
 alpha_time_escape_increment = 0.10
 alpha_time_escape_cap = 1.0
 

@@ -198,8 +198,10 @@ def step2_discover_state(titan_id: str) -> dict:
 
 # ── Step 3: Download from Arweave ────────────────────────────────────
 
-async def step3_download(tx_id: str, arweave_store) -> dict:
-    """Download TimeChain snapshot from Arweave."""
+async def step3_download(tx_id: str, provider) -> dict:
+    """Download TimeChain snapshot from Arweave via the ChainProvider (the one
+    sanctioned chain-read path — RFP_chain_provider). Returns raw bytes; step4
+    handles tarball-vs-JSON shape."""
     print("\n═══ STEP 3: DOWNLOAD FROM ARWEAVE ═══")
 
     if not tx_id:
@@ -209,7 +211,7 @@ async def step3_download(tx_id: str, arweave_store) -> dict:
     print(f"  Fetching: {tx_id}")
 
     try:
-        data = await arweave_store.fetch(tx_id)
+        data = await provider.get_bytes(tx_id)
         if data is None:
             # For devnet, check local store
             devnet_path = Path(f"data/arweave_devnet/{tx_id}.data")
@@ -512,11 +514,15 @@ def repair_mode(titan_id: str):
                     print(f"\n  Found Arweave backup: {latest['tx_id'][:30]}...")
                     print(f"  Extracting to {backup_dir}...")
 
+                    # Restore READ routes through the ChainProvider (the one
+                    # sanctioned chain-read path). TimeChainBackup's WRITE path
+                    # (upload cascade) is untouched here — it's not exercised by a
+                    # restore and migrates with that path's own redesign.
                     from titan_hcl.logic.timechain_backup import TimeChainBackup
-                    from titan_hcl.utils.arweave_store import ArweaveStore
-                    arweave = ArweaveStore(network="devnet")
+                    from titan_hcl.chain import ArweaveChainProvider
+                    provider = ArweaveChainProvider(keypair_path="", network="devnet")
                     backup = TimeChainBackup(data_dir=DATA_DIR, titan_id=titan_id,
-                                              arweave_store=arweave)
+                                              chain_provider=provider)
                     import asyncio
                     asyncio.run(backup.restore_from_arweave(
                         latest['tx_id'], target_dir=backup_dir))
@@ -580,10 +586,10 @@ async def run_resurrection(args):
     if not confirm(f"Restore from TX {tx_id[:30]}...?"):
         return
 
-    # Step 3
-    from titan_hcl.utils.arweave_store import ArweaveStore
-    arweave = ArweaveStore(keypair_path=KEYPAIR_PATH, network="devnet")
-    download = await step3_download(tx_id, arweave)
+    # Step 3 — restore reads via the ONE provider (RFP_chain_provider)
+    from titan_hcl.chain import ArweaveChainProvider
+    provider = ArweaveChainProvider(keypair_path=KEYPAIR_PATH, network="devnet")
+    download = await step3_download(tx_id, provider)
     if not download["passed"]:
         print("\n  ABORT: Download failed")
         return

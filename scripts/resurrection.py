@@ -278,27 +278,21 @@ def _load_manifest(titan_id: str, install_root: str, manifest_path: str | None):
 
 
 def _build_memo_fetch(verify_zk: bool):
-    """Return an async memo_fetch, or None.
-
-    SolanaClient.get_memo_for_tx is NOT yet wired (SPEC §24.13 follow-up), so
-    ZK-chain round-trip verification is unavailable. If the operator insists
-    on --verify-zk, abort with guidance rather than silently degrade.
-    """
+    """Return an async memo_fetch for the legacy --manifest ZK round-trip, or a
+    guard. Memo reads route through ChainProvider.read_memo (the one sanctioned
+    chain-read path — RFP_chain_provider). The sovereign v=3 default path fetches
+    its own memos via the provider inside restore_body_from_chain; this seam is
+    only the manifest-fallback's --verify-zk check."""
     if not verify_zk:
         async def _unused(sig: str) -> str:  # never called when verify_zk=False
             raise RuntimeError("memo_fetch invoked while verify_zk disabled")
         return _unused
-    try:
-        from titan_hcl.utils.solana_client import get_memo_for_tx  # type: ignore
-    except Exception:
-        print("  *** --verify-zk requested but SolanaClient.get_memo_for_tx is "
-              "not wired (SPEC §24.13). ***")
-        print("  Re-run WITHOUT --verify-zk: per-tarball sha256 + recomposed "
-              "event-Merkle still verify every archive against the manifest.")
-        sys.exit(1)
+    from titan_hcl.chain import ArweaveChainProvider
+    provider = ArweaveChainProvider(keypair_path="", network="mainnet")
 
     async def _memo_fetch(sig: str) -> str:
-        return await get_memo_for_tx(sig)
+        memo = await provider.read_memo(sig)
+        return memo or ""
     return _memo_fetch
 
 
@@ -359,7 +353,7 @@ def _restore_via_manifest(key_bytes: bytes, titan_pubkey: str, titan_id: str, *,
     requires the Maker's off-site manifest, so it does NOT satisfy Shard-1-only.
     """
     from titan_hcl.logic.backup_restore import build_arc_to_target, restore_full
-    from titan_hcl.utils.arweave_store import ArweaveStore
+    from titan_hcl.chain import ArweaveChainProvider
 
     data_dir = os.path.join(install_root, "data")
     manifest = _load_manifest(titan_id, install_root, manifest_path)
@@ -369,10 +363,11 @@ def _restore_via_manifest(key_bytes: bytes, titan_pubkey: str, titan_id: str, *,
     print(f"  Manifest loaded: {len(manifest.events)} event(s), "
           f"baseline={manifest.current_baseline_event_id}")
 
-    store = ArweaveStore(network=network)
+    # Restore reads through the ONE provider (RFP_chain_provider).
+    provider = ArweaveChainProvider(keypair_path="", network=network)
 
     async def _arweave_fetch(tx_id: str) -> bytes:
-        data = await store.fetch(tx_id)
+        data = await provider.get_bytes(tx_id)
         if data is None:
             raise RuntimeError(f"Arweave fetch returned None for {tx_id}")
         return data

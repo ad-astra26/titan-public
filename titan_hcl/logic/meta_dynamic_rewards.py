@@ -24,7 +24,9 @@ Session 2's blend logic lands with a full dataset.
 from __future__ import annotations
 
 import collections
+import json
 import logging
+import os
 import threading
 import time
 from typing import Optional, Tuple
@@ -57,7 +59,15 @@ class DynamicRewardAccumulator:
         time_escape_seconds_per_step: float = 604800.0,  # 7 days
         time_escape_increment: float = 0.10,
         time_escape_cap: float = 1.0,
+        save_path: Optional[str] = None,
     ):
+        # INV-PERSIST (RFP_cgn_loop_closure §7.A) — disk path for the emergent
+        # accumulator. Without this the whole learning store (rolling means +
+        # outcome tuples + α outcome-count + time-escape anchors) resets to
+        # empty every restart → α-ramp never leaves cold-start. None disables
+        # persistence (test/back-compat). Wired by MetaService to
+        # data/reasoning/meta_dynamic_rewards.json.
+        self._save_path = str(save_path) if save_path else None
         self._alpha_ramp_enabled = bool(alpha_ramp_enabled)
         # 5 boundaries: warmup, p0, p1, p2, p3 (5 tiers: 0.10/0.25/0.50/0.75/1.0)
         self._phase_boundaries = (
@@ -191,6 +201,17 @@ class DynamicRewardAccumulator:
         consumer_id = record.get("consumer_id", "")
         reward = record.get("outcome_reward")
         prim = record.get("actual_primitive_used")
+        # RFP_cgn_loop_closure §7.A — full-chain credit: when the outcome
+        # carries the primitive sequence the chain walked (Level-A chains do,
+        # via _conclude_chain → send_meta_outcome), apply the reward to every
+        # (consumer, primitive, sub_mode) tuple so the emergent reward learns
+        # which primitive paid off — not just one. Sub-mode is the chain's
+        # "PRIMITIVE.subtype" tail when available, else "_all".
+        seq = record.get("primitive_sequence")
+        if consumer_id and seq and reward is not None:
+            updated = self.record_outcome(
+                consumer_id, list(seq), record.get("sub_modes"), reward)
+            return 1 if updated else 0
         if consumer_id and prim and reward is not None:
             ok = self.record_single_step(consumer_id, prim, "_all", reward)
             return 1 if ok else 0
@@ -408,3 +429,108 @@ class DynamicRewardAccumulator:
             "per_consumer_positive_rate": pos_rate,
             "uptime_seconds": round(time.time() - self._t_boot, 1),
         }
+
+    # ── Persistence (INV-PERSIST — RFP_cgn_loop_closure §7.A / G10) ──────
+    # The emergent accumulator was in-memory-only: every restart reset
+    # _total_outcomes → 0 (α-ramp back to cold-start) and dropped every
+    # learned (consumer, primitive, sub_mode) rolling mean. Maker (emphatic):
+    # an in-memory learning store is unacceptable. save_all/load close it.
+    # Atomic write (tmp + os.replace) per the G16 persist convention.
+
+    def save_all(self) -> bool:
+        """Persist the full accumulator to ``self._save_path`` (atomic).
+
+        Returns True on a successful write, False if persistence is
+        disabled (no path) or the write failed. Snapshot is taken under
+        the lock; the disk write happens outside it.
+        """
+        if not self._save_path:
+            return False
+        with self._lock:
+            payload = {
+                "schema": 1,
+                "total_outcomes": int(self._total_outcomes),
+                # (consumer, primitive, sub_mode) tuple keys aren't JSON-
+                # representable — flatten to a record list, count + mean
+                # kept aligned so a partial write can't desync them.
+                "tuples": [
+                    {
+                        "c": k[0], "p": k[1], "m": k[2],
+                        "n": int(self._count.get(k, 0)),
+                        "mean": float(self._rolling_mean.get(k, 0.0)),
+                    }
+                    for k in self._count
+                ],
+                "neg_count": {str(c): int(n) for c, n in self._neg_count.items()},
+                "pos_count": {str(c): int(n) for c, n in self._pos_count.items()},
+                "time_escape_alpha_boost": float(self._time_escape_alpha_boost),
+                "last_tier_promotion_ts": float(self._last_tier_promotion_ts),
+                "last_observed_tier_index": int(self._last_observed_tier_index),
+                "ts": time.time(),
+            }
+        tmp = self._save_path + ".tmp"
+        try:
+            _dir = os.path.dirname(self._save_path)
+            if _dir:
+                os.makedirs(_dir, exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, self._save_path)
+            return True
+        except Exception as e:
+            logger.warning("[DynamicRewards] save_all failed (%s): %s",
+                           self._save_path, e)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+    def load(self) -> bool:
+        """Restore accumulator state from ``self._save_path`` if present.
+
+        Returns True when state was loaded, False when persistence is
+        disabled, the file is absent, or the read failed (a fresh
+        accumulator is left intact in every False case).
+        """
+        if not self._save_path or not os.path.exists(self._save_path):
+            return False
+        try:
+            with open(self._save_path) as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning("[DynamicRewards] load failed (%s): %s",
+                           self._save_path, e)
+            return False
+        if not isinstance(data, dict):
+            return False
+        with self._lock:
+            self._total_outcomes = int(data.get("total_outcomes", 0) or 0)
+            self._rolling_mean = {}
+            self._count = {}
+            for t in (data.get("tuples") or []):
+                try:
+                    key = (str(t["c"]), str(t["p"]), str(t["m"]))
+                    self._count[key] = int(t.get("n", 0) or 0)
+                    self._rolling_mean[key] = float(t.get("mean", 0.0) or 0.0)
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self._neg_count = collections.Counter(
+                {str(c): int(n) for c, n in
+                 (data.get("neg_count") or {}).items()})
+            self._pos_count = collections.Counter(
+                {str(c): int(n) for c, n in
+                 (data.get("pos_count") or {}).items()})
+            self._time_escape_alpha_boost = float(
+                data.get("time_escape_alpha_boost", 0.0) or 0.0)
+            self._last_tier_promotion_ts = float(
+                data.get("last_tier_promotion_ts", time.time())
+                or time.time())
+            self._last_observed_tier_index = int(
+                data.get("last_observed_tier_index", 0) or 0)
+        logger.info(
+            "[DynamicRewards] loaded %d outcomes / %d tuples from %s "
+            "(α-ramp resumes warm)",
+            self._total_outcomes, len(self._count), self._save_path)
+        return True

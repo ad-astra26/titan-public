@@ -38,6 +38,21 @@ class _MockArweave:
         return None if self._fail else self._tx_id
 
 
+@pytest.fixture
+def cascade_balance_ok(monkeypatch):
+    """Isolate the upload→manifest unit from the production Irys-balance gate (S4).
+
+    `snapshot_to_arweave` runs through BackupCascade, whose S4 `check_irys_balance`
+    spawns a real `node scripts/irys_upload.js balance` subprocess and needs a
+    funded keypair — neither exists in the unit env, and neither is the behaviour
+    under test here (the balance gate has its own coverage in test_backup_cascade).
+    Force S4 sufficient so the cascade reaches the actual upload + manifest record.
+    """
+    from titan_hcl.logic import backup_cascade as _bc
+    monkeypatch.setattr(_bc.BackupCascade, "check_irys_balance",
+                        lambda self, size_mb: (True, 9.99, "test-sufficient"))
+
+
 # ── Fixtures ─────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -94,7 +109,7 @@ def test_create_snapshot_tarball_no_genesis_returns_empty(tmp_path):
 
 # ── Upload with mock ─────────────────────────────────────────────────
 
-def test_snapshot_to_arweave_records_manifest(tc_dir):
+def test_snapshot_to_arweave_records_manifest(tc_dir, cascade_balance_ok):
     mock = _MockArweave(tx_id="TARBALL_TX_123")
     backup = TimeChainBackup(data_dir=str(tc_dir), titan_id="T1", arweave_store=mock)
     tx = asyncio.run(backup.snapshot_to_arweave())
@@ -114,7 +129,7 @@ def test_snapshot_to_arweave_no_store_returns_none(tc_dir):
     assert tx is None
 
 
-def test_snapshot_to_arweave_failure_no_manifest_entry(tc_dir):
+def test_snapshot_to_arweave_failure_no_manifest_entry(tc_dir, cascade_balance_ok):
     mock = _MockArweave(fail=True)
     backup = TimeChainBackup(data_dir=str(tc_dir), titan_id="T1", arweave_store=mock)
     tx = asyncio.run(backup.snapshot_to_arweave())
@@ -178,7 +193,7 @@ def test_per_titan_manifest_migration_from_legacy(tmp_path, monkeypatch):
     assert json.load(open(new_path))["snapshots"][0]["tx_id"] == "HIST"
 
 
-def test_per_titan_manifest_no_cross_contamination(tmp_path, monkeypatch):
+def test_per_titan_manifest_no_cross_contamination(tmp_path, monkeypatch, cascade_balance_ok):
     """T1 writes must not appear in T2's manifest."""
     import titan_hcl.logic.timechain_backup as tcb_mod
     # Reset module-level override so real per-Titan logic is used
