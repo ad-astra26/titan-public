@@ -728,70 +728,17 @@ def _recompute_loop(store: "ActivationStore",
             with cache_lock:
                 n_touched = store.recompute_and_persist(now)
                 items = store.items_tracked()
-                # Export atomic snapshot for cross-process readers
-                # (DuckDB 1.5+ lock workaround — see ACTIVATION_SNAPSHOT_NAME).
-                store.export_snapshot(snapshot_path)
-            # Bundle snapshot has its own internal lock — no need to hold
-            # cache_lock (and shouldn't, since maintain() is a separate
-            # write path with shorter critical section).
-            bundles_exported = bundle_store.export_snapshot(bundle_snapshot_path)
-            # Phase 4 FU-1 — spine snapshot for cross-process api reads.
-            # Holder pattern: synthesis_worker_main sets the exporter to
-            # EngramStore.export_snapshot AFTER kuzu_graph_obj is wired;
-            # default no-op until that completes.
-            try:
-                spine_exporter_holder["fn"]()
-            except Exception as _spine_exp_err:
-                logger.debug(
-                    "[synthesis_worker] spine_exporter call failed: %s",
-                    _spine_exp_err,
-                )
-            # Phase 5 §P5.C — push current B_i for every open fork into
-            # hypothesis_forks.activation so find_below_floor() reflects
-            # live activation. The updater is late-bound at fork-store
-            # wire time (default no-op so the loop fires before P5 wiring).
-            try:
-                fork_activation_updater_holder["fn"]()
-            except Exception as _fork_act_err:
-                logger.debug(
-                    "[synthesis_worker] fork_activation_updater call failed: "
-                    "%s", _fork_act_err,
-                )
-            # Phase 5 §P5.I — forks_snapshot.json for cross-process api reads.
-            try:
-                fork_exporter_holder["fn"]()
-            except Exception as _fork_exp_err:
-                logger.debug(
-                    "[synthesis_worker] fork_exporter call failed: %s",
-                    _fork_exp_err,
-                )
-            # Phase 6 §P6.K — oracles_snapshot.json for cross-process api reads.
-            try:
-                oracle_exporter_holder["fn"]()
-            except Exception as _ora_exp_err:
-                logger.debug(
-                    "[synthesis_worker] oracle_exporter call failed: %s",
-                    _ora_exp_err,
-                )
-            # Phase 10 §P10.B — synthesis_metrics_snapshot.json (observation-only).
-            try:
-                metrics_exporter_holder["fn"]()
-            except Exception as _met_exp_err:
-                logger.debug(
-                    "[synthesis_worker] metrics_exporter call failed: %s",
-                    _met_exp_err,
-                )
-            # WAL-hygiene (bugfix 2026-06-05) — bound the Kuzu spine WAL so its
-            # replay-on-open cost can never grow into the OOM-loop danger zone.
-            # No-op until wired (kuzu_graph_obj open) + only checkpoints past the
-            # size threshold / every ~30 passes (self-throttled inside the tick).
-            try:
-                kuzu_checkpoint_holder["fn"]()
-            except Exception as _kck_err:
-                logger.debug(
-                    "[synthesis_worker] kuzu_checkpoint call failed: %s",
-                    _kck_err,
-                )
+            # ── BREAK-THE-MONOLITH (2026-06-10) ──────────────────────────────
+            # The cross-process snapshot EXPORTS (activation/bundle/spine/fork/
+            # oracle/metrics) + the Kuzu WAL checkpoint USED to run inline here —
+            # ~34s of GIL-held work per pass that starved the 30s heartbeat thread
+            # (Python yields the GIL every ~5ms, but a long GIL-holding C call in
+            # an export blocks it) → guardian heartbeat_timeout crash-loop. They
+            # are now OFF this hot path, in `_export_loop` (its own daemon thread +
+            # cadence, per-step timed). This thread does ONLY the vectorized B_i
+            # recompute (above) + the watermark publish (below) — the fast critical
+            # path cross-process BridgeRecall freshness gates on. `bundles_exported`
+            # stays 0 here; the exporter logs the real count.
             # G13 (AUDIT §5.3): the tx-index FAISS build (embed + add, bounded)
             # runs on its OWN `synthesis-tx-index` daemon thread now — NOT
             # inline here — so a slow embed (the embedder lazy-load is seconds)
@@ -837,6 +784,74 @@ def _recompute_loop(store: "ActivationStore",
         slept = time.monotonic() - t0
         remaining = max(interval_s - slept, 0.1)
         stop_event.wait(remaining)
+
+
+def _export_loop(store: "ActivationStore",
+                 bundle_store: "StandingBundleStore",
+                 snapshot_path: str,
+                 bundle_snapshot_path: str,
+                 spine_exporter_holder: dict,
+                 fork_exporter_holder: dict,
+                 fork_activation_updater_holder: dict,
+                 oracle_exporter_holder: dict,
+                 metrics_exporter_holder: dict,
+                 kuzu_checkpoint_holder: dict,
+                 send_queue, name: str,
+                 interval_s: float,
+                 stop_event: threading.Event,
+                 cache_lock) -> None:
+    """Daemon thread — cross-process snapshot exports + Kuzu checkpoint, run OFF
+    the recompute/heartbeat-critical path (break-the-monolith, 2026-06-10).
+
+    These USED to run inline in `_recompute_loop`, making one pass ~34s of GIL-held
+    work that starved the 30s heartbeat thread → guardian heartbeat_timeout
+    crash-loop under load. Moving them here keeps the recompute thread (watermark
+    publish) fast. Each step is INDIVIDUALLY timed + soft-failing; the breakdown is
+    logged (always on a slow pass, else hourly) so a single long GIL-holding export
+    NAMES ITSELF — the instrumentation that tells us if any one step must be further
+    chunked. Own cadence so a slow export never delays the recompute watermark.
+    Only the activation snapshot needs `cache_lock` (it reads the activation cache);
+    the rest have their own internal locks / are independent."""
+    stop_event.wait(min(interval_s, 12.0))   # settle + offset from the recompute pass
+    pass_count = 0
+    while not stop_event.is_set():
+        t0 = time.monotonic()
+        timings: dict[str, int] = {}
+        bundles = 0
+
+        def _timed(label, fn):
+            _s = time.monotonic()
+            try:
+                return fn()
+            except Exception as _e:   # per-step soft-fail (matches the old inline guards)
+                logger.debug("[synthesis_worker] export step %s failed: %s", label, _e)
+            finally:
+                timings[label] = int((time.monotonic() - _s) * 1000)
+
+        # Activation snapshot — the only step that reads the activation cache.
+        with cache_lock:
+            _timed("activation", lambda: store.export_snapshot(snapshot_path))
+
+        def _bundle():
+            nonlocal bundles
+            bundles = bundle_store.export_snapshot(bundle_snapshot_path) or 0
+        _timed("bundle", _bundle)                                  # own internal lock
+        _timed("spine", lambda: spine_exporter_holder["fn"]())     # Engram spine → JSON
+        _timed("fork_activation", lambda: fork_activation_updater_holder["fn"]())
+        _timed("fork", lambda: fork_exporter_holder["fn"]())
+        _timed("oracle", lambda: oracle_exporter_holder["fn"]())
+        _timed("metrics", lambda: metrics_exporter_holder["fn"]())
+        _timed("kuzu_checkpoint", lambda: kuzu_checkpoint_holder["fn"]())
+
+        total_ms = int((time.monotonic() - t0) * 1000)
+        pass_count += 1
+        # Per-step breakdown names the dominant GIL-holder (the diagnostic we need).
+        if total_ms > RECOMPUTE_SLOW_WARN_MS or pass_count % 60 == 1:
+            lvl = logger.warning if total_ms > RECOMPUTE_SLOW_WARN_MS else logger.info
+            lvl("[synthesis_worker] export pass #%d total=%dms bundles=%d breakdown=%s "
+                "(OFF hot path)", pass_count, total_ms, bundles, timings)
+        slept = time.monotonic() - t0
+        stop_event.wait(max(interval_s - slept, 0.1))
 
 
 def synthesis_worker_main(recv_queue, send_queue, name: str,
@@ -1105,6 +1120,20 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
     rc_thread.start()
+
+    # BREAK-THE-MONOLITH (2026-06-10): the cross-process snapshot exports + Kuzu
+    # WAL checkpoint run on their OWN daemon thread, OFF the recompute/heartbeat-
+    # critical path (they were ~34s of inline GIL-held work that starved the
+    # heartbeat → crash-loop). Per-step timed so the dominant GIL-holder names itself.
+    export_thread = threading.Thread(
+        target=_export_loop,
+        args=(store, bundle_store, snapshot_path, bundle_snapshot_path,
+              spine_exporter_holder, fork_exporter_holder,
+              fork_activation_updater_holder, oracle_exporter_holder,
+              metrics_exporter_holder, kuzu_checkpoint_holder,
+              send_queue, name, interval_s, stop_event, cache_lock),
+        daemon=True, name=f"synthesis-export-{name}")
+    export_thread.start()
 
     # G13 — tx-index FAISS build runs on its OWN daemon thread (off the
     # recompute/watermark thread). No-op until the builder wires the holder
