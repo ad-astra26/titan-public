@@ -392,6 +392,7 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None,
     from .chat import router as chat_router
     from .pitch_chat import router as pitch_chat_router
     from .llm_proxy_endpoints import router as llm_proxy_router
+    from .soul_diary_routes import router as soul_diary_router
     from .v6 import router as v6_router
     from .v6_deprecation import router as v6_deprecation_router
 
@@ -402,6 +403,9 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None,
     app.include_router(chat_router)
     app.include_router(pitch_chat_router)
     app.include_router(llm_proxy_router)
+    # Soul-Diary public archive (RFP_titan_authored_soul_diary §7.P9) — read-only,
+    # serves the sanitized public projection (INV-SD-3); the daily X-post links here.
+    app.include_router(soul_diary_router)
     # Phase E — api/v6 single readout roof (RFP §2 Phase E). The legacy /v3,/v4
     # route bodies are removed from dashboard.py (no-shim); their handler
     # functions are re-mounted under /v6 by v6_router, and the legacy paths are

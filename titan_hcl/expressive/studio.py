@@ -113,11 +113,53 @@ class StudioCoordinator:
     # -------------------------------------------------------------------------
     # Meditation Art (Small Epoch — every 6 hours)
     # -------------------------------------------------------------------------
+    def _gather_live_felt(self) -> dict | None:
+        """Read Titan's current felt state from SHM (neuromod profile + mood) so
+        ANY meditation render is felt-driven without the caller threading it
+        (RFP §7.P7). Lazy, memoized ShmReaderBank; fully soft-fail → None (the
+        renderer then uses the legacy palette — no regression)."""
+        reader = getattr(self, "_felt_shm_reader", None)
+        if reader is None:
+            try:
+                from titan_hcl.api.shm_reader_bank import ShmReaderBank
+                reader = ShmReaderBank()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[Studio] felt SHM reader unavailable: %s", e)
+                reader = False
+            self._felt_shm_reader = reader
+        if reader is False:
+            return None
+        felt: dict = {}
+        try:
+            mods = ((reader.read_neuromod() or {}).get("modulators")) or {}
+            if mods:
+                felt["neuromod_levels"] = {
+                    k: float((v or {}).get("level", 0) or 0) for k, v in mods.items()}
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[Studio] neuromod read failed: %s", e)
+        try:
+            mind = reader.read_mind_state() or {}
+            if mind.get("mood_valence") is not None:
+                felt["valence"] = float(mind.get("mood_valence") or 0)
+            if mind.get("mood_intensity") is not None:
+                felt["intensity"] = float(mind.get("mood_intensity") or 0)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[Studio] mind_state read failed: %s", e)
+        return felt or None
+
     async def generate_meditation_art(
-        self, state_root: str, age_nodes: int, avg_intensity: int
+        self, state_root: str, age_nodes: int, avg_intensity: int,
+        *, felt: dict | None = None,
     ) -> str | None:
         """
         Generate a meditation flow field. Runs in a thread to avoid blocking.
+
+        ``felt`` (RFP §7.P7 / INV-SD-4) is Titan's TRUE felt state — when present
+        his real affect (valence/arousal/neuromods/coherence) drives the render
+        instead of the legacy 1-10 ``avg_intensity`` palette. When a caller does
+        NOT supply it, it is self-gathered from live SHM so ALL his meditation
+        art is felt-driven fleet-wide (soft-fall to the legacy palette if SHM is
+        unavailable).
 
         Returns:
             Path to the generated image, or None if skipped (STARVATION).
@@ -128,6 +170,8 @@ class StudioCoordinator:
             return None
 
         num_particles = self._particle_count(resolution, age_nodes)
+        if felt is None:
+            felt = self._gather_live_felt()
 
         def _render():
             from titan_hcl.expressive.art import ProceduralArtGen
@@ -135,7 +179,7 @@ class StudioCoordinator:
             art_gen = ProceduralArtGen(output_dir=str(self._meditation_dir))
             return art_gen.generate_flow_field(
                 state_root, age_nodes, avg_intensity,
-                resolution=resolution, num_particles=num_particles,
+                resolution=resolution, num_particles=num_particles, felt=felt,
             )
 
         try:
@@ -147,6 +191,7 @@ class StudioCoordinator:
                 "avg_intensity": avg_intensity,
                 "resolution": resolution,
                 "particles": num_particles,
+                "felt_driven": felt is not None,
             })
             self._prune_dir(self._meditation_dir, self._meditation_retention)
             logger.info("[Studio] Meditation art: %s", filepath)

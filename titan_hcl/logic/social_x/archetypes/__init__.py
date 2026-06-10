@@ -8,6 +8,7 @@ enforced inside ``ArchetypeBase``).
 """
 from .base import ArchetypeBase, ArchetypeCandidate
 from .proof_day import ProofDayArchetype, PROOF_DAY_POST_TYPE
+from .soul_diary import SoulDiaryArchetype, SOUL_DIARY_POST_TYPE
 from .world_mirror import WorldMirrorArchetype, WORLD_MIRROR_POST_TYPE
 from .outer_rumination import (
     OuterRuminationArchetype, OUTER_RUMINATION_POST_TYPE,
@@ -28,6 +29,7 @@ from .amplify import AmplifyArchetype, AMPLIFY_POST_TYPE
 
 ALL_ARCHETYPES = (
     ProofDayArchetype,
+    SoulDiaryArchetype,
     WorldMirrorArchetype,
     OuterRuminationArchetype,
     OuterInnerBridgeArchetype,
@@ -41,6 +43,7 @@ ALL_ARCHETYPES = (
 
 ARCHETYPE_POST_TYPES = (
     PROOF_DAY_POST_TYPE,
+    SOUL_DIARY_POST_TYPE,
     WORLD_MIRROR_POST_TYPE,
     OUTER_RUMINATION_POST_TYPE,
     OINB_POST_TYPE,
@@ -58,6 +61,7 @@ __all__ = (
     "ALL_ARCHETYPES",
     "ARCHETYPE_POST_TYPES",
     "ProofDayArchetype",
+    "SoulDiaryArchetype",
     "WorldMirrorArchetype",
     "OuterRuminationArchetype",
     "OuterInnerBridgeArchetype",
@@ -68,6 +72,7 @@ __all__ = (
     "SelfWatchingArchetype",
     "AmplifyArchetype",
     "PROOF_DAY_POST_TYPE",
+    "SOUL_DIARY_POST_TYPE",
     "WORLD_MIRROR_POST_TYPE",
     "OUTER_RUMINATION_POST_TYPE",
     "OINB_POST_TYPE",

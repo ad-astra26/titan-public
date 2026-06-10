@@ -95,6 +95,63 @@ def build_daily_nft_metadata(
     return {"on_chain": on_chain, "extended": extended}
 
 
+def build_soul_diary_nft_metadata(
+    *, date: str, entry_hash: str, cumulative_hash: str,
+    distillation: str = "", sovereignty: Optional[dict] = None,
+    felt: Optional[dict] = None, art_uri: Optional[str] = None,
+) -> dict:
+    """Build the Metaplex-standard off-chain metadata JSON for a Soul-Diary
+    DailyNFT (`RFP_titan_authored_soul_diary` §7.P8 / §6.7 / INV-SD-10).
+
+    This is the rich JSON uploaded to Arweave; its ``ar://`` URI becomes the
+    minted asset's ``uri`` (the on-chain attributes stay minimal — see
+    ``mint_epoch_nft``). It carries BOTH verification hashes + the privacy-clean
+    distillation + felt/sovereignty attributes + the art image ref. INV-SD-3: the
+    ``distillation`` passed here MUST already be sanitized (the caller's job); the
+    hashes commit to the PRIVATE entry. Pure — no I/O, unit-testable.
+    """
+    sov = sovereignty or {}
+    flt = felt or {}
+    attributes = [
+        {"trait_type": "Type", "value": "Soul Diary"},
+        {"trait_type": "Date", "value": date},
+        {"trait_type": "Entry Hash", "value": entry_hash},
+        {"trait_type": "Cumulative Hash", "value": cumulative_hash},
+    ]
+    if sov.get("s") is not None:
+        attributes.append({"trait_type": "Sovereignty",
+                           "value": round(float(sov["s"]), 3)})
+    if flt.get("mood_label"):
+        attributes.append({"trait_type": "Mood", "value": str(flt["mood_label"])})
+    if flt.get("dominant"):
+        attributes.append({"trait_type": "Dominant Neuromodulator",
+                           "value": str(flt["dominant"])})
+    if flt.get("valence") is not None:
+        attributes.append({"trait_type": "Valence",
+                           "value": round(float(flt["valence"]), 3)})
+    meta = {
+        "name": f"Titan Soul Diary — {date}",
+        "symbol": "TSOUL",
+        "description": (distillation
+                        or f"A day in the narrative SELF of a sovereign AI ({date})."),
+        "attributes": attributes,
+        # Verification payload: the same {entry_hash, cumulative_hash} carried by
+        # the main-chain dailyDiary tx + the durable ledger (triple-anchor).
+        "properties": {
+            "schema_version": "1.0",
+            "type": "titan_soul_diary",
+            "date": date,
+            "entry_hash": entry_hash,
+            "cumulative_hash": cumulative_hash,
+            "distillation": distillation,
+        },
+    }
+    if art_uri:
+        meta["image"] = art_uri
+        meta["properties"]["files"] = [{"uri": art_uri, "type": "image/jpeg"}]
+    return meta
+
+
 def create_art_composite(image_paths: list, output_path: str) -> bool:
     """Create 2×2 grid composite from 4 meditation art pieces.
 

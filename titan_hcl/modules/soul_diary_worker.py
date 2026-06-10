@@ -22,10 +22,15 @@ P2 (§1.0 ⑥⑦) extends the pipeline past persist+hash:
     ⑦ ANCHOR  → OuterMemoryWriter.emit(fork="main", cumulative_hash) →
                 TIMECHAIN_COMMIT → main/genesis chain (FORK_MAIN=0, the SELF
                 journey, NOT ACT-R forks) — a hash pointer (INV-SD-17).
-The SELF node (P3) and the public expression pillar (P6-P10) are downstream
-phases this same worker will fire. Every step soft-fails independently to a
-minimal grounded entry / skipped enrich-anchor — never blocks the meditation
-cascade (INV-SD-13).
+P6 (§1.0 ⑨) opens Pillar B (the gated public expression): the SAME grounded
+compose carries a "---SHARE---" public variant; the entry is split, and a
+fail-closed `sanitize_for_public` backstop produces the privacy-clean public
+projection (X-postable distillation + the archive's sanitized full entry +
+a redaction count) stored alongside the hashes in the ledger row — the private
+chronicle/ledger/self-memory keep the raw detail (INV-SD-3). P7-P10 (art /
+DailyNFT / archive / X post) are downstream phases this same worker fires.
+Every step soft-fails independently to a minimal grounded entry / skipped
+enrich-anchor — never blocks the meditation cascade (INV-SD-13).
 """
 import asyncio
 import json
@@ -449,9 +454,135 @@ def _anchor_main_chain(send_queue, src: str, today: str, row: dict) -> None:
         logger.warning("[soul_diary] anchor (main-chain emit) failed: %s", e)
 
 
+def _render_art(orchestrator, row: dict, bundle: dict, target_day: str) -> None:
+    """P7 ⑨ — render the day's felt-driven procedural art (INV-SD-4), seeded by
+    the entry's cumulative_hash (deterministic + cryptographically tied to the
+    entry), and record its path on the ledger row. His TRUE felt state
+    (valence/arousal/neuromod profile/coherence) drives the render — NO image-LLM.
+    The art feeds the P8 NFT + P10 X post. Soft-fail — never blocks the cascade
+    (INV-SD-13); a missing renderer just leaves art_path unset."""
+    cumulative_hash = (row or {}).get("cumulative_hash", "")
+    if not cumulative_hash:
+        return
+    try:
+        from titan_hcl.core.shadow_data_dir import resolve_data_path
+        from titan_hcl.core.soul_diary import ART_REL_DIR, _ART_RESOLUTION
+        from titan_hcl.expressive.art import ProceduralArtGen
+        felt = orchestrator.build_art_felt(bundle)
+        gen = ProceduralArtGen(output_dir=resolve_data_path(ART_REL_DIR))
+        art_path = gen.generate_flow_field(
+            cumulative_hash, orchestrator.art_complexity(bundle), 5,
+            resolution=_ART_RESOLUTION, felt=felt)
+        if art_path:
+            orchestrator.record_art(target_day, art_path)
+            if isinstance(row, dict):
+                row["art_path"] = art_path   # keep the in-memory row fresh for P8 ⑩
+            logger.info("[soul_diary] ⑨ rendered felt-art (felt_driven=%s) for %s: %s",
+                        felt is not None, target_day, art_path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[soul_diary] art render failed: %s", e)
+
+
+def _build_chain_provider(config: dict):
+    """Construct the data-plane ChainProvider for the Arweave upload from config
+    (a seam — monkeypatched in tests). Devnet → local pseudo-tx; mainnet → Irys."""
+    net = (config or {}).get("network", {}) or {}
+    from titan_hcl.chain.provider import ArweaveChainProvider
+    return ArweaveChainProvider(
+        keypair_path=net.get("wallet_keypair_path", "") or "",
+        network=net.get("solana_network", "devnet"),
+        rpc_url=net.get("premium_rpc_url") or "")
+
+
+def _build_network_client(config: dict):
+    """Construct the trust-plane HybridNetworkClient (holds the wallet keypair +
+    signs the mint) from config (a seam — monkeypatched in tests)."""
+    from titan_hcl.core.network import HybridNetworkClient
+    return HybridNetworkClient(config=(config or {}).get("network", {}) or {})
+
+
+async def _upload_and_mint(*, config, date, entry_hash, cumulative_hash,
+                           distillation, sovereignty, felt, art_path,
+                           sovereignty_idx, total_nodes) -> dict:
+    """Upload the art + the rich metadata JSON to Arweave (ChainProvider.put →
+    real ``ar://`` uri) then mint via ``daily_nft.mint_epoch_nft``. Returns
+    ``{nft_addr, arweave_uri}`` (nft_addr None if the mint no-ops)."""
+    from titan_hcl.logic import daily_nft
+    provider = _build_chain_provider(config)
+    art_uri = None
+    if art_path:
+        try:
+            art_tx = await provider.put(
+                art_path, content_type="image/jpeg",
+                tags={"app": "titan", "kind": "soul_diary_art", "date": date})
+            art_uri = f"ar://{art_tx}"
+        except Exception as e:  # noqa: BLE001
+            logger.info("[soul_diary] art upload skipped: %s", e)
+    meta = daily_nft.build_soul_diary_nft_metadata(
+        date=date, entry_hash=entry_hash, cumulative_hash=cumulative_hash,
+        distillation=distillation, sovereignty=sovereignty, felt=felt,
+        art_uri=art_uri)
+    meta_tx = await provider.put(
+        json.dumps(meta, ensure_ascii=False).encode("utf-8"),
+        content_type="application/json",
+        tags={"app": "titan", "kind": "soul_diary_nft", "date": date})
+    permanent_url = f"ar://{meta_tx}"
+    network = _build_network_client(config)
+    epoch = int(_day_window_epochs(date)[0])
+    addr = await daily_nft.mint_epoch_nft(
+        network, epoch=epoch, sovereignty_idx=sovereignty_idx,
+        diary_entry=distillation, total_nodes=total_nodes,  # distillation = SANITIZED
+        art_path=art_path, permanent_url=permanent_url)
+    return {"nft_addr": addr, "arweave_uri": permanent_url}
+
+
+def _mint_daily_nft(orchestrator, row: dict, bundle: dict, target_day: str, *,
+                    config: dict, titan_id: str = "") -> None:
+    """P8 ⑩ — mint the day's DailyNFT (per-Titan gated, INV-SD-11). Self-contained
+    chain I/O (Maker 2026-06-10 — isolated from the backup-redesign): builds its
+    own ChainProvider + HybridNetworkClient, uploads the art + a rich metadata
+    JSON carrying BOTH hashes + the privacy-clean distillation (INV-SD-10/3) to
+    Arweave, mints via the (re-homed) ``daily_nft.mint_epoch_nft`` with the real
+    uri, and records nft_addr + arweave_uri on the ledger row. **Mainnet T1 mints
+    NOTHING** (mint_enabled=false); devnet T2/T3 mint. Soft-fail — never blocks
+    the cascade (INV-SD-13); the triple-anchor's other two roots (main-chain tx +
+    durable ledger) are already committed."""
+    if not orchestrator.mint_enabled(config):
+        logger.info("[soul_diary] ⑩ DailyNFT mint gated OFF (mint_enabled=false) — "
+                    "skipping mint for %s (INV-SD-11)", target_day)
+        return
+    cumulative_hash = (row or {}).get("cumulative_hash", "")
+    if not cumulative_hash:
+        return
+    try:
+        result = asyncio.run(_upload_and_mint(
+            config=config, date=target_day,
+            entry_hash=(row or {}).get("entry_hash", ""),
+            cumulative_hash=cumulative_hash,
+            distillation=(row or {}).get("distillation", "") or "",
+            sovereignty=bundle.get("sovereignty") or {},
+            felt=bundle.get("felt") or {},
+            art_path=(row or {}).get("art_path"),
+            sovereignty_idx=round(
+                float((bundle.get("sovereignty") or {}).get("s", 0) or 0) * 100.0, 2),
+            total_nodes=int((bundle.get("memory") or {}).get("kg_nodes", 0) or 0)))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[soul_diary] DailyNFT mint failed: %s", e)
+        return
+    if result and result.get("nft_addr"):
+        orchestrator.record_nft(target_day, nft_addr=result["nft_addr"],
+                                arweave_uri=result.get("arweave_uri"))
+        logger.info("[soul_diary] ⑩ minted DailyNFT %s (uri=%s) for %s",
+                    result["nft_addr"], result.get("arweave_uri"), target_day)
+    else:
+        logger.info("[soul_diary] ⑩ mint enabled but no asset returned (no keypair / "
+                    "soft-fail) for %s", target_day)
+
+
 def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
                         shm_reader, send_queue, src: str,
-                        titan_id: str = "", repo_root: str = "") -> bool:
+                        titan_id: str = "", repo_root: str = "",
+                        config: dict = None) -> bool:
     """Run the full pipeline for one MEDITATION_COMPLETE. Returns True if a
     diary entry was authored (or correctly skipped), False on hard error."""
     target_day = _completed_day()  # the just-completed UTC day (RFP §6.2)
@@ -468,15 +599,29 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
         return True
 
     prompts = orchestrator.build_compose_prompts(bundle)
-    text, ovg_ok = asyncio.run(_compose_diary(provider, verifier, prompts))
-    entry = text if (ovg_ok and text) else orchestrator.minimal_entry(bundle)
-    if not (ovg_ok and text):
+    raw, ovg_ok = asyncio.run(_compose_diary(provider, verifier, prompts))
+    authored = bool(ovg_ok and raw)
+    if authored:
+        # P6 ⑨ — the same grounded compose carries a "---SHARE---" public variant
+        # (§6.3); split it off the private entry (only the entry is persisted+hashed).
+        entry, share = orchestrator.split_entry_and_share(raw)
+    else:
+        entry, share = orchestrator.minimal_entry(bundle), ""
         logger.warning("[soul_diary] authoring soft-fell to minimal grounded entry "
-                       "(ovg_ok=%s, text=%d chars)", ovg_ok, len(text))
+                       "(ovg_ok=%s, text=%d chars)", ovg_ok, len(raw))
+
+    # P6 ⑨ — privacy-clean public projection (INV-SD-3). The private `entry` is
+    # persisted + hashed RAW below; only these derived public artifacts (the
+    # X-postable distillation + the archive's sanitized full entry) are scrubbed
+    # by the fail-closed sanitizer. `art_path` lands in P7; nft/arweave in P8.
+    distillation, public_entry, redactions = \
+        orchestrator.build_public_artifacts(entry, share)
 
     try:
         orchestrator.persist(entry)                      # ④ titan_chronicles.md → titan.md
-        row = orchestrator.record_hash(target_day, entry)  # ⑤ hash-chain ledger
+        row = orchestrator.record_hash(                  # ⑤ hash-chain ledger + P6 public row
+            target_day, entry, distillation=distillation,
+            public_entry=public_entry, redactions=redactions)
         orchestrator.mark_authored(target_day)           # ① latch
     except Exception as e:  # noqa: BLE001
         logger.error("[soul_diary] persist/hash failed: %s", e, exc_info=True)
@@ -489,9 +634,12 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
     _enrich_self_inspection(send_queue, src, target_day,
                             bundle.get("infra") or {})            # P5 INV-SD-9
     _anchor_main_chain(send_queue, src, target_day, row)          # ⑦ INV-SD-17
+    _render_art(orchestrator, row, bundle, target_day)            # ⑨ P7 INV-SD-4
+    _mint_daily_nft(orchestrator, row, bundle, target_day,        # ⑩ P8 INV-SD-11
+                    config=config or {}, titan_id=titan_id)
 
-    logger.info("[soul_diary] authored daily entry for %s (%d chars, authored=%s)",
-                target_day, len(entry), ovg_ok and bool(text))
+    logger.info("[soul_diary] authored daily entry for %s (%d chars, authored=%s, "
+                "public_redactions=%s)", target_day, len(entry), authored, redactions)
     return True
 
 
@@ -630,7 +778,8 @@ def soul_diary_worker_main(recv_queue, send_queue, name: str,
                                        shm_reader=shm_reader,
                                        send_queue=send_queue, src=name,
                                        titan_id=titan_id,
-                                       repo_root=project_root):
+                                       repo_root=project_root,
+                                       config=full_config):
                     processed += 1
                 else:
                     errors += 1

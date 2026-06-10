@@ -3711,3 +3711,11 @@ confirm_window_turns = 3      # next-user-turns a researched node stays pending 
 delta                = 1.0    # explicit confirm ("thanks/correct") → confirmation_score += this → promote
 delta_weak           = 0.3    # no dispute within the window (silence ≠ endorsement) → weak-confirm → promote
 dispute_delta        = -1.0   # explicit dispute ("no/wrong/search more") → confirmation_score += this → prune + re-research
+
+[soul_diary]
+# RFP_titan_authored_soul_diary §7.P8 / INV-SD-11 — the per-Titan DailyNFT mint gate.
+# Base default OFF (safe): mainnet T1 mints NOTHING until explicitly flipped, even
+# though the path is fully wired + tested. Devnet T2/T3 set `mint_enabled = true` in
+# their `~/.titan/microkernel_<id>.toml` override (the same deep-merge as
+# l0_rust_enabled). No mint path bypasses this flag.
+mint_enabled = false

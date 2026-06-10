@@ -73,11 +73,19 @@ def last_cumulative(path: Optional[str] = None) -> str:
 
 
 def append_entry(date: str, entry_text: str, *, ts: Optional[float] = None,
-                 path: Optional[str] = None) -> dict:
+                 path: Optional[str] = None,
+                 distillation: Optional[str] = None,
+                 public_entry: Optional[str] = None,
+                 redactions: Optional[int] = None) -> dict:
     """Append one chained row for ``date``'s ``entry_text``; return the row.
 
-    Idempotent on ``date``: if a row already exists it is returned unchanged
-    (the daily latch should prevent a second call; the ledger is defensive).
+    ``entry_text`` is the PRIVATE entry — ``entry_hash`` commits to it (INV-SD-3).
+    The optional P6 public projection (``distillation`` = the X-postable share
+    line, ``public_entry`` = the sanitized full entry the archive renders,
+    ``redactions`` = the G9 count) is sanitized by the caller and stored in the
+    same durable, backed-up row (it is NOT part of the hash). Idempotent on
+    ``date``: an existing row is returned unchanged (the daily latch prevents a
+    second call; the ledger is defensive).
     """
     p = _ledger_path(path)
     rows = load_chain(p)
@@ -96,8 +104,14 @@ def append_entry(date: str, entry_text: str, *, ts: Optional[float] = None,
         "cumulative_hash": cumulative_hash,
         "prev_cumulative": prev,
         "ts": ts,
-        # anchor refs filled by later phases (P2 ⑦ / P8 ⑩)
+        # P6 public projection (sanitized; the hashes above commit to the PRIVATE
+        # entry — these public fields are NOT hashed, INV-SD-3).
+        "distillation": distillation,
+        "public_entry": public_entry,
+        "redactions": redactions,
+        # anchor refs filled by later phases (P2 ⑦ / P7 art / P8 ⑩)
         "nft_addr": None,
+        "art_path": None,
         "timechain_block": None,
         "arweave_uri": None,
     }
@@ -111,8 +125,10 @@ def append_entry(date: str, entry_text: str, *, ts: Optional[float] = None,
 def update_refs(date: str, *, nft_addr: Optional[str] = None,
                 timechain_block: Optional[str] = None,
                 arweave_uri: Optional[str] = None,
+                art_path: Optional[str] = None,
                 path: Optional[str] = None) -> bool:
-    """Fill anchor refs on an existing row (P2 ⑦ / P8 ⑩). Returns True if updated."""
+    """Fill anchor/art refs on an existing row (P2 ⑦ / P7 art / P8 ⑩). Returns
+    True if updated."""
     p = _ledger_path(path)
     rows = load_chain(p)
     for row in rows:
@@ -123,6 +139,8 @@ def update_refs(date: str, *, nft_addr: Optional[str] = None,
                 row["timechain_block"] = timechain_block
             if arweave_uri is not None:
                 row["arweave_uri"] = arweave_uri
+            if art_path is not None:
+                row["art_path"] = art_path
             _atomic_write(rows, p)
             return True
     return False

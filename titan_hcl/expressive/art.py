@@ -30,17 +30,24 @@ class ProceduralArtGen:
         self, state_root: str, age_nodes: int, avg_intensity: int,
         return_image: bool = False,
         resolution: int = 512, num_particles: int = 0,
+        felt: dict | None = None,
     ):
         """
-        Generate a Flow Field reflecting digital emotion during the Small Epoch.
+        Generate a Flow Field reflecting Titan's felt state.
 
         Args:
-            state_root: Cryptographic seed string.
+            state_root: Cryptographic seed string (deterministic art).
             age_nodes: Node count determining complexity.
-            avg_intensity: Emotion value (1-10) mapped to color palettes.
+            avg_intensity: Legacy emotion value (1-10) → color palette; used only
+                when ``felt`` is None (the pre-states-era fallback).
             return_image: If True, return PIL Image instead of saving.
             resolution: Canvas size (width=height).
             num_particles: Override particle count (0 = auto-scale from age_nodes).
+            felt: TRUE felt state ``{valence, arousal, neuromods, coherence}``
+                (RFP §7.P7 / INV-SD-4). When present, his real affect drives the
+                render — valence→hue, arousal→field energy, the neuromod profile→
+                accent palette, coherence→order — replacing the 1-10 palette. The
+                same ``(state_root, felt)`` always render identically.
 
         Returns:
             str | Image: Path to generated image, or PIL Image if return_image=True.
@@ -48,16 +55,41 @@ class ProceduralArtGen:
         random.seed(state_root)
         width = height = resolution
 
-        # Color mapping based on emotional intensity (1-10)
-        if avg_intensity >= 8:
-            bg_color = (15, 5, 5)
-            line_color_base = (200, 50, 50)
-        elif avg_intensity <= 3:
-            bg_color = (5, 10, 20)
-            line_color_base = (50, 150, 200)
+        # Pseudo-noise from seed (flow-field phase).
+        seed_val = int(hashlib.md5(state_root.encode()).hexdigest()[:8], 16) / 100000.0
+
+        # Auto-scaled base density/length (complexity from age_nodes).
+        base_particles = num_particles if num_particles > 0 else min(5000, 100 + (age_nodes * 20))
+
+        # ── render controls — felt-driven (P7) or the legacy 1-10 palette ──
+        fp = None
+        if felt is not None:
+            from titan_hcl.expressive.felt_palette import (
+                felt_to_render_params, normalize_felt,
+            )
+            canon = normalize_felt(felt)
+            if canon is not None:
+                fp = felt_to_render_params(canon)
+        if fp is not None:
+            bg_color = fp["bg_color"]
+            line_color_base = fp["line_color"]
+            particles = min(5000, int(base_particles * fp["particle_mult"]))
+            steps = fp["steps"]
+            freq = fp["turbulence_freq"]
+            turb_amp = fp["turbulence_amp"]
+            order = fp["order"]
+            jitter = fp["jitter"]
         else:
-            bg_color = (10, 10, 15)
-            line_color_base = (100, 200, 100)
+            # Legacy palette (felt unavailable) — byte-identical to the pre-P7 path.
+            if avg_intensity >= 8:
+                bg_color, line_color_base = (15, 5, 5), (200, 50, 50)
+            elif avg_intensity <= 3:
+                bg_color, line_color_base = (5, 10, 20), (50, 150, 200)
+            else:
+                bg_color, line_color_base = (10, 10, 15), (100, 200, 100)
+            particles = base_particles
+            steps = min(100, 20 + int(age_nodes / 2))
+            freq, turb_amp, order, jitter = 0.01, 1.0, 1.0, 20
 
         img = Image.new("RGB", (width, height), color=bg_color)
         draw = ImageDraw.Draw(img)
@@ -65,33 +97,25 @@ class ProceduralArtGen:
         # Scale step length with resolution
         step_len = max(1.0, resolution / 256.0)
 
-        # Growth Density
-        if num_particles > 0:
-            particles = num_particles
-        else:
-            particles = min(5000, 100 + (age_nodes * 20))
-        steps = min(100, 20 + int(age_nodes / 2))
-
-        # Pseudo-noise from seed
-        seed_val = int(hashlib.md5(state_root.encode()).hexdigest()[:8], 16) / 100000.0
-
         for _ in range(particles):
             x = random.randint(0, width)
             y = random.randint(0, height)
 
             for _ in range(steps):
                 angle = (
-                    math.sin(x * 0.01 + seed_val)
-                    * math.cos(y * 0.01 + seed_val)
-                    * math.pi * 2
+                    math.sin(x * freq + seed_val)
+                    * math.cos(y * freq + seed_val)
+                    * math.pi * 2 * turb_amp
                 )
+                if order < 1.0:    # coherence < 1 → fragment the flow (felt path)
+                    angle += random.uniform(-1.0, 1.0) * (1.0 - order) * math.pi
                 x_next = x + math.cos(angle) * step_len
                 y_next = y + math.sin(angle) * step_len
 
                 c = (
-                    max(0, min(255, line_color_base[0] + random.randint(-20, 20))),
-                    max(0, min(255, line_color_base[1] + random.randint(-20, 20))),
-                    max(0, min(255, line_color_base[2] + random.randint(-20, 20))),
+                    max(0, min(255, line_color_base[0] + random.randint(-jitter, jitter))),
+                    max(0, min(255, line_color_base[1] + random.randint(-jitter, jitter))),
+                    max(0, min(255, line_color_base[2] + random.randint(-jitter, jitter))),
                 )
                 draw.line([(x, y), (x_next, y_next)], fill=c, width=1)
                 x, y = x_next, y_next

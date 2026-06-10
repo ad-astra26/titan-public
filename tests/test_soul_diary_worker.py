@@ -7,10 +7,19 @@ daily-latch skip) with fakes — no bus, no real LLM, no real chronicle write.
 import asyncio
 from unittest.mock import MagicMock
 
+import pytest
+
 import titan_hcl.bus as bus
 from titan_hcl.core import soul_diary_chain
 from titan_hcl.core.soul_diary import SoulDiaryOrchestrator
 from titan_hcl.modules import soul_diary_worker as sdw
+
+
+@pytest.fixture(autouse=True)
+def _no_art_render(monkeypatch):
+    """P7 art render is a separate pipeline step (tested in test_soul_diary_p7_art);
+    no-op it here so these P1/P2 pipeline tests don't write image files."""
+    monkeypatch.setattr(sdw, "_render_art", lambda *a, **k: None)
 
 
 class _FakeProvider:

@@ -504,6 +504,10 @@ class RebirthBackup:
         # fixed: titan_HCL._append_to_chronicle writes meditation reflections again
         # on MEDITATION_COMPLETE). Was removed from §24.4.B while the writer was dead.
         ("titan_chronicles.md", "titan_chronicles.md"),            # ~varies: Scholar's Chronicle reflections
+        # Soul-diary hash-chain ledger — RFP_titan_authored_soul_diary P8 / INV-SD-12:
+        # the 3rd triple-anchor root (daily diff-incremental + Arweave for T1) so the
+        # tamper-evident {entry_hash, cumulative_hash} chain + public projection survive.
+        ("data/soul_diary_chain.json", "soul_diary_chain.json"),   # ~varies: tamper-evident diary ledger
         # MSL concept state — "I" identity + concept cascade (critical for resurrection)
         ("data/msl/msl_identity.json", "msl/msl_identity.json"),    # ~2KB: I-confidence, recipe, convergences
         ("data/msl/msl_concepts.json", "msl/msl_concepts.json"),    # ~90KB: YOU/YES/NO/WE/THEY + interaction matrix

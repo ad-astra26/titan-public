@@ -661,7 +661,7 @@ def test_dispatcher_constructs_all_ten(empty_social_x_db, tmp_path):
         experience_db=str(tmp_path / "exp.db"),
         meta_wisdom_db=str(tmp_path / "mw.db"),
     )
-    assert len(d.archetypes) == 10   # +amplify (10th archetype)
+    assert len(d.archetypes) == 11   # +soul_diary (11th archetype, RFP §7.P10)
     assert set(d.archetypes.keys()) == set(PRIORITY_ORDER)
 
 

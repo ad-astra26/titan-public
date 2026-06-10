@@ -19,6 +19,7 @@ from typing import Any
 from .archetypes import (
     ArchetypeCandidate,
     ProofDayArchetype,
+    SoulDiaryArchetype,
     WorldMirrorArchetype,
     OuterRuminationArchetype,
     OuterInnerBridgeArchetype,
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 # external signal isn't shadowed by a recent inner crystallization.
 PRIORITY_ORDER = (
     "proof_day",
+    "soul_diary",
     "world_mirror",
     "outer_inner_bridge",
     "outer_rumination",
@@ -83,6 +85,7 @@ class ArchetypeDispatcher:
 
         self.archetypes: dict[str, Any] = {
             "proof_day": ProofDayArchetype(**common),
+            "soul_diary": SoulDiaryArchetype(**common),
             "world_mirror": WorldMirrorArchetype(
                 **common, events_teacher_db=events_teacher_db,
                 social_graph_db=social_graph_db,
