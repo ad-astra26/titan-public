@@ -59,14 +59,14 @@ def _resolve_provider_name(inference_cfg: dict) -> str:
     """The configured inference provider for the worker's own LLM call.
 
     Canonical config key = ``inference_provider`` (``config.toml [inference]``);
-    ``provider`` accepted as a legacy alias; ``"venice"`` last-resort.
-    BUGFIX 2026-06-10: previously read only ``provider`` (the WRONG key), so it
-    always fell back to ``"venice"`` — which is 402-dead on the fleet — and every
-    diary entry soft-fell to the minimal grounded template instead of an authored
-    reflection. Reading the real key lets the diary use the live provider
-    (e.g. ``ollama_cloud``)."""
+    ``provider`` accepted as a legacy alias; ``"ollama_cloud"`` last-resort (the
+    fleet default — Ollama Cloud ``deepseek-v3.1:671b``, per topic_infra_stack;
+    venice is NOT a current provider).
+    BUGFIX 2026-06-10: previously read only ``provider`` (the WRONG key) and fell
+    back to ``"venice"`` — which is 402-dead on the fleet — so every diary entry
+    soft-fell to the minimal grounded template instead of an authored reflection."""
     return (inference_cfg.get("inference_provider")
-            or inference_cfg.get("provider") or "venice")
+            or inference_cfg.get("provider") or "ollama_cloud")
 
 
 async def _compose_diary(provider, verifier, prompts: dict) -> tuple[str, bool]:

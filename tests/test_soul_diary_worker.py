@@ -50,8 +50,8 @@ def test_resolve_provider_name_reads_canonical_key():
         {"inference_provider": "ollama_cloud", "provider": "venice"}) == "ollama_cloud"
     # legacy alias still honored when canonical absent.
     assert sdw._resolve_provider_name({"provider": "custom"}) == "custom"
-    # last-resort default.
-    assert sdw._resolve_provider_name({}) == "venice"
+    # last-resort default = the fleet default ollama_cloud (NOT venice).
+    assert sdw._resolve_provider_name({}) == "ollama_cloud"
 
 
 def test_compose_pass():
