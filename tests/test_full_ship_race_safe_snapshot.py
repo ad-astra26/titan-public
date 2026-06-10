@@ -202,6 +202,59 @@ def test_sweep_orphan_snapshots_removes_aged_orphans(tmp_path):
     assert source.exists() and source.read_text() == "real data"
 
 
+def test_sweep_reaps_in_tree_legacy_bksnap_orphans(tmp_path):
+    """The fix (AUDIT_bksnap_legacy_orphans_20260610): stray IN-TREE `.bksnap.`
+    files — the pre-2026-05-29 in-source-dir legacy incl. recursive chains — are
+    reaped (regardless of age), while the canonical source + the active
+    `.bksnap_scratch` + `.orch_drip_*` dirs are left untouched."""
+    data_root = tmp_path / "data"
+    src_dir = data_root / "reasoning"
+    src_dir.mkdir(parents=True)
+    source = src_dir / "rfp_alpha_activation.json"
+    source.write_text("real data")
+    # Legacy in-tree orphans INSIDE the source dir (incl. a recursive chain).
+    leg1 = src_dir / "rfp_alpha_activation.json.bksnap.aaaa"
+    leg2 = src_dir / "rfp_alpha_activation.json.bksnap.aaaa.bksnap.bbbb"
+    leg1.write_text("orphan"); leg2.write_text("orphan")
+    # An in-flight scratch snapshot (age 0) + an active drip artifact — survive.
+    scratch = data_root / full_ship._SCRATCH_DIRNAME
+    scratch.mkdir(parents=True)
+    fresh_scratch = scratch / "foo.json.bksnap.fresh"
+    fresh_scratch.write_text("in-flight")
+    drip = data_root / "backups" / ".orch_drip_T1"
+    drip.mkdir(parents=True)
+    drip_art = drip / "patch_foo.json.bksnap.live"
+    drip_art.write_text("active drip")
+
+    removed = full_ship.sweep_orphan_snapshots(str(data_root), max_age_s=3600.0)
+    assert removed == 2                              # the 2 in-tree legacy orphans
+    assert not leg1.exists() and not leg2.exists()
+    assert source.exists() and source.read_text() == "real data"  # source safe
+    assert fresh_scratch.exists()                    # in-flight scratch (age 0) safe
+    assert drip_art.exists()                         # active drip dir pruned, not reaped
+
+
+def test_sweep_reaps_aged_sqlite_snap_in_scratch(tmp_path):
+    """The scratch pass also reaps aged `<db>.snap.<rand>` SQLite online-backup
+    images (the leaked-baseline-snapshot space leak) — a marker distinct from
+    `.bksnap.`."""
+    import time as _t
+
+    data_root = tmp_path / "data"
+    scratch = data_root / full_ship._SCRATCH_DIRNAME
+    scratch.mkdir(parents=True)
+    snap = scratch / "consciousness.db.snap.deadbeef"
+    snap.write_bytes(b"x" * 1024)
+    # Fresh → survives (age-gated).
+    assert full_ship.sweep_orphan_snapshots(str(data_root), max_age_s=3600.0) == 0
+    assert snap.exists()
+    # Aged past the floor → reaped.
+    old = _t.time() - 7200
+    os.utime(snap, (old, old))
+    assert full_ship.sweep_orphan_snapshots(str(data_root), max_age_s=3600.0) == 1
+    assert not snap.exists()
+
+
 def test_full_ship_roundtrip_unchanged(tmp_path):
     """End-to-end: encode + read back through patch_path → bit-identical."""
     source = tmp_path / "x.json"

@@ -255,23 +255,32 @@ def backup_orchestrator_main(recv_queue, send_queue, name: str, config: dict) ->
     with suppress(Exception):
         loop.run_until_complete(backup.check_on_boot())
 
-    # 2026-05-29 — sweep leaked backup-snapshot hardlinks. A snapshot is
-    # normally unlinked by pack_event_tarball, but an abnormal mid-pack
-    # termination (RSS-kill, crash) leaks one into data/.bksnap_scratch.
-    # Bounded best-effort sweep at boot keeps the orphan set from growing.
-    # (The exponential blowup that produced 340,445 orphans is fixed at the
-    # source — snapshots now live out of the backed-up tree — this is the
-    # belt-and-suspenders hygiene pass.)
-    with suppress(Exception):
-        from titan_hcl.logic.diff_encoders.full_ship import (
-            sweep_orphan_snapshots,
-        )
-        swept = sweep_orphan_snapshots(
-            data_root=str(local_dir.parent) if local_dir.name == "backups"
-            else "data")
-        if swept:
-            logger.info("[BackupWorker] Swept %d orphan backup snapshot(s)",
-                        swept)
+    # 2026-05-29 — sweep leaked backup-snapshot hardlinks. Normally unlinked by
+    # pack_event_tarball; an abnormal mid-pack termination (RSS-kill, crash)
+    # leaks one into data/.bksnap_scratch. The exponential 340,445-orphan blowup
+    # is fixed at the SOURCE (snapshots live out of the backed-up tree). 2026-06-10
+    # (AUDIT_bksnap_legacy_orphans): the sweep now ALSO reaps the in-tree legacy
+    # residue (its long-promised pass that the body never ran) + aged `.snap.`
+    # SQLite images. Run OFF the boot critical path (daemon thread) — the in-tree
+    # data/ walk + a large legacy reap must never stall boot / the heartbeat-grace.
+    _sweep_root = (str(local_dir.parent) if local_dir.name == "backups"
+                   else "data")
+
+    def _boot_orphan_sweep():
+        try:
+            from titan_hcl.logic.diff_encoders.full_ship import (
+                sweep_orphan_snapshots,
+            )
+            swept = sweep_orphan_snapshots(data_root=_sweep_root)
+            if swept:
+                logger.info(
+                    "[BackupOrchestrator] Swept %d orphan backup snapshot(s) "
+                    "(scratch + in-tree legacy)", swept)
+        except Exception as _sw_e:  # noqa: BLE001
+            logger.warning("[BackupOrchestrator] orphan sweep failed: %s", _sw_e)
+
+    threading.Thread(target=_boot_orphan_sweep, name="backup-orphan-sweep",
+                     daemon=True).start()
 
     boot_elapsed = time.time() - init_start
     logger.info("[BackupWorker] Ready in %.1fs (local_dir=%s, mode=%s)",

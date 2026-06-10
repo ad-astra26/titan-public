@@ -50,6 +50,13 @@ logger = logging.getLogger(__name__)
 # backup-scope skip-lists (titan_hcl/logic/backup.py: _tier_specs_from_paths
 # IGNORE_SUFFIXES + _BACKUP_SKIP_PATTERNS) and by sweep_orphan_snapshots().
 BKSNAP_MARKER = ".bksnap."
+# SQLite online-backup images are named `<db>.snap.<rand>` by
+# backup_sqlite_snapshot.snapshot_dest_for — a DISTINCT marker from `.bksnap.`
+# (".bksnap." does not contain ".snap." as a substring). The scratch sweep must
+# match it too, else leaked baseline DB snapshots (e.g. a 3.3 GB
+# consciousness.db.snap.*) accumulate in .bksnap_scratch (AUDIT_bksnap_legacy_
+# orphans_20260610). NOT reaped in-tree (SQLite snaps only ever live in scratch).
+_SQLITE_SNAP_MARKER = ".snap."
 # Dedicated out-of-source-tree scratch dir name (a child of the data root).
 # CRITICAL: snapshots must NOT live inside a backed-up source dir, or the
 # next event's rglob re-snapshots them (.bksnap.X.bksnap.Y …) and the
@@ -193,33 +200,64 @@ def _race_safe_snapshot(current_path: str) -> tuple[str, bool]:
 
 def sweep_orphan_snapshots(data_root: str = "data",
                            max_age_s: float = 3600.0) -> int:
-    """Remove leaked backup snapshots from the scratch dir.
+    """Remove leaked backup snapshots — from the out-of-tree scratch dir AND any
+    stray in-tree LEGACY `.bksnap.` orphans. Best-effort; never raises.
 
-    A snapshot is normally unlinked by pack_event_tarball (patch_owned).
-    An abnormal termination mid-pack (RSS-kill, crash) can leak one into
-    `<data_root>/.bksnap_scratch`. This sweep removes snapshot files older
-    than `max_age_s` (so it never races a live event's in-flight snapshot).
-    Hardlink removal only drops the extra name; the canonical source inode
-    is untouched. Returns the number of orphans removed. Best-effort: never
-    raises.
+    TWO passes (called at backup_worker boot → self-cleans fleet-wide):
 
-    Called at backup_worker boot. Defensively also sweeps any stray
-    in-tree `.bksnap.` files left by the pre-2026-05-29 in-source-dir
-    placement (one-shot migration safety; the new code never creates them).
+      1. SCRATCH pass — `<data_root>/.bksnap_scratch`: reap `.bksnap.` (copy/
+         hardlink snaps) AND `.snap.` (SQLite online-backup images, named
+         `<db>.snap.<rand>`) older than `max_age_s` (so it never races a live
+         event's in-flight snapshot). The `.snap.` coverage closes the
+         leaked-baseline-DB-snapshot space leak (AUDIT_bksnap_legacy_orphans
+         _20260610 — a 3.3 GB consciousness.db.snap.* observed on T3).
+
+      2. IN-TREE LEGACY pass — the docstring's long-promised reap that the body
+         never did (the bug): walk `data_root` and remove stray `.bksnap.` files
+         left INSIDE the source dirs by the pre-2026-05-29 in-source-dir
+         placement (the 340k-orphan-incident residue — 346k inert chained
+         hardlinks on T3). The fixed creation path writes ONLY to
+         `.bksnap_scratch`, so ANY in-tree `.bksnap.` is legacy → safe to reap
+         (no age-gate needed). PRUNES `.bksnap_scratch` (pass 1 owns it) + the
+         orchestrator's active `.orch_drip_*` drip dirs (live disk-persisted
+         artifacts the BackupOrchestrator owns). Hardlink removal only drops the
+         extra name; the canonical source inode is untouched → cannot lose data,
+         frees file-count / directory entries.
+
+    Returns the number of orphans removed.
     """
     removed = 0
     now = time.time()
     scratch = os.path.join(data_root, _SCRATCH_DIRNAME)
+    # ── Pass 1: scratch dir (age-gated — never race an in-flight snapshot) ──
     try:
         if os.path.isdir(scratch):
             for name in os.listdir(scratch):
-                if BKSNAP_MARKER not in name:
+                if BKSNAP_MARKER not in name and _SQLITE_SNAP_MARKER not in name:
                     continue
                 fp = os.path.join(scratch, name)
                 try:
                     if now - os.path.getmtime(fp) < max_age_s:
                         continue
                     os.unlink(fp)
+                    removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    # ── Pass 2: in-tree legacy `.bksnap.` orphans (the never-reaped residue) ──
+    try:
+        for dirpath, dirnames, filenames in os.walk(data_root):
+            # Prune the scratch dir (pass 1 owns it) + the orchestrator's active
+            # drip dirs (live artifacts — not orphans).
+            dirnames[:] = [d for d in dirnames
+                           if d != _SCRATCH_DIRNAME
+                           and not d.startswith(".orch_drip_")]
+            for name in filenames:
+                if BKSNAP_MARKER not in name:
+                    continue
+                try:
+                    os.unlink(os.path.join(dirpath, name))
                     removed += 1
                 except OSError:
                     pass
