@@ -2051,16 +2051,18 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
                 config=_meta_cfg, send_queue=send_queue)
             if coordinator is not None:
                 coordinator._meta_engine = meta_engine
-            # Phase A (RFP_cgn_enhancements §9.1) — route concept-grounding
-            # META_REASON_REQUESTs into the engine's chain-trigger queue
-            # (should_trigger_meta Path #0). MetaService was constructed earlier
-            # without an engine ref; wire the sink now that the engine exists.
-            _ms_for_grounding = state_refs.get("_meta_service")
-            if _ms_for_grounding is not None:
-                _ms_for_grounding._grounding_sink = meta_engine.enqueue_grounding
-                logger.info(
-                    "[CognitiveWorker] Phase A — meta_service grounding_sink wired "
-                    "to meta_engine.enqueue_grounding (learning-event Path #0 active)")
+            # NOTE (2026-06-10 fix): the grounding_sink is wired CANONICALLY in the
+            # caller (search "CANONICAL grounding_sink wiring", ~line 657) where BOTH
+            # meta_engine (returned as state_refs["meta_engine"]) AND _meta_service
+            # (built in the caller, AFTER this function returns) exist. The earlier
+            # in-function attempt here referenced `state_refs` — which is NOT in scope
+            # inside _init_cognitive_engines (it is THIS function's RETURN value; see
+            # the same note at the top of this function) — so it raised
+            # `NameError: name 'state_refs' is not defined`, which the outer
+            # `except` swallowed as "MetaReasoningEngine init failed", aborting the
+            # init mid-way (meta_engine half-wired → started one chain then FROZE,
+            # tmc pinned, monoculture never moved). Removed; the canonical wiring is
+            # the sole, correct path. (Introduced by ff3583b4; broke T2 meta-reasoning.)
             # D-SPEC-70 v1.15.0 — attach inner_self_insight.bin SHM reader
             # so _prim_introspect can read pre-warmed cache per G20.
             # ShmReaderBank lazy-inited in state_refs at boot (see
