@@ -59,25 +59,7 @@ def create_tools(plugin):
         plug = tool_plugs.get(tool_id)
         if plug is None:
             return None
-        # EEL B1 (D-SPEC-153 / INV-Syn-29) — source THIS turn's GOAL so the
-        # oracle-verified tool-use forms an OUTCOME-keyed (oracle_id, goal_class)
-        # skill. The pre-LLM goal hook (INV-Syn-17) wrote the user message into the
-        # `goal` working-memory buffer BEFORE agent.arun; thread it as parent_goal.
-        # WITHOUT it the verdict carries parent_goal=None and the OracleRouter flush
-        # DROPS it (`if not e.parent_goal: continue`, oracle_router.py) → no positive
-        # skill ever forms (the 2026-06-09 soak found 0 promoted despite oracle
-        # coverage=1.0). Best-effort + soft: no goal buffer → parent_goal=None
-        # (unchanged behaviour, no regression).
-        parent_goal = None
-        try:
-            if _buffer_cache is not None:
-                _goal_row = _buffer_cache.get(_resolve_chat_id(), "goal")
-                if _goal_row:
-                    parent_goal = (_goal_row.get("content") or "").strip() or None
-        except Exception:
-            parent_goal = None
-        call = ToolCall(tool_id=tool_id, args=args, parent_chat_tx=parent_chat_tx,
-                        parent_goal=parent_goal)
+        call = ToolCall(tool_id=tool_id, args=args, parent_chat_tx=parent_chat_tx)
         return plug.invoke(call)
 
     # ------------------------------------------------------------------
