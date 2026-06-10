@@ -30,6 +30,7 @@ import collections
 import hashlib
 import inspect
 import logging
+import os
 import threading
 import time
 import tomllib
@@ -441,6 +442,12 @@ class MetaService:
             from .meta_dynamic_rewards import DynamicRewardAccumulator
             # RFP_meta-reasoning_CGN_FIX.md §4.4 — gentler 5-tier schedule
             # with α=0.10 warm-up + time-escape hatch.
+            # INV-PERSIST (RFP_cgn_loop_closure §7.A) — persist the emergent
+            # accumulator to data/reasoning/meta_dynamic_rewards.json, the same
+            # dir the engine writes meta_stats.json (TITAN_DATA_DIR-aware).
+            _data_dir = cfg.get("dynamic_rewards_save_dir") or os.path.join(
+                os.environ.get("TITAN_DATA_DIR", "data"), "reasoning")
+            _rewards_path = os.path.join(_data_dir, "meta_dynamic_rewards.json")
             self._rewards = DynamicRewardAccumulator(
                 alpha_ramp_enabled=self._alpha_ramp_enabled,
                 phase_warmup_end=int(cfg.get("alpha_phase_warmup_end", 500)),
@@ -457,7 +464,14 @@ class MetaService:
                     cfg.get("alpha_time_escape_increment", 0.10)),
                 time_escape_cap=float(
                     cfg.get("alpha_time_escape_cap", 1.0)),
+                save_path=_rewards_path,
             )
+            # Resume warm — load persisted outcomes/means/α-count on boot.
+            try:
+                self._rewards.load()
+            except Exception as _ld_err:
+                logger.warning(
+                    "[MetaService] rewards load on boot failed: %s", _ld_err)
         except Exception as e:
             logger.warning("[MetaService] DynamicRewardAccumulator init: %s", e)
             self._rewards = None
@@ -1132,6 +1146,11 @@ class MetaService:
             "actual_primitive_used":
                 payload.get("actual_primitive_used"),
             "context": str(payload.get("context", ""))[:256],
+            # RFP_cgn_loop_closure §7.A — full chain → multi-step credit in
+            # the accumulator (ingest_outcome_record dispatches to
+            # record_outcome when this is present).
+            "primitive_sequence": payload.get("primitive_sequence"),
+            "sub_modes": payload.get("sub_modes"),
         }
         with self._lock:
             self._outcomes.append(record)
@@ -1147,6 +1166,21 @@ class MetaService:
                     "[MetaService] outcome_sink error: %s (consumer=%s)",
                     e, consumer_id)
         return True
+
+    # ── Persistence (INV-PERSIST — RFP_cgn_loop_closure §7.A / G10) ──────
+
+    def save_all(self) -> bool:
+        """Persist the emergent-reward accumulator. Registered in
+        cognitive_worker._persist_engine_state (every 100 epochs + SAVE_NOW)
+        so the CGN-loop learning state survives restart. No-op when the
+        accumulator is disabled."""
+        if self._rewards is None:
+            return False
+        try:
+            return bool(self._rewards.save_all())
+        except Exception as e:
+            logger.warning("[MetaService] rewards save_all failed: %s", e)
+            return False
 
     # ── Status export (for /v4/meta-service) ────────────────────────
 
