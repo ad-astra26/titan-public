@@ -79,7 +79,7 @@ class ChainProvider(abc.ABC):
     async def read_memo(self, tx_sig: str) -> Optional[str]:
         raise NotImplementedError("ChainProvider.read_memo — RFP Phase B")
 
-    async def list_memos(self, address: str, *, limit: int) -> list[str]:
+    async def list_memos(self, address: str, *, limit: Optional[int] = None) -> list[str]:
         raise NotImplementedError("ChainProvider.list_memos — RFP Phase B")
 
     # ── FUNDING plane (Phase C — Irys deposit) ──────────────────────────────
@@ -269,7 +269,10 @@ class ArweaveChainProvider(ChainProvider):
         from titan_hcl.utils.solana_client import get_memo_for_tx
         return await get_memo_for_tx(tx_sig, rpc_url=self._rpc_url or None)
 
-    async def list_memos(self, address: str, *, limit: int) -> list[str]:
+    async def list_memos(self, address: str, *, limit: Optional[int] = None) -> list[str]:
+        """Signatures for `address`, newest→oldest (the resurrection-walk order).
+        `limit=None` walks the WHOLE chain (paginated) — required so a sovereign
+        resurrection sees back to the genesis anchor, not just the latest page."""
         from titan_hcl.utils.solana_client import get_signatures_for_address
         return await get_signatures_for_address(
             address, rpc_url=self._rpc_url or None, limit=limit)

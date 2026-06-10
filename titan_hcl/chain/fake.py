@@ -64,8 +64,8 @@ class FakeChainProvider(ChainProvider):
     async def read_memo(self, tx_sig: str) -> Optional[str]:
         return self._memos.get(tx_sig)
 
-    async def list_memos(self, address: str, *, limit: int) -> list[str]:
-        return list(reversed(self._memo_order))[:limit]   # newest-first, like the RPC
+    async def list_memos(self, address: str, *, limit: Optional[int] = None) -> list[str]:
+        return list(reversed(self._memo_order))[:limit]   # newest-first; None ⇒ all
 
     # ── FUNDING plane (minimal; for Phase C tests) ──
     async def balance(self) -> float:
