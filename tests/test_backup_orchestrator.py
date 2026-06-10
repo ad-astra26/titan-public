@@ -291,6 +291,79 @@ def test_resume_discards_on_stale_day(tmp_path, monkeypatch):
     assert o._drip is None
 
 
+def _finalized_staged(drip_dir, *, tarball_exists=True):
+    """A FINALIZED StagedBuild: fully encoded, its loose OWNED artifacts packed +
+    unlinked (gone from disk), tier_results pointing at a per-component tarball."""
+    os.makedirs(drip_dir, exist_ok=True)
+    tarball = os.path.join(drip_dir, "event_evt-test1_personality.tar.zst")
+    if tarball_exists:
+        with open(tarball, "wb") as f:
+            f.write(b"PACKED-EVENT-BYTES")
+    return StagedBuild(
+        event_id="evt-test1", event_type="baseline", baseline_trigger="monthly",
+        baseline_event_id="base1", prev_event_id=None, soul_present=False,
+        scratch_dir=drip_dir, titan_id="T1",
+        pending={"personality": []},                       # fully encoded
+        artifacts={"personality": [
+            # OWNED but GONE — packed into the tarball + unlinked by pack.
+            ("a0", {"patch_path": os.path.join(drip_dir, "patch_gone.snap.x.db"),
+                    "patch_owned": True, "patch_size_bytes": 5})]},
+        tier_results={"personality": TierShipResult(
+            tier="personality", tarball_path=tarball, tarball_size_bytes=18)})
+
+
+def test_resume_finalized_drip_survives_packed_artifacts(tmp_path, monkeypatch):
+    """CONVERGENCE FIX (RFP_backup_redesign_spine, 2026-06-10): a FINALIZED drip
+    (finalize_pack ran → loose owned artifacts packed into the tarballs + unlinked)
+    must RESUME to await-ship, NOT discard. The old unconditional missing_artifacts()
+    flagged the packed-and-gone artifacts as 'missing' and threw away a COMPLETED
+    baseline → re-baseline forever (never ships → manifest never gets a baseline →
+    never converges to incremental → the multi-GB working set re-accumulates)."""
+    drip = str(tmp_path / "drip")
+    staged = _finalized_staged(drip, tarball_exists=True)
+    backup = _FakeBackup(_FakeWorker(), staged)
+
+    class _FakeManifest:
+        current_baseline_event_id = "base1"
+    monkeypatch.setattr(
+        "titan_hcl.logic.backup_unified_manifest.UnifiedManifest.load",
+        classmethod(lambda cls, **kw: _FakeManifest()))
+
+    o = _orch(backup, tmp_path, monkeypatch)
+    o.drip_dir = drip
+    today = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    with open(os.path.join(drip, DRIP_PROGRESS_FILENAME), "w") as f:
+        json.dump({"staged": staged.to_dict(), "known_arcs": [],
+                   "today": today, "weekday": 0}, f)
+    # Loose owned artifact is gone, but the tarball survived → RESUME (not discard).
+    assert o._try_resume_drip(today) is True
+    assert o._drip is not None
+    assert os.path.exists(os.path.join(drip, DRIP_PROGRESS_FILENAME))  # not discarded
+
+
+def test_resume_finalized_drip_discards_on_missing_tarball(tmp_path, monkeypatch):
+    """The finalized-resume guard still discards when a TARBALL (the actual product)
+    is gone — there is no shippable event to recover, so re-plan."""
+    drip = str(tmp_path / "drip")
+    staged = _finalized_staged(drip, tarball_exists=False)   # tarball NOT written
+    backup = _FakeBackup(_FakeWorker(), staged)
+
+    class _FakeManifest:
+        current_baseline_event_id = "base1"
+    monkeypatch.setattr(
+        "titan_hcl.logic.backup_unified_manifest.UnifiedManifest.load",
+        classmethod(lambda cls, **kw: _FakeManifest()))
+
+    o = _orch(backup, tmp_path, monkeypatch)
+    o.drip_dir = drip
+    today = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    with open(os.path.join(drip, DRIP_PROGRESS_FILENAME), "w") as f:
+        json.dump({"staged": staged.to_dict(), "known_arcs": [],
+                   "today": today, "weekday": 0}, f)
+    assert o._try_resume_drip(today) is False
+    assert o._drip is None
+
+
 # ── Sunday restore-test (D.5 single-flight guard; audit H-bug fix) ──────────
 def test_restore_test_runs_sunday_and_emits_on_real_queue(tmp_path, monkeypatch):
     """On Sunday, lock-free → the restore-test runs AND its PASS event lands on

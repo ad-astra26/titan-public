@@ -774,11 +774,31 @@ class BackupOrchestrator:
         if staged.baseline_event_id != cur_baseline:
             self._discard_drip("baseline moved since the drip was persisted")
             return False
-        missing = staged.missing_artifacts()
-        if missing:
-            self._discard_drip(
-                f"{len(missing)} drip artifact(s) missing on disk")
-            return False
+        # Freshness depends on the drip's PHASE. A FINALIZED drip (finalize_pack
+        # ran → `tier_results` populated) has had its loose owned artifacts packed
+        # INTO the per-component tarballs and unlinked by pack_event_tarball — so
+        # `missing_artifacts()` (which checks those loose paths) would flag them ALL
+        # missing and DISCARD a COMPLETED baseline. That is the convergence-killer:
+        # a baseline that finishes building but is restarted before the meditation
+        # ships it gets thrown away → re-planned as a fresh baseline → re-dripped
+        # from scratch → never ships → manifest never gets a baseline → every plan
+        # is a full baseline forever (never incremental) + the multi-GB working set
+        # re-accumulates each cycle (the disk leak). For a finalized drip we must
+        # instead validate the TARBALLS survived; the loose artifacts are GONE BY
+        # DESIGN. (2026-06-10 — RFP_backup_redesign_spine convergence fix.)
+        if staged.tier_results:
+            missing_tar = [r.tarball_path for r in staged.tier_results.values()
+                           if r.tarball_path and not os.path.exists(r.tarball_path)]
+            if missing_tar:
+                self._discard_drip(
+                    f"{len(missing_tar)} staged tarball(s) missing on disk")
+                return False
+        else:
+            missing = staged.missing_artifacts()
+            if missing:
+                self._discard_drip(
+                    f"{len(missing)} drip artifact(s) missing on disk")
+                return False
         known_arcs = set(payload.get("known_arcs") or [])
         resolver = self.backup._make_diff_base_resolver(
             self.backup._baseline_working_dir(), known_arcs)
