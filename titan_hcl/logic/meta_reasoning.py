@@ -185,6 +185,7 @@ class MetaChainState:
     trigger_reason: str = ""
     awaiting_delegate: bool = False
     delegate_start_chains: int = 0
+    delegate_wait_ticks: int = 0   # diagnostic (2026-06-10): how long a DELEGATE has waited
     pre_state_132d: list = field(default_factory=list)
     # M7: BREAK checkpoints
     checkpoints: list = field(default_factory=list)
@@ -4454,6 +4455,7 @@ class MetaReasoningEngine:
         # Track delegation
         self.state.awaiting_delegate = True
         self.state.delegate_start_chains = reasoning_engine._total_chains
+        self.state.delegate_wait_ticks = 0
 
         return {"primitive": "DELEGATE", "sub_mode": sub,
                 "delegated": True, "bias": bias.tolist(),
@@ -4521,6 +4523,24 @@ class MetaReasoningEngine:
 
         chains_since = reasoning_engine._total_chains - self.state.delegate_start_chains
         if chains_since < 1:
+            # DIAGNOSTIC (2026-06-10): an unbounded DELEGATE wait wedges the whole
+            # meta-chain (tick early-returns here every epoch → no step → frozen).
+            # Latent for ages; only surfaced once meta-reasoning ran long enough to
+            # hit a DELEGATE. Log WHY it never resolves (throttled): if chains_since
+            # is stuck/negative, delegate_start_chains is stale vs the live reasoning
+            # _total_chains (e.g. reasoning's lifetime counter was restored LOWER
+            # than the baseline captured at delegate time → never reaches +1).
+            self.state.delegate_wait_ticks += 1
+            if (self.state.delegate_wait_ticks == 1
+                    or self.state.delegate_wait_ticks % 20 == 0):
+                logger.warning(
+                    "[META] DELEGATE waiting %d ticks: chains_since=%d "
+                    "(reasoning._total_chains=%d - delegate_start_chains=%d) "
+                    "chain_len=%d",
+                    self.state.delegate_wait_ticks, chains_since,
+                    int(getattr(reasoning_engine, "_total_chains", -1)),
+                    int(self.state.delegate_start_chains),
+                    len(self.state.chain))
             return {"action": "WAITING", "primitive": "DELEGATE",
                     "chains_since": chains_since}
 
