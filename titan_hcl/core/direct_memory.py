@@ -817,6 +817,105 @@ class TitanKnowledgeGraph:
         self.spine_ensure_self_node()
         return self._spine_link_self("SELF_HAS_SKILL", "Production", "skill_id", skill_id)
 
+    # ── LEARNING → REASONING subtree (RFP_synthesis_self_learning_meta_reasoning
+    # v1.1 / INV-OML-11). SELF → LEARNING → REASONING: the graphed outer
+    # chain-of-thought. Real scalars live in DuckDB reasoning_records + the FAISS
+    # signature; Kuzu holds the graph identity so "what have I reasoned?" resolves.
+
+    def spine_ensure_learning_node(self) -> bool:
+        """MERGE-equivalent: ensure the singleton `Learning` hub exists + is linked
+        under Self (SELF_HAS_LEARNING). Idempotent; one per Titan-graph."""
+        from titan_hcl.synthesis.kuzu_spine_schema import LEARNING_NODE_ID
+        try:
+            qr = self._conn.execute(
+                "MATCH (l:Learning {id: $id}) RETURN COUNT(l)", {"id": LEARNING_NODE_ID})
+            if not (qr.has_next() and qr.get_next()[0] > 0):
+                self._conn.execute(
+                    "CREATE (l:Learning {id: $id, created_at: $ts})",
+                    {"id": LEARNING_NODE_ID, "ts": time.time()})
+                logger.info("[KnowledgeGraph] created Learning hub node (id=%s)",
+                            LEARNING_NODE_ID)
+            self.spine_ensure_self_node()
+            self._spine_link_self("SELF_HAS_LEARNING", "Learning", "id", LEARNING_NODE_ID)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[KnowledgeGraph] spine_ensure_learning_node failed: %s", e)
+            return False
+
+    def spine_create_reasoning_node(
+        self, reasoning_id: str, kind: str, goal_class: str, action: str,
+        oracle_id: str, verdict: str, anchor_tx: str, created_at: float,
+    ) -> bool:
+        """INSERT one Reasoning node (kind='tool_use' leaf | 'macro_strategy').
+        Idempotent — returns False if the row already exists (safe on replay)."""
+        try:
+            self._conn.execute(
+                "CREATE (r:Reasoning {reasoning_id: $rid, kind: $kind, "
+                "goal_class: $gc, action: $act, oracle_id: $oid, verdict: $v, "
+                "anchor_tx: $atx, created_at: $ts})",
+                {"rid": reasoning_id, "kind": str(kind), "gc": str(goal_class or ""),
+                 "act": str(action or ""), "oid": str(oracle_id or ""),
+                 "v": str(verdict or ""), "atx": str(anchor_tx or ""),
+                 "ts": float(created_at)},
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if any(k in msg for k in ("primary key", "duplicate", "constraint", "violates")):
+                return False
+            logger.warning(
+                "[KnowledgeGraph] spine_create_reasoning_node(%s) failed: %s",
+                reasoning_id, e)
+            raise
+
+    def spine_link_learning_reasoning(self, reasoning_id: str) -> bool:
+        """Link a Reasoning node under the Learning hub (LEARNING_HAS_REASONING).
+        Idempotent; ensures the hub exists first."""
+        from titan_hcl.synthesis.kuzu_spine_schema import LEARNING_NODE_ID
+        self.spine_ensure_learning_node()
+        try:
+            qr = self._conn.execute(
+                "MATCH (r:Reasoning {reasoning_id: $rid}) RETURN COUNT(r)",
+                {"rid": reasoning_id})
+            if not (qr.has_next() and qr.get_next()[0] > 0):
+                return False  # node absent
+            qr = self._conn.execute(
+                "MATCH (l:Learning {id: $lid})-[e:LEARNING_HAS_REASONING]->"
+                "(r:Reasoning {reasoning_id: $rid}) RETURN COUNT(e)",
+                {"lid": LEARNING_NODE_ID, "rid": reasoning_id})
+            if qr.has_next() and qr.get_next()[0] > 0:
+                return True  # already linked
+            self._conn.execute(
+                "MATCH (l:Learning {id: $lid}), (r:Reasoning {reasoning_id: $rid}) "
+                "CREATE (l)-[:LEARNING_HAS_REASONING]->(r)",
+                {"lid": LEARNING_NODE_ID, "rid": reasoning_id})
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[KnowledgeGraph] spine_link_learning_reasoning(%s) failed: %s",
+                           reasoning_id, e)
+            return False
+
+    def spine_link_reasoning_composed_from(self, macro_id: str, leaf_id: str) -> bool:
+        """Link a macro Reasoning node to a leaf it was distilled from
+        (REASONING_COMPOSED_FROM; BRAIN Idea-precursor). Idempotent; best-effort."""
+        try:
+            qr = self._conn.execute(
+                "MATCH (m:Reasoning {reasoning_id: $m}), (l:Reasoning {reasoning_id: $l}) "
+                "RETURN COUNT(m), COUNT(l)", {"m": macro_id, "l": leaf_id})
+            if not qr.has_next():
+                return False
+            row = qr.get_next()
+            if not (row[0] > 0 and row[1] > 0):
+                return False
+            self._conn.execute(
+                "MATCH (m:Reasoning {reasoning_id: $m}), (l:Reasoning {reasoning_id: $l}) "
+                "CREATE (m)-[:REASONING_COMPOSED_FROM]->(l)",
+                {"m": macro_id, "l": leaf_id})
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[KnowledgeGraph] spine_link_reasoning_composed_from failed: %s", e)
+            return False
+
     def spine_backfill_self_links(self) -> dict:
         """One-time, idempotent boot pass: link every existing `domain="self"`
         Engram + every `Production` skill to the Self hub, so recall is complete

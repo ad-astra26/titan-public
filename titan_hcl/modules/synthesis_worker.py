@@ -78,6 +78,7 @@ from titan_hcl.bus import (
     MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
     RETRIEVAL_SAMPLE,
+    SELF_LEARN_MACRO_READY,
     SELF_LEARN_REWARD,
     SYNTHESIS_FORK_COMMAND,
     TOOL_CALL_VERDICT_RECORD,
@@ -2205,6 +2206,27 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         _skill_drain_thread.start()
         logger.info("[synthesis_worker] EEL B1 skill-score drain daemon started")
 
+    # RFP_synthesis_self_learning_meta_reasoning v1.1 (§1.2 C1 / INV-OML-11) — the
+    # ReasoningStore: every per-use reasoning episode graphed under SELF → LEARNING
+    # → REASONING (DuckDB scalars + FAISS signature + Kuzu node), written at
+    # verdict-time through the single SynthesisWriter. Soft: a wiring failure
+    # disables the graphed record only — the reward/training loop is unaffected.
+    reasoning_store = None
+    try:
+        from titan_hcl.synthesis.reasoning_store import ReasoningStore
+        reasoning_store = ReasoningStore(
+            store._conn,
+            faiss_path=os.path.join(_data_dir, "reasoning_vectors.faiss"),
+            graph=kuzu_graph_obj,
+            embedder=_shared_embedder,
+            writer=db_writer,
+        )
+        logger.info("[synthesis_worker] v1.1 ReasoningStore ready (SELF→LEARNING→REASONING)")
+    except Exception as _rs_err:  # noqa: BLE001
+        reasoning_store = None
+        logger.warning("[synthesis_worker] ReasoningStore wiring failed (graphed records "
+                       "off; reward loop unaffected): %s", _rs_err)
+
     # EEL B1 (D-SPEC-153 / INV-Syn-29) — wire the OracleRouter's skill-score
     # capture to the store. At each companion-batch flush, every canonical
     # verdict naming its (goal, tool) is forwarded here → derive (outcome,
@@ -3011,10 +3033,44 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             "policy_action": payload.get("action"),  # what the policy chose (telemetry)
                             "parent_tool_call_tx": _ptx,
                         })
+                        # C1 (INV-OML-11): graph the per-use Reasoning record under
+                        # SELF → LEARNING → REASONING (DuckDB + FAISS + Kuzu), keyed
+                        # by the tool_call_tx (the SC-search DEREF pointer). Soft.
+                        if reasoning_store is not None:
+                            reasoning_store.record_tool_use(
+                                reasoning_id=str(_ptx), goal_class=_gc, action="tool",
+                                oracle_id=str(payload.get("oracle_id", "") or ""),
+                                verdict=str(payload.get("verdict", "") or ""),
+                                reward=_reward, features=list(_decision_feats),
+                                signature_text=str(payload.get("parent_goal", "") or ""))
                     except Exception as _sl_err:
                         logger.debug(
-                            "[synthesis_worker] self-learn reward emit failed: %s",
+                            "[synthesis_worker] self-learn reward/record emit failed: %s",
                             _sl_err)
+                continue
+
+            if msg_type == SELF_LEARN_MACRO_READY:
+                # S2 (INV-OML-11): the self_learning worker distilled a winning
+                # macro-strategy → persist it as a `Reasoning(kind='macro_strategy')`
+                # node under SELF → LEARNING → REASONING via the single writer.
+                if reasoning_store is None:
+                    continue
+                try:
+                    reasoning_store.write_macro(
+                        reasoning_id=str(payload.get("label")
+                                         or f"macro::{payload.get('goal_class','')}"),
+                        goal_class=str(payload.get("goal_class", "") or ""),
+                        action=str(payload.get("action_name", "tool") or "tool"),
+                        signature=list(payload.get("signature") or []),
+                        b_i=float(payload.get("b_i", 1.0)),
+                        c=float(payload.get("c", 1.0)),
+                        time_cost=float(payload.get("time_cost", 1.0)),
+                        use_count=int(payload.get("use_count", 1)),
+                    )
+                    logger.info("[synthesis_worker] v1.1 macro-strategy stored under Self: %s",
+                                payload.get("label"))
+                except Exception as _macro_err:  # noqa: BLE001
+                    logger.debug("[synthesis_worker] macro store failed: %s", _macro_err)
                 continue
 
             if msg_type == USER_FEEDBACK_SIGNAL:
