@@ -480,22 +480,44 @@ class ActivationStore:
                 state.first_access, state.base_level, state.last_recompute)
 
     def _persist_rows(self, rows: list[tuple]) -> None:
-        """Batch upsert on the writer thread. ON CONFLICT DO UPDATE (NOT
-        INSERT OR REPLACE — that is DELETE+INSERT and churns the PK ART index,
-        the documented 2026-06-01 crash class). INV-Syn-3 sole writer."""
-        self._conn.executemany(
-            "INSERT INTO activation_state "
-            "(item_id, last_access, access_log, access_count, first_access, "
-            " base_level, last_recompute) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT (item_id) DO UPDATE SET "
-            "last_access=excluded.last_access, access_log=excluded.access_log, "
-            "access_count=excluded.access_count, "
-            "first_access=excluded.first_access, "
-            "base_level=excluded.base_level, "
-            "last_recompute=excluded.last_recompute",
-            rows,
-        )
+        """SET-BASED vectorized upsert on the writer thread (INV-Syn-3 sole writer).
+
+        ROOT-CAUSE FIX (2026-06-10, verified via py-spy + microbench): DuckDB's
+        `executemany` is ROW-BY-ROW, and per-row `ON CONFLICT DO UPDATE` is its
+        columnar/OLAP pathological worst case — 1519 rows took ~10.5s on an idle
+        box / ~30s on a contended one, and since the recompute marks ALL rows
+        changed every 60s (B_i decays with `now`), it ran every pass and BLOCKED
+        the entire SynthesisWriter queue (export/tx-index/skill-drain all stacked
+        behind it → 30s submit_sync timeouts → guardian heartbeat_timeout class).
+        A pyarrow-registered set-based upsert is ONE vectorized statement: ~157ms
+        for 1519 rows (66× faster). ON CONFLICT DO UPDATE (NOT INSERT OR REPLACE —
+        that DELETE+INSERTs + churns the PK ART index, the 2026-06-01 crash class)."""
+        if not rows:
+            return
+        import pyarrow as pa
+        cols = list(zip(*rows))   # transpose row-tuples → columns (order = _row_tuple)
+        tbl = pa.table({
+            "item_id": cols[0], "last_access": cols[1], "access_log": cols[2],
+            "access_count": cols[3], "first_access": cols[4],
+            "base_level": cols[5], "last_recompute": cols[6],
+        })
+        self._conn.register("_activation_stage", tbl)
+        try:
+            self._conn.execute(
+                "INSERT INTO activation_state "
+                "(item_id, last_access, access_log, access_count, first_access, "
+                " base_level, last_recompute) "
+                "SELECT item_id, last_access, access_log, access_count, "
+                "       first_access, base_level, last_recompute "
+                "FROM _activation_stage "
+                "ON CONFLICT (item_id) DO UPDATE SET "
+                "last_access=excluded.last_access, access_log=excluded.access_log, "
+                "access_count=excluded.access_count, "
+                "first_access=excluded.first_access, "
+                "base_level=excluded.base_level, "
+                "last_recompute=excluded.last_recompute")
+        finally:
+            self._conn.unregister("_activation_stage")
 
     def items_tracked(self) -> int:
         return len(self._cache)
