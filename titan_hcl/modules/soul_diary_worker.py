@@ -93,9 +93,13 @@ async def _compose_diary(provider, verifier, prompts: dict) -> tuple[str, bool]:
     """The worker's OWN grounded-compose + OVG (§1.0 ③, self-contained).
 
     Grounded: the prompt already carries the real day's facts. OVG: the
-    deterministic ``verify_safety`` truth-gate. Returns ``(text, ovg_ok)``;
-    an empty/failed compose or a blocked/erroring OVG → ``ovg_ok=False`` so the
-    caller soft-fails to the minimal grounded entry (INV-SD-13).
+    deterministic ``verify_safety`` truth-gate, run on the **strict
+    ``channel="soul_diary"``** so a numeric claim diverging from the grounded
+    gather is a HARD block (not the soft chat warning) — NO LLM-hallucinated
+    figure enters Titan's permanent narrative-SELF record (Maker 2026-06-10;
+    `_STRICT_CONSISTENCY_CHANNELS`). Returns ``(text, ovg_ok)``; an empty/failed
+    compose or a blocked/erroring OVG → ``ovg_ok=False`` so the caller soft-fails
+    to the numbers-only minimal grounded entry (INV-SD-2/13).
     """
     if provider is None:
         return "", False
@@ -114,7 +118,7 @@ async def _compose_diary(provider, verifier, prompts: dict) -> tuple[str, bool]:
         return text, False  # no OVG available → soft-fail (fail-closed, INV-SD-2)
     try:
         result = verifier.verify_safety(
-            text, channel="agent", injected_context=prompts["user_prompt"])
+            text, channel="soul_diary", injected_context=prompts["user_prompt"])
         return text, bool(getattr(result, "passed", False))
     except Exception as e:  # noqa: BLE001
         logger.warning("[soul_diary] OVG verify_safety failed: %s", e)
@@ -215,35 +219,49 @@ def _gather_social(shm_reader) -> dict:
 
 
 def _gather_onchain(shm_reader) -> dict:
-    """Metabolic / on-chain snapshot (G18) ← body_state.bin (sol_balance/sol_norm/
-    anchor_fresh) + network_state.bin (balance_sol fallback) + metabolism_state.bin
-    (tier/balance_pct) — his real metabolic life, what governs him (INV-SD-7)."""
+    """Metabolic / on-chain snapshot (G18) ← network_state.bin (balance_sol — the
+    authoritative RPC balance) + body_state.bin (sol_norm/anchor_fresh; its
+    sol_balance is a lagging cache, 0.0 at boot) + metabolism_state.bin
+    (tier/balance_pct) — his real metabolic life, what governs him (INV-SD-7).
+
+    SOL source priority = network_state.balance_sol (the direct RPC balance,
+    authoritative) over body_state.sol_balance (a derived cache that lags / reads
+    0.0 in the boot-grace window). balance_pct is guarded against its out-of-range
+    boot sentinel (-1.0) so the entry never renders a nonsensical '-100% energy'."""
     if shm_reader is None:
         return {}
     out: dict = {}
+    sol = None
+    try:
+        ns = shm_reader.read_network_state() or {}
+        if ns.get("balance_sol") is not None:
+            sol = float(ns.get("balance_sol") or 0)
+    except Exception as e:  # noqa: BLE001
+        logger.info("[soul_diary] network_state read failed: %s", e)
     try:
         bs = shm_reader.read_body_state() or {}
         if bs:
-            if bs.get("sol_balance") is not None:
-                out["sol_balance"] = round(float(bs.get("sol_balance") or 0), 5)
+            # body_state.sol_balance is a fallback only when the RPC balance is
+            # absent/zero (it lags and reads 0.0 during boot grace).
+            if (sol is None or sol == 0.0) and bs.get("sol_balance"):
+                sol = float(bs.get("sol_balance") or 0)
             out["sol_norm"] = round(float(bs.get("sol_norm", 0) or 0), 3)
             if bs.get("anchor_fresh") is not None:
                 out["anchor_fresh"] = round(float(bs.get("anchor_fresh") or 0), 3)
     except Exception as e:  # noqa: BLE001
         logger.info("[soul_diary] body_state read failed: %s", e)
-    if "sol_balance" not in out:
-        try:
-            ns = shm_reader.read_network_state() or {}
-            if ns and ns.get("balance_sol") is not None:
-                out["sol_balance"] = round(float(ns.get("balance_sol") or 0), 5)
-        except Exception as e:  # noqa: BLE001
-            logger.info("[soul_diary] network_state read failed: %s", e)
+    if sol is not None:
+        out["sol_balance"] = round(sol, 5)
     try:
         mb = shm_reader.read_metabolism_state() or {}
         if mb:
             if mb.get("tier"):
                 out["metabolic_tier"] = str(mb.get("tier"))
-            out["balance_pct"] = round(float(mb.get("balance_pct", 0) or 0), 3)
+            bp = mb.get("balance_pct")
+            # Guard the out-of-range boot sentinel (e.g. -1.0); only a sane
+            # 0..2 fraction is a real energy reading.
+            if bp is not None and 0.0 <= float(bp) <= 2.0:
+                out["balance_pct"] = round(float(bp), 3)
     except Exception as e:  # noqa: BLE001
         logger.info("[soul_diary] metabolism_state read failed: %s", e)
     return out

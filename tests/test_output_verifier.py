@@ -193,6 +193,49 @@ class TestContextConsistency:
         assert ok
 
 
+class TestStrictConsistencyChannels:
+    """The soul_diary channel hard-blocks numeric inconsistency (Maker 2026-06-10),
+    and the change is STRICTLY ADDITIVE — every pre-existing channel behaves
+    EXACTLY as before (x_post/x_reply still hard; chat/agent/telegram still soft).
+    `_STRICT_CONSISTENCY_CHANNELS` is a superset of `_EXTERNAL_POST_CHANNELS`, so
+    for any pre-existing channel `(c in _STRICT) == (c in _EXTERNAL)`."""
+
+    def setup_method(self):
+        self.ov = OutputVerifier.__new__(OutputVerifier)
+
+    def _hard(self, channel):
+        # consistency failed, everything else clean → only the channel policy decides.
+        checks = {"directives": True, "injection": True, "consistency": False,
+                  "identity": True, "qualia": True}
+        return self.ov._is_hard_fail(channel, checks, [])
+
+    def test_soul_diary_hard_blocks_inconsistency(self):
+        assert self._hard("soul_diary") is True          # NEW — the diary is strict
+
+    def test_external_channels_unchanged_still_hard(self):
+        assert self._hard("x_post") is True              # UNCHANGED
+        assert self._hard("x_reply") is True             # UNCHANGED
+
+    def test_other_channels_unchanged_still_soft(self):
+        # The exact channels other runtime paths use — must NOT start blocking.
+        for ch in ("chat", "agent", "telegram", "social", "x_research", ""):
+            assert self._hard(ch) is False, f"{ch!r} must stay soft (regression!)"
+
+    def test_strict_is_superset_of_external(self):
+        from titan_hcl.logic.output_verifier import (
+            _EXTERNAL_POST_CHANNELS, _STRICT_CONSISTENCY_CHANNELS)
+        assert _EXTERNAL_POST_CHANNELS <= _STRICT_CONSISTENCY_CHANNELS
+        assert _STRICT_CONSISTENCY_CHANNELS - _EXTERNAL_POST_CHANNELS == {"soul_diary"}
+
+    def test_hard_fails_still_block_every_channel(self):
+        # directives/injection failures must STILL hard-block on any channel
+        # (the additive change touches only the consistency branch).
+        bad = {"directives": False, "injection": True, "consistency": True,
+               "identity": True, "qualia": True}
+        for ch in ("chat", "agent", "soul_diary", "x_post"):
+            assert self.ov._is_hard_fail(ch, bad, ["d"]) is True
+
+
 class TestVerifyAndSign:
     """Test the full verify_and_sign pipeline."""
 

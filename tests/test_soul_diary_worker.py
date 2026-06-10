@@ -137,6 +137,29 @@ def test_gather_memory_social_onchain_real_fields():
             sdw._gather_onchain(None)) == ({}, {}, {})
 
 
+def test_gather_onchain_prefers_authoritative_sol_and_guards_sentinel():
+    """SOL = the authoritative RPC balance (network_state.balance_sol), NOT the
+    body_state cache that reads 0.0 in the boot-grace window; and the out-of-range
+    balance_pct boot sentinel (-1.0) is dropped, never rendered as '-100% energy'.
+    (Both surfaced live on the 2026-06-09 verify entry, 2026-06-10.)"""
+    shm = MagicMock()
+    shm.read_body_state.return_value = {"sol_balance": 0.0, "sol_norm": 0.0,
+                                        "anchor_fresh": 0.0}            # lagging cache
+    shm.read_network_state.return_value = {"balance_sol": 0.009860001}  # authoritative
+    shm.read_metabolism_state.return_value = {"tier": "HEALTHY", "balance_pct": -1.0}
+    oc = sdw._gather_onchain(shm)
+    assert oc["sol_balance"] == 0.00986          # network_state wins over body 0.0
+    assert "balance_pct" not in oc               # -1.0 sentinel guarded out
+    assert oc["metabolic_tier"] == "HEALTHY"
+    # when the RPC balance is genuinely absent, fall back to a non-zero body cache.
+    shm.read_network_state.return_value = {}
+    shm.read_body_state.return_value = {"sol_balance": 0.5, "sol_norm": 0.1}
+    assert sdw._gather_onchain(shm)["sol_balance"] == 0.5
+    # a sane balance_pct still renders.
+    shm.read_metabolism_state.return_value = {"tier": "LOW", "balance_pct": 0.42}
+    assert sdw._gather_onchain(shm)["balance_pct"] == 0.42
+
+
 def test_gather_engrams_today_filters_day_window(tmp_path, monkeypatch):
     """engrams_today reads data/spine_snapshot.json and returns ONLY names whose
     latest version's created_at lies in the target_day UTC window (latest-version
