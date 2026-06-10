@@ -713,6 +713,48 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
         stop_event.wait(interval_s)
 
 
+def _skill_abstraction_loop(skill_store: Any, llm_propose, stop_event: threading.Event,
+                            interval_s: float, name: str) -> None:
+    """Daemon thread — drain the durable `skill_abstraction_queue` OFF the dream/
+    writer thread (dream-hardening 2026-06-10). The dream's miner only ENQUEUES
+    recurrent failure clusters; this loop makes the LLM abstraction call HERE
+    (off-writer — network I/O, GIL-released, never blocks the heartbeat or the
+    dream) then RECORDS the result through the writer (persist + 'done', or
+    attempts++/retry/'failed'). Save/resume: the queue is durable + this loop
+    resumes from status='pending' on every boot, so a slow/timed-out LLM never
+    blocks dreaming and a pending abstraction survives a restart/crash."""
+    stop_event.wait(min(interval_s, 20.0))
+    while not stop_event.is_set():
+        try:
+            pending = skill_store.fetch_pending_abstractions()
+            for entry in pending:
+                if stop_event.is_set():
+                    break
+                p = entry.get("payload") or {}
+                cluster_meta = {
+                    "sequence": p.get("sequence"),
+                    "occurrence_count": p.get("occurrence_count"),
+                    "kind": p.get("kind"),
+                    "members_summary": p.get("members_summary"),
+                }
+                proposal = None
+                try:
+                    # The LLM call — OFF the writer/dream thread (its whole point).
+                    proposal = llm_propose(cluster_meta, p.get("kind"))
+                except Exception as e:
+                    logger.warning(
+                        "[synthesis_worker] abstraction LLM call raised: %s", e)
+                skill_id = skill_store.record_abstraction_result(
+                    entry["cluster_id"], proposal)
+                if skill_id:
+                    logger.info(
+                        "[synthesis_worker] negative skill abstracted off-hot-path "
+                        "→ %s (cluster=%s)", skill_id, entry["cluster_id"])
+        except Exception as e:
+            logger.debug("[synthesis_worker] abstraction drain tick failed: %s", e)
+        stop_event.wait(interval_s)
+
+
 def _recompute_loop(store: "ActivationStore",
                     bundle_store: "StandingBundleStore",
                     status_writer: "SynthStatusWriter",
@@ -2344,6 +2386,21 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 max_skills_per_pass=int(skill_cfg.get("miner_max_skills_per_pass", 10)),
             )
             logger.info("[synthesis_worker] Phase 8 ProceduralMiner ready")
+            # Dream-hardening (2026-06-10): the negative-skill LLM abstraction runs
+            # on its OWN daemon thread, OFF the dream/writer thread, draining the
+            # durable skill_abstraction_queue the miner enqueues into. The LLM call
+            # happens off-writer (GIL-released) with retry; results persist via the
+            # writer; resumes pending entries on every boot (save/resume). So a slow
+            # /timed-out LLM never blocks the dream and the work is never lost.
+            _abstraction_thread = threading.Thread(
+                target=_skill_abstraction_loop,
+                args=(procedural_skill_store, _miner_llm_propose, stop_event,
+                      interval_s, name),
+                daemon=True, name=f"synthesis-abstraction-{name}")
+            _abstraction_thread.start()
+            logger.info(
+                "[synthesis_worker] dream-hardening: skill-abstraction daemon "
+                "started (off-hot-path LLM, durable queue, resumes on boot)")
         except Exception as exc:
             logger.warning(
                 "[synthesis_worker] Phase 8 ProceduralMiner wiring failed: %s",

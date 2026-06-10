@@ -85,6 +85,13 @@ PROCESSED_PURGE_WINDOW_S: float = 600.0
 # the trivial DDL through once the writer drains its boot backlog.
 SCHEMA_INIT_TIMEOUT_S: float = 180.0
 
+# Dream-hardening (2026-06-10): the negative-skill LLM-abstraction queue. The
+# off-hot-path daemon drains up to this many clusters/tick and RETRIES a failed
+# (timed-out / unparseable) LLM abstraction up to MAX_ATTEMPTS before marking it
+# 'failed' (give up gracefully — never retry forever, never silently lose it).
+ABSTRACTION_DRAIN_LIMIT: int = 8
+ABSTRACTION_MAX_ATTEMPTS: int = 5
+
 
 def compute_skill_id(oracle_id: str, goal_class: str) -> str:
     """Deterministic skill_id from the OUTCOME `(oracle_id, goal_class)` (EEL B1).
@@ -183,6 +190,8 @@ class ProceduralSkillStore:
         self._persists_seen = 0
         self._events_enqueued = 0
         self._events_drained = 0
+        self._abstractions_enqueued = 0
+        self._abstractions_compiled = 0
         self._cell_updates = 0
         self._promotions_seen = 0
         self._verifications_seen = 0
@@ -250,6 +259,26 @@ class ProceduralSkillStore:
                 "  success             BOOLEAN NOT NULL,"
                 "  parent_tool_call_tx TEXT,"
                 "  processed           BOOLEAN DEFAULT FALSE"
+                ")"
+            )
+            # Dream-hardening (2026-06-10): the negative-skill LLM ABSTRACTION is
+            # decoupled from the dream into this DURABLE queue + an off-hot-path
+            # daemon. The dream's miner ENQUEUES recurrent failure clusters here
+            # (fast, no LLM); the abstraction daemon drains them, making the LLM
+            # call OFF the dream/writer thread, with retry — so a slow/timed-out
+            # LLM never blocks dreaming and the work is never lost. PERSISTENT
+            # across restarts/crashes: the table is durable, entries are marked
+            # 'done' only AFTER the skill persists, and the daemon RESUMES from
+            # status='pending' on every boot (save/resume). PK-only (INV-Syn-30).
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS skill_abstraction_queue ("
+                "  cluster_id   TEXT    PRIMARY KEY,"          # sha256(sequence|kind)
+                "  payload      TEXT    NOT NULL,"             # JSON: sequence/occurrence_count/kind/members_summary/compiled_from
+                "  enqueued_at  DOUBLE  NOT NULL,"
+                "  attempts     INTEGER DEFAULT 0,"
+                "  status       TEXT    DEFAULT 'pending',"    # pending | done | failed
+                "  last_attempt DOUBLE,"
+                "  skill_id     TEXT"                          # set on 'done'
                 ")"
             )
             # Root-cause fix (D-SPEC-154 / INV-Syn-30): NO secondary ART indexes
@@ -677,6 +706,127 @@ class ProceduralSkillStore:
             )
             self._persists_seen += 1
         self.snapshot_export()
+        return skill_id
+
+    # ── Dream-hardening: off-hot-path negative-skill abstraction queue ───
+    # (2026-06-10) The dream ENQUEUES recurrent failure clusters here (fast, no
+    # LLM); the synthesis_worker abstraction daemon FETCHES pending entries,
+    # makes the LLM call OFF the writer/dream thread, then RECORDS the result
+    # (persist + 'done', or attempts++/'failed'). Durable + save/resume: the
+    # daemon resumes from status='pending' on every boot.
+
+    @on_writer
+    def enqueue_abstraction(self, prepared: dict, ts: Optional[float] = None) -> bool:
+        """Idempotent enqueue of a prepared recurrent cluster (no LLM here).
+        `prepared` = {cluster_id, sequence, occurrence_count, kind,
+        members_summary, compiled_from}. Returns True if NEWLY enqueued (False if
+        already queued/done/failed — ON CONFLICT DO NOTHING keeps it idempotent
+        across re-mines)."""
+        cid = prepared.get("cluster_id")
+        if not cid:
+            return False
+        payload = json.dumps(prepared, ensure_ascii=False, separators=(",", ":"))
+        ts_val = float(ts) if ts is not None else float(self._clock())
+        with self._lock:
+            before = self._db.execute(
+                "SELECT COUNT(*) FROM skill_abstraction_queue WHERE cluster_id = ?",
+                [cid]).fetchone()[0]
+            self._db.execute(
+                "INSERT INTO skill_abstraction_queue (cluster_id, payload, enqueued_at) "
+                "VALUES (?, ?, ?) ON CONFLICT (cluster_id) DO NOTHING",
+                [cid, payload, ts_val])
+            self._abstractions_enqueued += int(before == 0)
+        return before == 0
+
+    @on_writer
+    def fetch_pending_abstractions(
+        self, *, limit: int = ABSTRACTION_DRAIN_LIMIT,
+        max_attempts: int = ABSTRACTION_MAX_ATTEMPTS,
+    ) -> list[dict]:
+        """Return up to `limit` pending clusters (attempts < max), oldest first —
+        the daemon then makes the LLM call OFF this thread. Resumes naturally on
+        boot (the table is durable). Returns [{cluster_id, payload(dict)}]."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT cluster_id, payload, attempts FROM skill_abstraction_queue "
+                "WHERE status = 'pending' AND attempts < ? "
+                "ORDER BY enqueued_at ASC LIMIT ?",
+                [int(max_attempts), max(1, int(limit))]).fetchall()
+        out: list[dict] = []
+        for cid, payload_json, attempts in rows:
+            try:
+                out.append({"cluster_id": cid, "attempts": int(attempts),
+                            "payload": json.loads(payload_json)})
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @on_writer
+    def record_abstraction_result(
+        self, cluster_id: str, proposal: Optional[dict], *,
+        max_attempts: int = ABSTRACTION_MAX_ATTEMPTS,
+    ) -> Optional[str]:
+        """Record the outcome of a daemon LLM-abstraction attempt. On a VALID
+        proposal → derive the outcome + persist the negative skill + mark 'done'
+        (returns skill_id). On failure → attempts++ and mark 'failed' once it hits
+        max_attempts, else leave 'pending' for retry (returns None). The LLM call
+        already happened OFF this thread; this is only the fast DB write."""
+        row = None
+        with self._lock:
+            r = self._db.execute(
+                "SELECT payload, attempts FROM skill_abstraction_queue "
+                "WHERE cluster_id = ? AND status = 'pending'", [cluster_id]).fetchall()
+            row = r[0] if r else None
+        if row is None:
+            return None
+        try:
+            p = json.loads(row[0])
+        except (TypeError, ValueError):
+            p = {}
+        attempts = int(row[1])
+        nl = ((proposal or {}).get("nl_description") or "").strip()
+        spec = (proposal or {}).get("executable_spec")
+        valid = bool(nl) and isinstance(spec, dict) and bool(p.get("compiled_from"))
+        if not valid:
+            new_attempts = attempts + 1
+            new_status = "failed" if new_attempts >= int(max_attempts) else "pending"
+            with self._lock:
+                self._db.execute(
+                    "UPDATE skill_abstraction_queue SET attempts = ?, status = ?, "
+                    "last_attempt = ? WHERE cluster_id = ?",
+                    [new_attempts, new_status, float(self._clock()), cluster_id])
+            return None
+        # Valid → derive (oracle_id sentinel marks the recurrence origin) + persist.
+        from titan_hcl.synthesis.goal_class import (
+            goal_class as _derive_goal_class, make_task_shape as _derive_task_shape)
+        seq = p.get("sequence")
+        tool_sig = ("+".join(str(s) for s in seq)
+                    if isinstance(seq, (list, tuple)) else str(seq))[:80]
+        try:
+            skill_id = self.persist_negative_skill(
+                oracle_id="miner_recurrence", goal_class=_derive_goal_class(nl),
+                task_shape=_derive_task_shape("procedural", tool_sig, ""),
+                name=f"[negative] {nl.split('.')[0][:64] or 'compiled_skill'}",
+                nl_description=nl, compiled_from=list(p.get("compiled_from") or []),
+                executable_spec=spec,
+                preconditions=(proposal or {}).get("preconditions") or [],
+                postconditions=(proposal or {}).get("postconditions") or [],
+                ts=self._clock())
+        except Exception as e:
+            # persist failed → treat as a retryable attempt (don't lose the cluster).
+            logger.warning("[ProceduralSkillStore] abstraction persist failed: %s", e)
+            with self._lock:
+                self._db.execute(
+                    "UPDATE skill_abstraction_queue SET attempts = ?, last_attempt = ? "
+                    "WHERE cluster_id = ?",
+                    [attempts + 1, float(self._clock()), cluster_id])
+            return None
+        with self._lock:
+            self._db.execute(
+                "UPDATE skill_abstraction_queue SET status = 'done', skill_id = ?, "
+                "last_attempt = ? WHERE cluster_id = ?",
+                [skill_id, float(self._clock()), cluster_id])
+            self._abstractions_compiled += 1
         return skill_id
 
     # ── INV-Syn-20 verifier mutators (on the outcome row) ────────────────
