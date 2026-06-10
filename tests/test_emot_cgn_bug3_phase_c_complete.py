@@ -16,49 +16,69 @@ Wired sites (spirit_worker.py):
 3. :6278 self_model (introspection: confidence * 0.3)
 4. :5683 reasoning (ARC episode reward scaled)
 5. :8583 reasoning (kin-exchange hypothesis confidence * 0.3)
+
+2026-06-10: the emit gate changed from the fixed `|reward-0.5|>0.3` to an
+EMERGENT reward-surprise gate (|reward - running_mean| >= k·running_std) — see
+cgn_consumer_client.emit_chain_outcome_insight. So these tests now warm up a
+per-consumer baseline first; the INTENT (accept the 3 consumers, filter
+non-informative outcomes, pass surprising negatives) is unchanged.
 """
+
+import queue
 
 import pytest
 
+from titan_hcl.logic.cgn_consumer_client import (
+    emit_chain_outcome_insight, _PEER_REWARD_MIN_N,
+    _PEER_REWARD_HIST, _PEER_CROSS_INSIGHT_RATE_STATE,
+)
+
+
+def _reset(consumer):
+    _PEER_REWARD_HIST.pop(consumer, None)
+    _PEER_CROSS_INSIGHT_RATE_STATE.pop(consumer, None)
+
+
+def _warmup(consumer, q, base=0.5):
+    """Feed MIN_N baseline samples so the surprise gate has a baseline.
+    Warm-up emits nothing (the gate stays silent until a baseline forms)."""
+    for _ in range(_PEER_REWARD_MIN_N):
+        emit_chain_outcome_insight(q, "spirit", consumer, base)
+
 
 def test_emit_chain_outcome_insight_accepts_reasoning_strategy_consumer():
-    """Module-level helper accepts the 3 new consumer names."""
-    from titan_hcl.logic.cgn_consumer_client import emit_chain_outcome_insight
-    import queue
-
+    """Module-level helper accepts the 3 new consumer names; a reward that
+    surprises the consumer's baseline emits a chain_outcome CGN_CROSS_INSIGHT."""
     for consumer in ("reasoning_strategy", "self_model", "reasoning"):
+        _reset(consumer)
         q = queue.Queue()
-        # Use a high-magnitude reward to pass the informative filter
+        _warmup(consumer, q, base=0.5)
+        assert q.empty(), "warm-up must not emit"
         result = emit_chain_outcome_insight(
             q, "spirit", consumer, terminal_reward=0.9, ctx={"test": True})
-        # Rate-gate is per-consumer; fresh queue → first emit succeeds
-        assert result is True, f"{consumer} emit should return True for informative reward"
+        assert result is True, f"{consumer} should emit on a surprising reward"
         msg = q.get_nowait()
         assert msg["type"] == "CGN_CROSS_INSIGHT"
         assert msg["payload"]["origin_consumer"] == consumer
         assert msg["payload"]["insight_type"] == "chain_outcome"
+        _reset(consumer)
 
 
 def test_emit_chain_outcome_insight_filters_non_informative_rewards():
-    """Rewards near 0.5 (|r - 0.5| <= 0.3) are filtered as non-informative."""
-    from titan_hcl.logic.cgn_consumer_client import (
-        emit_chain_outcome_insight, _PEER_CROSS_INSIGHT_RATE_STATE)
-    import queue
-
-    # Clear rate state so tests don't interfere
-    _PEER_CROSS_INSIGHT_RATE_STATE.pop("reasoning_test1", None)
+    """Emergent gate: a reward WITHIN the consumer's running baseline is filtered
+    (relative surprise — replaces the old fixed |r-0.5|>0.3)."""
+    c = "reasoning_test1"
+    _reset(c)
     q = queue.Queue()
-
-    # Non-informative (reward 0.6, delta=0.1 <= 0.3) → filtered
-    result = emit_chain_outcome_insight(
-        q, "spirit", "reasoning_test1", terminal_reward=0.6)
+    _warmup(c, q, base=0.5)
+    # Within baseline (|0.52 - 0.5| < 1σ floor of 0.05) → filtered
+    result = emit_chain_outcome_insight(q, "spirit", c, terminal_reward=0.52)
     assert result is False
     assert q.empty()
-
-    # Informative (reward 0.9, delta=0.4 > 0.3) → passes
-    result = emit_chain_outcome_insight(
-        q, "spirit", "reasoning_test1", terminal_reward=0.9)
+    # Surprising (|0.9 - 0.5| >> 1σ) → passes
+    result = emit_chain_outcome_insight(q, "spirit", c, terminal_reward=0.9)
     assert result is True
+    _reset(c)
 
 
 def test_bug3_wire_points_migrated_off_deleted_spirit_worker():
@@ -76,21 +96,19 @@ def test_bug3_wire_points_migrated_off_deleted_spirit_worker():
 
 
 def test_emit_chain_outcome_insight_negative_rewards_pass_informative_filter():
-    """Negative rewards (like self_model's -0.1 miss) need to pass the
-    informative filter too. |(-0.1) - 0.5| = 0.6 > 0.3 → informative."""
-    from titan_hcl.logic.cgn_consumer_client import (
-        emit_chain_outcome_insight, _PEER_CROSS_INSIGHT_RATE_STATE)
-    import queue
-
-    _PEER_CROSS_INSIGHT_RATE_STATE.pop("self_model_neg_test", None)
+    """Negative rewards (self_model's -0.1 miss) surprise a ~0.5 baseline and
+    emit. |(-0.1) - 0.5| = 0.6 >> 1σ → informative."""
+    c = "self_model_neg_test"
+    _reset(c)
     q = queue.Queue()
-
+    _warmup(c, q, base=0.5)
     result = emit_chain_outcome_insight(
-        q, "spirit", "self_model_neg_test", terminal_reward=-0.1,
+        q, "spirit", c, terminal_reward=-0.1,
         ctx={"source": "self_prediction", "confirmed": False})
-    assert result is True, "negative rewards should pass the informative filter"
+    assert result is True, "negative rewards should surprise a positive baseline"
     msg = q.get_nowait()
     assert msg["payload"]["terminal_reward"] == -0.1
+    _reset(c)
 
 
 if __name__ == "__main__":

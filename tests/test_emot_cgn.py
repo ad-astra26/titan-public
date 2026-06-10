@@ -711,29 +711,48 @@ def test_get_blended_v_without_ctx_returns_beta():
         assert v == 0.5  # Beta(1,1) prior mean
 
 
-def test_cross_insight_emitted_on_high_reward_chain():
-    """Upgrade III outgoing: CGN_CROSS_INSIGHT emitted for informative chain."""
+def test_cross_insight_emitted_on_emotion_transition():
+    """Upgrade III outgoing (emergent gate, 2026-06-10): CGN_CROSS_INSIGHT is
+    emitted on an emotion TRANSITION whose V-contrast exceeds the current V-spread
+    — replaces the old fixed |reward-0.5|>0.3 gate (which the agent's reward
+    regime rarely crossed → channel muted)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        q = _MockSendQueue()
+        ec = EmotCGNConsumer(save_dir=tmp, send_queue=q)
+        q.sent.clear()
+        # A transition between two distinct emotions is the cross-consumer signal.
+        ec.observe_chain_evidence(1, "IMPASSE_TENSION", "RESOLUTION", 0.95,
+                                  ctx={"DA": 0.9})
+        insights = [m for m in q.sent if m.get("type") == "CGN_CROSS_INSIGHT"]
+        assert len(insights) >= 1
+        payload = insights[0]["payload"]
+        assert payload["origin_consumer"] == "emotional"
+        assert payload["insight_type"] == "emotion_outcome"
+        assert payload["emotion_start"] == "IMPASSE_TENSION"
+        assert payload["emotion_end"] == "RESOLUTION"
+
+
+def test_cross_insight_not_emitted_without_transition():
+    """Emergent gate (2026-06-10): NO emission when the dominant emotion did not
+    transition — even at an extreme reward. Proves the gate moved OFF the old
+    fixed reward-deviation threshold onto emotion-transition + V-contrast."""
     with tempfile.TemporaryDirectory() as tmp:
         q = _MockSendQueue()
         ec = EmotCGNConsumer(save_dir=tmp, send_queue=q)
         q.sent.clear()
         ec.observe_chain_evidence(1, "FLOW", "FLOW", 0.95, ctx={"DA": 0.9})
         insights = [m for m in q.sent if m.get("type") == "CGN_CROSS_INSIGHT"]
-        assert len(insights) >= 1
-        payload = insights[0]["payload"]
-        assert payload["origin_consumer"] == "emotional"
-        assert payload["insight_type"] == "emotion_outcome"
-        assert payload["emotion_start"] == "FLOW"
+        assert len(insights) == 0
 
 
 def test_cross_insight_rate_limited_02hz():
-    """0.2 Hz rate limit — two immediate emits → only 1 passes through."""
+    """0.2 Hz rate limit — two immediate transition-emits → only 1 passes."""
     with tempfile.TemporaryDirectory() as tmp:
         q = _MockSendQueue()
         ec = EmotCGNConsumer(save_dir=tmp, send_queue=q)
         q.sent.clear()
-        ec.observe_chain_evidence(1, "FLOW", "FLOW", 0.95, ctx={})
-        ec.observe_chain_evidence(2, "FLOW", "FLOW", 0.95, ctx={})
+        ec.observe_chain_evidence(1, "FLOW", "PEACE", 0.95, ctx={})
+        ec.observe_chain_evidence(2, "PEACE", "FLOW", 0.95, ctx={})
         insights = [m for m in q.sent if m.get("type") == "CGN_CROSS_INSIGHT"]
         assert len(insights) == 1
 

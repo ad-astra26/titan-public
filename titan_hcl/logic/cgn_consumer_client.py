@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -148,6 +148,18 @@ def _np_multinomial(probs: np.ndarray) -> int:
 # 5s rate window.
 _PEER_CROSS_INSIGHT_RATE_STATE: Dict[str, float] = {}
 
+# Per-consumer running reward window for the emergent surprise gate (see
+# emit_chain_outcome_insight). Replaces the old fixed |reward-0.5|>0.3 gate,
+# which was mismatched to Titan's reward regime (rewards cluster well inside
+# [0.2, 0.8]) and muted the peer cross-insight channel fleet-wide. The bar is
+# RELATIVE to each consumer's own experience (k running std-devs) — no fixed
+# reward constant (RFP emergence-over-determinism rule).
+_PEER_REWARD_HIST: Dict[str, "deque"] = {}
+_PEER_REWARD_WINDOW = 64      # rolling outcomes per consumer
+_PEER_REWARD_MIN_N = 8        # warm-up: build a baseline before gating
+_PEER_REWARD_SIGMA_K = 1.0    # emit when |reward - mean| >= k·std (1σ surprise)
+_PEER_REWARD_STD_FLOOR = 0.05  # guards a degenerate (~0) std early on
+
 
 def emit_chain_outcome_insight(send_queue, src_module: str,
                                 consumer_name: str,
@@ -162,18 +174,34 @@ def emit_chain_outcome_insight(send_queue, src_module: str,
     CGNConsumerClient.emit_cross_insight method.
 
       - 5-second rate gate per `consumer_name`
-      - Informative-only: |reward - 0.5| > 0.3
+      - Informative-only: reward surprises THIS consumer's own running baseline
+        (|reward - running_mean| >= k·running_std) — emergent/relative, no fixed
+        reward constant (replaces the old |reward-0.5|>0.3, which the agent's
+        reward regime rarely crossed → channel muted fleet-wide).
 
     Returns True if emitted.
     """
     if send_queue is None:
         return False
     now = time.time()
+    # Emergent reward-surprise gate. Accumulate EVERY outcome (independent of the
+    # rate gate, so the baseline reflects true experience), then emit only when
+    # this outcome deviates from the consumer's running mean by >= k running σ.
+    # Warm-up (< _PEER_REWARD_MIN_N) builds the baseline without emitting.
+    _r = float(terminal_reward)
+    _hist = _PEER_REWARD_HIST.setdefault(
+        consumer_name, deque(maxlen=_PEER_REWARD_WINDOW))
+    _informative = False
+    if len(_hist) >= _PEER_REWARD_MIN_N:
+        _mean = sum(_hist) / len(_hist)
+        _std = float(np.std(_hist)) or _PEER_REWARD_STD_FLOOR
+        _informative = abs(_r - _mean) >= _PEER_REWARD_SIGMA_K * _std
+    _hist.append(_r)   # update baseline AFTER the decision
     last = _PEER_CROSS_INSIGHT_RATE_STATE.get(consumer_name, 0.0)
     if now - last < 5.0:
         return False
     try:
-        if abs(float(terminal_reward) - 0.5) <= 0.3:
+        if not _informative:
             return False
         send_queue.put_nowait({
             "type": "CGN_CROSS_INSIGHT",

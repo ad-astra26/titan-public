@@ -6,9 +6,14 @@ The 8th CGN consumer. Standalone subprocess per rFP_emot_cgn_v2.md §10 ADR
 `memory/feedback_architectural_decisions_no_drift.md`. Scaffold follows the
 exact structure of `titan_hcl/modules/language_worker.py`.
 
-Owns (when Phase 1.6e lands): EmotCGNConsumer, EmotionClusterer, HAOV
-hypotheses, β-posterior, cluster state, CGN worker registration +
-transitions, `/dev/shm/titan/emot_state.bin` shm-mirror writes.
+Owns (LIVE — the migration from meta_reasoning landed in Phase 1.6e.1; this
+worker is now the SOLE owner. meta_reasoning holds `self._emot_cgn = None`
+(meta_reasoning.py:1124,1134) and only EMITS EMOT_CHAIN_EVIDENCE to this worker —
+the 1.6h cutover): EmotCGNConsumer (per-emotion β-posterior V + HAOV hypotheses +
+the graduation/rollback state machine), the v3 RegionClusterer (density-based
+emergent emotion over the 208D felt-space), CGN 8th-consumer registration +
+transitions, and `/dev/shm/titan/emot_state.bin` shm-mirror writes. This is a
+fundamental, LIVE part of Titan's inner self — NOT a shadow/scaffold.
 
 Bus protocol (full wire shipped across Phase 1.6 sub-phases):
   EMOT_CHAIN_EVIDENCE   (meta_reasoning → emot_cgn)  — per chain conclude
@@ -40,11 +45,17 @@ zero-copy mmap, no bus roundtrip. Bus is for EVENTS, shm is for STATE
 
 Entry point: emot_cgn_worker_main(recv_queue, send_queue, name, config)
 
-Phase 1.6a (this commit): SCAFFOLD ONLY — subprocess boot + heartbeat +
-MODULE_SHUTDOWN handler + TBD dispatch for future bus messages. No
-EmotCGNConsumer yet; that arrives in Phase 1.6e with the migration
-from `meta_reasoning.py`. Shadow-mode EMOT-CGN continues to run in
-meta_reasoning until 1.6e swaps ownership.
+"Shadow mode" here means ONLY the graduation state machine's SHADOW phase
+(emot_cgn.py:_check_graduation_and_rollback — scale-invariant rollback at ~2σ):
+the consumer ALWAYS computes its β-posterior + clusters; `shadow` vs `active`
+gates only whether emot grounding INFLUENCES behaviour. It has nothing to do
+with meta_reasoning. (The original Phase-1.6a scaffold note here — "SCAFFOLD
+ONLY … no EmotCGNConsumer yet … shadow EMOT-CGN runs in meta_reasoning until
+1.6e" — was never updated after the 1.6e.1 migration landed and was wrong from
+then on; corrected 2026-06-10.)
+
+A future "emotional body" RFP will eventually replace EMOT-CGN, but that work is
+weeks out and NOT implemented — until then EMOT-CGN is THE live emotional self.
 """
 import logging
 import os

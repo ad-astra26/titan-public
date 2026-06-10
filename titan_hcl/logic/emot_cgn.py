@@ -132,7 +132,10 @@ class EmotPrimitive:
     variance: float = 0.25
     last_updated_ts: float = 0.0
     last_updated_chain: int = 0
-    haov_rules: list = field(default_factory=list)
+    # NOTE: emot has NO per-primitive haov_rules list (that field exists only on
+    # META-CGN's PrimitiveConcept). EMOT-CGN's hypotheses live in self._hypotheses
+    # (the 8 seed EmotHypothesis objects); graduation reads those. The vestigial
+    # field + its serialization were dropped 2026-06-10.
 
     def recompute_derived(self) -> None:
         a = max(BETA_PARAM_FLOOR, float(self.alpha))
@@ -589,9 +592,28 @@ class EmotCGNConsumer:
         if now - self._last_cross_insight_ts < 5.0:
             return
         try:
-            informative = (abs(terminal_reward - 0.5) > 0.3
-                           or (p_start != p_end
-                               and bool(ctx.get("strategy_shift", False))))
+            # Emergent informative gate (RFP emergence-over-determinism rule).
+            # Replaces the old fixed |reward-0.5|>0.3, which was mismatched to
+            # Titan's reward regime (rewards cluster ~0.2-0.35) and muted this
+            # channel — and got WORSE as reward healed toward 0.5. The
+            # cross-consumer signal is an emotion TRANSITION whose V-contrast
+            # exceeds the current spread of grounded V across sampled emotions:
+            # the felt-value shifted by more than the population's own
+            # variability. The bar scales with what the agent has actually
+            # learned — no hardcoded reward floor. strategy_shift stays an
+            # independent OR-signal.
+            informative = False
+            if p_start != p_end:
+                _ps = self._primitives.get(p_start)
+                _pe = self._primitives.get(p_end)
+                if _ps is not None and _pe is not None:
+                    _v_contrast = abs(float(_pe.V) - float(_ps.V))
+                    _sampled = [float(pc.V) for pc in self._primitives.values()
+                                if int(getattr(pc, "n_samples", 0)) > 0]
+                    _v_spread = (float(np.std(_sampled))
+                                 if len(_sampled) >= 2 else 0.0)
+                    informative = _v_contrast >= _v_spread
+                informative = informative or bool(ctx.get("strategy_shift", False))
             if not informative:
                 return
             msg = {
@@ -1600,7 +1622,7 @@ class EmotCGNConsumer:
                     continue
                 allowed = {"primitive_id", "alpha", "beta", "V", "confidence",
                            "n_samples", "variance", "last_updated_ts",
-                           "last_updated_chain", "haov_rules"}
+                           "last_updated_chain"}
                 filtered = {k: v for k, v in p_data.items() if k in allowed}
                 concept = EmotPrimitive(**filtered)
                 concept.recompute_derived()
