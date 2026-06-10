@@ -373,247 +373,12 @@ class RebirthBackup:
                         "stuck)", today)
                 return
 
-        # 1. ZK Epoch Snapshot (every meditation) — DISABLED for mainnet MVM
-        #    TimeChain merkle root is now committed via vault in meditation.py.
-        #    ZK compressed snapshots are redundant (raw data → Arweave instead).
-        #    Re-enable via [mainnet_budget] zk_compression_enabled = true
-        sovereignty_idx = 0
-        try:
-            sovereignty_idx = await self._compute_sovereignty()
-            _budget = self.network._config.get("mainnet_budget", {}) if hasattr(self.network, '_config') else {}
-            if _budget.get("zk_compression_enabled", False):
-                archive_hash = f"meditation_{epoch}_{int(time.time())}"
-                await self._zk_epoch_snapshot(
-                    archive_hash, None, total_nodes, sovereignty_idx,
-                )
-            else:
-                logger.debug("[Backup] ZK epoch snapshot skipped (zk_compression_enabled=false)")
-        except Exception as e:
-            logger.warning("[Backup] ZK epoch snapshot failed: %s", e)
-
-        # 2. Personality backup (1st meditation of day)
-        # SPEC §24 / rFP_backup_diff_baseline_unified_v1 Phase 1 (2026-05-15):
-        # CAS-gated date check closes the dedup race documented in
-        # AUDIT_irys_arweave_costs_20260514 §4 BUG-2 (15 personality uploads
-        # on 2026-05-12 from concurrent MEDITATION_COMPLETE events all
-        # passing the bare `if today != _last_personality_date` check before
-        # any of them could set the date). The lock is held only across
-        # the CAS itself — the upload runs outside the lock so cascading
-        # work doesn't serialize.
-        do_personality = False
-        async with self._get_personality_cas_lock():
-            if today != self._last_personality_date:
-                self._last_personality_date = today
-                self._save_backup_state()
-                do_personality = True
-        if do_personality:
-            logger.info("[Backup] Daily personality backup triggered (1st meditation of %s)", today)
-            # L5 (2026-05-14): if [backup].local_diff_enabled=true, route
-            # through the local diff/baseline engine instead of the full
-            # tarball cascade. Saves ~4× local disk by shipping daily
-            # incremental patches against a weekly baseline (xdelta3).
-            # Local-only — doesn't touch Arweave path. Default false; flip
-            # on after observing manifest behavior.
-            _backup_cfg = (self._full_config.get("backup", {}) or {})
-            _local_diff_enabled = bool(_backup_cfg.get("local_diff_enabled", False))
-            _local_dir = _backup_cfg.get("local_dir", "data/backups")
-            if _local_diff_enabled:
-                # 2026-05-23 D-SPEC-123 follow-up — Maker policy: NO legacy
-                # fallback on L5 failure either. Legacy cascade is bug-laden
-                # + costs money. When L5 is the chosen path, an L5 failure
-                # logs ERROR + Maker-notify; the next meditation retries.
-                # Silent fallback to the legacy upload pipeline was strictly
-                # worse than failing visibly.
-                try:
-                    diff_result = await asyncio.to_thread(
-                        self.create_local_diff_event, _local_dir)
-                    if diff_result:
-                        logger.info(
-                            "[Backup] L5 personality (%s): %s (%.2fMB)",
-                            diff_result["type"], diff_result["event_id"][:8],
-                            diff_result["size_mb"])
-                    else:
-                        logger.error(
-                            "[Backup] L5 personality returned None — NO "
-                            "legacy fallback (Maker policy); next meditation "
-                            "will retry")
-                        self._alert_backup_failure(
-                            "L5_personality", "create_local_diff_event "
-                            "returned None")
-                except Exception as e:
-                    logger.exception(
-                        "[Backup] L5 personality crashed — NO legacy "
-                        "fallback (Maker policy); next meditation will "
-                        "retry: %s", e)
-                    self._alert_backup_failure("L5_personality", str(e))
-            else:
-                try:
-                    result = await self.upload_personality_to_arweave()
-                    if result:
-                        _tx = result.get("arweave_tx", "?")
-                        _sz = result.get("size_mb", 0)
-                        _hash = result.get("archive_hash", "")
-                        logger.info("[Backup] Personality → Arweave: tx=%s (%.1fMB)", _tx[:20], _sz)
-                        # Update titan.md frontmatter
-                        self._update_titan_frontmatter(
-                            sovereignty_milestone=sovereignty_idx,
-                            epochs_completed=epoch,
-                        )
-                        # Anchor backup hash on-chain (daily integrity proof)
-                        await self.anchor_backup_hash(_hash, _sz, "personality")
-                        # Update vault shadow_url_hash with backup archive hash
-                        await self._update_vault_shadow_hash(_hash)
-                        # Alert Maker via Telegram
-                        self._alert_backup_success("personality", _sz, _hash, _tx)
-                    else:
-                        self._alert_backup_failure("personality", "Upload returned None")
-                except Exception as e:
-                    logger.error("[Backup] Daily personality backup failed: %s", e)
-                    self._alert_backup_failure("personality", str(e))
-                    # Reset date so it retries next meditation
-                    self._last_personality_date = ""
-                    self._save_backup_state()
-
-        # 3. Soul package (1st meditation on Sunday)
-        # SPEC §24 Phase 1 (2026-05-15) — CAS lock per personality rationale.
-        do_soul = False
-        async with self._get_soul_cas_lock():
-            if weekday == 6 and today != self._last_soul_date:
-                self._last_soul_date = today
-                self._save_backup_state()
-                do_soul = True
-        if do_soul:
-            logger.info("[Backup] Weekly soul package triggered (Sunday %s)", today)
-            try:
-                result = await self.upload_soul_package_to_arweave()
-                if result:
-                    _tx = result.get("arweave_tx", "?")
-                    _sz = result.get("size_mb", 0)
-                    _hash = result.get("archive_hash", "")
-                    logger.info("[Backup] Soul package → Arweave: tx=%s (%.1fMB)", _tx[:20], _sz)
-                    self._alert_backup_success("soul_package", _sz, _hash, _tx)
-                else:
-                    self._alert_backup_failure("soul_package", "Upload returned None")
-            except Exception as e:
-                logger.error("[Backup] Weekly soul package failed: %s", e)
-                self._alert_backup_failure("soul_package", str(e))
-                self._last_soul_date = ""
-                self._save_backup_state()
-
-        # 5. TimeChain backup (daily, alongside personality)
-        # SPEC §24 Phase 1 (2026-05-15) — CAS lock per personality rationale.
-        # 2026-05-06 fix preserved: persist timechain date BEFORE upload so
-        # restarts don't re-trigger (was the BUG-TIMECHAIN-BACKUP-RESTART-LEAK
-        # source — pre-fix that wrote 160 backups in 16d on T3).
-        do_timechain = False
-        async with self._get_timechain_cas_lock():
-            if today != self._last_timechain_date:
-                self._last_timechain_date = today
-                self._save_backup_state()
-                do_timechain = True
-        if do_timechain:
-            try:
-                from titan_hcl.logic.timechain_backup import TimeChainBackup
-                # rFP Phase 1 BUG-5: use injected ArweaveStore (constructed once at
-                # boot) instead of re-reading config + reconstructing per-backup.
-                # Falls back to config-read only if injection didn't happen (legacy boot path).
-                _tc_arweave = self._arweave_store
-                if _tc_arweave is None:
-                    try:
-                        _tc_budget = self._full_config.get("mainnet_budget", {})
-                        if _tc_budget.get("backup_arweave_enabled", False):
-                            _tc_net_cfg = self._full_config.get("network", {})
-                            _tc_net = _tc_net_cfg.get("solana_network", "devnet")
-                            if _tc_net == "mainnet-beta":
-                                _tc_net = "mainnet"
-                            _tc_kp = _tc_net_cfg.get("wallet_keypair_path", "")
-                            if _tc_kp:
-                                from titan_hcl.utils.arweave_store import ArweaveStore
-                                _tc_arweave = ArweaveStore(keypair_path=_tc_kp, network=_tc_net)
-                    except Exception as _ae:
-                        swallow_warn('[Backup] TimeChain ArweaveStore fallback init', _ae,
-                                     key="logic.backup.timechain_arweavestore_fallback_init", throttle=100)
-
-                tc_backup = TimeChainBackup(
-                    data_dir="data/timechain",
-                    titan_id=self._titan_id,
-                    arweave_store=_tc_arweave,
-                )
-                # rFP_backup_worker Phase 0: tarball path (proven working via cron).
-                # rFP Phase 2 extension 2026-04-20: full 10-step cascade applied via
-                # full_config passthrough → S2 validate + S3 local + S4 balance +
-                # S6 verify + S10 cleanup now cover TimeChain uploads too.
-                tc_retention = int(self._full_config.get("backup", {}).get(
-                    "local_rolling_days", 30))
-                tc_tx = await tc_backup.snapshot_to_arweave(
-                    full_config=self._full_config,
-                    retention_days=tc_retention,
-                )
-                if tc_tx:
-                    logger.info("[Backup] TimeChain → Arweave: tx=%s", tc_tx[:20])
-                elif _tc_arweave is None:
-                    logger.info("[Backup] TimeChain Arweave upload skipped (no ArweaveStore)")
-                else:
-                    logger.warning("[Backup] TimeChain Arweave upload returned None")
-            except Exception as e:
-                logger.warning("[Backup] TimeChain backup failed: %s", e)
-
-        # 4. MyDay NFT (every Nth meditation — L12 housekeeping closure
-        # 2026-05-26). Two improvements over the previous code:
-        #   (a) honor the `daily_nft_enabled` config flag at
-        #       config.toml [mainnet_budget] line 465 — it was being
-        #       ignored, so the mint was attempted on every fleet
-        #       member regardless of the gate (Maker comment said
-        #       "enable after discussion"; gate now actually gates).
-        #   (b) read the threshold from `titan_params.toml`
-        #       `meditations_per_daily_nft` (currently 4) instead of
-        #       hardcoded 4 — same value today, but param-driven so
-        #       tuning doesn't require a code change.
-        mainnet_budget_cfg = (self._full_config.get("mainnet_budget")
-                               if isinstance(self._full_config, dict)
-                               else {}) or {}
-        daily_nft_enabled = bool(
-            mainnet_budget_cfg.get("daily_nft_enabled", False))
-        meditations_per_nft = int(
-            self._full_config.get("meditations_per_daily_nft", 4)
-            if isinstance(self._full_config, dict) else 4)
-        if (daily_nft_enabled
-                and self._meditation_count_since_nft >= meditations_per_nft):
-            self._meditation_count_since_nft = 0
-            self._save_backup_state()
-            try:
-                from titan_hcl.logic.reflection import ReflectionLogic
-                reflection = ReflectionLogic(None)
-                diary_entry = await reflection.generate_myday_diary_entry(
-                    nodes_count=total_nodes,
-                    learning_score=min(100.0, total_nodes * 2.5),
-                    unique_souls=0,
-                    social_score=0.0,
-                    mood_score=0.5,
-                    sovereignty_index=sovereignty_idx,
-                )
-                nft_addr = await self.mint_epoch_nft(
-                    epoch=int(time.time()),
-                    sovereignty_idx=sovereignty_idx,
-                    diary_entry=diary_entry,
-                    total_nodes=total_nodes,
-                )
-                if nft_addr:
-                    logger.info("[Backup] MyDay NFT minted: %s", nft_addr)
-            except Exception as e:
-                swallow_warn('[Backup] MyDay NFT skipped', e,
-                             key="logic.backup.myday_nft_skipped", throttle=100)
-        elif not daily_nft_enabled and self._meditation_count_since_nft >= meditations_per_nft:
-            # Gate is OFF — log once per overflow to make the disable
-            # visible without spamming. Counter does NOT reset so when
-            # the gate flips on, the next meditation mints immediately.
-            logger.debug(
-                "[Backup] MyDay NFT skipped (daily_nft_enabled=false, "
-                "count=%d threshold=%d)",
-                self._meditation_count_since_nft, meditations_per_nft)
-
-        # Save state after all operations
-        self._save_backup_state()
+        # ── Legacy non-unified_v2 backup path RETIRED (RFP_backup_redesign_spine
+        #    Phase B / B-1, 2026-06-10; no-shim). The ZK-epoch-snapshot + the legacy
+        #    per-type personality/NFT full-tarball path lived here and was DEAD on every
+        #    Titan (unified_v2_enabled=true fleet-wide — the branch above returns). The
+        #    unified §24 pipeline (BackupWorker) owns backups now; mint_epoch_nft +
+        #    vault/frontmatter eviction is Phase E.
 
     async def _compute_sovereignty(self) -> float:
         """The sovereignty index (0-100%) used for backup persistence + the
@@ -3177,10 +2942,11 @@ class RebirthBackup:
 
     def _build_staged_event_v2(self, weekday: int):
         """Pre-BUILD a unified event (no upload, no manifest mutation). Returns a
-        StagedEvent or None (arweave gate off / manifest unloadable). Mirrors
-        _run_unified_event_v2's spec/resolver wiring."""
+        StagedBuild or None (arweave gate off / manifest unloadable). Mirrors
+        _run_unified_event_v2's spec/resolver wiring; the build/pack mechanics
+        are carved into BackupWorker (RFP_backup_redesign_spine Phase B)."""
         from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
-        from titan_hcl.logic.backup_upload_pipeline import build_unified_event
+        from titan_hcl.logic.backup_worker_pipeline import BackupWorker
         try:
             _budget = (self._full_config or {}).get("mainnet_budget", {}) or {}
         except Exception:
@@ -3210,12 +2976,20 @@ class RebirthBackup:
             self._precheck_diff_base(manifest))
         _baseline_resolver = self._make_diff_base_resolver(base_dir, _known_arcs)
 
-        staged = build_unified_event(
-            titan_id=self._titan_id, manifest=manifest,
-            personality_specs=p_specs, timechain_specs=t_specs,
-            soul_specs=s_specs, baseline_resolver=_baseline_resolver,
-            force_event_type=_force_et, force_trigger=_force_trig,
-        )
+        import tempfile
+        worker = BackupWorker(titan_id=self._titan_id, chain_provider=None)
+        scratch_dir = tempfile.mkdtemp(
+            prefix=f"titan_backup_stage_{self._titan_id}_")
+        staged = worker.plan_build(
+            manifest=manifest, personality_specs=p_specs, timechain_specs=t_specs,
+            soul_specs=s_specs, scratch_dir=scratch_dir,
+            force_event_type=_force_et, force_trigger=_force_trig)
+        # Phase B: drain the whole build now (one-shot). Phase D drives the
+        # per-batch idle drip by calling build_slice across idle ticks; here the
+        # stager builds it inline off the recv loop, then finalize-packs.
+        while worker.build_slice(staged, _baseline_resolver):
+            pass
+        worker.finalize_pack(staged)
         logger.info(
             "[Backup] §24 staged event BUILT: id=%s type=%s (off-loop; "
             "awaiting meditation to ship)", staged.event_id[:8],
@@ -3227,7 +3001,7 @@ class RebirthBackup:
         manifest fresh for the staleness check + append. Returns True if shipped;
         False on stale-baseline (caller rebuilds) / gate-off / failure."""
         from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
-        from titan_hcl.logic.backup_upload_pipeline import ship_staged_event
+        from titan_hcl.logic.backup_worker_pipeline import BackupWorker
         # §24.12 / INV-BR-4 — halt scheduled backups after a failed restore-test.
         if self._is_backups_halted():
             logger.warning("[Backup] §24.12 backups HALTED (failed restore-test) — "
@@ -3243,26 +3017,6 @@ class RebirthBackup:
         except ValueError as e:
             logger.error("[Backup] §24 ship-stage: manifest load failed: %s", e)
             return False
-
-        async def _arweave_upload(data: bytes, tags: dict) -> str:
-            import tempfile
-            with tempfile.NamedTemporaryFile(
-                delete=False, suffix=".tar.gz",
-                prefix=f"titan_unified_{self._titan_id}_",
-            ) as f:
-                f.write(data)
-                tmp_path = f.name
-            try:
-                tx = await self._ensure_chain().put(tmp_path, tags=tags)  # RFP_chain_provider Phase A (streams the temp file via the Irys daemon)
-                if not tx:
-                    raise RuntimeError(
-                        "ArweaveStore.upload_file returned empty tx_id")
-                return tx
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
 
         async def _v3_chain_commit(event_id, ts, event_type, event_root,
                                    components, prev_sig):
@@ -3283,10 +3037,11 @@ class RebirthBackup:
         # refresh (CRITICAL on the staged path — the pack ran off-loop, possibly
         # ~20 min before this ship, so re-copying live source would drift). We
         # rmtree staged.scratch_dir ourselves in the finally below.
-        result = await ship_staged_event(
-            staged, manifest=manifest, arweave_uploader=_arweave_upload,
-            zk_committer=_v3_chain_commit, bus_emit=_bus_emit,
-            cleanup_scratch=False, encryptor=self._build_v3_encryptor())
+        worker = BackupWorker(titan_id=self._titan_id,
+                              chain_provider=self._ensure_chain())
+        result = await worker.ship_event(
+            staged, manifest=manifest, zk_committer=_v3_chain_commit,
+            bus_emit=_bus_emit, encryptor=self._build_v3_encryptor())
 
         try:
             if result.status == "stale_baseline":
