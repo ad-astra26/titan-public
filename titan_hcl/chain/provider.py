@@ -273,3 +273,91 @@ class ArweaveChainProvider(ChainProvider):
         from titan_hcl.utils.solana_client import get_signatures_for_address
         return await get_signatures_for_address(
             address, rpc_url=self._rpc_url or None, limit=limit)
+
+    # ── FUNDING plane (Phase C) — Irys deposit, bounded (INV-CP-5) ──────────
+    async def balance(self) -> float:
+        """Irys deposit balance in SOL. Daemon-only (INV-CP-3); devnet has no real
+        deposit (returns +inf so the cap/runway logic treats it as unlimited)."""
+        if self._devnet:
+            return float("inf")
+        from titan_hcl.utils.irys_persistent_client import get_daemon, IrysDaemonError
+        try:
+            daemon = await get_daemon(self._keypair_path, self._rpc_url)
+        except Exception as e:
+            raise IrysDaemonError(
+                f"Irys daemon unavailable for balance — HARD-FAIL (INV-CP-3): {e}") from e
+        _atomic, readable = await daemon.balance()
+        return float(readable)
+
+    async def fund(self, amount_sol: float, *, daily_cap_sol: float = 0.0) -> Optional[str]:
+        """Top up the Irys deposit by `amount_sol`, BOUNDED: trimmed to the
+        remaining daily cap (when `daily_cap_sol` > 0), and every top-up recorded
+        to the audit log atomically. Returns the fund tx, or None (capped to zero /
+        devnet / no-tx). The runway/target DECISION (how much, when) is the
+        caller's — this is the bounded primitive (INV-CP-5)."""
+        if amount_sol <= 0 or self._devnet:
+            return None
+        if daily_cap_sol > 0:
+            _today, today_total, _n = self._fund_today_total()
+            remaining = max(0.0, daily_cap_sol - today_total)
+            if remaining <= 0:
+                logger.info("[ChainProvider] fund: daily cap %.4f reached (today %.4f)",
+                            daily_cap_sol, today_total)
+                return None
+            amount_sol = min(amount_sol, remaining)
+        from titan_hcl.utils.irys_persistent_client import get_daemon, IrysDaemonError
+        try:
+            daemon = await get_daemon(self._keypair_path, self._rpc_url)
+        except Exception as e:
+            raise IrysDaemonError(
+                f"Irys daemon unavailable for fund — HARD-FAIL (INV-CP-3): {e}") from e
+        res = await daemon.fund(int(round(amount_sol * 1e9)))
+        tx = None
+        if isinstance(res, dict):
+            tx = (res.get("tx_id") or res.get("tx") or res.get("id")
+                  or res.get("signature"))
+        if tx:
+            self._record_fund(amount_sol, str(tx))
+        return tx
+
+    # funding-state accumulator (moved from BackupCascade — funding IS chain I/O;
+    # config keys live under [chain.fund] per Q-CP-3). Atomic write + audit jsonl.
+    @staticmethod
+    def _fund_state_dir() -> str:
+        return os.path.join("data", "backups")
+
+    def _fund_today_total(self):
+        import json
+        import time
+        path = os.path.join(self._fund_state_dir(), ".auto_fund_daily.json")
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        try:
+            with open(path) as f:
+                st = json.load(f)
+            if st.get("date") != today:
+                return today, 0.0, 0
+            return today, float(st.get("total_sol", 0.0)), int(st.get("tx_count", 0))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return today, 0.0, 0
+
+    def _record_fund(self, amount_sol: float, tx_id: str) -> None:
+        import json
+        import time
+        d = self._fund_state_dir()
+        try:
+            os.makedirs(d, exist_ok=True)
+            today, total, n = self._fund_today_total()
+            new = {"date": today, "total_sol": total + amount_sol,
+                   "tx_count": n + 1, "last_tx_id": tx_id, "last_ts": time.time()}
+            sp = os.path.join(d, ".auto_fund_daily.json")
+            tmp = sp + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(new, f)
+            os.replace(tmp, sp)
+            with open(os.path.join(d, "auto_fund_audit.jsonl"), "a") as f:
+                f.write(json.dumps({
+                    "ts": time.time(), "amount_sol": round(amount_sol, 6),
+                    "tx_id": tx_id,
+                    "today_total_sol": round(new["total_sol"], 6)}) + "\n")
+        except Exception as e:
+            logger.warning("[ChainProvider] fund record failed: %s", e)

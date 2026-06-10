@@ -75,19 +75,24 @@ async def test_get_to_file_missing_returns_false(tmp_path):
 # ── ABC contract: trust/funding not yet implemented (Phase B/C) ────────────
 
 @pytest.mark.asyncio
-async def test_real_provider_commit_needs_signer_funding_still_deferred():
+async def test_real_provider_commit_needs_signer():
     """The real provider's commit_memo (Phase B) REQUIRES a network_client
-    (signer) — without one it raises a clear RuntimeError, never a silent no-op.
-    Funding (Phase C) still defers to NotImplementedError (the ABC default)."""
+    (signer) — without one it raises a clear RuntimeError, never a silent no-op."""
     cp = ArweaveChainProvider(keypair_path="/nonexistent", network="devnet")  # no network_client
     with pytest.raises(RuntimeError):
         await cp.commit_memo("memo")
     with pytest.raises(RuntimeError):                       # head-bundle path also needs the signer
         await cp.commit_memo("memo", state_root="deadbeef" * 8)
-    with pytest.raises(NotImplementedError):
-        await cp.balance()
-    with pytest.raises(NotImplementedError):
-        await cp.fund(0.01)
+
+
+@pytest.mark.asyncio
+async def test_real_provider_funding_devnet_is_noop():
+    """Phase C: on devnet there is no real Irys deposit — balance() is +inf
+    (treated as unlimited by runway logic) and fund() is a no-op (no spend)."""
+    cp = ArweaveChainProvider(keypair_path="/nonexistent", network="devnet")
+    assert await cp.balance() == float("inf")
+    assert await cp.fund(0.01) is None
+    assert await cp.fund(0.01, daily_cap_sol=0.05) is None
 
 
 # ── Phase B — trust plane (Fake-backed) ─────────────────────────────────────
@@ -125,6 +130,35 @@ async def test_commit_memo_state_root_changes_sig():
     s_head = await cp.commit_memo("same-memo", state_root="cd" * 32)
     s_tail = await cp.commit_memo("same-memo")
     assert s_head != s_tail
+
+
+# ── Phase C — funding plane ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_fake_balance_fund_roundtrip():
+    cp = FakeChainProvider()
+    assert await cp.balance() == 1.0
+    sig = await cp.fund(0.05)
+    assert sig and sig.startswith("fakefund_")
+    assert await cp.balance() == pytest.approx(1.05)
+    assert cp.fund_log == [0.05]
+
+
+def test_provider_fund_accumulator_atomic(tmp_path, monkeypatch):
+    """Phase C INV-CP-5: the daily-fund accumulator records atomically (date +
+    total_sol + tx_count) and appends an audit row — the bounded state the daily
+    cap reads to trim `fund()`. (The daemon spend itself is a live gate.)"""
+    monkeypatch.chdir(tmp_path)
+    cp = ArweaveChainProvider(keypair_path="/nonexistent", network="mainnet")
+    cp._record_fund(0.03, "tx1")
+    _t, total, n = cp._fund_today_total()
+    assert total == pytest.approx(0.03) and n == 1
+    cp._record_fund(0.01, "tx2")
+    _t2, total2, n2 = cp._fund_today_total()
+    assert total2 == pytest.approx(0.04) and n2 == 2
+    # the remaining-cap math fund() uses to trim a top-up
+    assert max(0.0, 0.05 - total2) == pytest.approx(0.01)
+    assert os.path.exists(os.path.join("data", "backups", "auto_fund_audit.jsonl"))
 
 
 def test_chain_provider_is_abstract():

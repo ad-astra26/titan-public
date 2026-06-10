@@ -2094,6 +2094,7 @@ class RebirthBackup:
 
         component_sigs: dict = {}
         head_sig: Optional[str] = None
+        chain = self._ensure_chain()  # RFP_chain_provider Phase B tail
         for i, comp in enumerate(components):
             try:
                 memo = build_v3_memo(
@@ -2107,25 +2108,22 @@ class RebirthBackup:
                 logger.error("[Backup] v=3 memo build failed (%s): %s",
                              comp.get("tier"), e)
                 return None
-            memo_ix = build_memo_instruction(self.network.pubkey, memo)
-            if memo_ix is None:
-                logger.error("[Backup] v=3 memo ix build failed (%s)", comp.get("tier"))
+            # RFP_chain_provider Phase B tail — the memo-ix build, the head's
+            # vault commit_state bundle, and the tx send all move INTO
+            # `chain.commit_memo`: ONE tx per component, `state_root` set ⇒ the
+            # head ([commit_ix, memo_ix]); None ⇒ a tail (or a backfill, the
+            # commit_state=False case). Memo BUILDING stays above (build_v3_memo).
+            head = (i == 0 and commit_state)
+            try:
+                sig = await chain.commit_memo(
+                    memo,
+                    state_root=event_merkle_root if head else None,
+                    sovereignty_bp=sovereignty_bp if head else None,
+                )
+            except Exception as e:
+                logger.error("[Backup] v=3 chain commit raised (%s): %s",
+                             comp.get("tier"), e)
                 return None
-            ixs = [memo_ix]
-            if i == 0 and commit_state:  # head co-bundles commit_state(event_merkle_root)
-                try:
-                    state_root = bytes.fromhex(event_merkle_root)
-                except ValueError:
-                    logger.error("[Backup] v=3: event_merkle_root not valid hex")
-                    return None
-                commit_ix = build_vault_commit_instruction(
-                    self.network.pubkey, state_root, sovereignty_bp, vault_program_id)
-                if commit_ix is not None:
-                    ixs = [commit_ix, memo_ix]
-                else:
-                    logger.warning(
-                        "[Backup] v=3: commit_state ix unavailable — head memo-only")
-            sig = await self.network.send_sovereign_transaction(ixs, priority="LOW")
             if not sig:
                 logger.error("[Backup] v=3 chain commit: TX send failed (%s)",
                              comp.get("tier"))
@@ -2928,21 +2926,24 @@ class RebirthBackup:
             return None
 
     def _ensure_chain(self):
-        """Lazy-init the ChainProvider data plane (RFP_chain_provider Phase A).
-        An injected provider (tests → FakeChainProvider) wins. Otherwise build a
-        real ArweaveChainProvider with the SAME keypair/network resolution as
-        `_ensure_arweave_store_for_unified` (consistency; INV-CP-1's single-signer
-        finalizes when the Solana plane moves in, Phase B). Construction does no
-        I/O (the daemon connects lazily on first put), so this never raises here."""
+        """Lazy-init the ChainProvider (RFP_chain_provider). An injected provider
+        (tests → FakeChainProvider) wins. Otherwise build a real
+        ArweaveChainProvider: the data plane (Phase A) uses the same keypair/
+        network as `_ensure_arweave_store_for_unified`; the trust plane (Phase B)
+        is wired with `self.network` (the Solana signer for `commit_memo`) + the
+        vault program id. Construction does no I/O (daemon/RPC connect lazily)."""
         if self._chain_provider is not None:
             return self._chain_provider
         from titan_hcl.chain import ArweaveChainProvider
         kp = os.path.expanduser("~/.config/solana/id.json")
         net = "mainnet" if self._titan_id == "T1" else "devnet"
-        rpc = ((self._full_config or {}).get("network", {}) or {}).get(
-            "premium_rpc_url", "") or ""
+        ncfg = (self._full_config or {}).get("network", {}) or {}
+        rpc = ncfg.get("premium_rpc_url", "") or ""
+        vpid = (getattr(self.network, "_vault_program_id", None)
+                or ncfg.get("vault_program_id"))
         self._chain_provider = ArweaveChainProvider(
-            keypair_path=kp, network=net, rpc_url=rpc)
+            keypair_path=kp, network=net, rpc_url=rpc,
+            network_client=self.network, vault_program_id=vpid)
         return self._chain_provider
 
     async def _run_unified_event_v2(self, weekday: int) -> bool:
