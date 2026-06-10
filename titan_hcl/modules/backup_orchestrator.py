@@ -1,12 +1,29 @@
 """
-Backup Worker — Guardian-supervised process.
+Backup Orchestrator — Guardian-supervised process (the `backup` module).
 
-Owns the RebirthBackup instance (daily personality + weekly soul + TimeChain +
-ZK epoch + MyDay NFT). Promoted from TitanCore._backup_loop per rFP_backup_worker
-Phase 1 (2026-04-20). Replaces the trigger-file handoff with bus-event handoff.
+The SOURCE OF TRUTH for backup AND restore routines (RFP_backup_redesign_spine
+Phase D). Owns the RebirthBackup instance + the BackupOrchestrator brain:
+  • idle-driven per-file-batch DRIP — plan once → BackupWorker.build_slice per
+    idle tick → finalize_pack — with a 3-LAYER readiness guarantee (INV-BRS-3/5):
+      1. idle drip (primary)        — load1 < ncores·idle_load_factor AND ship-lock free
+      2. deadline force (failsafe-1) — past staged_by_utc → force-complete off-path
+      3. synchronous last-resort (failsafe-2) — meditation finds no stage → bounded
+         inline build+ship via the SAME BackupWorker primitive (run_in_executor)
+  • owns the ONE manifest-truth gate (_todays_backup_already_landed) + single-flight
+  • DISK-PERSISTED drip — the partial StagedBuild survives a restart (INV-BRS-7);
+    baseline-staleness + missing-artifact checks discard+re-plan when unsound
+  • drives the Sunday restore-test under the single-flight lock (fixes the audit
+    H-bug: the old stager restore-test was unguarded + on its own asyncio loop)
+  • owns the SPEC §11.B.2 MODULE_ERROR cascade from ONE place
+
+Replaces the old over-stuffed stager (modules/backup_worker.py → renamed here,
+no-shim INV-BRS-9). The build/ship MECHANICS live in
+backup_worker_pipeline.BackupWorker (Phase B); the crypto/manifest are KEPT
+verbatim (INV-BRS-8). Promoted from TitanCore._backup_loop per rFP_backup_worker
+Phase 1 (2026-04-20); bus-event handoff (was the trigger-file handoff).
 
 Bus consumption:
-  MEDITATION_COMPLETE   — primary trigger (was: data/backup_trigger.json file)
+  MEDITATION_COMPLETE   — primary ship trigger (was: data/backup_trigger.json file)
   BACKUP_TRIGGER_MANUAL — Maker-forced backup via /v4/backup/trigger
   MODULE_SHUTDOWN       — graceful exit (Guardian standard)
 
@@ -15,21 +32,16 @@ Bus emission:
   BACKUP_SUCCEEDED      — type, arweave_tx, size_mb, hash, duration_s
   BACKUP_FAILED         — type, step, error, duration_s
   BACKUP_HEALTH_ALERT   — severity, issue, diagnostic
-  BACKUP_DIFF_ALERT     — (Phase I5) size_delta, missing_aux, etc.
   BACKUP_WORKER_READY   — titan_id, arweave_wired, boot_elapsed_s
+  MODULE_ERROR          — SPEC §11.B.2 cascade (orchestrator-owned, one place)
 
-Phase 2 failsafe cascade (rFP §5.3) wraps each upload in 10 steps:
-  1 build → 2 validate → 3 local-ALWAYS → 4 balance → 5 upload →
-  6 verify → 7 manifest → 8 anchor → 9 emit → 10 cleanup
-
-See: titan-docs/rFP_backup_worker.md
+See: titan-docs/RFP_backup_redesign_spine.md (§7.D) + AUDIT_backup_subsystem.md
 """
 
 import asyncio
 import json
 import logging
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -63,14 +75,19 @@ _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
 
 
 @with_error_envelope(module_name="backup", subsystem="entry", severity=_phase11_sev.FATAL)
-def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
-    """Main loop for the Backup Worker subprocess.
+def backup_orchestrator_main(recv_queue, send_queue, name: str, config: dict) -> None:
+    """Main loop for the Backup Orchestrator subprocess (the `backup` module).
+
+    Boots RebirthBackup + the BackupOrchestrator brain (idle-drip + 3-layer
+    readiness + the one gate + disk-persisted drip + restore-test), then runs
+    the recv loop (meditation ship / manual trigger / SAVE_NOW / shutdown / probe
+    / swap). RFP_backup_redesign_spine Phase D.
 
     Args:
         recv_queue: bus → worker
         send_queue: worker → bus
         name: Guardian module name ("backup")
-        config: full config dict (rFP Phase 3 reads [backup] section from here)
+        config: full config dict (reads [backup] + [backup.orchestrator])
     """
     global _WORKER_READY, _BOOT_DEADLINE
     _WORKER_READY = False
@@ -328,10 +345,14 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         save_state_cb=_b1_save_state,
     )
 
-    # Phase 2 (2026-05-31): pre-stage the daily event off the recv loop so the
-    # meditation ship is fast + never blocks the bus (the diff-build that used to
-    # crash the worker now happens here, ahead of time).
-    _start_stager(state)
+    # RFP_backup_redesign_spine Phase D: the BackupOrchestrator brain replaces
+    # the old one-shot stager — idle-driven per-file-batch drip + 3-layer
+    # readiness guarantee (INV-BRS-3/5) + the one manifest-truth gate +
+    # disk-persisted resume (INV-BRS-7) + the single-flight-guarded Sunday
+    # restore-test. The build/ship mechanics stay in BackupWorker (Phase B).
+    orchestrator = BackupOrchestrator(state, full_config, send_queue, name)
+    state["orchestrator"] = orchestrator
+    orchestrator.start()
 
     while True:
         try:
@@ -384,14 +405,18 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
-            logger.info("[BackupWorker] Shutdown: %s",
+            logger.info("[BackupOrchestrator] Shutdown: %s",
                         msg.get("payload", {}).get("reason"))
+            # Stop the drip tick thread (the in-progress drip is already on disk
+            # after every tick → a restart resumes it; INV-BRS-7).
+            with suppress(Exception):
+                orchestrator.stop()
             # §11.H.9(2) flush-on-MODULE_SHUTDOWN — durably persist the in-memory
             # tracking state (dedup dates + meditation counters) before exit.
             try:
                 backup._save_backup_state()
             except Exception as _sd_err:  # noqa: BLE001
-                logger.warning("[BackupWorker] shutdown state flush failed: %s",
+                logger.warning("[BackupOrchestrator] shutdown state flush failed: %s",
                                _sd_err)
             break
 
@@ -487,97 +512,376 @@ def _dispatch_backup_offloop(state: dict, handler, msg: dict) -> None:
         target=_runner, name="backup-cascade-offloop", daemon=True).start()
 
 
-# ── Phase 2 pre-stage daemon (2026-05-31) ─────────────────────────────────
+# ── BackupOrchestrator — the brain (RFP_backup_redesign_spine Phase D) ─────
 
-def _maybe_build_stage(state: dict) -> None:
-    """Ensure a fresh pre-built event exists for today (build it if not).
-
-    The heavy diff/pack runs HERE, on the stager's daemon thread, ahead of the
-    first meditation — so the meditation ship is fast + never blocks the recv
-    loop. The existing full_ship.encode_diff already race-safe-snapshots the live
-    DBs, so reading them mid-write is safe. Gate-aware: _build_staged_event_v2
-    returns None when backup_arweave is disabled.
-    """
-    backup = state["backup"]
-    # §24.12 / INV-BR-4 — a failed weekly restore-test halts scheduled backups.
-    if backup._is_backups_halted():
-        logger.warning("[BackupWorker] §24.12 backups HALTED (failed restore-test) "
-                       "— stager idle until the halt is cleared")
-        return
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    cur = getattr(backup, "_staged_event", None)
-    if cur is not None and cur.get("date") == today:
-        return  # already staged for today
-    # Don't pile a heavy build on top of a meditation cascade already running
-    # (single-flight with the off-loop ship/inline-build).
-    if state["_backup_lock"].locked():
-        logger.debug("[BackupWorker] stager: cascade in flight — deferring build")
-        return
-    weekday = datetime.now(timezone.utc).weekday()
-    staged = backup._build_staged_event_v2(weekday)
-    if staged is not None:
-        backup.stage_built_event(staged, today)
-        # LIVE-path validation record (replaces the retired legacy boot
-        # dry-run) — feeds the dashboard backup health card.
-        _record_stage_dry_run_result(staged)
+# [backup.orchestrator] config defaults (UTC; §7.D / Q-BRS-2/3 / D-BRS-D).
+_DEF_BYTE_BUDGET_MB = 64        # per build_slice tick (per-file-batch drip)
+_DEF_IDLE_LOAD_FACTOR = 0.75    # idle ⇔ load1 < ncores·factor (meditation-CPU proxy)
+_DEF_STAGED_BY_UTC = "06:00"    # deadline-force wall-clock (before the earliest
+                                # plausible 1st meditation — tune per fleet)
+_DEF_DRIP_INTERVAL_S = 120.0    # tick cadence WHILE actively dripping
+_DEF_POLL_INTERVAL_S = 1200.0   # slow poll when staged/complete (≡ old stager)
+_DEF_BOOT_SETTLE_S = 60.0       # let boot settle before the first tick
 
 
-def _maybe_run_restore_test(state: dict) -> None:
-    """§24.12 (Phase R4) — on Sunday, once/day, run the weekly FULL-chain restore-test
-    OFF the recv loop (stager thread). Skips when already halted (awaiting Maker
-    investigation — a green test is the recovery, run only after a manual clear)."""
-    backup = state["backup"]
-    if backup._is_backups_halted():
-        return  # halted → wait for investigation; do not auto-clear
-    now = datetime.now(timezone.utc)
-    if now.weekday() != 6:  # Sunday only (§24.12)
-        return
-    today = now.strftime("%Y-%m-%d")
-    if getattr(backup, "_last_restore_test_date", None) == today:
-        return
-    backup._last_restore_test_date = today
+class BackupOrchestrator:
+    """The backup-module brain: idle-driven per-file-batch drip + a 3-layer
+    readiness guarantee + the ONE manifest-truth gate + a disk-persisted drip +
+    the single-flight-guarded Sunday restore-test. Drives BackupWorker (the build
+    mechanics, Phase B) + RebirthBackup (plan/ship/restore wiring); owns NO
+    crypto/manifest (INV-BRS-8). Replaces the old one-shot stager."""
 
-    def _bus_emit(name, payload):
+    def __init__(self, state: dict, full_config: dict, send_queue,
+                 name: str) -> None:
+        self.state = state
+        self.send_queue = send_queue
+        self.name = name
+        self.backup = state["backup"]
+        self.titan_id = state.get("titan_id", "T1")
+        oc = (((full_config or {}).get("backup", {}) or {})
+              .get("orchestrator", {}) or {})
+        self.byte_budget = (
+            int(oc.get("byte_budget_mb", _DEF_BYTE_BUDGET_MB)) * 1024 * 1024)
+        self.idle_load_factor = float(
+            oc.get("idle_load_factor", _DEF_IDLE_LOAD_FACTOR))
+        self.staged_by_utc = str(oc.get("staged_by_utc", _DEF_STAGED_BY_UTC))
+        self.drip_interval_s = float(
+            oc.get("drip_interval_s", _DEF_DRIP_INTERVAL_S))
+        self.poll_interval_s = float(
+            oc.get("poll_interval_s", _DEF_POLL_INTERVAL_S))
+        self.boot_settle_s = float(oc.get("boot_settle_s", _DEF_BOOT_SETTLE_S))
+        # Periodic side-state flush (Maker pattern: "save on timer continuously").
+        # Belt-and-suspenders — halt/force-baseline/mirror/dry-run already flush
+        # immediately on change; this catches meditation-count drift + guarantees
+        # the consolidated readout (INV-BRS-7) is fresh for consumers.
+        self._state_flush_interval_s = float(
+            oc.get("state_flush_interval_s", 300.0))
+        # The STABLE per-Titan drip scratch dir (a dot-prefixed sibling of the
+        # baseline mirror, OUTSIDE the backed-up source set). Holds the partial
+        # patch artifacts + drip_progress.json so a restart resumes (INV-BRS-7).
+        self.drip_dir = os.path.join(
+            "data", "backups", f".orch_drip_{self.titan_id}")
+        # {worker, staged, resolver, known_arcs, today, weekday} | None
+        self._drip: Optional[dict] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # ── lifecycle ──────────────────────────────────────────────────────────
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._tick_loop, name="backup-orchestrator", daemon=True)
+        self._thread.start()
+        logger.info(
+            "[BackupOrchestrator] started — drip byte_budget=%d MB, "
+            "idle<%.2f·ncores, staged_by=%s UTC, tick=%.0fs/poll=%.0fs "
+            "(drip_dir=%s)",
+            self.byte_budget // (1024 * 1024), self.idle_load_factor,
+            self.staged_by_utc, self.drip_interval_s, self.poll_interval_s,
+            self.drip_dir)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _tick_loop(self) -> None:
+        # Let boot + dependent modules settle before the first heavy tick.
+        if self._stop.wait(self.boot_settle_s):
+            return
+        last_flush = 0.0
+        while not self._stop.is_set():
+            try:
+                self._drip_tick()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[BackupOrchestrator] drip tick failed: %s",
+                               e, exc_info=True)
+                self._emit_module_error("drip", e)
+            try:
+                self.run_restore_test_if_due()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[BackupOrchestrator] restore-test cycle failed: %s",
+                    e, exc_info=True)
+                self._emit_module_error("restore_test", e)
+            # Periodic side-state flush (INV-BRS-7 readout fresh; the per-change
+            # flushes already cover halt/force-baseline/mirror/dry-run).
+            now = time.monotonic()
+            if now - last_flush >= self._state_flush_interval_s:
+                last_flush = now
+                try:
+                    self.backup._save_backup_state()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[BackupOrchestrator] periodic state flush failed: %s", e)
+            # Tick fast while actively dripping; slow poll when staged/complete.
+            interval = (self.drip_interval_s if self._drip is not None
+                        else self.poll_interval_s)
+            self._stop.wait(interval)
+
+    # ── idle / deadline signals (Q-BRS-3 / Q-BRS-2) ─────────────────────────
+    def _is_idle(self) -> bool:
+        """Idle ⇔ load1 < ncores·idle_load_factor (the meditation-CPU proxy —
+        there is NO MEDITATION_START reaching backup, module_catalog broadcast
+        filter) AND the ship single-flight lock is free (§7.D / Q-BRS-3)."""
         try:
-            b = state.get("bus") or getattr(backup, "bus", None) \
-                or getattr(backup, "_bus", None)
-            if b is not None and hasattr(b, "emit"):
-                b.emit(name, payload)
-        except Exception:
+            load1 = os.getloadavg()[0]
+            ncores = os.cpu_count() or 1
+        except (OSError, AttributeError):
+            return True  # can't read load (best-effort) — allow the drip
+        if load1 >= ncores * self.idle_load_factor:
+            return False
+        if self.state["_backup_lock"].locked():
+            return False  # a ship/cascade already in flight (single-flight)
+        return True
+
+    def _past_staged_by_deadline(self) -> bool:
+        """True once the UTC time-of-day has passed `staged_by_utc` (failsafe-1:
+        force-complete the drip OFF the meditation path)."""
+        try:
+            hh, mm = (int(x) for x in self.staged_by_utc.split(":", 1))
+        except (ValueError, AttributeError):
+            hh, mm = 6, 0
+        now = datetime.now(timezone.utc)
+        return (now.hour, now.minute) >= (hh, mm)
+
+    # ── the drip tick (the 3-layer readiness — INV-BRS-3/5) ─────────────────
+    def _drip_tick(self) -> None:
+        """One tick of the readiness machine. Layer-1 (idle drip) + Layer-2
+        (deadline force) live here; Layer-3 (synchronous last-resort) is in
+        RebirthBackup.on_meditation_complete (bounded inline build+ship)."""
+        backup = self.backup
+        # §24.12 / INV-BR-4 — a failed weekly restore-test halts scheduled backups.
+        if backup._is_backups_halted():
+            if self._drip is not None:
+                self._discard_drip("backups halted (failed restore-test)")
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Day rollover → drop a stale in-progress drip.
+        if self._drip is not None and self._drip.get("today") != today:
+            self._discard_drip("UTC day rollover")
+        # A fresh stage is already parked for today → nothing to build.
+        cur = getattr(backup, "_staged_event", None)
+        if cur is not None and cur.get("date") == today:
+            return
+        # Today's backup already LANDED (manifest truth — the ONE gate) → no stage.
+        if backup._todays_backup_already_landed():
+            return
+        # Ensure an active drip (resume the persisted one, else plan fresh).
+        if self._drip is None:
+            if not self._begin_or_resume_drip(today):
+                return  # arweave gate off / manifest unloadable → retry next tick
+        drip = self._drip
+        if drip is None:
+            return
+        staged = drip["staged"]
+        # LAYER 1+2: advance ONE bounded batch if idle (primary) OR past the
+        # staged-by deadline (failsafe-1: drop the idle-gate). ≤1 batch/tick →
+        # bounded RSS/CPU (INV-BRS-3).
+        if not staged.fully_encoded:
+            past_deadline = self._past_staged_by_deadline()
+            idle = self._is_idle()
+            if idle or past_deadline:
+                drip["worker"].build_slice(
+                    staged, drip["resolver"], byte_budget=self.byte_budget)
+                self._persist_drip(drip)
+                if past_deadline and not idle:
+                    logger.info(
+                        "[BackupOrchestrator] deadline-force drip batch (load "
+                        "high, past staged_by=%s UTC) — off the meditation path",
+                        self.staged_by_utc)
+            return
+        # Fully encoded → finalize (ONE streamed pack pass) + park for the ship.
+        if not staged.tier_results:
+            drip["worker"].finalize_pack(staged)
+            self._persist_drip(drip)
+        backup.stage_built_event(staged, today)
+        _record_stage_dry_run_result(backup, staged)
+        logger.info(
+            "[BackupOrchestrator] daily event STAGED for %s — id=%s type=%s; "
+            "awaiting meditation to ship", today, staged.event_id[:8],
+            staged.event_type)
+        # Parked; the persisted progress self-clears when the ship rmtree's scratch.
+        self._drip = None
+
+    # ── drip plan / resume / persist (INV-BRS-7 — disk-persisted drip) ──────
+    def _drip_progress_path(self) -> str:
+        from titan_hcl.logic.backup_worker_pipeline import (
+            DRIP_PROGRESS_FILENAME)
+        return os.path.join(self.drip_dir, DRIP_PROGRESS_FILENAME)
+
+    def _begin_or_resume_drip(self, today: str) -> bool:
+        if self._try_resume_drip(today):
+            return True
+        weekday = datetime.now(timezone.utc).weekday()
+        planned = self.backup._plan_staged_build_v2(
+            weekday, scratch_dir=self.drip_dir, byte_budget=self.byte_budget)
+        if planned is None:
+            return False  # arweave gate off / manifest unloadable
+        worker, staged, resolver, known_arcs = planned
+        self._drip = {"worker": worker, "staged": staged, "resolver": resolver,
+                      "known_arcs": list(known_arcs), "today": today,
+                      "weekday": weekday}
+        self._persist_drip(self._drip)
+        logger.info(
+            "[BackupOrchestrator] drip PLANNED for %s — id=%s type=%s, "
+            "%d files pending", today, staged.event_id[:8], staged.event_type,
+            sum(len(v) for v in staged.pending.values()))
+        return True
+
+    def _try_resume_drip(self, today: str) -> bool:
+        """Reload a disk-persisted drip after a restart (INV-BRS-7). Validates
+        freshness — same day, baseline still current, all OWNED artifacts on disk
+        — and DISCARDS+re-plans on any mismatch (the 3-layer readiness still
+        guarantees the ship). A finalized-but-unshipped reload re-parks via the
+        tick's finalize branch (no rebuild)."""
+        p = self._drip_progress_path()
+        if not os.path.exists(p):
+            return False
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, ValueError):
+            self._discard_drip("unreadable persisted drip")
+            return False
+        if payload.get("today") != today:
+            self._discard_drip("persisted drip is for a stale day")
+            return False
+        try:
+            from titan_hcl.logic.backup_worker_pipeline import (
+                BackupWorker, StagedBuild)
+            staged = StagedBuild.from_dict(payload["staged"])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[BackupOrchestrator] drip reload parse failed: %s "
+                           "— re-planning", e)
+            self._discard_drip("reload parse failed")
+            return False
+        # Freshness: the baseline the incrementals diff against must still be
+        # current, and every OWNED patch artifact must still be on disk.
+        try:
+            from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
+            manifest = UnifiedManifest.load(
+                titan_id=self.backup._titan_id, base_dir="data")
+            cur_baseline = manifest.current_baseline_event_id
+        except Exception:  # noqa: BLE001
+            cur_baseline = None
+        if staged.baseline_event_id != cur_baseline:
+            self._discard_drip("baseline moved since the drip was persisted")
+            return False
+        missing = staged.missing_artifacts()
+        if missing:
+            self._discard_drip(
+                f"{len(missing)} drip artifact(s) missing on disk")
+            return False
+        known_arcs = set(payload.get("known_arcs") or [])
+        resolver = self.backup._make_diff_base_resolver(
+            self.backup._baseline_working_dir(), known_arcs)
+        worker = BackupWorker(titan_id=self.backup._titan_id,
+                              chain_provider=None, byte_budget=self.byte_budget)
+        self._drip = {
+            "worker": worker, "staged": staged, "resolver": resolver,
+            "known_arcs": list(known_arcs), "today": today,
+            "weekday": int(payload.get(
+                "weekday", datetime.now(timezone.utc).weekday())),
+        }
+        logger.info(
+            "[BackupOrchestrator] drip RESUMED for %s — id=%s, %d files still "
+            "pending (restart-survived: baseline current, artifacts intact)",
+            today, staged.event_id[:8],
+            sum(len(v) for v in staged.pending.values()))
+        return True
+
+    def _persist_drip(self, drip: dict) -> None:
+        """Atomically write the drip progress (INV-BRS-7) — after every
+        build_slice + finalize, so a restart mid-drip resumes. Best-effort: a
+        persist failure only forfeits restart-resume (the drip still completes
+        in-process + the failsafes still guarantee the ship)."""
+        try:
+            os.makedirs(self.drip_dir, exist_ok=True)
+            payload = {
+                "staged": drip["staged"].to_dict(),
+                "known_arcs": list(drip["known_arcs"]),
+                "today": drip["today"],
+                "weekday": drip["weekday"],
+            }
+            p = self._drip_progress_path()
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, p)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[BackupOrchestrator] drip persist failed: %s", e)
+
+    def _discard_drip(self, reason: str) -> None:
+        """Drop the in-progress drip + its scratch (re-plan next tick)."""
+        import shutil
+        logger.info(
+            "[BackupOrchestrator] discarding drip — %s (re-plan next tick)",
+            reason)
+        drip = self._drip
+        self._drip = None
+        try:
+            sd = (drip["staged"].scratch_dir if drip else self.drip_dir)
+            if sd and os.path.isdir(sd):
+                shutil.rmtree(sd, ignore_errors=True)
+        except Exception:  # noqa: BLE001
             pass
 
-    import asyncio as _aio
-    try:
-        _aio.run(backup._run_weekly_restore_test(bus_emit=_bus_emit))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[BackupWorker] §24.12 restore-test runner failed: %s",
-                       e, exc_info=True)
+    # ── Sunday restore-test (D.5 — single-flight-guarded; fixes audit H-bug) ──
+    def run_restore_test_if_due(self) -> None:
+        """§24.12 (Phase R4) — Sunday, once/day, the weekly FULL-chain
+        restore-test. Now UNDER the single-flight lock (the old stager ran it
+        UNGUARDED on its own asyncio loop — audit §1.5/H-bug) and emits its
+        PASS/FAIL events on the REAL send_queue (the old `_bus_emit` probed
+        state["bus"]/backup.bus/backup._bus — none exist → silent no-op, audit
+        H-bug). Read-only (scratch dir). Warm-unification (routing through
+        RestoreWorker.restore — a manifest→chain §24.12 behaviour change) stays a
+        Maker-gated follow-up."""
+        backup = self.backup
+        if backup._is_backups_halted():
+            return  # halted → wait for investigation; never auto-clear
+        now = datetime.now(timezone.utc)
+        if now.weekday() != 6:  # Sunday only (§24.12)
+            return
+        today = now.strftime("%Y-%m-%d")
+        if getattr(backup, "_last_restore_test_date", None) == today:
+            return
+        lock = self.state["_backup_lock"]
+        if not lock.acquire(blocking=False):
+            return  # a ship/cascade in flight — retry next tick (single-flight)
+        try:
+            backup._last_restore_test_date = today
 
+            def _bus_emit(evt, payload):
+                try:
+                    _send(self.send_queue, evt, self.name, "all", payload)
+                except Exception:
+                    pass
 
-def _start_stager(state: dict) -> None:
-    """Start the Phase 2 background stager thread."""
-    poll_s = 1200.0  # 20 min — cheap no-op when a fresh stage exists; catches
-                     # the UTC day rollover well before the first meditation.
+            import asyncio as _aio
+            _aio.run(backup._run_weekly_restore_test(bus_emit=_bus_emit))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[BackupOrchestrator] §24.12 restore-test runner failed: %s",
+                e, exc_info=True)
+            self._emit_module_error("restore_test", e)
+        finally:
+            lock.release()
 
-    def _loop():
-        time.sleep(60.0)   # let boot + boot-dry-run settle first
-        while True:
-            try:
-                _maybe_build_stage(state)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "[BackupWorker] stager cycle failed: %s", e, exc_info=True)
-            try:
-                _maybe_run_restore_test(state)   # §24.12 Sunday full-chain restore-test
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "[BackupWorker] restore-test cycle failed: %s", e, exc_info=True)
-            time.sleep(poll_s)
-
-    threading.Thread(target=_loop, name="backup-stager", daemon=True).start()
-    logger.info(
-        "[BackupWorker] Phase 2 stager started (poll=%.0fs) — pre-builds the "
-        "daily event off-loop so meditation ships fast", poll_s)
+    # ── SPEC §11.B.2 MODULE_ERROR cascade (D.4 — ONE place) ─────────────────
+    def _emit_module_error(self, subsystem: str, exc: Exception) -> None:
+        """The orchestrator-owned MODULE_ERROR emission (SPEC §11.B.2), the ONE
+        place backup's structured errors surface (replacing the scattered
+        swallow_warn — audit §1.6). Best-effort double-fault guard — never
+        raises into the tick loop."""
+        try:
+            from titan_hcl.errors import (
+                ModuleError, ModuleErrorCode, Severity)
+            from titan_hcl.bus import publish_module_error
+            err = ModuleError.from_exception(
+                exc, module_name=self.name, subsystem=subsystem,
+                error_code=ModuleErrorCode.STORAGE_DEGRADED,
+                severity=Severity.ERROR)
+            publish_module_error(self.send_queue, err)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ── Meditation-triggered cascade (Phase 2 §5.3) ───────────────────────────
@@ -939,13 +1243,15 @@ def _handle_manual(state: dict, msg: dict) -> None:
 
 # ── Phase 2 / I4 helpers ─────────────────────────────────────────────────
 
-def _record_stage_dry_run_result(staged) -> None:
-    """Write data/backup_dry_run_result.json from a freshly-built unified_v2
-    staged event — the LIVE-path replacement for the retired legacy boot
-    dry-run. Records per-tier pack sizes so the dashboard's backup health card
-    reflects a real unified_v2 build (zstd, GIL-friendly), not a redundant
-    legacy gzip archive. Best-effort; never raises into the stager loop.
-    """
+def _record_stage_dry_run_result(backup, staged) -> None:
+    """Record a freshly-staged unified_v2 event's per-tier pack sizes for the
+    dashboard backup-health card — the LIVE-path replacement for the retired
+    legacy boot dry-run (a real unified_v2 build: zstd, GIL-friendly).
+
+    Phase D (INV-BRS-7): writes into the CONSOLIDATED orchestrator side-state
+    (`backup._last_dry_run`, persisted in _BACKUP_STATE_PATH) instead of the
+    standalone data/backup_dry_run_result.json. Best-effort; never raises into
+    the drip loop."""
     try:
         steps = {}
         total = 0
@@ -953,90 +1259,26 @@ def _record_stage_dry_run_result(staged) -> None:
             sz = int(getattr(r, "tarball_size_bytes", 0) or 0)
             total += sz
             steps[tier] = f"OK ({sz/1024/1024:.1f} MB)"
-        status = {
+        backup._last_dry_run = {
             "ok": True,
             "ts": time.time(),
-            "source": "unified_v2_stager",
+            "source": "unified_v2_drip",
             "event_type": getattr(staged, "event_type", "?"),
             "steps": steps,
             "total_mb": round(total / 1024 / 1024, 1),
         }
-        with open("data/backup_dry_run_result.json", "w") as f:
-            json.dump(status, f, indent=2)
+        backup._save_backup_state()
     except Exception as e:  # noqa: BLE001
-        logger.warning("[BackupWorker] stage dry-run result write failed: %s", e)
+        logger.warning(
+            "[BackupOrchestrator] stage dry-run result record failed: %s", e)
 
 
-def _check_runway(state: dict) -> None:
-    """rFP §5.5 — compute days-of-runway at current spend rate.
-
-    Emits BACKUP_HEALTH_ALERT on tier transitions. Separate from I6 daily
-    cron — that one writes telemetry JSON; this is in-loop tier watch.
-    """
-    if state["mode"] != "mainnet_arweave":
-        return
-    keypair = state["keypair_path"]
-    if not keypair or not os.path.exists(keypair):
-        return
-
-    try:
-        out = subprocess.check_output(
-            ["node", "scripts/irys_upload.js", "balance", keypair,
-             "https://api.mainnet-beta.solana.com"],
-            env={**os.environ, "NODE_PATH": _node_path()},
-            timeout=30,
-        )
-        data = json.loads(out.decode())
-        if data.get("status") != "ok":
-            return
-        irys_sol = float(data.get("balance_readable", 0))
-    except Exception as e:
-        logger.debug("[BackupWorker] Irys balance check failed: %s", e)
-        return
-
-    # Estimate at ~0.0125 SOL/day (rFP §3 budget + shrink-daily applied)
-    # Conservative: daily personality ~35MB + weekly soul amortized ~30MB/day
-    # At Irys ~0.0002 SOL/MB → ~0.013 SOL/day. Use 0.015 for safety margin.
-    daily_est = 0.015
-    days_runway = irys_sol / daily_est if daily_est > 0 else 9999
-
-    if days_runway > 30:
-        tier = "green"
-    elif days_runway > 7:
-        tier = "yellow"
-    elif days_runway > 1:
-        tier = "orange"
-    else:
-        tier = "red"
-
-    # Only alert on yellow+ (green is silent)
-    if tier != "green":
-        _send(state["send_queue"], "BACKUP_HEALTH_ALERT", state["name"], "all", {
-            "severity": tier,
-            "issue": "irys_runway",
-            "irys_sol": round(irys_sol, 6),
-            "days_runway": round(days_runway, 1),
-            "daily_est_sol": daily_est,
-        })
-        logger.info("[BackupWorker] Runway tier=%s (%.1f days, %.4f SOL deposit)",
-                    tier, days_runway, irys_sol)
-        # rFP Phase 6 — Maker Telegram per §5.5 tiers
-        # Cooldown escalates with urgency: red=4h, orange=12h, yellow=daily
-        cooldowns = {"yellow": 86400, "orange": 43200, "red": 14400}
-        with suppress(Exception):
-            from titan_hcl.utils.maker_notify import (
-                notify_maker, format_runway_alert)
-            notify_maker(f"runway_{tier}", state["titan_id"],
-                         format_runway_alert(tier, irys_sol, days_runway),
-                         cooldown_s=cooldowns.get(tier, 86400))
-
-
-def _node_path() -> str:
-    """Resolve NODE_PATH for the subprocess (for @irys/sdk global install)."""
-    try:
-        return subprocess.check_output(["npm", "root", "-g"], timeout=10).decode().strip()  # noqa: async-block — backup worker sequential main loop (run_until_complete); not a concurrent/FastAPI loop
-    except Exception:
-        return "/usr/lib/node_modules"
+# ── _check_runway + _node_path DELETED (RFP_backup_redesign_spine Phase D) ──
+#    Dead since the RFP_chain_provider Phase C tail removed the recv-loop call
+#    (the `node …balance` subprocess inside `except Empty:` — audit worker bug
+#    C1). Zero callers remained (verified). Runway/funding now belongs to the
+#    ChainProvider (`balance`/`fund`, in-process) driven off-loop; the
+#    orchestrator owns the alert (no-shim, INV-BRS-9).
 
 
 # ── Bus helpers (mirror memory_worker pattern) ────────────────────────────

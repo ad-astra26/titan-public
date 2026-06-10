@@ -6312,11 +6312,21 @@ async def get_v4_backup_status(request: Request):
         local_dir = cfg_backup.get("local_dir", "data/backups")
         result["local_snapshots"] = _count_local_snapshots(local_dir)
         result["local_dir"] = local_dir
-        dry_path = "data/backup_dry_run_result.json"
-        if _os.path.exists(dry_path):
+        # Phase D (RFP_backup_redesign_spine / INV-BRS-7): the backup-health
+        # dry-run card + the halt status moved into the ONE consolidated backup
+        # state file (data/backup_state.json), the synthesis-snapshot-style
+        # readout the orchestrator timer-persists (was the standalone
+        # data/backup_dry_run_result.json + the .restore_test_halt sidecar).
+        state_path = "data/backup_state.json"
+        if _os.path.exists(state_path):
             try:
-                with open(dry_path) as f:
-                    result["last_dry_run"] = _json.load(f)
+                with open(state_path) as f:
+                    _bstate = _json.load(f)
+                if _bstate.get("last_dry_run"):
+                    result["last_dry_run"] = _bstate["last_dry_run"]
+                result["halted"] = bool(_bstate.get("halted", False))
+                if _bstate.get("halt_reason"):
+                    result["halt_reason"] = _bstate["halt_reason"]
             except Exception:
                 pass
         # Phase 9 — offhost mirror status (T1 only: others show disabled)

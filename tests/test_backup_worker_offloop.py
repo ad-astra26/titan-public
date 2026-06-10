@@ -15,7 +15,10 @@ import asyncio
 import threading
 import time
 
-from titan_hcl.modules import backup_worker
+# RFP_backup_redesign_spine Phase D: modules/backup_worker.py → backup_orchestrator.py
+# (no-shim rename). `_dispatch_backup_offloop` is unchanged; alias keeps the
+# offloop-contract tests pinned to the same symbol.
+from titan_hcl.modules import backup_orchestrator as backup_worker
 
 
 def _fresh_state():

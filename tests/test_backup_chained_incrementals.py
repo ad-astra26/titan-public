@@ -93,6 +93,20 @@ class _PhaseBBackup(RebirthBackup):
         self._full_config = full_config or {"backup": {"chained_incrementals": chained}}
         self._store = store
         self.alerts: list[str] = []
+        # Phase D (INV-BRS-7): the halt/force-baseline/mirror methods are now
+        # in-memory + flush via _save_backup_state. This carrier bypasses
+        # RebirthBackup.__init__, so seed the side-state attrs + stub the flush
+        # (persistence isn't under test here — the in-memory logic is).
+        self._halted = False
+        self._halt_reason = ""
+        self._halt_failed_event_id = None
+        self._force_baseline_pending = False
+        self._last_dry_run = None
+        self._last_restore_test_date = None
+        self._mirror_state = None
+
+    def _save_backup_state(self):
+        pass  # no-op: don't touch the real data/backup_state.json in unit tests
 
     def _baseline_working_dir(self):
         return self._mirror
@@ -353,12 +367,12 @@ def test_halt_mechanism_and_force_baseline_marker(tmp_path, monkeypatch):
     assert backup._is_backups_halted() is False
     backup._set_backups_halt(reason="HALT_BROKEN_CHAIN", failed_event_id="evtX")
     assert backup._is_backups_halted() is True
-    assert os.path.exists(backup._force_baseline_marker_path())
+    assert backup._force_baseline_pending is True   # Phase D: in-memory token
 
-    # A clear lifts the halt but LEAVES the force-baseline marker → resume rebases.
+    # A clear lifts the halt but LEAVES the force-baseline token → resume rebases.
     backup._clear_backups_halt()
     assert backup._is_backups_halted() is False
-    assert os.path.exists(backup._force_baseline_marker_path())
+    assert backup._force_baseline_pending is True
 
     # Marker is one-shot.
     assert backup._take_force_baseline() is True
@@ -425,6 +439,6 @@ async def test_restore_test_fail_halts_backups(tmp_path, monkeypatch):
         memo_fetch=solana.fetch, bus_emit=lambda n, p: emitted.append((n, p)))
     assert ok is False
     assert backup._is_backups_halted() is True                 # INV-BR-4 halt
-    assert os.path.exists(backup._force_baseline_marker_path())  # INV-BKP-5 recovery armed
+    assert backup._force_baseline_pending is True              # INV-BKP-5 recovery armed
     assert backup.alerts, "a FAILED restore-test must maker_notify"
     assert any(n == "BACKUP_RESTORE_TEST_FAIL" for n, _ in emitted)

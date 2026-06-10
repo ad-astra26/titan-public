@@ -75,7 +75,7 @@ WORKER_DRAIN_FILE = {
     "timechain":        "titan_hcl/modules/timechain_worker.py",
     # spirit_worker RETIRED (D-SPEC-116) — engines live in cognitive_worker.
     "cognitive_worker": "titan_hcl/modules/cognitive_worker.py",
-    "backup":           "titan_hcl/modules/backup_worker.py",
+    "backup":           "titan_hcl/modules/backup_orchestrator.py",
 }
 
 # Workers that consume NO broadcasts (only targeted QUERY) — reply_only=True.

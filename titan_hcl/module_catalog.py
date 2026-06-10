@@ -90,7 +90,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     from titan_hcl.modules.knowledge_worker import knowledge_worker_main
     from titan_hcl.modules.emot_cgn_worker import emot_cgn_worker_main
     from titan_hcl.modules.timechain_worker import timechain_worker_main
-    from titan_hcl.modules.backup_worker import backup_worker_main
+    from titan_hcl.modules.backup_orchestrator import backup_orchestrator_main
     from titan_hcl.persistence_entry import imw_main
 
     # Microkernel v2 Phase B.2.1 — spawn graduation gate. When true, the
@@ -1977,7 +1977,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     guardian.register(ModuleSpec(
         name="backup",
         layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (on-chain anchoring + 3-2-1 cold storage)
-        entry_fn=backup_worker_main,
+        entry_fn=backup_orchestrator_main,  # RFP_backup_redesign_spine Phase D (was backup_worker_main)
         config=config,  # full config — reads [backup]/[network]/[info_banner]/[mainnet_budget]/[memory_and_storage]
         rss_limit_mb=500,     # Phase 5 / 5G (2026-05-19): reverted 1200 → 500 after streaming
                               # encoders shipped (5A). Previously bumped 800 → 1200 was an anti-pattern

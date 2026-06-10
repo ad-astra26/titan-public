@@ -173,119 +173,16 @@ def test_timechain_paths_count_matches_spec():
 
 
 # ── Dedup race — async CAS lock regression test ─────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_personality_cas_lock_dedup_blocks_concurrent_meditations(monkeypatch):
-    """SPEC §24 / rFP_backup_diff_baseline_unified_v1 Phase 1 — closes
-    AUDIT_irys_arweave_costs_20260514 §4 BUG-2 (concurrent MEDITATION_COMPLETE
-    events all passing the bare date check before any could set the date,
-    observed 15 personality uploads on 2026-05-12).
-
-    Fires N concurrent on_meditation_complete events for the same UTC day.
-    Asserts upload_personality_to_arweave is invoked EXACTLY ONCE despite
-    the concurrent fan-out — the CAS lock + atomic date-write closes the
-    window between the read and the write.
-    """
-    rb = RebirthBackup(network_client=None, titan_id="T1",
-                       arweave_store=None, full_config={
-                           "backup": {"local_diff_enabled": False},
-                       })
-
-    # Disable all the side-effects we don't care about for this test
-    upload_call_count = {"n": 0}
-
-    async def _fake_upload(*a, **kw):
-        upload_call_count["n"] += 1
-        # Simulate non-trivial upload duration so concurrent calls have
-        # time to race at the CAS gate
-        await asyncio.sleep(0.05)
-        return {"arweave_tx": "fake_tx", "size_mb": 1.0, "archive_hash": "fake_hash"}
-
-    async def _noop_async(*a, **kw):
-        return None
-
-    def _noop_sync(*a, **kw):
-        return None
-
-    monkeypatch.setattr(rb, "upload_personality_to_arweave", _fake_upload)
-    monkeypatch.setattr(rb, "_compute_sovereignty", lambda: _noop_async())
-    monkeypatch.setattr(rb, "anchor_backup_hash", _noop_async)
-    monkeypatch.setattr(rb, "_update_vault_shadow_hash", _noop_async)
-    monkeypatch.setattr(rb, "_update_titan_frontmatter", _noop_sync)
-    monkeypatch.setattr(rb, "_alert_backup_success", _noop_sync)
-    monkeypatch.setattr(rb, "_alert_backup_failure", _noop_sync)
-    monkeypatch.setattr(rb, "_save_backup_state", _noop_sync)
-    # Block timechain path so test focuses on personality CAS
-    rb._last_timechain_date = "2099-12-31"
-    # Block soul path — not Sunday
-    rb._last_soul_date = "2099-12-31"
-
-    # Fire 10 concurrent meditation events
-    payload = {"success": True, "epoch": 1, "promoted": 0}
-    results = await asyncio.gather(*[
-        rb.on_meditation_complete(payload) for _ in range(10)
-    ])
-
-    assert upload_call_count["n"] == 1, (
-        f"CAS lock should permit exactly 1 personality upload across 10 "
-        f"concurrent meditations; observed {upload_call_count['n']}. "
-        f"Regression: AUDIT §4 BUG-2 dedup race re-opened."
-    )
-
-
-@pytest.mark.asyncio
-async def test_timechain_cas_lock_dedup_blocks_concurrent_meditations(monkeypatch):
-    """Companion to the personality CAS test — timechain gate has its own lock."""
-    rb = RebirthBackup(network_client=None, titan_id="T1",
-                       arweave_store=None, full_config={
-                           "backup": {"local_diff_enabled": False, "local_rolling_days": 30},
-                           "mainnet_budget": {"backup_arweave_enabled": False},
-                           "network": {"solana_network": "devnet"},
-                       })
-
-    timechain_call_count = {"n": 0}
-
-    async def _fake_snapshot_to_arweave(*a, **kw):
-        timechain_call_count["n"] += 1
-        await asyncio.sleep(0.05)
-        return None
-
-    # Block personality + soul paths
-    rb._last_personality_date = "2099-12-31"
-    rb._last_soul_date = "2099-12-31"
-
-    async def _noop_async(*a, **kw):
-        return None
-
-    def _noop_sync(*a, **kw):
-        return None
-
-    monkeypatch.setattr(rb, "_compute_sovereignty", lambda: _noop_async())
-    monkeypatch.setattr(rb, "_save_backup_state", _noop_sync)
-    rb.memory = None  # short-circuit memory.get_persistent_count
-
-    # Patch TimeChainBackup to capture concurrent calls without doing real work
-    import titan_hcl.logic.timechain_backup as tcb_module
-
-    class _FakeTCB:
-        def __init__(self, *a, **kw):
-            pass
-
-        async def snapshot_to_arweave(self, *a, **kw):
-            return await _fake_snapshot_to_arweave()
-
-    monkeypatch.setattr(tcb_module, "TimeChainBackup", _FakeTCB)
-
-    payload = {"success": True, "epoch": 1, "promoted": 0}
-    await asyncio.gather(*[
-        rb.on_meditation_complete(payload) for _ in range(10)
-    ])
-
-    assert timechain_call_count["n"] == 1, (
-        f"CAS lock should permit exactly 1 timechain upload across 10 "
-        f"concurrent meditations; observed {timechain_call_count['n']}"
-    )
+#
+# DELETED (RFP_backup_redesign_spine Phase D): the two legacy per-tier CAS
+# tests (`test_personality_cas_lock_dedup_blocks_concurrent_meditations` +
+# `test_timechain_cas_lock_dedup_blocks_concurrent_meditations`) exercised the
+# LEGACY per-type cascade (`upload_personality_to_arweave` / the legacy
+# `TimeChainBackup` ship) that Phase B-1 RETIRED from `on_meditation_complete`
+# (no-shim). They tested deleted behaviour (→ 0 uploads) and were stale-red on
+# origin. The unified_v2 daily-gate dedup (the live "ships exactly once across
+# concurrent meditations" guarantee — atomic events, no per-tier split) is
+# covered below by `test_unified_v2_ships_once_per_day_across_concurrent_meditations`.
 
 
 def test_cas_locks_are_lazy_constructed():
@@ -353,7 +250,12 @@ def _unified_v2_rb(monkeypatch, ship_counter, tmp_path, *, shipped=True, raises=
                 m.save()
         return shipped
 
-    monkeypatch.setattr(rb, "_run_unified_event_v2", _fake_run)
+    # RFP_backup_redesign_spine Phase D: with no fresh stage parked,
+    # on_meditation_complete's last-resort is now the BOUNDED
+    # `_inline_build_and_ship_v2` (build_slice + streamed ship via BackupWorker),
+    # NOT the legacy whole-file `_run_unified_event_v2`. The daily CAS gate this
+    # test pins is unchanged — it just drives the new ship method.
+    monkeypatch.setattr(rb, "_inline_build_and_ship_v2", _fake_run)
     monkeypatch.setattr(rb, "_alert_backup_failure", lambda *a, **kw: None)
     monkeypatch.setattr(rb, "_save_backup_state", lambda *a, **kw: None)
     return rb

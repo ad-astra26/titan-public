@@ -14,7 +14,7 @@ import pytest
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from titan_hcl.modules.backup_worker import _run_offhost_mirror
+from titan_hcl.modules.backup_orchestrator import _run_offhost_mirror
 
 
 def _state(full_config, send_queue=None):
@@ -96,8 +96,8 @@ def test_happy_path_emits_complete(tmp_path):
             ],
             "completed_at": 1778000000,
         })), \
-         mock.patch("titan_hcl.modules.backup_worker._send", side_effect=_capture_send), \
-         mock.patch("titan_hcl.modules.backup_worker._write_i7_telemetry"):
+         mock.patch("titan_hcl.modules.backup_orchestrator._send", side_effect=_capture_send), \
+         mock.patch("titan_hcl.modules.backup_orchestrator._write_i7_telemetry"):
         state = _state(cfg)
         _run_offhost_mirror(state, med_count=7)
 
@@ -132,8 +132,8 @@ def test_partial_failure_emits_failed(tmp_path):
                  "duration_s": 0.5, "error": "ssh: connection refused"},
             ],
         })), \
-         mock.patch("titan_hcl.modules.backup_worker._send", side_effect=_capture_send), \
-         mock.patch("titan_hcl.modules.backup_worker._write_i7_telemetry"):
+         mock.patch("titan_hcl.modules.backup_orchestrator._send", side_effect=_capture_send), \
+         mock.patch("titan_hcl.modules.backup_orchestrator._write_i7_telemetry"):
         state = _state(cfg)
         _run_offhost_mirror(state, med_count=9)
 
@@ -158,8 +158,8 @@ def test_mirror_crash_emits_failed_not_raised(tmp_path):
     with mock.patch(
         "titan_hcl.logic.offhost_mirror.OffhostMirror.pull_all",
         new=mock.AsyncMock(side_effect=RuntimeError("rsync exploded"))), \
-         mock.patch("titan_hcl.modules.backup_worker._send", side_effect=_capture_send), \
-         mock.patch("titan_hcl.modules.backup_worker._write_i7_telemetry"):
+         mock.patch("titan_hcl.modules.backup_orchestrator._send", side_effect=_capture_send), \
+         mock.patch("titan_hcl.modules.backup_orchestrator._write_i7_telemetry"):
         state = _state(cfg)
         # Must NOT raise — a mirror failure can never fail the backup
         _run_offhost_mirror(state, med_count=12)
@@ -188,8 +188,8 @@ def test_cleanup_called_on_success(tmp_path):
          mock.patch(
              "titan_hcl.logic.offhost_mirror.OffhostMirror.cleanup_all",
              new=_fake_cleanup), \
-         mock.patch("titan_hcl.modules.backup_worker._send"), \
-         mock.patch("titan_hcl.modules.backup_worker._write_i7_telemetry"):
+         mock.patch("titan_hcl.modules.backup_orchestrator._send"), \
+         mock.patch("titan_hcl.modules.backup_orchestrator._write_i7_telemetry"):
         state = _state(cfg)
         _run_offhost_mirror(state, med_count=1)
 

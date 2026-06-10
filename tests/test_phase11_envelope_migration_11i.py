@@ -28,7 +28,7 @@ import pytest
 ENTRY_ROSTER: list[tuple[str, str, str]] = [
     ("titan_hcl.modules.agency_worker",                  "agency_worker_main", "agency_worker"),
     ("titan_hcl.modules.agno_worker",                    "agno_worker_main", "agno_worker"),
-    ("titan_hcl.modules.backup_worker",                  "backup_worker_main", "backup"),
+    ("titan_hcl.modules.backup_orchestrator",            "backup_orchestrator_main", "backup"),
     ("titan_hcl.modules.body_worker",                    "body_worker_main", "body"),
     ("titan_hcl.modules.cgn_worker",                     "cgn_worker_main", "cgn"),
     ("titan_hcl.modules.cognitive_worker",               "cognitive_worker_main", "cognitive_worker"),

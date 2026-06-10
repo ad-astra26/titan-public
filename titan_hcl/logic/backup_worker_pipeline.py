@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Callable, Iterable, Optional
 
 from titan_hcl.logic.backup_unified_manifest import UnifiedManifest, new_event_id
@@ -42,6 +43,46 @@ logger = logging.getLogger("titan.backup.worker")
 # Default drip slice budget (Q-BRS-D / D-BRS-D — per-file-batch, bounded bytes).
 _DEFAULT_BYTE_BUDGET = 64 * 1024 * 1024  # 64 MB / build_slice tick
 _TIER_ORDER = ("personality", "timechain", "soul")
+
+# The Orchestrator's disk-persisted drip progress file (Phase D / INV-BRS-7).
+# Lives INSIDE the StagedBuild.scratch_dir so the progress record + the patch
+# artifacts it points at are one self-contained, restart-survivable unit.
+DRIP_PROGRESS_FILENAME = "drip_progress.json"
+
+
+def _relocate_owned_artifact(dd: dict, scratch_dir: str) -> None:
+    """Move an OWNED patch artifact (a temp `.vcdiff` / SQLite snapshot / tail /
+    skip file — `patch_owned=True`, the expensive drip work) INTO `scratch_dir`
+    and rewrite `patch_path`, so a disk-persisted drip survives a process
+    restart (Phase D). `patch_owned=False` artifacts are live-source pointers
+    (zero work, re-read at finalize_pack) — left in place. shutil.move handles a
+    cross-device snapshot (e.g. /tmp → data/). Best-effort: a relocation failure
+    leaves the artifact where the encoder wrote it (still packable this run; only
+    a mid-drip restart would miss it → the Orchestrator's reload validation then
+    discards + re-plans)."""
+    if not dd.get("patch_owned"):
+        return
+    src = dd.get("patch_path")
+    if not src or not os.path.exists(src):
+        return
+    src_real = os.path.realpath(src)
+    scratch_real = os.path.realpath(scratch_dir)
+    if os.path.dirname(src_real) == scratch_real:
+        return  # already in scratch
+    dst = os.path.join(scratch_dir, f"patch_{os.path.basename(src)}")
+    # Disambiguate a basename collision (two temps with the same suffix).
+    n = 0
+    while os.path.exists(dst):
+        n += 1
+        dst = os.path.join(scratch_dir, f"patch_{n}_{os.path.basename(src)}")
+    try:
+        shutil.move(src, dst)
+        dd["patch_path"] = dst
+    except OSError as e:
+        logger.warning(
+            "[BackupWorker] drip artifact relocate %s → %s failed: %s "
+            "(packable this run; a mid-drip restart would re-plan)",
+            src, dst, e)
 
 
 @dataclass
@@ -67,6 +108,68 @@ class StagedBuild:
     @property
     def fully_encoded(self) -> bool:
         return all(not specs for specs in self.pending.values())
+
+    # ── Disk persistence (Phase D drip resume — INV-BRS-7) ────────────────
+    def to_dict(self) -> dict:
+        """JSON-serializable snapshot for the Orchestrator's disk-persisted drip
+        (RFP §7.B / §7.D). Every field is primitive or a dataclass of primitives;
+        the patch artifacts themselves live on disk in `scratch_dir` (kept there
+        by `_relocate_owned_artifact`), so this record + that dir are one
+        self-contained, restart-survivable unit."""
+        return {
+            "event_id": self.event_id,
+            "event_type": self.event_type,
+            "baseline_trigger": self.baseline_trigger,
+            "baseline_event_id": self.baseline_event_id,
+            "prev_event_id": self.prev_event_id,
+            "soul_present": self.soul_present,
+            "scratch_dir": self.scratch_dir,
+            "titan_id": self.titan_id,
+            "built_at": self.built_at,
+            "pending": {c: [asdict(s) for s in specs]
+                        for c, specs in self.pending.items()},
+            "artifacts": {c: [[arc, dd] for arc, dd in arts]
+                          for c, arts in self.artifacts.items()},
+            "tier_results": {c: asdict(r)
+                             for c, r in self.tier_results.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StagedBuild":
+        """Reconstruct a StagedBuild persisted by `to_dict` (drip resume). The
+        Orchestrator validates freshness (baseline match + `missing_artifacts`)
+        AFTER reload and discards on any mismatch."""
+        pending = {c: [TierFileSpec(**s) for s in specs]
+                   for c, specs in (d.get("pending") or {}).items()}
+        artifacts = {c: [(arc, dd) for arc, dd in arts]
+                     for c, arts in (d.get("artifacts") or {}).items()}
+        tier_results = {c: TierShipResult(**r)
+                        for c, r in (d.get("tier_results") or {}).items()}
+        return cls(
+            event_id=d["event_id"], event_type=d["event_type"],
+            baseline_trigger=d.get("baseline_trigger"),
+            baseline_event_id=d.get("baseline_event_id"),
+            prev_event_id=d.get("prev_event_id"),
+            soul_present=bool(d.get("soul_present")),
+            scratch_dir=d["scratch_dir"], titan_id=d["titan_id"],
+            pending=pending, artifacts=artifacts, tier_results=tier_results,
+            built_at=float(d.get("built_at", 0.0)),
+        )
+
+    def missing_artifacts(self) -> list:
+        """OWNED patch-artifact paths recorded in `artifacts` that are no longer
+        on disk (a restart that lost the scratch, or a swept temp). A non-empty
+        list ⇒ the persisted drip is unsound → the Orchestrator discards +
+        re-plans (the 3-layer readiness still guarantees the ship)."""
+        missing = []
+        for arts in self.artifacts.values():
+            for _arc, dd in arts:
+                if not dd.get("patch_owned"):
+                    continue  # live-source pointer — re-read at pack, not persisted work
+                pp = dd.get("patch_path")
+                if pp and not os.path.exists(pp):
+                    missing.append(pp)
+        return missing
 
 
 class BackupWorker:
@@ -138,6 +241,10 @@ class BackupWorker:
                     dd = _build_incremental_payload(spec, base_path)
                 if dd is None:
                     continue   # source absent on disk — skip (matches build_tier)
+                # Phase D: keep the OWNED artifact inside scratch_dir so a
+                # disk-persisted drip survives a restart (the encoders write
+                # temps to /tmp / snapshot dirs by default).
+                _relocate_owned_artifact(dd, staged.scratch_dir)
                 staged.artifacts[component].append((spec.arc_name, dd))
                 spent += int(dd.get("patch_size_bytes", 0) or 0)
             if spent >= budget:

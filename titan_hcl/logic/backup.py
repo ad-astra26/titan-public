@@ -138,6 +138,23 @@ class RebirthBackup:
         self._staged_event = None
         self._stage_lock = threading.Lock()
 
+        # RFP_backup_redesign_spine Phase D / INV-BRS-7 — orchestrator-owned
+        # recovery/scheduling SIDE-STATE, consolidated from 4 scattered side-files
+        # (.restore_test_halt / .force_baseline / backup_dry_run_result /
+        # .mirror_state) into ONE in-memory object persisted in _BACKUP_STATE_PATH
+        # (the ONE atomic state file). The orchestrator timer-flushes it + the
+        # existing SAVE_NOW / MODULE_SHUTDOWN wiring flushes it; halt/force-baseline
+        # flush IMMEDIATELY (fail-closed: a crash must never lose a halt). Consumers
+        # (dashboard) read the consolidated JSON readout (synthesis-snapshot style —
+        # ModuleStateWriter carries only a state string, hand-rolled SHM is barred).
+        self._halted = False
+        self._halt_reason = ""
+        self._halt_failed_event_id = None
+        self._force_baseline_pending = False   # one-shot R4 recovery token (INV-BKP-5)
+        self._last_dry_run = None              # dashboard backup-health card
+        self._last_restore_test_date = None    # §24.12 Sunday once/day gate
+        self._mirror_state = None              # {event_id, chained, arcs, ts} | None
+
         # Load persisted backup state if available
         self._load_backup_state()
 
@@ -201,8 +218,19 @@ class RebirthBackup:
                 self._last_timechain_date = state.get("last_timechain_date", "")
                 self._meditation_count = state.get("meditation_count", 0)
                 self._meditation_count_since_nft = state.get("meditation_count_since_nft", 0)
-                logger.info("[Backup] Loaded state: personality=%s, soul=%s, meditations=%d",
-                            self._last_personality_date, self._last_soul_date, self._meditation_count)
+                # Phase D side-state (INV-BRS-7 consolidation)
+                self._halted = bool(state.get("halted", False))
+                self._halt_reason = state.get("halt_reason", "") or ""
+                self._halt_failed_event_id = state.get("halt_failed_event_id")
+                self._force_baseline_pending = bool(
+                    state.get("force_baseline_pending", False))
+                self._last_dry_run = state.get("last_dry_run")
+                self._last_restore_test_date = state.get("last_restore_test_date")
+                self._mirror_state = state.get("mirror_state")
+                logger.info("[Backup] Loaded state: personality=%s, soul=%s, "
+                            "meditations=%d, halted=%s",
+                            self._last_personality_date, self._last_soul_date,
+                            self._meditation_count, self._halted)
         except Exception as e:
             swallow_warn('[Backup] No backup state loaded', e,
                          key="logic.backup.no_backup_state_loaded", throttle=100)
@@ -225,6 +253,14 @@ class RebirthBackup:
                     "last_timechain_date": self._last_timechain_date,
                     "meditation_count": self._meditation_count,
                     "meditation_count_since_nft": self._meditation_count_since_nft,
+                    # Phase D side-state (INV-BRS-7) — ONE owned state file
+                    "halted": self._halted,
+                    "halt_reason": self._halt_reason,
+                    "halt_failed_event_id": self._halt_failed_event_id,
+                    "force_baseline_pending": self._force_baseline_pending,
+                    "last_dry_run": self._last_dry_run,
+                    "last_restore_test_date": self._last_restore_test_date,
+                    "mirror_state": self._mirror_state,
                     "updated_at": time.time(),
                 }, f, indent=2)
             os.replace(tmp, self._BACKUP_STATE_PATH)
@@ -347,12 +383,15 @@ class RebirthBackup:
                         if not shipped:
                             logger.info(
                                 "[Backup] §24 staged ship declined (stale/failed)"
-                                " — falling back to inline build")
-                            shipped = await self._run_unified_event_v2(
-                                weekday=weekday)
+                                " — falling back to a bounded inline build "
+                                "(Phase D last-resort)")
+                            shipped = await self._inline_build_and_ship_v2(
+                                weekday)
                     else:
-                        shipped = await self._run_unified_event_v2(
-                            weekday=weekday)
+                        # Phase D failsafe-2 (INV-BRS-3): no fresh stage at
+                        # meditation → bounded inline build+ship via BackupWorker
+                        # (NOT the legacy f.read _run_unified_event_v2).
+                        shipped = await self._inline_build_and_ship_v2(weekday)
                 except Exception as e:
                     logger.exception(
                         "[Backup] §24 unified_v2 ship raised — no backup this "
@@ -2024,39 +2063,27 @@ class RebirthBackup:
         return bool(cfg.get("chained_incrementals",
                             _BACKUP_CHAINED_INCREMENTALS_DEFAULT))
 
-    def _mirror_state_path(self) -> str:
-        return os.path.join(self._baseline_working_dir(), ".mirror_state.json")
-
     def _load_mirror_state(self) -> Optional[dict]:
-        """Read the sidecar {"event_id": str, "arcs": {arc: sha}}. None if
-        absent/unreadable (→ precheck adopts the mirror or recovers, fail-closed).
-        A local, regenerable integrity cache — NOT part of the §24.3 on-chain
-        schema, so a loss only triggers recovery, never data loss."""
-        import json
-        p = self._mirror_state_path()
-        if not os.path.exists(p):
+        """The rolling-mirror integrity sidecar — {"event_id": str, "chained":
+        bool, "arcs": {arc: sha}} — Phase D (INV-BRS-7): now lives IN-MEMORY in
+        the consolidated _BACKUP_STATE_PATH, not a co-located .mirror_state.json.
+        None if never written (→ precheck adopts the mirror or recovers,
+        fail-closed). A regenerable cache: a loss only forces a self_heal
+        baseline, never data loss (a stale .mirror_state.json from before the
+        Phase-D deploy is simply ignored → one self-heal baseline on first run)."""
+        st = self._mirror_state
+        if not isinstance(st, dict) or not isinstance(st.get("arcs"), dict):
             return None
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict) or not isinstance(data.get("arcs"), dict):
-                return None
-            return data
-        except (OSError, ValueError):
-            return None
+        return st
 
     def _write_mirror_state(self, event_id: str, arcs: dict) -> None:
-        """Atomically record the mirror's arc→sha map after an advance/recover."""
-        import json
-        p = self._mirror_state_path()
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        payload = {"event_id": event_id,
-                   "chained": self._chained_incrementals_enabled(),
-                   "arcs": arcs, "ts": time.time()}
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        os.replace(tmp, p)
+        """Record the mirror's arc→sha map after an advance/recover (Phase D:
+        into the consolidated state object, persisted via _save_backup_state)."""
+        self._mirror_state = {
+            "event_id": event_id,
+            "chained": self._chained_incrementals_enabled(),
+            "arcs": arcs, "ts": time.time()}
+        self._save_backup_state()
 
     def _hash_mirror_dir(self, base: str) -> dict:
         """{arc(relpath): file_merkle_root} for every file in the mirror, EXCLUDING
@@ -2428,63 +2455,40 @@ class RebirthBackup:
 
     # ── Phase R4: weekly full-chain restore-test + self-heal halt (§24.12, 2026-06-09) ──
 
-    def _restore_test_halt_path(self) -> str:
-        return os.path.join("data", "backups",
-                            f".restore_test_halt_{self._titan_id}.json")
-
-    def _force_baseline_marker_path(self) -> str:
-        return os.path.join("data", "backups",
-                            f".force_baseline_{self._titan_id}")
-
     def _is_backups_halted(self) -> bool:
         """True if a failed weekly restore-test HALTED scheduled backups (INV-BR-4).
-        Fail-closed: an unreadable halt-flag is treated as halted."""
-        import json
-        p = self._restore_test_halt_path()
-        if not os.path.exists(p):
-            return False
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                return bool(json.load(f).get("halted"))
-        except (OSError, ValueError):
-            return True
+        Phase D (INV-BRS-7): in-memory, loaded from _BACKUP_STATE_PATH at boot +
+        flushed IMMEDIATELY on set/clear. The consolidated state file is atomic
+        (tmp+os.replace → never torn), so the prior 'fail-closed on an unreadable
+        SEPARATE halt file' paranoia is subsumed (an unreadable main state file is
+        a far bigger problem, surfaced by _load_backup_state)."""
+        return bool(self._halted)
 
     def _set_backups_halt(self, reason: str, failed_event_id) -> None:
-        """HALT scheduled backups + arm the one-shot force-baseline recovery marker.
-        The marker is a SEPARATE file so it survives a halt-clear → the first event
-        after the Maker investigates+clears rebases to a clean baseline."""
-        import json
-        p = self._restore_test_halt_path()
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"halted": True, "reason": reason,
-                       "failed_event_id": failed_event_id, "ts": time.time()}, f)
-        os.replace(tmp, p)
-        try:
-            with open(self._force_baseline_marker_path(), "w", encoding="utf-8") as f:
-                f.write(str(failed_event_id or reason))
-        except OSError:
-            pass
+        """HALT scheduled backups + arm the one-shot force-baseline recovery
+        token (INV-BR-4 / INV-BKP-5). force_baseline_pending survives a halt-clear
+        (so the resume event rebases to a clean baseline). Persists IMMEDIATELY —
+        a crash must never lose a halt → never back up a suspect chain."""
+        self._halted = True
+        self._halt_reason = reason
+        self._halt_failed_event_id = failed_event_id
+        self._force_baseline_pending = True
+        self._save_backup_state()
 
     def _clear_backups_halt(self) -> None:
-        """Lift the halt (a green restore-test auto-clears; or an investigated manual
-        clear). Leaves the force-baseline marker intact → the resume event is a baseline."""
-        p = self._restore_test_halt_path()
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+        """Lift the halt (a green restore-test auto-clears; or an investigated
+        manual clear). Leaves force_baseline_pending intact → the resume event is
+        a baseline. Persists immediately."""
+        if self._halted:
+            self._halted = False
+            self._halt_reason = ""
+            self._save_backup_state()
 
     def _take_force_baseline(self) -> bool:
-        """One-shot: consume the R4 recovery force-baseline marker if present."""
-        p = self._force_baseline_marker_path()
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+        """One-shot: consume the R4 recovery force-baseline token if armed."""
+        if self._force_baseline_pending:
+            self._force_baseline_pending = False
+            self._save_backup_state()
             return True
         return False
 
@@ -2940,11 +2944,20 @@ class RebirthBackup:
                 return True
         return False
 
-    def _build_staged_event_v2(self, weekday: int):
-        """Pre-BUILD a unified event (no upload, no manifest mutation). Returns a
-        StagedBuild or None (arweave gate off / manifest unloadable). Mirrors
-        _run_unified_event_v2's spec/resolver wiring; the build/pack mechanics
-        are carved into BackupWorker (RFP_backup_redesign_spine Phase B)."""
+    def _plan_staged_build_v2(self, weekday: int, scratch_dir=None,
+                              *, byte_budget=None):
+        """RFP_backup_redesign_spine Phase D — the PLAN half of a staged build:
+        manifest load, tier specs, the §24 diff-base integrity precheck + the
+        new-vs-known resolver, and `BackupWorker.plan_build` (seeds the pending
+        specs — NO encode/pack yet). Returns `(worker, staged, baseline_resolver,
+        known_arcs)` or None (arweave gate off / manifest unloadable).
+
+        The BackupOrchestrator drives `build_slice` across idle ticks (the drip)
+        and `finalize_pack` at the deadline/ship; the one-shot
+        `_build_staged_event_v2` drains it inline (cold/inline fallback + tests).
+        `scratch_dir=None` → a fresh tempdir (one-shot); the Orchestrator passes
+        its STABLE per-Titan drip dir so a disk-persisted drip survives a restart.
+        `byte_budget` overrides the per-slice byte budget ([backup.orchestrator])."""
         from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
         from titan_hcl.logic.backup_worker_pipeline import BackupWorker
         try:
@@ -2969,24 +2982,43 @@ class RebirthBackup:
         s_specs = (self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
                    if (weekday == 6 or _should_rebase) else None)
         base_dir = self._baseline_working_dir()
-        # Phase B integrity precheck (sync stager thread → asyncio.run the async
+        # Phase B integrity precheck (sync caller thread → asyncio.run the async
         # precheck; the only async part is a rare chain-reconstruct). Decides
-        # force-baseline (missing KNOWN diff-base) + builds the new-vs-known resolver.
+        # force-baseline (missing KNOWN diff-base) + builds the new-vs-known
+        # resolver. ⚠ One-shot side effect: `_take_force_baseline` is CONSUMED
+        # here — so the Orchestrator runs this ONCE per plan and persists
+        # `known_arcs`; on a drip RESUME it rebuilds the resolver from the
+        # persisted known_arcs (NOT a re-precheck), preserving the force-baseline.
         _force_et, _force_trig, _known_arcs = asyncio.run(
             self._precheck_diff_base(manifest))
         _baseline_resolver = self._make_diff_base_resolver(base_dir, _known_arcs)
 
-        import tempfile
-        worker = BackupWorker(titan_id=self._titan_id, chain_provider=None)
-        scratch_dir = tempfile.mkdtemp(
-            prefix=f"titan_backup_stage_{self._titan_id}_")
+        if scratch_dir is None:
+            import tempfile
+            scratch_dir = tempfile.mkdtemp(
+                prefix=f"titan_backup_stage_{self._titan_id}_")
+        else:
+            os.makedirs(scratch_dir, exist_ok=True)
+        _kw = {"titan_id": self._titan_id, "chain_provider": None}
+        if byte_budget is not None:
+            _kw["byte_budget"] = int(byte_budget)
+        worker = BackupWorker(**_kw)
         staged = worker.plan_build(
             manifest=manifest, personality_specs=p_specs, timechain_specs=t_specs,
             soul_specs=s_specs, scratch_dir=scratch_dir,
             force_event_type=_force_et, force_trigger=_force_trig)
-        # Phase B: drain the whole build now (one-shot). Phase D drives the
-        # per-batch idle drip by calling build_slice across idle ticks; here the
-        # stager builds it inline off the recv loop, then finalize-packs.
+        return worker, staged, _baseline_resolver, _known_arcs
+
+    def _build_staged_event_v2(self, weekday: int):
+        """Pre-BUILD a unified event in ONE shot (no upload, no manifest mutation).
+        Returns a StagedBuild or None. KEPT for the cold/inline fallback + the
+        prestage tests; Phase D's BackupOrchestrator drives the per-batch idle
+        drip via `_plan_staged_build_v2` + `build_slice` across ticks instead."""
+        planned = self._plan_staged_build_v2(weekday)
+        if planned is None:
+            return None
+        worker, staged, _baseline_resolver, _known_arcs = planned
+        # Drain the whole build now (one-shot). Phase D drips this batch-by-batch.
         while worker.build_slice(staged, _baseline_resolver):
             pass
         worker.finalize_pack(staged)
@@ -2995,6 +3027,24 @@ class RebirthBackup:
             "awaiting meditation to ship)", staged.event_id[:8],
             staged.event_type)
         return staged
+
+    async def _inline_build_and_ship_v2(self, weekday: int) -> bool:
+        """RFP_backup_redesign_spine Phase D synchronous last-resort (failsafe-2,
+        INV-BRS-3): when no fresh stage is ready at meditation, build the event
+        INLINE via the SAME bounded BackupWorker primitive the drip uses
+        (`build_slice` byte-budget + streamed `finalize_pack`), then stream-ship
+        it (`_ship_staged_event_v2`) — NOT the legacy whole-file-buffering inline
+        path (`_run_unified_event_v2`, kept only for the manual trigger). The
+        build runs in a thread (its precheck `asyncio.run` needs a clean loop +
+        the CPU-bound build_slice/pack stays OFF the meditation coroutine), so
+        RSS stays bounded and meditation waits only briefly. Returns True if
+        shipped."""
+        loop = asyncio.get_running_loop()
+        staged = await loop.run_in_executor(
+            None, self._build_staged_event_v2, weekday)
+        if staged is None:
+            return False
+        return await self._ship_staged_event_v2(staged)
 
     async def _ship_staged_event_v2(self, staged) -> bool:
         """SHIP a pre-built StagedEvent (fast, on meditation). Reloads the
