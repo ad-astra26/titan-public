@@ -111,8 +111,9 @@ class _PhaseBBackup(RebirthBackup):
     def _baseline_working_dir(self):
         return self._mirror
 
-    def _send_telegram_alert(self, message):
-        self.alerts.append(message)
+    # _send_telegram_alert was DELETED in production (RFP Phase E — alerts route
+    # through titan_hcl.utils.maker_alert.send_maker_alert). Tests capture alerts
+    # by monkeypatching backup.send_maker_alert → self.alerts (see _capture_alerts).
 
     def _ensure_arweave_store_for_unified(self):
         return self._store
@@ -265,10 +266,13 @@ def test_resolver_raises_for_known_missing_returns_none_for_new(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_precheck_flag_off_missing_known_forces_self_heal_baseline(tmp_path):
+async def test_precheck_flag_off_missing_known_forces_self_heal_baseline(tmp_path, monkeypatch):
     mirror = str(tmp_path / "mirror")
     os.makedirs(mirror)
     backup = _PhaseBBackup(mirror, chained=False)
+    # Phase E: alerts route through send_maker_alert — capture into backup.alerts.
+    monkeypatch.setattr("titan_hcl.logic.backup.send_maker_alert",
+                        lambda text, *a, **k: backup.alerts.append(text))
     # sidecar says config.txt is KNOWN, but it is absent from the mirror.
     backup._write_mirror_state("base1", {"config.txt": "deadbeef"})
     force_et, force_trig, known = await backup._precheck_diff_base(
@@ -434,6 +438,9 @@ async def test_restore_test_fail_halts_backups(tmp_path, monkeypatch):
 
     arweave._store.clear()  # tarballs gone → reconstruct fetch fails → restore FAILS
     backup = _PhaseBBackup(str(tmp_path / "mirror"), chained=True, store=arweave)
+    # Phase E: the restore-test-failed alert routes through send_maker_alert.
+    monkeypatch.setattr("titan_hcl.logic.backup.send_maker_alert",
+                        lambda text, *a, **k: backup.alerts.append(text))
     emitted: list = []
     ok = await backup._run_weekly_restore_test(
         memo_fetch=solana.fetch, bus_emit=lambda n, p: emitted.append((n, p)))

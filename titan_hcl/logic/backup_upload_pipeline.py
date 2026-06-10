@@ -23,7 +23,8 @@ Per meditation:
        e. Capture per-fork block_ranges (for timechain) from each file's
           diff_dict — needed by Phase 8 surgical repair.
   4. Compute event_merkle_root from per-component tarball sha256s.
-  5. commit_event_merkle_to_zk_vault → zk_commit_tx.
+  5. commit_event_v3_chain / ChainProvider.commit_memo → zk_commit_tx
+     (the v=2 commit_event_merkle_to_zk_vault wrapper was retired — RFP Phase E).
   6. UnifiedManifest.append_event(make_event(...)) + .save().
   7. Emit BACKUP_EVENT_COMPLETE on the bus.
 

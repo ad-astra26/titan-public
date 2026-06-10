@@ -25,6 +25,7 @@ from typing import Optional
 
 from titan_hcl.utils.crypto import hash_file
 from titan_hcl.utils.silent_swallow import swallow_warn
+from titan_hcl.utils.maker_alert import send_maker_alert
 
 logger = logging.getLogger(__name__)
 
@@ -890,7 +891,9 @@ class RebirthBackup:
         # 2026-04-30 — wire Telegram notifier for auto-fund alerts (closes
         # rFP §5.5 silent-depletion gap). BackupCascade.auto_fund_irys_if_needed
         # invokes this callback on every successful auto-fund event.
-        cascade._telegram_notifier = self._send_telegram_alert
+        cascade._telegram_notifier = (
+            lambda m: send_maker_alert(
+                m, alert_key="backup.cascade_fund", rate_limit_seconds=0.0))
         cascade_result = await cascade.run(
             archive_path, "personality", _upload_personality,
             get_latest_record_fn=self.get_latest_backup_record,
@@ -1020,7 +1023,9 @@ class RebirthBackup:
         cascade = BackupCascade(full_config=self._full_config,
                                  arweave_store=store, local_dir=local_dir)
         # 2026-04-30 — wire Telegram notifier for auto-fund alerts (soul path).
-        cascade._telegram_notifier = self._send_telegram_alert
+        cascade._telegram_notifier = (
+            lambda m: send_maker_alert(
+                m, alert_key="backup.cascade_fund", rate_limit_seconds=0.0))
         cascade_result = await cascade.run(
             archive_path, "soul", _upload_soul,
             get_latest_record_fn=self.get_latest_backup_record,
@@ -1145,53 +1150,24 @@ class RebirthBackup:
         }
 
     # -------------------------------------------------------------------------
-    # Telegram Alerts — Notify Maker on backup events
+    # Maker alerts — backup events (RFP_backup_redesign_spine Phase E eviction)
     # -------------------------------------------------------------------------
-    _TELEGRAM_BOT_TOKEN = "8531091229:AAElGsqbsLDvDfxaCwMwG1qGdBzyVlksI0c"
-    _TELEGRAM_CHAT_ID = "0"
-
-    def _send_telegram_alert(self, message: str):
-        """Send backup alert to Maker via Telegram. Non-blocking, fire-and-forget.
-
-        Phase E.2.4 fix: previous version used sync httpx.post inside a sync
-        method called from async contexts. The "non-blocking" comment was
-        aspirational — the call actually blocked the event loop for up to
-        10s on slow Telegram API responses. Now uses a daemon thread so
-        it's truly fire-and-forget regardless of caller context.
-        """
-        def _post():
-            try:
-                import httpx
-                url = f"https://api.telegram.org/bot{self._TELEGRAM_BOT_TOKEN}/sendMessage"
-                httpx.post(url, json={
-                    "chat_id": self._TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "Markdown",
-                }, timeout=10)
-            except Exception as e:
-                swallow_warn('[Backup] Telegram alert failed (non-critical)', e,
-                             key="logic.backup.telegram_alert_failed_non_critical", throttle=100)
-        import threading
-        threading.Thread(target=_post, daemon=True,
-                         name="telegram-alert").start()
-
-    def _alert_backup_success(self, backup_type: str, size_mb: float,
-                               archive_hash: str, arweave_tx: str = ""):
-        """Alert Maker on successful backup."""
-        tx_info = f"\nArweave: `{arweave_tx[:20]}...`" if arweave_tx else "\nStorage: local"
-        self._send_telegram_alert(
-            f"✅ *Titan Backup OK*\n"
-            f"Type: {backup_type}\n"
-            f"Size: {size_mb:.1f} MB\n"
-            f"Hash: `{archive_hash[:16]}`{tx_info}"
-        )
+    # The duplicate in-class Telegram POST (`_send_telegram_alert`) + its
+    # token/chat-id constants + the orphaned `_alert_backup_success` were DELETED:
+    # backup alerts now route through the unified, rate-limited
+    # `titan_hcl.utils.maker_alert.send_maker_alert` (ONE Telegram impl fleet-wide;
+    # its defaults mirror the old backup token/chat). `_alert_backup_failure`
+    # stays as the backup-specific failure FORMATTER (4 callers).
 
     def _alert_backup_failure(self, backup_type: str, error: str):
-        """Alert Maker on backup failure — immediate."""
-        self._send_telegram_alert(
+        """Alert Maker on backup failure via the unified send_maker_alert
+        (rate-limited per failure-type to avoid storms — RFP Phase E)."""
+        send_maker_alert(
             f"🔴 *Titan Backup FAILED*\n"
             f"Type: {backup_type}\n"
-            f"Error: {error[:200]}"
+            f"Error: {error[:200]}",
+            alert_key=f"backup.failure.{backup_type}",
+            rate_limit_seconds=300.0,
         )
 
     # -------------------------------------------------------------------------
@@ -1239,9 +1215,10 @@ class RebirthBackup:
                         logger.warning("[Backup] Restore error for %s: %s", member.name, e)
 
             logger.info("[Backup] Restored %d files (%d errors)", len(restored), len(errors))
-            self._send_telegram_alert(
+            send_maker_alert(
                 f"🔄 *Titan Restore Complete*\n"
-                f"Files: {len(restored)}\nErrors: {len(errors)}"
+                f"Files: {len(restored)}\nErrors: {len(errors)}",
+                alert_key="backup.restore_complete", rate_limit_seconds=300.0,
             )
             return {"success": len(errors) == 0, "restored": len(restored), "errors": errors}
 
@@ -1305,8 +1282,9 @@ class RebirthBackup:
             )
 
             logger.info("[Backup] Downloading personality from Arweave: %s", tx_id[:20])
-            self._send_telegram_alert(
-                f"🔄 *Titan Restore Started*\nDownloading from Arweave: `{tx_id[:20]}...`"
+            send_maker_alert(
+                f"🔄 *Titan Restore Started*\nDownloading from Arweave: `{tx_id[:20]}...`",
+                alert_key="backup.restore_started", rate_limit_seconds=300.0,
             )
 
             data = await store.fetch(tx_id)
@@ -1472,65 +1450,6 @@ class RebirthBackup:
 
         except Exception as e:
             logger.warning("[Backup] Backup hash anchor failed (non-critical): %s", e)
-            return None
-
-    # ── SPEC §24.7 — ZK Vault Merkle commit per unified-manifest event ─────
-    #
-    # Distinct from `anchor_backup_hash` above (which is the legacy Phase 8
-    # per-asset v=2 chain). This method anchors the EVENT-level Merkle root
-    # — one event = personality + timechain + soul together = one Solana
-    # commit — as required by SPEC §24.7 for the Arweave plane's
-    # backup_unified_manifest.
-    #
-    # The two anchor channels coexist:
-    #   anchor_backup_hash       — per-asset chain (TITAN|BACKUP|v=2|...)
-    #   commit_event_merkle_to_zk_vault  — per-event chain (v=2;event_id=...)
-    # Restore walks both chains independently per §24.7 + §11.H.4.
-    async def commit_event_merkle_to_zk_vault(
-        self,
-        event_id: str,
-        event_merkle_root: str,
-        prev_event_merkle_root: Optional[str] = None,
-    ) -> Optional[str]:
-        """SPEC §24.7 — submit event_merkle_root as v=2 Solana memo.
-
-        Builds the canonical `v=2;event_id={id};root={root[:32]};prev={prev[:16]}`
-        memo (or `prev=genesis` for first event) and sends via existing
-        `network.send_sovereign_transaction([memo_ix], priority="LOW")`.
-
-        Returns Solana tx_id on success — caller stores in the manifest
-        event's `zk_commit_tx` field. Returns None on failure (caller
-        emits BACKUP_EVENT_FAILED + retries on next meditation cycle).
-        """
-        from titan_hcl.logic.backup_zk_commit import build_zk_memo
-
-        if not self.network or not hasattr(self.network, "send_sovereign_transaction"):
-            return None
-
-        try:
-            from titan_hcl.utils.solana_client import (
-                build_memo_instruction, is_available)
-            if not is_available() or self.network.keypair is None:
-                return None
-
-            memo_text = build_zk_memo(
-                event_id=event_id,
-                event_merkle_root=event_merkle_root,
-                prev_event_merkle_root=prev_event_merkle_root,
-            )
-            memo_ix = build_memo_instruction(self.network.pubkey, memo_text)
-            sig = await self.network.send_sovereign_transaction(
-                [memo_ix], priority="LOW"
-            )
-            if sig:
-                logger.info(
-                    "[Backup] §24.7 event Merkle anchored on-chain: tx=%s "
-                    "event_id=%s root=%s...",
-                    sig[:20] if len(sig) > 20 else sig,
-                    event_id[:8], event_merkle_root[:16])
-            return sig
-        except Exception as e:
-            logger.warning("[Backup] §24.7 ZK Vault event commit failed: %s", e)
             return None
 
     # ── SPEC §24.12 (5J-2) — Sovereign v=3 chain commit (per-component memos) ─
@@ -1840,7 +1759,8 @@ class RebirthBackup:
                f"next backup is a full snapshot.")
         logger.warning("[Backup] %s", msg)
         try:
-            self._send_telegram_alert(msg)
+            send_maker_alert(msg, alert_key="backup.self_heal",
+                             rate_limit_seconds=3600.0)
         except Exception:
             pass
 
@@ -2294,10 +2214,12 @@ class RebirthBackup:
                 reason, fe, result.errors)
             self._set_backups_halt(reason=reason, failed_event_id=fe)
             try:
-                self._send_telegram_alert(
+                send_maker_alert(
                     f"🛑 §24.12 WEEKLY RESTORE-TEST FAILED — reason={reason}, "
                     f"event={str(fe)[:12]}. Scheduled Arweave backups are HALTED "
-                    f"until investigated; restore-from-Arweave may be at risk.")
+                    f"until investigated; restore-from-Arweave may be at risk.",
+                    alert_key="backup.restore_test_failed",
+                    rate_limit_seconds=3600.0)
             except Exception:
                 pass
             if bus_emit:

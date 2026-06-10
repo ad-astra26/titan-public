@@ -6,12 +6,14 @@ Per rFP §5.2 test coverage:
   - prev-chain linkage round-trip via parse_zk_memo
   - Length bound: memo stays within Solana memo cap
 
-Plus a thin integration test that RebirthBackup.commit_event_merkle_to_zk_vault
-delegates to send_sovereign_transaction with the canonical memo (mocked Solana).
+(The RebirthBackup.commit_event_merkle_to_zk_vault integration tests were removed
+in RFP_backup_redesign_spine Phase E — that v=2 wrapper was subsumed by
+commit_event_v3_chain / ChainProvider.commit_memo and deleted. The v=2 memo
+CRYPTO below — compute_event_merkle_root / build_zk_memo / parse_zk_memo — is
+KEPT, INV-BRS-8.)
 """
 
 import hashlib
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -167,97 +169,3 @@ def test_parse_zk_memo_rejects_malformed(bad_memo):
 
 def test_zk_commit_memo_version_constant():
     assert ZK_COMMIT_MEMO_VERSION == 2
-
-
-# ── RebirthBackup integration (mocked Solana) ─────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_commit_event_merkle_to_zk_vault_builds_correct_memo():
-    """RebirthBackup.commit_event_merkle_to_zk_vault delegates to
-    send_sovereign_transaction with the canonical v=2 memo + returns
-    the resulting tx_id."""
-    # Build a fake network client
-    fake_network = MagicMock()
-    fake_network.send_sovereign_transaction = AsyncMock(return_value="fake_tx_sig_123")
-    fake_network.keypair = object()  # not None
-    fake_network.pubkey = MagicMock()
-
-    rb = RebirthBackup(network_client=fake_network, titan_id="T1",
-                       arweave_store=None, full_config={})
-
-    # Patch the solana_client module so we don't need a real Solana client
-    captured_memo = []
-
-    def _fake_build_memo_ix(pubkey, text):
-        captured_memo.append(text)
-        return "fake_memo_ix"
-
-    with patch("titan_hcl.utils.solana_client.is_available", return_value=True), \
-         patch("titan_hcl.utils.solana_client.build_memo_instruction",
-               side_effect=_fake_build_memo_ix):
-        sig = await rb.commit_event_merkle_to_zk_vault(
-            event_id="ev_abc",
-            event_merkle_root="a" * 64,
-            prev_event_merkle_root="b" * 64,
-        )
-
-    assert sig == "fake_tx_sig_123"
-    assert len(captured_memo) == 1
-    memo = captured_memo[0]
-    assert memo.startswith("v=2;event_id=ev_abc;")
-    assert f"root={'a' * 32}" in memo
-    assert f"prev={'b' * 16}" in memo
-    fake_network.send_sovereign_transaction.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_commit_event_merkle_returns_none_when_no_network():
-    """No network client → return None, don't crash."""
-    rb = RebirthBackup(network_client=None, titan_id="T1",
-                       arweave_store=None, full_config={})
-    result = await rb.commit_event_merkle_to_zk_vault(
-        event_id="ev_x", event_merkle_root="a" * 64,
-        prev_event_merkle_root=None,
-    )
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_commit_event_merkle_returns_none_when_keypair_missing():
-    fake_network = MagicMock()
-    fake_network.send_sovereign_transaction = AsyncMock()
-    fake_network.keypair = None  # no signing key
-
-    rb = RebirthBackup(network_client=fake_network, titan_id="T1",
-                       arweave_store=None, full_config={})
-    with patch("titan_hcl.utils.solana_client.is_available", return_value=True):
-        result = await rb.commit_event_merkle_to_zk_vault(
-            event_id="ev_x", event_merkle_root="a" * 64,
-            prev_event_merkle_root=None,
-        )
-    assert result is None
-    fake_network.send_sovereign_transaction.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_commit_event_merkle_handles_send_failure():
-    """If send_sovereign_transaction raises, return None gracefully
-    (caller emits BACKUP_EVENT_FAILED + retries next meditation)."""
-    fake_network = MagicMock()
-    fake_network.send_sovereign_transaction = AsyncMock(
-        side_effect=RuntimeError("Solana RPC unreachable"))
-    fake_network.keypair = object()
-    fake_network.pubkey = MagicMock()
-
-    rb = RebirthBackup(network_client=fake_network, titan_id="T1",
-                       arweave_store=None, full_config={})
-
-    with patch("titan_hcl.utils.solana_client.is_available", return_value=True), \
-         patch("titan_hcl.utils.solana_client.build_memo_instruction",
-               return_value="fake_ix"):
-        result = await rb.commit_event_merkle_to_zk_vault(
-            event_id="ev_x", event_merkle_root="a" * 64,
-            prev_event_merkle_root=None,
-        )
-    assert result is None
