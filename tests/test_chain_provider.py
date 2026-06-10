@@ -75,18 +75,56 @@ async def test_get_to_file_missing_returns_false(tmp_path):
 # ── ABC contract: trust/funding not yet implemented (Phase B/C) ────────────
 
 @pytest.mark.asyncio
-async def test_dataplane_only_provider_defers_trust_and_funding():
-    """ArweaveChainProvider implements the Phase-A data plane; the trust +
-    funding verbs raise NotImplementedError until Phases B/C (the ABC default)."""
-    cp = ArweaveChainProvider(keypair_path="/nonexistent", network="devnet")
-    with pytest.raises(NotImplementedError):
+async def test_real_provider_commit_needs_signer_funding_still_deferred():
+    """The real provider's commit_memo (Phase B) REQUIRES a network_client
+    (signer) — without one it raises a clear RuntimeError, never a silent no-op.
+    Funding (Phase C) still defers to NotImplementedError (the ABC default)."""
+    cp = ArweaveChainProvider(keypair_path="/nonexistent", network="devnet")  # no network_client
+    with pytest.raises(RuntimeError):
         await cp.commit_memo("memo")
-    with pytest.raises(NotImplementedError):
-        await cp.read_memo("sig")
+    with pytest.raises(RuntimeError):                       # head-bundle path also needs the signer
+        await cp.commit_memo("memo", state_root="deadbeef" * 8)
     with pytest.raises(NotImplementedError):
         await cp.balance()
     with pytest.raises(NotImplementedError):
         await cp.fund(0.01)
+
+
+# ── Phase B — trust plane (Fake-backed) ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_commit_read_memo_roundtrip():
+    """commit_memo → a sig; read_memo(sig) returns the memo text. The per-event
+    contract: a HEAD commit (state_root set) and a TAIL commit (no state_root)
+    both produce readable memos."""
+    cp = FakeChainProvider()
+    head_sig = await cp.commit_memo("v=3;e1;PT;url=tx_p", state_root="ab" * 32,
+                                    sovereignty_bp=7000)
+    tail_sig = await cp.commit_memo("v=3;e1;TC;url=tx_t")
+    assert head_sig and tail_sig and head_sig != tail_sig
+    assert await cp.read_memo(head_sig) == "v=3;e1;PT;url=tx_p"
+    assert await cp.read_memo(tail_sig) == "v=3;e1;TC;url=tx_t"
+    assert await cp.read_memo("fakesig_unknown") is None
+
+
+@pytest.mark.asyncio
+async def test_list_memos_newest_first():
+    """list_memos returns sigs newest→oldest (the resurrection-walk order), capped
+    at limit — mirroring getSignaturesForAddress."""
+    cp = FakeChainProvider()
+    sigs = [await cp.commit_memo(f"v=3;e{i}") for i in range(5)]
+    listed = await cp.list_memos("Titan_pubkey", limit=3)
+    assert listed == list(reversed(sigs))[:3]    # newest 3, newest-first
+
+
+@pytest.mark.asyncio
+async def test_commit_memo_state_root_changes_sig():
+    """The head-bundle (state_root) is part of the committed tx — the Fake's sig
+    reflects it, so a head commit is distinguishable from the same memo as a tail."""
+    cp = FakeChainProvider()
+    s_head = await cp.commit_memo("same-memo", state_root="cd" * 32)
+    s_tail = await cp.commit_memo("same-memo")
+    assert s_head != s_tail
 
 
 def test_chain_provider_is_abstract():

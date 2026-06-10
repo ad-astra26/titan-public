@@ -99,11 +99,17 @@ class ArweaveChainProvider(ChainProvider):
     (devnet). Absorbs `ArweaveStore`'s upload/fetch I/O (RFP §5).
     """
 
-    def __init__(self, *, keypair_path: str, network: str, rpc_url: str = ""):
+    def __init__(self, *, keypair_path: str, network: str, rpc_url: str = "",
+                 network_client=None, vault_program_id: Optional[str] = None):
         self._keypair_path = keypair_path
         self._network = (network or "devnet").strip().lower()
         self._rpc_url = rpc_url
         self._devnet = self._network not in ("mainnet", "mainnet-beta")
+        # Solana TRUST plane (Phase B): the signer/sender (a HybridNetworkClient
+        # exposing `.pubkey` + `.send_sovereign_transaction`). `commit_memo`
+        # REQUIRES it; reads (`read_memo`/`list_memos`) need only `rpc_url`.
+        self._network_client = network_client
+        self._vault_program_id = vault_program_id
 
     # ── put ──
     async def put(self, src: PutSource, *,
@@ -227,3 +233,43 @@ class ArweaveChainProvider(ChainProvider):
                     last = str(e)[:48]
         logger.debug("[ChainProvider] head(%s) unverified: %s", tx_id[:16], last)
         return "unverified"
+
+    # ── TRUST plane (Phase B) — absorbs the I/O tail of commit_event_v3_chain ──
+    async def commit_memo(self, memo_text: str, *, state_root: Optional[str] = None,
+                          sovereignty_bp: Optional[int] = None) -> Optional[str]:
+        """Send ONE memo-bearing Solana tx (RFP §1.2). state_root set ⇒ bundle the
+        ZK-Vault commit_state on the same tx (the event HEAD). Mirrors the live
+        commit pattern: ixs = [commit_ix, memo_ix] for the head, [memo_ix] for a
+        tail; priority="LOW". Memo BUILDING stays in the caller (`build_v3_memo`)."""
+        if self._network_client is None:
+            raise RuntimeError(
+                "ChainProvider.commit_memo needs a network_client (Solana signer) "
+                "— inject one for the trust plane")
+        from titan_hcl.utils.solana_client import (
+            build_memo_instruction, build_vault_commit_instruction)
+        memo_ix = build_memo_instruction(self._network_client.pubkey, memo_text)
+        if memo_ix is None:
+            logger.error("[ChainProvider] commit_memo: memo ix build failed")
+            return None
+        ixs = [memo_ix]
+        if state_root is not None:
+            try:
+                root_bytes = bytes.fromhex(state_root)
+            except ValueError:
+                logger.error("[ChainProvider] commit_memo: state_root not valid hex")
+                return None
+            commit_ix = build_vault_commit_instruction(
+                self._network_client.pubkey, root_bytes,
+                int(sovereignty_bp or 0), self._vault_program_id)
+            if commit_ix is not None:
+                ixs = [commit_ix, memo_ix]  # commit FIRST, then memo (live order)
+        return await self._network_client.send_sovereign_transaction(ixs, priority="LOW")
+
+    async def read_memo(self, tx_sig: str) -> Optional[str]:
+        from titan_hcl.utils.solana_client import get_memo_for_tx
+        return await get_memo_for_tx(tx_sig, rpc_url=self._rpc_url or None)
+
+    async def list_memos(self, address: str, *, limit: int) -> list[str]:
+        from titan_hcl.utils.solana_client import get_signatures_for_address
+        return await get_signatures_for_address(
+            address, rpc_url=self._rpc_url or None, limit=limit)
