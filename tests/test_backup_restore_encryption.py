@@ -6,11 +6,10 @@ Covers:
   2. decrypt_from_manifest passthrough for legacy records (algorithm="none").
   3. decrypt_from_manifest rejects unknown algorithm.
   4. load_keypair_bytes on a well-formed file returns (kp_bytes, pubkey).
-  5. End-to-end: encrypt a tarball via cascade, then look up the record that
-     cascade-enriched pipeline would produce and decrypt it — simulates the live
-     RebirthBackup.restore_personality_from_arweave path.
+  5. End-to-end: encrypt a tarball via backup_crypto (the unified encryption
+     SoT), build the manifest stanza a backup record would hold, and decrypt it
+     — simulates the live RebirthBackup.restore_personality_from_arweave path.
 """
-import asyncio
 import base64
 import hashlib
 import io
@@ -20,11 +19,13 @@ import tarfile
 
 import pytest
 
-from titan_hcl.logic.backup_cascade import BackupCascade
 from titan_hcl.logic.backup_crypto import (
     ALGORITHM_ID,
     decrypt_from_manifest,
+    derive_backup_key,
     derive_master_key,
+    encrypt_tarball,
+    key_id,
     load_keypair_bytes,
 )
 
@@ -122,37 +123,35 @@ def test_load_keypair_bytes_malformed_raises(tmp_path):
 # 3. End-to-end: cascade-encrypted tarball decrypts via manifest
 # ────────────────────────────────────────────────────────────────────────────
 
-def test_cascade_encrypted_then_decrypt_via_manifest(tmp_path):
-    """Simulates RebirthBackup.restore_personality_from_arweave flow:
-    record was created by cascade (captures encryption stanza), restore path
-    reads the record and reconstructs plaintext from the Arweave bytes.
+def test_unified_encrypted_then_decrypt_via_manifest(tmp_path):
+    """End-to-end: a tarball encrypted by the unified pipeline (backup_crypto —
+    the live encryption SoT) decrypts via its captured manifest stanza. Mirrors
+    the restore path: the record holds the encryption stanza, restore fetches
+    the ciphertext bytes and reconstructs plaintext.
     """
-    cfg = {"backup": {"mode": "local_only"}, "network": {}}
-    cascade = BackupCascade(full_config=cfg, arweave_store=object(),
-                             local_dir=str(tmp_path))
     kp = _fake_kp()
     master = derive_master_key(kp, TITAN_PUBKEY)
-    ctx = {"master_key": master, "tier": "private"}
 
-    src = tmp_path / "src.tar.gz"
     payload = b"end-to-end restore payload"
-    with open(src, "wb") as f:
-        f.write(_make_tarball_bytes(payload))
-    plaintext = src.read_bytes()
+    plaintext = _make_tarball_bytes(payload)
+    backup_id = hashlib.sha256(plaintext).hexdigest()[:16]
+    bkey = derive_backup_key(master, backup_id, "personality")
+    ct, iv, tag = encrypt_tarball(plaintext, bkey)  # ct = ciphertext_with_tag
 
-    async def _no_upload(_):
-        return {"arweave_tx": "devnet-skip"}
+    # The encryption stanza a backup record would hold (what restore reads).
+    stanza = {
+        "algorithm": ALGORITHM_ID,
+        "key_id": key_id(backup_id, "personality"),
+        "tier": "private",
+        "iv_b64": base64.b64encode(iv).decode("ascii"),
+        "auth_tag_b64": base64.b64encode(tag).decode("ascii"),
+        "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
+        "ciphertext_sha256": hashlib.sha256(ct).hexdigest(),
+        "backup_id": backup_id,
+    }
 
-    result = asyncio.run(cascade.run(str(src), "personality", _no_upload,
-                                      encryption=ctx))
-    # Local copy is ciphertext
-    assert "encryption" in result
-    ciphertext_on_disk = open(result["local_path"], "rb").read()
-
-    # Simulate remote fetch: we already have the bytes. Use the record's
-    # encryption stanza (what backup records would hold) to decrypt.
-    recovered = decrypt_from_manifest(
-        ciphertext_on_disk, result["encryption"], kp, TITAN_PUBKEY, "personality")
+    # Simulate remote fetch: we already have the bytes. Decrypt via the stanza.
+    recovered = decrypt_from_manifest(ct, stanza, kp, TITAN_PUBKEY, "personality")
     assert recovered == plaintext
 
 

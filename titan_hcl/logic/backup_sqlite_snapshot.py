@@ -35,13 +35,10 @@ logger = logging.getLogger("titan.backup.sqlite_snapshot")
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"  # 16-byte file header
 
-# conn.backup step size — mirrors writer_service._SNAPSHOT_BACKUP_* so the IMW
-# op and the self-written read-conn path step at the same cadence. Stepped
-# pages+sleep (NOT VACUUM INTO) so a hot DB yields the source lock between
-# batches; the online-backup API guarantees a consistent point-in-time image
-# even under concurrent writes (auto-restart on mid-copy source change).
-_BACKUP_PAGES = 1024       # ~4 MB per step at the 4 KiB default page size
-_BACKUP_SLEEP_S = 0.001    # 1 ms yield between page batches
+# §24.5.a v0.4.1 (2026-06-10): the self-written-DB snapshot uses VACUUM INTO (one
+# atomic consistent statement) — mirrors the IMW op (writer_service). It SUPERSEDED
+# the stepped `conn.backup(pages,sleep)`, which restarted from page 1 on every
+# external commit → LIVELOCKED on a continuously-written DB (never converged).
 _BACKUP_TIMEOUT_S = 30.0
 
 
@@ -113,20 +110,24 @@ def _prepare_dest(dest_path: str) -> None:
 
 
 def _read_conn_backup(src_path: str, dest_path: str) -> int:
-    """Consistent online backup of a SELF-written SQLite DB via our OWN
-    read-only connection (WAL-safe, concurrency-safe across processes). Stepped
-    pages+sleep. Returns the snapshot size in bytes. Synchronous — run off the
-    heartbeat thread by the caller (INV-BRS-3)."""
+    """Consistent point-in-time snapshot of a SELF-written SQLite DB via
+    `VACUUM INTO` on our OWN connection (WAL-safe, concurrency-safe across
+    processes). Returns the snapshot size in bytes. Synchronous — run off the
+    heartbeat thread by the caller (INV-BRS-3).
+
+    `VACUUM INTO` (one atomic statement = one consistent read transaction)
+    SUPERSEDED the stepped `conn.backup(pages,sleep)` online-backup API, which
+    restarted from page 1 on every external commit and so LIVELOCKED on a hot DB
+    (never converged). It converges in a single pass under concurrent writes; in
+    WAL mode the read transaction never blocks the writer. query_only=1 is NOT
+    set — VACUUM is write-classed (SQLITE_READONLY otherwise) yet writes only
+    `dest_path`, never the source. `_prepare_dest` removes any prior image first
+    (VACUUM INTO requires the target not exist)."""
     import sqlite3
     _prepare_dest(dest_path)
     src = sqlite3.connect(src_path, timeout=_BACKUP_TIMEOUT_S)
     try:
-        src.execute("PRAGMA query_only=1")  # read-only source connection
-        dst = sqlite3.connect(dest_path)
-        try:
-            src.backup(dst, pages=_BACKUP_PAGES, sleep=_BACKUP_SLEEP_S)
-        finally:
-            dst.close()
+        src.execute("VACUUM INTO ?", (dest_path,))
     finally:
         src.close()
     return os.path.getsize(dest_path) if os.path.exists(dest_path) else 0

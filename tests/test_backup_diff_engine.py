@@ -187,6 +187,57 @@ def test_self_written_sqlite_snapshot_consistent_under_writes(tmp_path):
         th.join(timeout=5)
 
 
+# ── Livelock regression guard (§24.5.a v0.4.1: VACUUM INTO, not stepped) ─
+
+
+def test_sqlite_snapshot_converges_under_continuous_writes(tmp_path):
+    """The stepped `conn.backup(pages,sleep)` restarted from page 1 on every
+    external commit, so a continuously-written DB larger than one backup step
+    NEVER converged (50% CPU spin + 300 s IPC timeout + partial `.snap.` litter).
+    VACUUM INTO converges in one pass. The DB is sized past one 1024-page step
+    (>4 MB) and a writer hammers commits throughout — a regression to any
+    restart-on-write mechanic would hang past the bound instead of completing.
+    (The smaller GA1 tests above do NOT catch this — they fit in one step.)"""
+    db = tmp_path / "hot_self.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+    conn.executemany("INSERT INTO t(v) VALUES(?)", [("x" * 2048,) for _ in range(4000)])
+    conn.commit()
+    conn.close()
+    assert db.stat().st_size > 4 * 1024 * 1024   # > one stepped batch
+
+    stop = threading.Event()
+
+    def hammer():
+        w = sqlite3.connect(str(db), timeout=30)
+        w.execute("PRAGMA journal_mode=WAL")
+        i = 4000
+        while not stop.is_set():
+            w.execute("INSERT INTO t(v) VALUES(?)", (f"hot-{i}",))
+            w.commit()
+            i += 1
+        w.close()
+
+    th = threading.Thread(target=hammer)
+    th.start()
+    time.sleep(0.05)
+    try:
+        dest = tmp_path / "snap.db"
+        t0 = time.monotonic()
+        snapshot_sqlite_sync(str(db), str(dest))   # must CONVERGE, not livelock
+        elapsed = time.monotonic() - t0
+        assert elapsed < 20.0, f"snapshot took {elapsed:.1f}s — livelock regression?"
+        s = sqlite3.connect(str(dest))
+        try:
+            assert s.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            s.close()
+    finally:
+        stop.set()
+        th.join(timeout=5)
+
+
 # ── GA1(b): IMW snapshot consistency + commit loop NOT stalled ───────
 
 

@@ -1,7 +1,7 @@
 """Integration tests for scripts/decrypt_backup.py — rFP_backup_worker Phase 7.4.
 
 Exercises the Maker emergency-recovery CLI end-to-end:
-  - Encrypt a tarball via BackupCascade, persist a record file
+  - Encrypt a tarball via backup_crypto (the unified encryption SoT), persist a record file
   - Invoke decrypt_backup.py via subprocess with:
       * --keypair-file flow (pre-reconstructed keypair)
       * --shard1-hex/--shard2-hex flow (2-of-3 Shamir reconstruction)
@@ -11,7 +11,6 @@ Exercises the Maker emergency-recovery CLI end-to-end:
   - Verify wrong-key (bad shards) aborts with nonzero
   - Verify legacy "algorithm=none" record aborts with exit 1
 """
-import asyncio
 import base64
 import hashlib
 import io
@@ -23,8 +22,9 @@ import tarfile
 
 import pytest
 
-from titan_hcl.logic.backup_cascade import BackupCascade
-from titan_hcl.logic.backup_crypto import derive_master_key
+from titan_hcl.logic.backup_crypto import (
+    ALGORITHM_ID, derive_backup_key, derive_master_key, encrypt_tarball, key_id,
+)
 from titan_hcl.utils.shamir import split_secret
 
 
@@ -58,36 +58,49 @@ def _make_tarball(path: str, payload: bytes = b"maker recovery payload") -> byte
         return f.read()
 
 
-def _cascade(tmp_path):
-    cfg = {"backup": {"mode": "local_only"}, "network": {}}
-    return BackupCascade(full_config=cfg, arweave_store=object(),
-                         local_dir=str(tmp_path))
+def _encrypt_tarball(tmp_path, backup_type: str = "personality", tier: str = "private"):
+    """Produce an encrypted backup fixture the way the live unified pipeline does
+    (backup_crypto — the encryption SoT), in the exact shape the decrypt CLI reads:
+    a `.enc` ciphertext-with-tag file + a backup record JSON carrying the
+    `encryption` stanza (algorithm/key_id/iv_b64/backup_id/plaintext_sha256).
 
-
-def _encrypt_tarball(tmp_path):
-    """Returns (ciphertext_path, record_path, kp_bytes, titan_pubkey, plaintext_sha, plaintext)."""
+    Returns (ciphertext_path, record_path, kp_bytes, titan_pubkey, plaintext_sha, plaintext).
+    """
     kp = _fake_kp()
     titan_pubkey = _kp_pubkey(kp)  # Must match what CLI derives from the same bytes
     master = derive_master_key(kp, titan_pubkey)
-    ctx = {"master_key": master, "tier": "private"}
-    cascade = _cascade(tmp_path)
     src = tmp_path / "src.tar.gz"
     plaintext = _make_tarball(str(src))
+    plaintext_sha = hashlib.sha256(plaintext).hexdigest()
+    backup_id = plaintext_sha[:16]
+    bkey = derive_backup_key(master, backup_id, backup_type)
+    ct, iv, tag = encrypt_tarball(plaintext, bkey)  # ct = ciphertext_with_tag
 
-    async def _no_upload(_):
-        return {"arweave_tx": "devnet-skip"}
+    enc_path = tmp_path / "src.tar.gz.enc"
+    enc_path.write_bytes(ct)
 
-    result = asyncio.run(cascade.run(str(src), "personality", _no_upload,
-                                      encryption=ctx))
-    # Construct a backup record (like _store_backup_record would)
-    record = dict(result)
-    record.setdefault("manifest_version", "1.0")
+    stanza = {
+        "algorithm": ALGORITHM_ID,
+        "key_id": key_id(backup_id, backup_type),
+        "tier": tier,
+        "iv_b64": base64.b64encode(iv).decode("ascii"),
+        "auth_tag_b64": base64.b64encode(tag).decode("ascii"),
+        "plaintext_sha256": plaintext_sha,
+        "ciphertext_sha256": hashlib.sha256(ct).hexdigest(),
+        "backup_id": backup_id,
+    }
+    record = {
+        "local_path": str(enc_path),
+        "backup_type": backup_type,
+        "encryption": stanza,
+        "manifest_version": "1.0",
+    }
     record_path = tmp_path / "personality_record.json"
     with open(record_path, "w") as f:
         json.dump(record, f, indent=2)
 
-    return (result["local_path"], str(record_path), kp, titan_pubkey,
-            hashlib.sha256(plaintext).hexdigest(), plaintext)
+    return (str(enc_path), str(record_path), kp, titan_pubkey,
+            plaintext_sha, plaintext)
 
 
 def _run_cli(*args, cwd=None):

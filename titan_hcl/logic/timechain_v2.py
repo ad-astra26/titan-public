@@ -3331,51 +3331,6 @@ class TimeChainOrchestrator:
         # included in the weekly soul package — no separate upload needed here.
         # The orchestrator's role is sealing + genesis, not backup.
 
-    # ── Phase 4: Integrated Backup ──────────────────────────────────
-
-    def _trigger_backup(self, epoch_id: int):
-        """Trigger Arweave backup in background thread (non-blocking).
-
-        Backup takes 5-30s (disk read + compress + upload) and MUST NOT
-        block the main worker loop. Runs in a daemon thread.
-        """
-        import threading
-
-        def _do_backup():
-            import asyncio
-            try:
-                loop = asyncio.new_event_loop()
-                tx_id = loop.run_until_complete(self._backup.snapshot_to_arweave())
-                loop.close()
-                if tx_id:
-                    self._last_backup_ts = time.time()
-                    logger.warning(
-                        "[Orchestrator] *** ARWEAVE BACKUP COMPLETE *** "
-                        "tx=%s epoch=%d blocks=%d",
-                        tx_id[:24] if tx_id else "none", epoch_id,
-                        self._tc.total_blocks)
-                    if self._send_queue:
-                        # INTENTIONAL_BROADCAST: observability-only Arweave-
-                        # backup confirmation. Frontend dashboard + audit
-                        # consumer the stream; no in-process handler needed.
-                        self._send_queue.put({
-                            "type": "TIMECHAIN_BACKUP_COMPLETE",
-                            "src": self._worker_name, "dst": "all",
-                            "ts": time.time(),
-                            "payload": {
-                                "tx_id": tx_id, "epoch_id": epoch_id,
-                                "blocks": self._tc.total_blocks,
-                            },
-                        })
-                else:
-                    logger.error("[Orchestrator] Arweave backup FAILED at epoch=%d", epoch_id)
-            except Exception as e:
-                logger.error("[Orchestrator] Arweave backup error: %s", e)
-
-        t = threading.Thread(target=_do_backup, daemon=True, name="arweave-backup")
-        t.start()
-        logger.info("[Orchestrator] Arweave backup started (background, epoch=%d)", epoch_id)
-
     # UNUSED_PUBLIC_API: reserved for TIMECHAIN-ANCHOR-WIRING — shipped
     # half-built in commit a45f18d (2026-04-11 Phase 4 Step 3) but never
     # activated: zero callers + zero handlers. Current on-chain write path

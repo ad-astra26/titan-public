@@ -171,6 +171,53 @@ def test_pack_event_tarball_skips_missing_patch_path_no_raise(tmp_path):
     assert "vanished.json" not in info["packed_arc_names"]
 
 
+def test_pack_event_tarball_skips_size_race_no_raise(tmp_path):
+    """Encode→pack SIZE RACE guard (RFP_backup_redesign_spine, 2026-06-10):
+    if an artifact shrank since its size was recorded at encode (a hardlinked
+    LIVE binary mutated in place, the owned=False fallback, a torn write), the
+    recorded patch_size_bytes exceeds the file on disk. tar.addfile would read
+    patch_size_bytes and hit OSError 'unexpected end of data', aborting the whole
+    event. The guard must SKIP+NAME that file instead of raising."""
+    from titan_hcl.logic.backup_event_tarball import (
+        FileDiffSpec, pack_event_tarball,
+    )
+
+    good = tmp_path / "good.json"
+    good.write_text("good content")
+    shrunk = tmp_path / "shrunk.bin"
+    shrunk.write_bytes(b"x" * 100)            # actually 100 bytes on disk
+
+    dd_good = full_ship.encode_diff(str(good))
+    # Forge a diff_dict claiming a LARGER size than the file holds (the shrink).
+    dd_shrunk = {
+        "patch_path": str(shrunk),
+        "patch_size_bytes": 100 + 4096,       # recorded > actual → race
+        "patch_owned": False,
+        "encoder": "full_ship",
+        "diff_mode": "full",
+        "merkle_root": "0" * 64,
+    }
+
+    output_path = str(tmp_path / "event.tar.zst")
+    info = pack_event_tarball(
+        event_id="size-race-1", event_type="incremental",
+        component="personality",
+        file_specs=[
+            FileDiffSpec(arc_name="good.json", diff_dict=dd_good),
+            FileDiffSpec(arc_name="shrunk.bin", diff_dict=dd_shrunk),
+        ],
+        output_path=output_path,
+    )
+    # Must NOT raise; good file packed, shrunk file skipped + counted.
+    assert os.path.exists(output_path)
+    assert info["file_count"] == 1
+    assert info["files_requested"] == 2
+    assert info["files_skipped_size_race"] == 1
+    assert info["files_skipped_vanished"] == 0   # distinct from the vanished guard
+    assert "good.json" in info["packed_arc_names"]
+    assert "shrunk.bin" not in info["packed_arc_names"]
+
+
 def test_sweep_orphan_snapshots_removes_aged_orphans(tmp_path):
     """sweep_orphan_snapshots removes aged .bksnap orphans from the scratch
     dir while leaving canonical sources (and fresh in-flight snapshots)

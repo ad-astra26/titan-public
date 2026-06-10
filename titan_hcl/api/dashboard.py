@@ -11881,31 +11881,6 @@ async def get_v4_timechain_verify_memories(request: Request,
         return _error(str(e))
 
 
-# POST /v4/timechain/backup-now — Trigger immediate TimeChain backup
-async def post_v4_timechain_backup_now(request: Request):
-    """Trigger an immediate TimeChain backup to Arweave (devnet)."""
-    try:
-        from titan_hcl.logic.timechain_backup import TimeChainBackup
-        from titan_hcl.utils.arweave_store import ArweaveStore
-        arweave = ArweaveStore(network="devnet")
-        backup = TimeChainBackup(
-            data_dir="data/timechain", titan_id="T1", arweave_store=arweave)
-        # rFP_backup_worker Phase 2 cascade: pass full_config for balance
-        # check + local-always save + upload verify + cleanup.
-        try:
-            from titan_hcl.config_loader import load_titan_config
-            _full_cfg = load_titan_config()
-        except Exception:
-            _full_cfg = {}
-        tx_id = backup.snapshot_to_arweave(full_config=_full_cfg)
-        if tx_id:
-            return _ok({"tx_id": tx_id, "status": "uploaded"})
-        return _error("upload failed")
-    except Exception as e:
-        logger.error("[Dashboard] /v4/timechain/backup-now error: %s", e)
-        return _error(str(e))
-
-
 # =====================================================================
 # TIMESERIES — Universal historical metrics
 # =====================================================================

@@ -340,8 +340,6 @@ _T = (
      None, None, (), ("timechain_worker",), True, "/v4/timechain/backup-status"),
     ("/v6/timechain/verify-memories", "GET", "get_v4_timechain_verify_memories", "timechain", "readout",
      None, None, (), ("timechain_worker",), True, "/v4/timechain/verify-memories"),
-    ("/v6/timechain/backup-now", "POST", "post_v4_timechain_backup_now", "timechain", "mutation",
-     None, "commands.timechain_backup_now", (), ("timechain_worker",), False, "/v4/timechain/backup-now"),
     ("/v6/timechain/developmental-timeline", "GET", "get_v4_developmental_timeline", "timechain", "readout",
      None, None, (), ("timechain_worker",), True, "/v4/developmental-timeline"),
 

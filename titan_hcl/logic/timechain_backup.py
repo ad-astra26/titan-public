@@ -1,20 +1,21 @@
 """
-titan_hcl/logic/timechain_backup.py — Memory Sovereignty for TimeChain.
+titan_hcl/logic/timechain_backup.py — TimeChain restore / resurrection + genesis verification.
 
-Sovereign backup system: snapshots TimeChain fork files + index to Arweave
-via Irys, records Arweave TX IDs in a local manifest, and provides a
-resurrection path to rebuild from permanent storage.
+The TimeChain backup WRITE path was unified into the BackupOrchestrator /
+BackupWorker pipeline (RFP_backup_redesign_spine, 2026-06-10): the TimeChain
+fork files + index.db + auxiliary/maker_proposals.db ship as the `timechain`
+tier of the daily incremental event via the ChainProvider — there is no
+separate TimeChain upload anymore (the old snapshot_to_arweave/BackupCascade
+write path was removed with this reconciliation).
 
-Architecture:
-  Layer 1: Local TimeChain files (data/timechain/)
-  Layer 2: Arweave permanent storage (via Irys, daily snapshots)
-  Layer 3: ZK compressed proofs (Solana, per checkpoint)
-  Layer 4: Solana memo inscriptions (tc_merkle + tc_height, every epoch)
+This module is now the READ / verify half:
+  - restore_from_arweave(): fetch + rebuild a TimeChain from a permanent
+    snapshot (used by scripts/resurrect_timechain.py — the resurrection path).
+  - verify_genesis_integrity(): check genesis against soul directives + identity.
+  - get_backup_status(): read the legacy Arweave manifest for observability.
 
-Layer 4 is already wired (spirit_loop.py memo extension).
-This module implements Layer 2 (Arweave) and Layer 3 (ZK) integration.
-
-Triggered by: meditation cycle (RebirthBackup.on_meditation_complete)
+Restore-path unification onto the RFP RestoreWorker is the deliberate next
+step (GC1 warm-unification).
 """
 
 import base64
@@ -87,7 +88,9 @@ AUXILIARY_BACKUP_PATHS: dict[str, str] = {
 # manifest is a cache for debugging; the authoritative state is on-disk
 # backup files themselves.
 class TimeChainBackup:
-    """Sovereign backup — ensures TimeChain survives any infrastructure failure."""
+    """TimeChain restore + genesis verification — the read/verify half of
+    sovereign memory. The write path lives in the unified BackupOrchestrator
+    (TimeChain ships as the `timechain` tier of the daily incremental)."""
 
     def __init__(self, data_dir: str = "data/timechain",
                  titan_id: str = "T1",
@@ -156,227 +159,6 @@ class TimeChainBackup:
         with open(tmp, "w") as f:
             json.dump(self._manifest, f, indent=2)
         os.replace(tmp, path)
-
-    # ── Snapshot Creation ─────────────────────────────────────────────
-    # rFP_backup_worker Phase 0 (2026-04-13): JSON+base64 create_snapshot()
-    # retired — silently returned None on mainnet due to payload size. Cron at
-    # scripts/arweave_backup.py has always used tarball path successfully.
-    # Restore path (_restore_from_json) kept for backward-compat with historical
-    # devnet JSON snapshots via scripts/resurrect_timechain.py.
-
-    def create_snapshot_tarball(self) -> tuple[bytes, dict]:
-        """Create a Zstd-compressed tarball of all TimeChain data.
-
-        Uses Zstd level 19 for optimal compression (~24% of raw size).
-        Includes both v1 and v2 blocks (coexist in same chain files).
-        Returns (compressed_bytes, metadata_dict).
-        """
-        from titan_hcl.logic.timechain import TimeChain
-
-        tc = TimeChain(data_dir=str(self._data_dir), titan_id=self._titan_id)
-        if not tc.has_genesis:
-            return b"", {}
-
-        # Create uncompressed tar first
-        buf = BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tar:
-            # Add all chain files (v1 + v2 blocks)
-            for path in sorted(self._data_dir.glob("chain_*.bin")):
-                tar.add(str(path), arcname=path.name)
-
-            # Add sidechain files
-            sc_dir = self._data_dir / "sidechains"
-            if sc_dir.exists():
-                for path in sorted(sc_dir.glob("sc_*.bin")):
-                    tar.add(str(path), arcname=f"sidechains/{path.name}")
-
-            # Add index DB
-            index_path = self._data_dir / "index.db"
-            if index_path.exists():
-                tar.add(str(index_path), arcname="index.db")
-
-            # Phase C R8 / TitanMaker — auxiliary databases (governance state)
-            # See AUXILIARY_BACKUP_PATHS at top of module. v3 tarballs include
-            # this section under auxiliary/; v2 readers ignore unknown members.
-            for arc_name, disk_path in AUXILIARY_BACKUP_PATHS.items():
-                if os.path.exists(disk_path):
-                    tar.add(disk_path, arcname=arc_name)
-                    logger.info(
-                        "[TimeChainBackup] Auxiliary added: %s → %s",
-                        disk_path, arc_name)
-
-        raw_tar = buf.getvalue()
-
-        # Compress with Zstd level 19 (best ratio for archival)
-        try:
-            import zstandard
-            cctx = zstandard.ZstdCompressor(level=19)
-            tarball = cctx.compress(raw_tar)
-            compression = "zstd-19"
-        except ImportError:
-            # Fallback to gzip if zstandard not available
-            import gzip as _gzip
-            tarball = _gzip.compress(raw_tar, compresslevel=9)
-            compression = "gzip-9"
-
-        metadata = {
-            "version": 3,  # was 2 — adds AUXILIARY_BACKUP_PATHS support
-            "titan_id": self._titan_id,
-            "genesis_hash": tc.genesis_hash.hex(),
-            "merkle_root": tc.compute_merkle_root().hex(),
-            "total_blocks": tc.total_blocks,
-            "tarball_sha256": hashlib.sha256(tarball).hexdigest(),
-            "tarball_size_bytes": len(tarball),
-            "raw_size_bytes": len(raw_tar),
-            "compression": compression,
-            "timestamp": time.time(),
-            "auxiliary_paths": list(AUXILIARY_BACKUP_PATHS.keys()),
-        }
-
-        logger.info("[TimeChainBackup] Tarball: %d bytes (%.1f MB, %s, %.0f%% ratio), "
-                     "%d blocks",
-                     len(tarball), len(tarball) / 1024 / 1024, compression,
-                     len(tarball) / len(raw_tar) * 100, tc.total_blocks)
-        return tarball, metadata
-
-    # ── Arweave Upload ────────────────────────────────────────────────
-
-    async def snapshot_to_arweave(self,
-                                    full_config: Optional[dict] = None,
-                                    local_dir: str = "data/backups",
-                                    retention_days: int = 30) -> Optional[str]:
-        """Upload TimeChain snapshot through rFP §5.3 10-step failsafe cascade.
-
-        Runs: S1 build → S2 validate → S3 local-always → S4 balance → S5 upload
-              → S6 verify → S7 manifest → S10 cleanup.
-
-        Returns Arweave TX ID on success, None on failure (local snapshot
-        still saved even on upload failure — S3 is irreducible).
-
-        Args:
-            full_config: merged config (enables [backup] mode detection + Irys
-                balance check). Optional — falls back to arweave-or-local based
-                on `self._arweave` presence.
-            local_dir: override [backup].local_dir (default data/backups).
-            retention_days: S10 cleanup threshold.
-        """
-        # 2026-04-14 fix: create_snapshot_tarball() does Zstd-level-19
-        # compression of the entire TimeChain — synchronous, blocks the
-        # asyncio event loop for seconds. Move CPU-bound work to thread pool.
-        import asyncio
-        build_result = await asyncio.to_thread(self.create_snapshot_tarball)
-        if not build_result:
-            return None
-        tarball, metadata = build_result
-        if not tarball:
-            return None
-
-        # Use [backup] config override for local_dir if present
-        cfg_backup = (full_config or {}).get("backup", {}) or {}
-        effective_local_dir = cfg_backup.get("local_dir", local_dir)
-
-        from titan_hcl.logic.backup_cascade import BackupCascade
-        cascade = BackupCascade(
-            full_config=full_config or {},
-            arweave_store=self._arweave,
-            local_dir=effective_local_dir,
-        )
-
-        # Upload closure — receives bytes (not path) since tarball is in-memory
-        content_type = ("application/zstd"
-                        if metadata.get("compression", "").startswith("zstd")
-                        else "application/gzip")
-        tags = {
-            "Content-Type": content_type,
-            "App-Name": "Titan-TimeChain",
-            "Titan-ID": self._titan_id,
-            "Genesis-Hash": metadata["genesis_hash"],
-            "Merkle-Root": metadata["merkle_root"],
-            "Block-Count": str(metadata["total_blocks"]),
-            "Snapshot-Time": str(int(metadata["timestamp"])),
-            "Tarball-SHA256": metadata["tarball_sha256"],
-        }
-
-        async def _upload(tarball_bytes: bytes):
-            """S5 — upload tarball via ArweaveStore; record manifest on success."""
-            if not self._arweave:
-                logger.warning("[TimeChainBackup] No ArweaveStore configured (local_only?)")
-                return None
-            tx_id = await self._arweave.upload_file_bytes(
-                tarball_bytes, tags, "application/gzip"
-            ) if hasattr(self._arweave, 'upload_file_bytes') else (
-                await self._arweave.upload_json(metadata, tags)
-            )
-            if not tx_id:
-                logger.error("[TimeChainBackup] Arweave upload FAILED")
-                return None
-            # S7 manifest update
-            self._record_arweave_anchor(tx_id, metadata)
-            logger.info(
-                "[TimeChainBackup] Arweave upload: tx=%s blocks=%d size=%.1fKB",
-                tx_id[:20], metadata["total_blocks"],
-                metadata["tarball_size_bytes"] / 1024)
-            return {
-                "arweave_tx": tx_id,
-                "size_mb": round(metadata["tarball_size_bytes"] / 1024 / 1024, 2),
-                "blocks": metadata["total_blocks"],
-            }
-
-        # Run cascade — uses in-memory bytes variant
-        ext = "tar.zst" if content_type == "application/zstd" else "tar.gz"
-        from titan_hcl.logic.backup_crypto import build_encryption_context_from_config
-        result = await cascade.run_bytes(
-            tarball_bytes=tarball,
-            archive_hash=metadata["tarball_sha256"],
-            backup_type="timechain",
-            upload_fn=_upload,
-            retention_days=retention_days,
-            ext=ext,
-            encryption=build_encryption_context_from_config(full_config or {}),
-        )
-
-        if not result:
-            return None
-
-        # Preserve legacy return contract — return tx_id str (not dict)
-        if result.get("cascade_fail"):
-            logger.warning("[TimeChainBackup] Cascade failed at %s",
-                           result.get("cascade_fail"))
-            return None
-        tx_id = result.get("arweave_tx")
-        if tx_id:
-            return tx_id
-        # local_only or low_balance — local snapshot saved, no tx
-        logger.info("[TimeChainBackup] Cascade result: mode=%s local=%s "
-                    "(no Arweave tx)", result.get("mode"), result.get("local_path"))
-        return None
-
-    # snapshot_to_arweave_json() retired 2026-04-13 — rFP_backup_worker Phase 0.
-    # The JSON+base64 upload path silently returned None on mainnet (likely
-    # payload-size limit via Irys). Cron at scripts/arweave_backup.py has always
-    # used tarball (snapshot_to_arweave) successfully. Callers updated:
-    # titan_hcl/logic/backup.py, titan_hcl/api/dashboard.py.
-
-    def _record_arweave_anchor(self, tx_id: str, metadata: dict):
-        """Record an Arweave TX ID in the local manifest."""
-        entry = {
-            "tx_id": tx_id,
-            "genesis_hash": metadata["genesis_hash"],
-            "merkle_root": metadata["merkle_root"],
-            "total_blocks": metadata["total_blocks"],
-            "timestamp": metadata["timestamp"],
-            "tarball_sha256": metadata.get("tarball_sha256", ""),
-            "size_bytes": metadata.get("tarball_size_bytes", 0),
-        }
-        self._manifest["snapshots"].append(entry)
-        self._manifest["last_snapshot_time"] = metadata["timestamp"]
-        self._manifest["total_snapshots"] = len(self._manifest["snapshots"])
-
-        # Keep last 100 entries (daily for ~3 months)
-        if len(self._manifest["snapshots"]) > 100:
-            self._manifest["snapshots"] = self._manifest["snapshots"][-100:]
-
-        self._save_manifest()
 
     # ── Restoration ───────────────────────────────────────────────────
 

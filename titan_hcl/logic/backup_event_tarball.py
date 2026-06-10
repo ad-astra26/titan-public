@@ -177,6 +177,7 @@ def pack_event_tarball(
     # in-memory path. Owned temp paths (encoder-created vcdiff / tail files)
     # are unlinked AFTER tarball is finalized.
     owned_paths_to_cleanup: list[str] = []
+    size_race_skips = 0   # files skipped by the encode→pack size-race guard
 
     # Helper: stream sha256 from a file-handle WHILE reading exactly N bytes,
     # so we don't read the file twice (once for sha256, once for tar.addfile).
@@ -227,6 +228,30 @@ def pack_event_tarball(
                     patch_size = spec.diff_dict.get(
                         "patch_size_bytes", os.path.getsize(patch_path)
                     )
+                    # INSTRUMENT (RFP_backup_redesign_spine, 2026-06-10): guard the
+                    # encode→pack SIZE RACE. `info.size` is the size recorded at
+                    # ENCODE; tar.addfile then reads exactly that many bytes. If the
+                    # artifact shrank since (a hardlinked LIVE binary that mutated in
+                    # place, the owned=False direct-source fallback, or a torn/
+                    # disk-pressured write), copyfileobj hits EOF → OSError
+                    # "unexpected end of data", aborting the WHOLE event (observed on
+                    # T3, every drip tick). Re-stat now; on ANY mismatch NAME the
+                    # culprit (arc_name + recorded vs actual + owned) and SKIP it (the
+                    # next event re-captures it) rather than crash. This stops the
+                    # abort AND captures which source isn't a stable snapshot so the
+                    # structural fix can target it (a stable copy/sqlite-snap is
+                    # immutable → actual == recorded → never skipped here).
+                    actual_size = os.path.getsize(patch_path)
+                    if actual_size != patch_size:
+                        logger.warning(
+                            "[pack_event_tarball] SIZE-RACE %s — patch_path=%s "
+                            "recorded=%d actual=%d delta=%d owned=%s — SKIPPING "
+                            "(re-captured next event)",
+                            spec.arc_name, patch_path, patch_size, actual_size,
+                            actual_size - patch_size,
+                            spec.diff_dict.get("patch_owned"))
+                        size_race_skips += 1
+                        continue
                     member_name = FILES_PREFIX + spec.arc_name
                     info = tarfile.TarInfo(name=member_name)
                     info.size = patch_size
@@ -327,8 +352,9 @@ def pack_event_tarball(
         "file_count": len(files_meta),                # actually packed
         "files_requested": len(file_specs),           # what caller asked for
         "files_skipped_vanished": (
-            len(file_specs) - len(files_meta)
+            len(file_specs) - len(files_meta) - size_race_skips
         ),    # SKIP'd by the patch_path-vanished guard (D-SPEC-123 follow-up)
+        "files_skipped_size_race": size_race_skips,  # SKIP'd by the encode→pack size-race guard
         "packed_arc_names": [m["arc_name"] for m in files_meta],
     }
 

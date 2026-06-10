@@ -446,67 +446,13 @@ class RebirthBackup:
             else:
                 logger.warning("[Backup] Boot check: %s MISSING (%s)", label, path)
 
-        # rFP Phase 4 — age-based catch-up
-        summary = {"critical_ok": True, "catchup_fired": False,
-                    "last_age_h": None}
-        try:
-            from titan_hcl.logic.backup_cascade import BackupCascade
-            is_local_only = BackupCascade(
-                full_config=self._full_config,
-                arweave_store=self._arweave_store,
-            ).is_local_only()
-            latest = self.get_latest_backup_record("personality")
-            if latest and "uploaded_at" in latest:
-                last_age_s = time.time() - float(latest["uploaded_at"])
-                last_age_h = last_age_s / 3600.0
-                summary["last_age_h"] = round(last_age_h, 1)
-                if last_age_h > 24 and not is_local_only:
-                    if self._unified_v2_enabled():
-                        # Maker policy 2026-05-23 (D-SPEC-123 follow-up): NO legacy
-                        # full-tarball upload path when unified_v2 owns backups.
-                        # This boot catch-up (upload_personality_to_arweave, ~50MB)
-                        # was an OVERLOOKED legacy callsite — commit abbf6f84 retired
-                        # the on_meditation_complete fallback but missed this one. It
-                        # (a) re-uploaded a full tarball on EVERY worker restart — the
-                        # SOL drain Maker flagged ("I'm not paying for full daily
-                        # reuploads") — and (b) ran SYNCHRONOUSLY here, before the
-                        # worker's `booted` transition, so on a ~176k-file personality
-                        # tree the ~200s build kept the worker in `starting` past
-                        # Guardian's stale-heartbeat threshold → kill → restart →
-                        # catch-up fires again → boot-loop, which is WHY unified_v2
-                        # never got to ship its first baseline. get_latest_backup_record
-                        # reads legacy data/backup_records/ which unified_v2 never
-                        # writes, so last_age_h is ALWAYS stale under unified_v2 — the
-                        # >24h guard can never gate this off on its own. Unified events
-                        # fire on MEDITATION_COMPLETE; no boot catch-up is needed.
-                        # See RFP_phase_c_enhancements §3B.0 bugs #1/#2/#3.
-                        logger.info(
-                            "[Backup] Boot catch-up SKIPPED — unified_v2 owns "
-                            "backups; legacy full-upload path retired here per Maker "
-                            "2026-05-23 policy (last legacy record %.1fh ago is "
-                            "expected: unified_v2 writes the manifest, not "
-                            "backup_records/)", last_age_h)
-                        summary["catchup_skipped_unified_v2"] = True
-                    else:
-                        logger.info(
-                            "[Backup] Boot catch-up: last personality upload %.1fh ago — firing now",
-                            last_age_h)
-                        summary["catchup_fired"] = True
-                        try:
-                            result = await self.upload_personality_to_arweave()
-                            if result:
-                                tx = result.get("arweave_tx", "local_only")
-                                logger.info("[Backup] Boot catch-up complete: %s", tx)
-                                summary["catchup_result"] = tx
-                        except Exception as e:
-                            logger.warning("[Backup] Boot catch-up failed: %s", e)
-                            summary["catchup_error"] = str(e)
-            elif not latest:
-                logger.info("[Backup] Boot: no prior personality record (first run?)")
-        except Exception as e:
-            swallow_warn('[Backup] Boot catch-up check error', e,
-                         key="logic.backup.boot_catch_up_check_error", throttle=100)
-        return summary
+        # Backup catch-up is owned by unified_v2: the BackupOrchestrator drips
+        # the daily incremental and the meditation event ships it. The legacy
+        # boot catch-up (full-tarball re-upload via TimeChainBackup/BackupCascade)
+        # was retired here with the write-path reconciliation — it was a SOL
+        # drain and ran synchronously before `booted`, stalling boot into a
+        # Guardian-kill loop (RFP_backup_redesign_spine, 2026-06-10).
+        return {"critical_ok": True}
 
     # -------------------------------------------------------------------------
     # Hash — delegated to utils/crypto.py (Single Source of Truth)
@@ -802,255 +748,6 @@ class RebirthBackup:
             logger.error("[Backup] Personality archive failed: %s", e)
             return None
 
-    async def upload_personality_to_arweave(
-        self, archive_path: str = None, network: str = None,
-    ) -> Optional[dict]:
-        """Upload personality archive to Arweave (permanent).
-
-        Returns dict with arweave_tx, archive_hash, size_mb.
-        Network defaults to configured solana_network (mainnet-beta or devnet).
-        Gated by [mainnet_budget] backup_arweave_enabled in config.toml.
-        """
-        # Resolve network from merged config if not explicitly passed
-        if network is None:
-            try:
-                from titan_hcl.config_loader import load_titan_config
-                cfg = load_titan_config()
-                network = cfg.get("network", {}).get("solana_network", "devnet")
-                # Map "mainnet-beta" → "mainnet" for ArweaveStore
-                if network == "mainnet-beta":
-                    network = "mainnet"
-                # Check arweave gate
-                budget = cfg.get("mainnet_budget", {})
-                if not budget.get("backup_arweave_enabled", False):
-                    logger.debug("[Backup] Arweave backup disabled (backup_arweave_enabled=false)")
-                    return None
-            except Exception:
-                network = "devnet"
-
-        # rFP Phase 2 cascade: S1 build → S2 validate → S3 local-always →
-        # S4 balance → S5 upload → S6 verify → S7 manifest → S10 cleanup
-        if not archive_path:
-            import asyncio as _asyncio_local
-            archive_path = await _asyncio_local.to_thread(
-                self.create_personality_archive, arweave_tier=True)
-        if not archive_path or not os.path.exists(archive_path):
-            return None
-
-        # Resolve ArweaveStore (prefer injected per rFP BUG-5)
-        store = self._arweave_store
-        if store is None:
-            try:
-                from titan_hcl.utils.arweave_store import ArweaveStore
-                store = ArweaveStore(
-                    keypair_path=(getattr(self.network, '_wallet_path', None)
-                                  or getattr(self.network, '_keypair_path', None)),
-                    network=network,
-                )
-            except Exception as e:
-                logger.error("[Backup] ArweaveStore build failed: %s", e)
-                with suppress(FileNotFoundError):
-                    os.remove(archive_path)
-                return None
-
-        async def _upload_personality(path):
-            """S5 closure — ArweaveStore upload (record-writing moved to main flow
-            so the cascade-enriched dict, including Phase 7 encryption stanza,
-            lands in the manifest)."""
-            archive_hash = self.calculate_hash(path)
-            size_mb = os.path.getsize(path) / (1024 * 1024)
-            tx_id = await store.upload_file(
-                path,
-                tags={
-                    "Type": "Titan-Personality-Backup",
-                    "Archive-Hash": archive_hash[:16],
-                    "Size-MB": f"{size_mb:.1f}",
-                    "Timestamp": str(int(time.time())),
-                },
-                content_type="application/gzip",
-            )
-            if not tx_id:
-                return None
-            logger.info("[Backup] Personality uploaded to Arweave: %s (%.1fMB, hash=%s...)",
-                        tx_id[:16] if not tx_id.startswith("devnet") else tx_id,
-                        size_mb, archive_hash[:12])
-            return {
-                "arweave_tx": tx_id,
-                "archive_hash": archive_hash,
-                "size_mb": round(size_mb, 2),
-                "permanent_url": store.get_permanent_url(tx_id),
-                "uploaded_at": time.time(),
-            }
-
-        from titan_hcl.logic.backup_cascade import BackupCascade
-        retention = int(self._full_config.get("backup", {}).get("local_rolling_days", 30))
-        local_dir = self._full_config.get("backup", {}).get(
-            "local_dir", self._LOCAL_BACKUP_DIR)
-        cascade = BackupCascade(full_config=self._full_config,
-                                 arweave_store=store, local_dir=local_dir)
-        # 2026-04-30 — wire Telegram notifier for auto-fund alerts (closes
-        # rFP §5.5 silent-depletion gap). BackupCascade.auto_fund_irys_if_needed
-        # invokes this callback on every successful auto-fund event.
-        cascade._telegram_notifier = (
-            lambda m: send_maker_alert(
-                m, alert_key="backup.cascade_fund", rate_limit_seconds=0.0))
-        cascade_result = await cascade.run(
-            archive_path, "personality", _upload_personality,
-            get_latest_record_fn=self.get_latest_backup_record,
-            retention_days=retention,
-            encryption=self._build_encryption_context(),
-        )
-
-        # Persist the cascade-enriched record (includes Phase 7 encryption stanza)
-        if cascade_result and cascade_result.get("arweave_tx"):
-            self._store_backup_record("personality", cascade_result)
-
-        # Cleanup temp build artifact (local copy is in data/backups/)
-        if archive_path and archive_path.startswith("/tmp/"):
-            with suppress(FileNotFoundError):
-                os.remove(archive_path)
-
-        return cascade_result
-
-    # =========================================================================
-    # Soul Package → Arweave (Weekly)
-    # =========================================================================
-
-    def create_soul_package(self, output_path: str = None) -> Optional[str]:
-        """Create full soul package: personality + consciousness + knowledge graph.
-
-        This is the weekly backup — everything needed to fully resurrect Titan.
-
-        Returns output path on success, None on failure.
-        """
-        if not output_path:
-            output_path = f"/tmp/titan_soul_{int(time.time())}.tar.gz"
-
-        try:
-            all_paths = self.PERSONALITY_PATHS + self.WEEKLY_EXTRA_PATHS
-            skip_patterns = self._BACKUP_SKIP_PATTERNS
-
-            def _filter(ti):
-                name = ti.name
-                if name.endswith(('.tmp', '.pyc')) or '__pycache__' in name:
-                    return None
-                # Weekly soul INCLUDES .jsonl (forensic replay tier)
-                # Only skip historical dev backups — one-time snapshots not live state
-                if any(p in name for p in skip_patterns):
-                    return None
-                return ti
-
-            with tarfile.open(output_path, "w:gz", compresslevel=9) as tar:
-                for source_path, archive_name in all_paths:
-                    source = Path(source_path)
-                    if source.exists():
-                        if source.is_dir():
-                            tar.add(str(source), arcname=archive_name, filter=_filter)
-                        else:
-                            tar.add(str(source), arcname=archive_name)
-                        logger.debug("[Backup] Soul package: added %s", archive_name)
-
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            logger.info("[Backup] Soul package: %.1f MB at %s", size_mb, output_path)
-            return output_path
-
-        except Exception as e:
-            logger.error("[Backup] Soul package failed: %s", e)
-            return None
-
-    async def upload_soul_package_to_arweave(
-        self, network: str = "devnet"
-    ) -> Optional[dict]:
-        """Upload full soul package to Arweave (weekly).
-
-        Includes personality + consciousness.db + Kuzu graph.
-        ~200MB compressed, ~$1 on Arweave via Irys.
-        """
-        # rFP Phase 2 cascade for soul (weekly): same 10-step failsafe flow.
-        # Phase E.2.4: ~200MB tarball + gzip-9 compression — wrap to_thread.
-        import asyncio as _asyncio_local
-        archive_path = await _asyncio_local.to_thread(self.create_soul_package)
-        if not archive_path or not os.path.exists(archive_path):
-            return None
-
-        store = self._arweave_store
-        if store is None:
-            try:
-                from titan_hcl.utils.arweave_store import ArweaveStore
-                store = ArweaveStore(
-                    keypair_path=(getattr(self.network, '_wallet_path', None)
-                                  or getattr(self.network, '_keypair_path', None)),
-                    network=network,
-                )
-            except Exception as e:
-                logger.error("[Backup] ArweaveStore build failed: %s", e)
-                with suppress(FileNotFoundError):
-                    os.remove(archive_path)
-                return None
-
-        async def _upload_soul(path):
-            """S5 closure — record-writing moved to main flow (see personality)."""
-            archive_hash = self.calculate_hash(path)
-            size_mb = os.path.getsize(path) / (1024 * 1024)
-            tx_id = await store.upload_file(
-                path,
-                tags={
-                    "Type": "Titan-Soul-Package",
-                    "Archive-Hash": archive_hash[:16],
-                    "Size-MB": f"{size_mb:.1f}",
-                    "Timestamp": str(int(time.time())),
-                },
-                content_type="application/gzip",
-            )
-            if not tx_id:
-                return None
-            logger.info("[Backup] Soul package uploaded to Arweave: %s (%.1fMB)",
-                        tx_id[:16] if not tx_id.startswith("devnet") else tx_id,
-                        size_mb)
-            return {
-                "arweave_tx": tx_id,
-                "archive_hash": archive_hash,
-                "size_mb": round(size_mb, 2),
-                "permanent_url": store.get_permanent_url(tx_id),
-                "uploaded_at": time.time(),
-            }
-
-        from titan_hcl.logic.backup_cascade import BackupCascade
-        retention = int(self._full_config.get("backup", {}).get(
-            "soul_local_rolling_days", 90))
-        local_dir = self._full_config.get("backup", {}).get(
-            "local_dir", self._LOCAL_BACKUP_DIR)
-        cascade = BackupCascade(full_config=self._full_config,
-                                 arweave_store=store, local_dir=local_dir)
-        # 2026-04-30 — wire Telegram notifier for auto-fund alerts (soul path).
-        cascade._telegram_notifier = (
-            lambda m: send_maker_alert(
-                m, alert_key="backup.cascade_fund", rate_limit_seconds=0.0))
-        cascade_result = await cascade.run(
-            archive_path, "soul", _upload_soul,
-            get_latest_record_fn=self.get_latest_backup_record,
-            retention_days=retention,
-            encryption=self._build_encryption_context(),
-        )
-
-        # Persist cascade-enriched record (Phase 7 — captures encryption stanza)
-        if cascade_result and cascade_result.get("arweave_tx"):
-            self._store_backup_record("soul_package", cascade_result)
-
-        if archive_path and archive_path.startswith("/tmp/"):
-            with suppress(FileNotFoundError):
-                os.remove(archive_path)
-
-        return cascade_result
-
-    # -------------------------------------------------------------------------
-    # Phase 7 — Encryption context (opt-in via [backup].encryption_enabled)
-    # -------------------------------------------------------------------------
-    def _build_encryption_context(self) -> Optional[dict]:
-        """Delegate to shared helper. Returns None when encryption disabled."""
-        from titan_hcl.logic.backup_crypto import build_encryption_context_from_config
-        return build_encryption_context_from_config(self._full_config)
-
     def _build_v3_encryptor(self):
         """Mode-B encryptor for the v=3 event pipeline (RFP G2 / INV-MBR-13).
 
@@ -1087,7 +784,7 @@ class RebirthBackup:
         """Store backup record locally for verification queries.
 
         Phase 7 — bumps manifest_version to 1.0 and preserves the `encryption`
-        stanza threaded through by BackupCascade. Legacy records lacking these
+        stanza threaded through by the unified backup pipeline. Legacy records lacking these
         fields are treated as manifest_version="0" + encryption.algorithm="none".
         """
         import json
@@ -2777,8 +2474,8 @@ class RebirthBackup:
 
     async def _auto_fund_irys_before_upload(self) -> None:
         """Irys auto-fund via the ChainProvider (RFP_chain_provider Phase C tail) —
-        `chain.balance()` + the BOUNDED `chain.fund()` replace the
-        `BackupCascade` subprocess-`node` path (INV-CP-3). Config moves to
+        `chain.balance()` + the BOUNDED `chain.fund()` replace the legacy
+        subprocess-`node` Irys path (INV-CP-3). Config moves to
         `[chain.fund]` (Q-CP-3 clean cut). No-op when disabled / runway sufficient
         / devnet. The runway→amount DECISION here is contained; it moves to the
         BackupOrchestrator in the next redesign step (which will also enforce the

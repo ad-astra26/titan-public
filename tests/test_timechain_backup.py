@@ -1,161 +1,44 @@
 """
-tests/test_timechain_backup.py — TimeChainBackup tarball path verification.
+tests/test_timechain_backup.py — TimeChainBackup restore + manifest verification.
 
-Per rFP_backup_worker Phase 0 (2026-04-13): JSON write path retired, tarball
-path is the single unified upload path. These tests verify the tarball
-creation + restore roundtrip + upload-with-mock flow.
+The TimeChain backup WRITE path (create_snapshot_tarball / snapshot_to_arweave
+/ BackupCascade) was removed in the backup write-path reconciliation
+(RFP_backup_redesign_spine, 2026-06-10): TimeChain now ships as the `timechain`
+tier of the unified daily incremental via the ChainProvider. TimeChainBackup is
+now the read/verify half — restore + genesis-verify + manifest. These tests
+guard that the write path stays retired and the restore/manifest surface stays
+intact (used by scripts/resurrect_timechain.py).
 
 Run:
     source test_env/bin/activate
     python -m pytest tests/test_timechain_backup.py -v -p no:anchorpy
 """
-import asyncio
-import os
-from pathlib import Path
-
-import pytest
-
 from titan_hcl.logic.timechain_backup import TimeChainBackup
 
 
-class _MockArweave:
-    """Minimal ArweaveStore mock: just records calls + returns a tx id."""
+# ── Write-path retirement verified (this reconciliation's regression guard) ──
 
-    def __init__(self, tx_id: str = "MOCK_TX_12345", fail: bool = False):
-        self._tx_id = tx_id
-        self._fail = fail
-        self.calls: list[dict] = []
-
-    async def upload_file_bytes(self, data: bytes, tags: dict, content_type: str):
-        self.calls.append({
-            "method": "upload_file_bytes",
-            "size": len(data), "tags": tags, "content_type": content_type,
-        })
-        return None if self._fail else self._tx_id
-
-    async def upload_json(self, snapshot: dict, tags: dict):
-        self.calls.append({"method": "upload_json", "tags": tags})
-        return None if self._fail else self._tx_id
-
-
-@pytest.fixture
-def cascade_balance_ok(monkeypatch):
-    """Isolate the upload→manifest unit from the production Irys-balance gate (S4).
-
-    `snapshot_to_arweave` runs through BackupCascade, whose S4 `check_irys_balance`
-    spawns a real `node scripts/irys_upload.js balance` subprocess and needs a
-    funded keypair — neither exists in the unit env, and neither is the behaviour
-    under test here (the balance gate has its own coverage in test_backup_cascade).
-    Force S4 sufficient so the cascade reaches the actual upload + manifest record.
-    """
-    from titan_hcl.logic import backup_cascade as _bc
-    monkeypatch.setattr(_bc.BackupCascade, "check_irys_balance",
-                        lambda self, size_mb: (True, 9.99, "test-sufficient"))
-
-
-# ── Fixtures ─────────────────────────────────────────────────────────
-
-@pytest.fixture
-def tc_dir(tmp_path, monkeypatch):
-    """Create a minimal TimeChain data dir + isolated manifest path.
-
-    CRITICAL: MANIFEST_PATH is module-level hardcoded (BUG-4 per rFP audit).
-    Without monkeypatch, tests would write to production manifest. Phase 1 of
-    rFP fixes this by making MANIFEST_PATH per-Titan; until then, tests must
-    monkeypatch MANIFEST_PATH + CWD to avoid pollution.
-    """
-    import titan_hcl.logic.timechain_backup as tcb_mod
-    isolated_manifest = str(tmp_path / "arweave_manifest_test.json")
-    monkeypatch.setattr(tcb_mod, "MANIFEST_PATH", isolated_manifest)
-    monkeypatch.chdir(tmp_path)
-
-    from titan_hcl.logic.timechain import TimeChain
-    tc = TimeChain(data_dir=str(tmp_path), titan_id="T1")
-    if not tc.has_genesis:
-        tc.create_genesis({"prime_directives": ["Sovereign Integrity"], "titan_id": "T1"})
-    return tmp_path
-
-
-# ── Tarball creation ─────────────────────────────────────────────────
-
-def test_create_snapshot_tarball_has_metadata(tc_dir):
-    backup = TimeChainBackup(data_dir=str(tc_dir), titan_id="T1")
-    tarball, metadata = backup.create_snapshot_tarball()
-    assert isinstance(tarball, bytes)
-    assert len(tarball) > 0
-    # Required metadata fields per rFP
-    for key in ("version", "titan_id", "genesis_hash", "merkle_root",
-                "total_blocks", "tarball_sha256", "tarball_size_bytes",
-                "compression", "timestamp"):
-        assert key in metadata, f"missing metadata key: {key}"
-    assert metadata["titan_id"] == "T1"
-    assert metadata["compression"] in ("zstd-19", "gzip-9")
-
-
-def test_create_snapshot_tarball_sha256_matches(tc_dir):
-    import hashlib
-    backup = TimeChainBackup(data_dir=str(tc_dir), titan_id="T1")
-    tarball, metadata = backup.create_snapshot_tarball()
-    assert hashlib.sha256(tarball).hexdigest() == metadata["tarball_sha256"]
-
-
-def test_create_snapshot_tarball_no_genesis_returns_empty(tmp_path):
-    """Tarball create on empty dir should return (b'', {}) per current contract."""
-    backup = TimeChainBackup(data_dir=str(tmp_path), titan_id="T1")
-    tarball, metadata = backup.create_snapshot_tarball()
-    assert tarball == b""
-    assert metadata == {}
-
-
-# ── Upload with mock ─────────────────────────────────────────────────
-
-def test_snapshot_to_arweave_records_manifest(tc_dir, cascade_balance_ok):
-    mock = _MockArweave(tx_id="TARBALL_TX_123")
-    backup = TimeChainBackup(data_dir=str(tc_dir), titan_id="T1", arweave_store=mock)
-    tx = asyncio.run(backup.snapshot_to_arweave())
-    assert tx == "TARBALL_TX_123"
-    assert len(mock.calls) == 1
-    # Should use tarball path — upload_file_bytes, not upload_json
-    assert mock.calls[0]["method"] == "upload_file_bytes"
-    # Manifest should have one entry
-    status = backup.get_backup_status()
-    assert status["total_snapshots"] == 1
-    assert status["latest_tx"] == "TARBALL_TX_123"
-
-
-def test_snapshot_to_arweave_no_store_returns_none(tc_dir):
-    backup = TimeChainBackup(data_dir=str(tc_dir), titan_id="T1", arweave_store=None)
-    tx = asyncio.run(backup.snapshot_to_arweave())
-    assert tx is None
-
-
-def test_snapshot_to_arweave_failure_no_manifest_entry(tc_dir, cascade_balance_ok):
-    mock = _MockArweave(fail=True)
-    backup = TimeChainBackup(data_dir=str(tc_dir), titan_id="T1", arweave_store=mock)
-    tx = asyncio.run(backup.snapshot_to_arweave())
-    assert tx is None
-    status = backup.get_backup_status()
-    assert status["total_snapshots"] == 0
-
-
-# ── JSON path retirement verified ────────────────────────────────────
-
-def test_snapshot_to_arweave_json_no_longer_exists():
-    """Phase 0 retirement: JSON write path must be gone."""
+def test_write_path_retired():
+    """The legacy TimeChain backup WRITE path must be gone — it was unified into
+    the BackupOrchestrator/BackupWorker (timechain tier via ChainProvider)."""
     backup = TimeChainBackup(data_dir="data/timechain", titan_id="T1")
-    assert not hasattr(backup, "snapshot_to_arweave_json"), \
-        "snapshot_to_arweave_json should be retired per rFP Phase 0"
-    assert not hasattr(backup, "create_snapshot"), \
-        "create_snapshot (JSON path) should be retired per rFP Phase 0"
+    for gone in ("snapshot_to_arweave", "create_snapshot_tarball",
+                 "_record_arweave_anchor",
+                 "snapshot_to_arweave_json", "create_snapshot"):
+        assert not hasattr(backup, gone), (
+            f"{gone} should be retired — TimeChain backup writes live in the "
+            "unified BackupOrchestrator, not here")
 
 
-def test_restore_from_json_preserved_for_backward_compat():
-    """JSON RESTORE path kept for scripts/resurrect_timechain.py historical recovery."""
+def test_restore_surface_preserved_for_resurrection():
+    """The restore/verify surface MUST survive — scripts/resurrect_timechain.py
+    (the resurrection path) + the /v4/timechain/backup-status endpoint use it."""
     backup = TimeChainBackup(data_dir="data/timechain", titan_id="T1")
-    assert hasattr(backup, "_restore_from_json"), \
-        "_restore_from_json must be preserved for historical devnet snapshot recovery"
-    assert hasattr(backup, "_restore_from_tarball"), \
-        "_restore_from_tarball is the primary restore path"
+    for kept in ("restore_from_arweave", "_restore_from_tarball",
+                 "_restore_from_json", "verify_genesis_integrity",
+                 "get_backup_status", "get_latest_arweave_tx"):
+        assert hasattr(backup, kept), (
+            f"{kept} must be preserved for resurrection / status")
 
 
 # ── Per-Titan manifest path (rFP Phase 1 BUG-4 fix) ──────────────────
@@ -191,33 +74,3 @@ def test_per_titan_manifest_migration_from_legacy(tmp_path, monkeypatch):
     assert os.path.exists(str(legacy) + ".bak_pre_per_titan_20260413")
     import json
     assert json.load(open(new_path))["snapshots"][0]["tx_id"] == "HIST"
-
-
-def test_per_titan_manifest_no_cross_contamination(tmp_path, monkeypatch, cascade_balance_ok):
-    """T1 writes must not appear in T2's manifest."""
-    import titan_hcl.logic.timechain_backup as tcb_mod
-    # Reset module-level override so real per-Titan logic is used
-    monkeypatch.setattr(tcb_mod, "MANIFEST_PATH", "data/timechain/arweave_manifest.json")
-    monkeypatch.chdir(tmp_path)
-    from titan_hcl.logic.timechain import TimeChain
-    # Create two Titans sharing a data_dir but different titan_id manifests
-    tc = TimeChain(data_dir=str(tmp_path), titan_id="T1")
-    tc.create_genesis({"prime_directives": ["Sovereign Integrity"], "titan_id": "T1"})
-
-    # T1's backup
-    mock1 = _MockArweave(tx_id="T1_TX_A")
-    b1 = TimeChainBackup(data_dir=str(tmp_path), titan_id="T1", arweave_store=mock1)
-    asyncio.run(b1.snapshot_to_arweave())
-
-    # T2's backup (shared data_dir in test; real deploys have separate VPS)
-    mock2 = _MockArweave(tx_id="T2_TX_B")
-    b2 = TimeChainBackup(data_dir=str(tmp_path), titan_id="T2", arweave_store=mock2)
-    asyncio.run(b2.snapshot_to_arweave())
-
-    # T1's manifest should ONLY have T1_TX_A; T2's only T2_TX_B
-    s1 = b1.get_backup_status()
-    s2 = b2.get_backup_status()
-    assert s1["latest_tx"] == "T1_TX_A"
-    assert s2["latest_tx"] == "T2_TX_B"
-    # Independent manifest files
-    assert s1["manifest_path"] != s2["manifest_path"]

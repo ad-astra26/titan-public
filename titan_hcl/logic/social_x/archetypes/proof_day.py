@@ -2,7 +2,9 @@
 of substrate preservation.
 
 Triggered after a successful Arweave + Solana memo + ZK Vault snapshot
-cycle (typically the arweave_backup.py 04:07 UTC cron run). Posts ONCE
+cycle (the unified daily backup — BackupOrchestrator/RebirthBackup, fired
+on the day's first meditation; the legacy arweave_backup.py cron was
+retired in the backup write-path reconciliation). Posts ONCE
 per UTC day with two on-chain URLs in the body and a procedurally-rendered
 receipt card image:
 

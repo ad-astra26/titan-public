@@ -1,10 +1,11 @@
-"""Tests for AUXILIARY_BACKUP_PATHS wiring in TimeChainBackup.
+"""Tests for AUXILIARY_BACKUP_PATHS relocation in TimeChainBackup (restore side).
 
-Verifies that maker_proposals.db (and any future auxiliary databases)
-get included in the snapshot tarball at create time and relocated to
-their disk paths during restore. Critical for governance state
-durability — without this wiring, R8 signatures and Maker dialogue
-history would not survive infrastructure failure.
+Verifies that maker_proposals.db (and any future auxiliary databases) are
+relocated to their disk paths during restore. Critical for governance state
+durability — without this, R8 signatures and Maker dialogue history would not
+survive infrastructure failure. (The create-time backup of these files now
+rides the unified `timechain` tier — data/timechain/auxiliary/maker_proposals.db
+is in RebirthBackup.TIMECHAIN_PATHS — not the retired create_snapshot_tarball.)
 """
 import io
 import os
@@ -20,63 +21,6 @@ def test_auxiliary_backup_paths_constant_includes_maker_proposals():
     assert "auxiliary/maker_proposals.db" in AUXILIARY_BACKUP_PATHS
     assert AUXILIARY_BACKUP_PATHS["auxiliary/maker_proposals.db"] == \
         "data/maker_proposals.db"
-
-
-def test_auxiliary_files_included_in_tarball(tmp_path, monkeypatch):
-    """Verify create_snapshot_tarball() includes auxiliary files when present."""
-    from titan_hcl.logic.timechain_backup import (
-        AUXILIARY_BACKUP_PATHS, TimeChainBackup,
-    )
-    # Build a real ProposalStore at a tmp path so the file exists
-    from titan_hcl.maker import ProposalStore, ProposalType
-    fake_aux_path = tmp_path / "fake_maker_proposals.db"
-    store = ProposalStore(db_path=str(fake_aux_path))
-    store.create(
-        proposal_type=ProposalType.CONTRACT_BUNDLE,
-        title="Test bundle",
-        description="A test bundle for backup wiring",
-        payload={"x": 1}, requires_signature=True)
-    assert fake_aux_path.exists()
-
-    # Monkey-patch AUXILIARY_BACKUP_PATHS to point to our tmp file
-    monkeypatch.setattr(
-        "titan_hcl.logic.timechain_backup.AUXILIARY_BACKUP_PATHS",
-        {"auxiliary/maker_proposals.db": str(fake_aux_path)},
-    )
-
-    # Build a minimal fake TimeChain dir so create_snapshot_tarball doesn't bail
-    fake_tc_dir = tmp_path / "timechain"
-    fake_tc_dir.mkdir()
-    # Skip the "no genesis" early-return by stubbing TimeChain
-    from unittest.mock import patch, MagicMock
-    fake_tc = MagicMock()
-    fake_tc.has_genesis = True
-    fake_tc.genesis_hash = b"\x00" * 32
-    fake_tc.compute_merkle_root = lambda: b"\x01" * 32
-    fake_tc.total_blocks = 0
-    with patch("titan_hcl.logic.timechain.TimeChain", return_value=fake_tc):
-        backup = TimeChainBackup(data_dir=str(fake_tc_dir), titan_id="T1")
-        tarball, metadata = backup.create_snapshot_tarball()
-
-    assert metadata["version"] == 3
-    assert "auxiliary/maker_proposals.db" in metadata["auxiliary_paths"]
-
-    # Decompress + inspect tarball members
-    if metadata["compression"].startswith("zstd"):
-        import zstandard
-        raw = zstandard.ZstdDecompressor().decompress(tarball, max_output_size=50_000_000)
-        tar_buf = io.BytesIO(raw)
-        with tarfile.open(fileobj=tar_buf, mode="r") as tar:
-            names = [m.name for m in tar.getmembers()]
-    else:
-        import gzip
-        raw = gzip.decompress(tarball)
-        tar_buf = io.BytesIO(raw)
-        with tarfile.open(fileobj=tar_buf, mode="r") as tar:
-            names = [m.name for m in tar.getmembers()]
-
-    assert "auxiliary/maker_proposals.db" in names, \
-        f"Expected auxiliary/maker_proposals.db in tarball, got: {names}"
 
 
 def test_auxiliary_files_relocated_during_restore(tmp_path, monkeypatch):
