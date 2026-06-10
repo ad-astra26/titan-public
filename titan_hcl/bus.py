@@ -263,6 +263,32 @@ TOOL_CALL_VERDICT_RECORD = "TOOL_CALL_VERDICT_RECORD"
 # hits, fork, source, ts}.
 RETRIEVAL_SAMPLE = "RETRIEVAL_SAMPLE"
 
+# ── Outer Meta-Reasoning Self-Learning (RFP_synthesis_self_learning_meta_
+# reasoning Phase 1 / §7.A) — the verifiable-lane closed loop. The reward is
+# ASYNC (the oracle verdict arrives at the dream-flush, NOT at turn time), so
+# the decision and the reward are two events joined on `parent_tool_call_tx`
+# by the self_learning_worker (INV-OML-7; the join is the load-bearing detail).
+#
+# agno DECIDE path → self_learning_worker. Emitted AFTER the backstop runs (so
+# parent_tool_call_tx is known). Payload: {parent_tool_call_tx, features (the
+# OuterFeatures float list), action (int index), goal_class, turn_id, ts}.
+SELF_LEARN_DECISION = "SELF_LEARN_DECISION"
+# synthesis_worker (OracleRouter score-event flush) → self_learning_worker. The
+# joined reward for a stashed decision. Payload: {parent_tool_call_tx, reward
+# (+1 verified-true / −1 false), oracle_id, goal_class, ts}.
+SELF_LEARN_REWARD = "SELF_LEARN_REWARD"
+# self_learning_worker → synthesis_worker. A distilled winning macro-strategy to
+# persist under the `Self` spine node (Reasoning node + SELF_HAS_REASONING edge)
+# via the single SynthesisWriter (INV-Syn-19/28 / INV-OML-8). Payload:
+# {signature (float list), goal_class, b_i, c, time_cost, use_count, verified
+# (bool → timechain anchor), label, ts}.
+SELF_LEARN_MACRO_READY = "SELF_LEARN_MACRO_READY"
+# self_learning_worker (idle EXPLORE loop, metabolically gated) → the background
+# idle chat loop. Ask the real pipeline to pose an uncertain verifiable problem
+# so its reward flows back through the normal join (exploration never on a live
+# user turn — INV-OML-9). Payload: {goal_class, prompt_hint, ts}.
+SELF_LEARN_EXPLORE_REQUEST = "SELF_LEARN_EXPLORE_REQUEST"
+
 # Phase 2 standing-contract event (PLAN_synthesis_engine_Phase2.md 2B,
 # D-P2-4): emitted by the post-seal contract hook in
 # timechain_v2.Mempool/BlockBuilder for every TX sealed that matches an

@@ -70,13 +70,16 @@ def test_exploit_action_valid_index():
 
 
 def test_explore_low_temperature_concentrates():
-    # at near-zero temperature, sampling collapses to (near) argmax.
+    # at near-zero temperature, sampling collapses to argmax. Seed a clear
+    # winner first so the test is deterministic regardless of random init ties.
     p = OuterMetaPolicy()
+    tool = OUTER_ACTIONS.index("tool")
+    p.seed_prior(tool, strength=10.0)
     x = _feat(requires_tool=True, has_code_signal=True)
-    greedy = p.exploit_action(x)
+    assert p.exploit_action(x) == tool
     draws = [p.select_action(x, temperature=0.1) for _ in range(200)]
-    # the greedy action dominates the low-temperature samples
-    assert draws.count(greedy) > 120
+    # the dominant action takes ~all of the low-temperature samples
+    assert draws.count(tool) > 180
 
 
 def test_learn_shifts_toward_rewarded_action():

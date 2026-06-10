@@ -1382,6 +1382,40 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         boot_priority="post_boot",
     ))
 
+    # self_learning_worker — the OUTER meta-reasoning policy owner
+    # (RFP_synthesis_self_learning_meta_reasoning Phase 1 / §7.A). Off-hot-path
+    # half of the verifiable-lane closed loop: stashes the agno DECIDE by
+    # parent_tool_call_tx (SELF_LEARN_DECISION), joins the async oracle reward at
+    # the dream-flush (SELF_LEARN_REWARD), trains the OuterMetaPolicy (numpy
+    # REINFORCE), publishes weights to SHM (read O(1) by the next DECIDE turn),
+    # and distils winning macro-strategies → synthesis_worker (SELF_LEARN_MACRO_
+    # READY). Owns ONLY data/self_learning.duckdb (G21 / INV-OML-8) — never a
+    # spine handle. Saves the policy on every update → nothing buffered (not a
+    # SAVE_NOW critical_data_writer). Spawn-gated on the config flag (default
+    # off → byte-identical grounded_route, the agno consume-gate also off).
+    _self_learning_enabled = bool(
+        ((config.get("synthesis", {}) or {}).get("self_learning", {}) or {}).get(
+            "enabled", False))
+    from titan_hcl.modules.self_learning_worker import self_learning_worker_main
+    guardian.register(ModuleSpec(
+        name="self_learning",
+        layer="L2",
+        entry_fn=self_learning_worker_main,
+        config=config,
+        rss_limit_mb=250,    # numpy policy + a small duckdb; no LLM, no SHM weight load
+        autostart=_self_learning_enabled,   # only when the flag is flipped on
+        lazy=False,
+        heartbeat_timeout=120.0,
+        broadcast_topics=[
+            _bus_constants.SELF_LEARN_DECISION,
+            _bus_constants.SELF_LEARN_REWARD,
+            _bus_constants.MODULE_SHUTDOWN,
+        ],
+        start_method="spawn" if _spawn_grad else "fork",
+        critical_data_writer=False,  # policy is saved on every update; nothing to flush
+        boot_priority="post_boot",
+    ))
+
     # observatory_worker — extracted per RFP_phase_c_titan_hcl_cleanup
     # Phase A+B (Track 2, 2026-05-21). Maker-greenlit inline.
     # Owns the two residual Observatory-output PRODUCTION loops carved out
