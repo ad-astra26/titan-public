@@ -30,8 +30,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-import numpy as np
-
 # Defaults match arch §5.2; runtime values come from titan_params.toml.
 DEFAULT_DECAY_D = 0.5
 DEFAULT_WINDOW_N = 20
@@ -131,67 +129,6 @@ def base_level(
     if sum_powers <= 0.0:
         return float("-inf")
     return math.log(sum_powers)
-
-
-def base_level_batch(
-    states,
-    now: float,
-    d: float = DEFAULT_DECAY_D,
-    window_n: int = DEFAULT_WINDOW_N,
-) -> np.ndarray:
-    """Vectorized B_i over many states — numerically identical to per-state
-    ``base_level()`` but **GIL-RELEASING** (numpy C-level array ops), so the 60s
-    recompute over ~1500 items no longer holds the GIL ~50s and starves the
-    synthesis heartbeat (the ``heartbeat_timeout`` crash-loop, root-caused
-    2026-06-10 / `feedback_no_bulk_cpu_on_worker_thread_gil_starves_heartbeat`).
-
-    Returns ``np.ndarray[float64]`` of B_i aligned with ``states`` (``-inf`` for a
-    never-accessed item, exactly like ``base_level``). ``window_n`` is accepted for
-    signature parity but UNUSED in the math — exactly like ``base_level``, which
-    sums the FULL ``access_log`` and derives ``retained = len(access_log)`` (the
-    sliding-window cap lives in ``record_access``, not here). The reduction is over
-    a ``(N, max_len)`` padded matrix where ``max_len`` is the longest log in the
-    population (≤ window_n=20 in production → below numpy's 128-element pairwise
-    threshold, so each row sums as a naive left-fold — the SAME order as the scalar
-    loop → agreement to libm-``pow`` ULP, proven in
-    ``test_activation_vectorized_recompute``). NaN marks empty log slots so
-    ``nansum`` skips them (contributing exactly 0, like the loop's shorter range)."""
-    n = len(states)
-    if n == 0:
-        return np.empty(0, dtype=np.float64)
-    # Size to the ACTUAL longest log (NOT window_n) so the sum covers every
-    # retained timestamp exactly as the scalar loop does — base_level ignores
-    # window_n and iterates the whole access_log.
-    max_len = max((len(s.access_log) for s in states), default=0)
-    if max_len == 0:
-        return np.full(n, -np.inf, dtype=np.float64)   # every item cold
-    logs = np.full((n, max_len), np.nan, dtype=np.float64)
-    retained = np.empty(n, dtype=np.int64)
-    access_count = np.empty(n, dtype=np.int64)
-    first_access = np.empty(n, dtype=np.float64)
-    for i, st in enumerate(states):
-        log = st.access_log
-        r = len(log)
-        if r:
-            logs[i, :r] = log
-        retained[i] = r
-        access_count[i] = st.access_count
-        first_access[i] = st.first_access
-    # Σ max(now − t_j, ε)^(−d) over the retained log (NaN pad → skipped by nansum).
-    ages = np.maximum(now - logs, EPSILON_AGE_S)        # NaN propagates through maximum
-    sum_powers = np.nansum(ages ** (-d), axis=1)         # NaN → 0 contribution
-    # Petrov O(1) tail for the (access_count − retained) older accesses.
-    tail_count = access_count - retained
-    age_first = np.maximum(now - first_access, EPSILON_AGE_S)
-    tail_div = (1.0 - d) if d < 1.0 else 1.0             # match the scalar degenerate branch
-    tail_term = np.where(tail_count > 0,
-                         tail_count * (age_first ** (-d)) / tail_div, 0.0)
-    sum_powers = sum_powers + tail_term
-    # B_i = ln(sum_powers); −inf for cold (count==0 | empty log) or sum≤0 — same as base_level.
-    out = np.full(n, -np.inf, dtype=np.float64)
-    valid = (access_count > 0) & (retained > 0) & (sum_powers > 0.0)
-    out[valid] = np.log(sum_powers[valid])
-    return out
 
 
 def recompute_all(

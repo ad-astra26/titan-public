@@ -469,6 +469,17 @@ class EngramStore:
             composed_from=composed_from,
         )
 
+        # Step 4 (§7.P3a / INV-SD-16): a `domain="self"` engram (the soul-diary +
+        # self-about content) joins the Self hub via SELF_HAS_ENGRAM, so one-hop
+        # self-recall stays current. Best-effort — never aborts the create.
+        if (domain_hint or "").strip().lower() == "self":
+            try:
+                self._graph.spine_link_self_engram(concept_id, 1)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[EngramStore] SELF_HAS_ENGRAM link for %s failed: %s",
+                    concept_id, e)
+
         return Engram(
             concept_id=concept_id, version=1, name=name,
             memory_type=memory_type, groundedness=initial_groundedness,

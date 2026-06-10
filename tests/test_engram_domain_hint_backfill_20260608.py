@@ -32,27 +32,31 @@ def test_derive_consciousness_phenomenology_to_philosophy_of_mind():
         assert derive_domain_hint(name) == "philosophy_of_mind", name
 
 
-def test_derive_self_introspective_social_bucket():
+def test_derive_self_vs_social_split():
+    # RFP_titan_authored_soul_diary §7.P2 split the former self+social mega-
+    # bucket: Titan-about-himself markers (self/introspect/…) → "self"; the
+    # interpersonal/social content that was previously mislabeled "self" → "social".
     for name in ("Titan Self Profile Snapshot", "Titan Self-Profile",
-                 "Atmospheric Interpersonal Presence",
+                 "Seaside Introspective Dialogue"):   # "introspect" → self (most-specific)
+        assert derive_domain_hint(name) == "self", name
+    for name in ("Atmospheric Interpersonal Presence",
                  "Atmospheric Interpersonal Stillness",
                  "Titan's Interpersonal Reflections",
                  "Human-AI Emotional Resonance",
                  "Interactions with Rio the Musician",
                  "Seaside Contemplation Dialogue", "Seaside Indigo Dialogue",
-                 "Seaside Introspective Dialogue",
                  "Dream Consolidation Wisdom Patterns",
                  "Emergent Emotional Composition"):
-        assert derive_domain_hint(name) == "self", name
+        assert derive_domain_hint(name) == "social", name
 
 
-def test_derive_philosophical_social_resolves_to_self_not_philosophy():
-    # The live LLM labeled this introspective/social cluster "self" (e.g.
-    # "Seaside Philosophical Dialogue" → self); the social/reflection cue must
-    # win over the bare "philosoph" rule (ordering contract).
+def test_derive_philosophical_social_resolves_to_social_not_philosophy():
+    # The social/reflection cue must win over the bare "philosoph" rule (ordering
+    # contract). Post-§7.P2-split the label is "social" (was "self" while self +
+    # social shared one bucket).
     for name in ("Philosophical Social Resonance", "Philosophical Social Synthesis",
                  "Philosophical Social Reflections", "Synthetic Philosophical Reflection"):
-        assert derive_domain_hint(name) == "self", name
+        assert derive_domain_hint(name) == "social", name
 
 
 def test_derive_standalone_philosophy_without_social_cue():
@@ -135,7 +139,7 @@ def test_backfill_labels_blanks_skips_artifacts_preserves_existing(tmp_path):
     hints = _snapshot_hints(store, tmp_path)
     assert hints["already_hinted"] == "biology"          # untouched
     assert hints["voss"] == "philosophy_of_mind"
-    assert hints["seaside"] == "self"
+    assert hints["seaside"] == "social"                  # §7.P2 split (was "self")
     assert hints["adv"] == "security"
     assert hints["e2e"] == ""                            # test artifact skipped
     assert hints["framework"] == ""                     # low-confidence skipped

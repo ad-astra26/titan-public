@@ -3188,9 +3188,7 @@ class MetaCGNConsumer:
 
     def log_haov_chain(self, chain_id: int, primitives: list,
                        dominant: Optional[str], terminal_reward: float,
-                       domain: Optional[str] = None,
-                       trigger_reason: Optional[str] = None,
-                       grounding_concept: Optional[str] = None) -> None:
+                       domain: Optional[str] = None) -> None:
         """Log chain-conclusion entry for HAOV correlation analysis.
 
         Called from meta_reasoning chain-conclude path alongside
@@ -3198,12 +3196,6 @@ class MetaCGNConsumer:
         handle_cross_consumer_signal. Join by time window (e.g. signals
         within 60s before chain start) reveals which subsystem signals
         actually predict outcome quality.
-
-        RFP_cgn_loop_closure §7.A — ``trigger_reason`` + ``grounding_concept``
-        are logged so gates G5 (share of chains with
-        trigger_reason=concept_grounding) and G11 (chains carrying a
-        grounding_concept) are checkable from the jsonl; they were absent
-        before, leaving §4.3/§4.7 unverifiable.
         """
         self._log_haov_entry({
             "kind": "chain",
@@ -3212,9 +3204,6 @@ class MetaCGNConsumer:
             "dominant": dominant,
             "terminal_reward": float(terminal_reward),
             "domain": domain,
-            "trigger_reason": str(trigger_reason) if trigger_reason else "",
-            "grounding_concept": (
-                str(grounding_concept) if grounding_concept else ""),
         })
 
     def handle_cross_consumer_signal(self, consumer: str, event_type: str,

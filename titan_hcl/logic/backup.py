@@ -84,7 +84,7 @@ class RebirthBackup:
     """
 
     def __init__(self, network_client, config: dict = None, titan_id: str = "T1",
-                 arweave_store=None, full_config: dict = None, chain_provider=None):
+                 arweave_store=None, full_config: dict = None):
         """
         Args:
             network_client: Solana RPC client (for ZK snapshot + NFT mint)
@@ -93,16 +93,12 @@ class RebirthBackup:
             arweave_store: injected ArweaveStore (rFP Phase 1 BUG-5 fix —
                 constructed ONCE at boot rather than rebuilt per-backup)
             full_config: optional full config dict (for mainnet_budget flag)
-            chain_provider: injected ChainProvider (RFP_chain_provider Phase A —
-                the data-plane path for Arweave put/get; tests inject a
-                FakeChainProvider). Lazily built by `_ensure_chain()` if None.
         """
         config = config or {}
         self.network = network_client
         self.current_snapshot_hash = None
         self._titan_id = titan_id
         self._arweave_store = arweave_store  # BUG-5: injected once at boot
-        self._chain_provider = chain_provider  # RFP_chain_provider Phase A
         self._full_config = full_config or {}
 
         # Will be wired by TitanHCL.__init__
@@ -326,11 +322,11 @@ class RebirthBackup:
                         today, self._meditation_count)
                     return
 
-                # Irys auto-fund via ChainProvider (RFP Phase C tail) — top up
-                # before the upload; bounded by the daily cap inside chain.fund.
+                # Irys auto-fund (re-homed 2026-05-31) — top up before the upload,
+                # same caps (auto_fund_enabled / daily cap / runway / reserve).
                 # Best-effort; a fund hiccup never blocks the backup.
                 try:
-                    await self._auto_fund_irys_before_upload()
+                    self._auto_fund_irys_before_upload()
                 except Exception as _af_err:
                     logger.warning(
                         "[Backup] §24 Irys auto-fund check raised: %s", _af_err)
@@ -2094,7 +2090,6 @@ class RebirthBackup:
 
         component_sigs: dict = {}
         head_sig: Optional[str] = None
-        chain = self._ensure_chain()  # RFP_chain_provider Phase B tail
         for i, comp in enumerate(components):
             try:
                 memo = build_v3_memo(
@@ -2108,22 +2103,25 @@ class RebirthBackup:
                 logger.error("[Backup] v=3 memo build failed (%s): %s",
                              comp.get("tier"), e)
                 return None
-            # RFP_chain_provider Phase B tail — the memo-ix build, the head's
-            # vault commit_state bundle, and the tx send all move INTO
-            # `chain.commit_memo`: ONE tx per component, `state_root` set ⇒ the
-            # head ([commit_ix, memo_ix]); None ⇒ a tail (or a backfill, the
-            # commit_state=False case). Memo BUILDING stays above (build_v3_memo).
-            head = (i == 0 and commit_state)
-            try:
-                sig = await chain.commit_memo(
-                    memo,
-                    state_root=event_merkle_root if head else None,
-                    sovereignty_bp=sovereignty_bp if head else None,
-                )
-            except Exception as e:
-                logger.error("[Backup] v=3 chain commit raised (%s): %s",
-                             comp.get("tier"), e)
+            memo_ix = build_memo_instruction(self.network.pubkey, memo)
+            if memo_ix is None:
+                logger.error("[Backup] v=3 memo ix build failed (%s)", comp.get("tier"))
                 return None
+            ixs = [memo_ix]
+            if i == 0 and commit_state:  # head co-bundles commit_state(event_merkle_root)
+                try:
+                    state_root = bytes.fromhex(event_merkle_root)
+                except ValueError:
+                    logger.error("[Backup] v=3: event_merkle_root not valid hex")
+                    return None
+                commit_ix = build_vault_commit_instruction(
+                    self.network.pubkey, state_root, sovereignty_bp, vault_program_id)
+                if commit_ix is not None:
+                    ixs = [commit_ix, memo_ix]
+                else:
+                    logger.warning(
+                        "[Backup] v=3: commit_state ix unavailable — head memo-only")
+            sig = await self.network.send_sovereign_transaction(ixs, priority="LOW")
             if not sig:
                 logger.error("[Backup] v=3 chain commit: TX send failed (%s)",
                              comp.get("tier"))
@@ -2495,9 +2493,8 @@ class RebirthBackup:
         None) streams the plaintext tarball directly; Mode-B decrypts to dest. The
         staged file is ALWAYS the PLAINTEXT tarball, so its sha256 == the component
         merkle_root (restore_full verifies that streamed). Reuses the audited
-        backup_crypto helpers + the streaming `ChainProvider.get_to_file`
-        (RFP_chain_provider Phase A — the restore-fetch caller migrated here)."""
-        chain = self._ensure_chain()
+        backup_crypto helpers + the streaming ArweaveStore.fetch_to_file."""
+        store = self._ensure_arweave_store_for_unified()
         tx_meta: dict = {}
         for ev in manifest.events:
             for comp in ("personality", "timechain", "soul"):
@@ -2522,7 +2519,7 @@ class RebirthBackup:
             return cache["master"]
 
         async def _fetch_to_file(tx_id: str, dest_path: str) -> bool:
-            if chain is None:
+            if store is None:
                 return False
             meta = tx_meta.get(tx_id)
             if meta and meta.get("iv"):
@@ -2531,7 +2528,7 @@ class RebirthBackup:
                 # single read — but it's the encrypted-user fallback (T1 is
                 # Mode-A) and still far below the old all-components-in-RAM peak.
                 ct_tmp = dest_path + ".ct"
-                ok = await chain.get_to_file(tx_id, ct_tmp)
+                ok = await store.fetch_to_file(tx_id, ct_tmp)
                 if not ok:
                     return False
                 try:
@@ -2551,7 +2548,7 @@ class RebirthBackup:
                     except OSError:
                         pass
             # Mode-A: stream the plaintext tarball straight to dest (chunked).
-            return await chain.get_to_file(tx_id, dest_path)
+            return await store.fetch_to_file(tx_id, dest_path)
         return _fetch_to_file
 
     async def _recover_mirror_to_latest(self, manifest, latest_id) -> bool:
@@ -2925,27 +2922,6 @@ class RebirthBackup:
             )
             return None
 
-    def _ensure_chain(self):
-        """Lazy-init the ChainProvider (RFP_chain_provider). An injected provider
-        (tests → FakeChainProvider) wins. Otherwise build a real
-        ArweaveChainProvider: the data plane (Phase A) uses the same keypair/
-        network as `_ensure_arweave_store_for_unified`; the trust plane (Phase B)
-        is wired with `self.network` (the Solana signer for `commit_memo`) + the
-        vault program id. Construction does no I/O (daemon/RPC connect lazily)."""
-        if self._chain_provider is not None:
-            return self._chain_provider
-        from titan_hcl.chain import ArweaveChainProvider
-        kp = os.path.expanduser("~/.config/solana/id.json")
-        net = "mainnet" if self._titan_id == "T1" else "devnet"
-        ncfg = (self._full_config or {}).get("network", {}) or {}
-        rpc = ncfg.get("premium_rpc_url", "") or ""
-        vpid = (getattr(self.network, "_vault_program_id", None)
-                or ncfg.get("vault_program_id"))
-        self._chain_provider = ArweaveChainProvider(
-            keypair_path=kp, network=net, rpc_url=rpc,
-            network_client=self.network, vault_program_id=vpid)
-        return self._chain_provider
-
     async def _run_unified_event_v2(self, weekday: int) -> bool:
         """Production wiring for backup_upload_pipeline.run_unified_event.
 
@@ -3051,7 +3027,7 @@ class RebirthBackup:
                 f.write(data)
                 tmp_path = f.name
             try:
-                tx = await self._ensure_chain().put(tmp_path, tags=tags)  # RFP_chain_provider Phase A (streams the temp file via the Irys daemon)
+                tx = await store.upload_file(tmp_path, tags=tags)
                 if not tx:
                     raise RuntimeError(
                         "ArweaveStore.upload_file returned empty tx_id"
@@ -3253,7 +3229,7 @@ class RebirthBackup:
                 f.write(data)
                 tmp_path = f.name
             try:
-                tx = await self._ensure_chain().put(tmp_path, tags=tags)  # RFP_chain_provider Phase A (streams the temp file via the Irys daemon)
+                tx = await store.upload_file(tmp_path, tags=tags)
                 if not tx:
                     raise RuntimeError(
                         "ArweaveStore.upload_file returned empty tx_id")
@@ -3323,25 +3299,20 @@ class RebirthBackup:
             if getattr(staged, "scratch_dir", None) and os.path.isdir(staged.scratch_dir):
                 shutil.rmtree(staged.scratch_dir, ignore_errors=True)
 
-    async def _auto_fund_irys_before_upload(self) -> None:
-        """Irys auto-fund via the ChainProvider (RFP_chain_provider Phase C tail) —
-        `chain.balance()` + the BOUNDED `chain.fund()` replace the
-        `BackupCascade` subprocess-`node` path (INV-CP-3). Config moves to
-        `[chain.fund]` (Q-CP-3 clean cut). No-op when disabled / runway sufficient
-        / devnet. The runway→amount DECISION here is contained; it moves to the
-        BackupOrchestrator in the next redesign step (which will also enforce the
-        wallet-reserve floor against the live wallet balance)."""
-        fcfg = ((self._full_config or {}).get("chain", {}) or {}).get("fund", {}) or {}
-        if not fcfg.get("enabled", False):
+    def _auto_fund_irys_before_upload(self) -> None:
+        """Re-homed Irys auto-fund (2026-05-31). The auto-fund hook lived only in
+        the legacy BackupCascade.run() path, which the unified_v2 migration
+        retired — so it stopped firing after 2026-05-19 and the deposit went red.
+        Re-invoke it from the unified_v2 daily path, before the upload, with the
+        SAME caps (config-gated by [backup].auto_fund_enabled + daily cap +
+        runway floor + wallet reserve; the audit log + Telegram alert are emitted
+        inside auto_fund_irys_if_needed). No-op when disabled / runway sufficient.
+        """
+        bcfg = (self._full_config or {}).get("backup", {}) or {}
+        if not bcfg.get("auto_fund_enabled", False):
             return
-        chain = self._ensure_chain()
-        try:
-            irys_sol = await chain.balance()
-        except Exception as e:
-            logger.warning("[Backup] §24 Irys auto-fund: balance query failed: %s", e)
-            return
-        if irys_sol == float("inf"):
-            return  # devnet — no real deposit
+        from titan_hcl.logic.backup_cascade import BackupCascade
+        cascade = BackupCascade(full_config=self._full_config)
         # Runway estimator needs a representative upload size — use the staged
         # event's total tarball size when available, else a sane daily default.
         size_mb = 35.0
@@ -3356,24 +3327,18 @@ class RebirthBackup:
                     size_mb = total / 1048576.0
         except Exception:
             pass
-        avg_cost = max(size_mb, 1.0) * 0.0002 * 2.0  # 2× safety margin (match S4)
-        daily_burn = avg_cost * float(fcfg.get("avg_uploads_per_day", 3.0))
-        runway = irys_sol / daily_burn if daily_burn > 0 else 1e9
-        if runway >= float(fcfg.get("min_runway_days", 3.0)):
-            return  # runway sufficient
-        target_sol = float(fcfg.get("target_runway_days", 14.0)) * daily_burn
-        amount = max(0.0, target_sol - irys_sol)
-        if amount <= 0:
-            return
-        try:
-            tx = await chain.fund(
-                amount, daily_cap_sol=float(fcfg.get("daily_cap_sol", 0.05)))
-        except Exception as e:
-            logger.warning("[Backup] §24 Irys auto-fund: fund failed: %s", e)
-            return
-        if tx:
-            logger.info("[Backup] §24 Irys auto-fund: FUNDED ~%.4f SOL (runway was "
-                        "%.2fd) tx=%s", amount, runway, str(tx)[:16])
+        result = cascade.auto_fund_irys_if_needed(size_mb)
+        action = (result or {}).get("action")
+        if action == "funded":
+            logger.info(
+                "[Backup] §24 Irys auto-fund: FUNDED %.4f SOL (runway was %.2fd) "
+                "tx=%s", result.get("amount_sol", 0.0),
+                result.get("runway_before_days", 0.0),
+                str(result.get("tx_id", ""))[:16])
+        elif action and action != "no_action":
+            logger.info(
+                "[Backup] §24 Irys auto-fund: %s (%s)",
+                action, result.get("reason", ""))
 
     # ── Local diff/baseline event (L5, 2026-05-14) ─────────────────────────
     #

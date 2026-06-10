@@ -235,14 +235,6 @@ class MetaChainState:
     grounding_concept: str = ""
     grounding_consumer: str = ""
     entry_primitive: str = ""
-    # RFP_cgn_loop_closure §7.A (ARC-4) — the originating request's id +
-    # question_type, carried so _conclude_chain can emit a META_REASON_OUTCOME
-    # back to the emergent-reward accumulator (handle_outcome REQUIRES a
-    # request_id). Empty for the mechanical experience_pressure/periodic
-    # chains, which therefore emit no outcome (only concept-seeded Level-A
-    # chains feed the loop).
-    grounding_request_id: str = ""
-    grounding_question_type: str = ""
     # ── Phase G (RFP_cgn_enhancements §9.3) — teacher-binding outcome tracking ──
     # The strongest ReasoningBinding that matched this chain's context (highest
     # sim×conf), plus whether the chain CHOSE its recommended primitive
@@ -1120,12 +1112,6 @@ class MetaReasoningEngine:
         self._total_meta_steps = 0
         self._total_wisdom_saved = 0
         self._total_eurekas = 0
-        # RFP_cgn_loop_closure §7.A — ARC-4 outcome-emit counter (G3/G4 live
-        # check) + last-chain audit fields (G5; surfaced in get_audit_stats →
-        # meta_reasoning_state.bin so the SHM readout carries real values).
-        self._meta_outcomes_emitted = 0
-        self._last_chain_reason = ""
-        self._last_chain_succeeded = False
         # META-CGN Producer #4 — pending eureka events queue.
         # _fire_eureka appends here (decoupled from bus/send_queue); spirit_worker
         # drains after each meta_engine.tick() and emits via emit_meta_cgn_signal.
@@ -2087,22 +2073,6 @@ class MetaReasoningEngine:
         }
 
         return {
-            # ── RFP_cgn_loop_closure §7.A telemetry fix (G5) ──
-            # The publisher (meta_reasoning_state_publisher.py:167) reads these
-            # straight from get_audit_stats() but they were NEVER provided here
-            # (the lifetime counter lives only in get_stats() as "total_chains")
-            # → the SHM slot, hence /v6/cognition/meta-reasoning, has reported 0
-            # since the slot was created (cd755d197), the exact stale-0 the RFP
-            # §0.1 flags. Surface them from the live engine counters so the
-            # readout stops lying. (Schema field total_meta_chains already
-            # reserved in meta_reasoning_state.bin v2 / D-SPEC-91 — no SPEC bump.)
-            "total_meta_chains": int(self._total_meta_chains),
-            "last_chain_id": int(self.get_last_chain_id()),
-            "last_chain_reason": str(getattr(self, "_last_chain_reason", "") or ""),
-            "last_chain_succeeded": bool(
-                getattr(self, "_last_chain_succeeded", False)),
-            "meta_outcomes_emitted": int(
-                getattr(self, "_meta_outcomes_emitted", 0)),
             "diversity": {
                 "unique_prims_ema_50chains": round(float(unique_ema), 3),
                 "unique_prims_per_chain_recent": recent_uniques[-20:],
@@ -2305,13 +2275,6 @@ class MetaReasoningEngine:
             self.state.grounding_concept = str(_g.get("concept_id", ""))
             self.state.grounding_consumer = str(_g.get("consumer", ""))
             self.state.entry_primitive = str(_g.get("entry_primitive", ""))
-            # RFP_cgn_loop_closure §7.A (ARC-4) — keep the request id +
-            # question_type so _conclude_chain can emit the outcome that
-            # feeds the emergent-reward accumulator (the half that was missing
-            # → α-ramp starved). The grounding payload carries both
-            # (meta_service.handle_request:949).
-            self.state.grounding_request_id = str(_g.get("request_id", ""))
-            self.state.grounding_question_type = str(_g.get("question_type", ""))
             if self.state.grounding_concept:
                 self.state.entity_refs["current_topic"] = self.state.grounding_concept
             self._active_grounding = None  # consume once
@@ -3049,43 +3012,6 @@ class MetaReasoningEngine:
         self.buffer.record(
             [0.0] * META_POLICY_INPUT_DIM, 0, 0, terminal_reward, done=True)
 
-        # ── RFP_cgn_loop_closure §7.A telemetry (G5) — last-chain audit ──
-        # Surfaced via get_audit_stats → meta_reasoning_state.bin so the SHM
-        # readout stops lying (the endpoint reported last_chain_*=empty).
-        self._last_chain_reason = str(self.state.trigger_reason or "")
-        self._last_chain_succeeded = True
-
-        # ── RFP_cgn_loop_closure §7.A (ARC-4) — emit META_REASON_OUTCOME ──
-        # THE root-cause fix: concept-seeded Level-A chains concluded but emitted
-        # NO outcome (grep-confirmed 0 emissions), so the emergent-reward
-        # accumulator was never fed by the loop → α-ramp starved forever. Emit
-        # the chain's terminal_reward (the §1.3 worked-example value, signed
-        # [-1,+1]) tagged with the full primitive_sequence for multi-step credit
-        # (record_outcome). ONLY concept-seeded chains carry a request_id (the
-        # mechanical experience_pressure/periodic chains don't, and handle_outcome
-        # requires one) — so this fires exactly for the Level-A loop, by design.
-        if self.state.grounding_request_id and self.state.grounding_consumer:
-            try:
-                from titan_hcl.logic.meta_service_client import send_meta_outcome
-                send_meta_outcome(
-                    request_id=self.state.grounding_request_id,
-                    consumer_id=self.state.grounding_consumer,
-                    outcome_reward=max(-1.0, min(1.0, float(terminal_reward))),
-                    actual_primitive_used=(
-                        prims_in_chain[0] if prims_in_chain else None),
-                    primitive_sequence=list(prims_in_chain),
-                    context=(f"chain{self.state.chain_id}:"
-                             f"{self.state.grounding_concept}")[:256],
-                    send_queue=self._send_queue,
-                    src="cognitive_worker",
-                )
-                self._meta_outcomes_emitted += 1
-            except Exception as _oc_err:
-                swallow_warn(
-                    '[logic.meta_reasoning] _conclude_chain: META_REASON_OUTCOME emit',
-                    _oc_err,
-                    key='logic.meta_reasoning.conclude.outcome_emit', throttle=100)
-
         # ── TUNING-012 v2 Sub-phase B: record chain outcome for IQL training ──
         # Refine the task embedding with the actual final domain (was "pending"
         # at chain start since FORMULATE.define hadn't run yet).
@@ -3232,9 +3158,6 @@ class MetaReasoningEngine:
                     dominant=dominant_primitive,
                     terminal_reward=task_success_mcgn,
                     domain=final_domain_mcgn,
-                    # RFP_cgn_loop_closure §7.A — make G5/G11 checkable from jsonl
-                    trigger_reason=self.state.trigger_reason,
-                    grounding_concept=self.state.grounding_concept,
                 )
                 self._meta_cgn.evaluate_graduation()
                 self._meta_cgn.check_impasse()

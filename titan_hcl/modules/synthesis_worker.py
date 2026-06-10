@@ -91,7 +91,6 @@ from titan_hcl.synthesis.activation import (
     DEFAULT_WINDOW_N,
     ActivationState,
     base_level,
-    base_level_batch,
     record_access,
 )
 from titan_hcl.synthesis.standing_store import (
@@ -422,30 +421,19 @@ class ActivationStore:
         """Recompute every cached state's B_i and persist to DuckDB.
         Returns the count of rows actually upserted (states that changed).
         """
-        states = list(self._cache.values())
-        if not states:
-            return 0
-        # VECTORIZED B_i (GIL-RELEASING) — the per-item pure-Python loop over
-        # ~1500 items held the GIL ~50s and STARVED the synthesis heartbeat →
-        # guardian heartbeat_timeout crash-loop (root-caused 2026-06-10;
-        # feedback_no_bulk_cpu_on_worker_thread_gil_starves_heartbeat). numpy
-        # releases the GIL during the C-level reduction, so the separate
-        # heartbeat thread runs while B_i is computed. base_level_batch is
-        # numerically identical to base_level (test_activation_vectorized_
-        # recompute) — only the GIL behaviour + wall-time change (50s → sub-s).
-        bis = base_level_batch(states, now, d=d, window_n=window_n)
         rows: list[tuple] = []
-        # Residual loop is cheap (float compares + tuple packing, no pow/log) —
-        # microseconds, not the old 50s; the heavy math is now the vectorized op.
-        for state, new_bi in zip(states, bis):
-            new_bi = float(new_bi)
-            if new_bi != state.base_level or state.last_recompute == 0.0:
+        for state in self._cache.values():
+            new_bi = base_level(state, now, d=d, window_n=window_n)
+            changed = (new_bi != state.base_level
+                       or state.last_recompute == 0.0)
+            if changed:
                 state.base_level = new_bi
                 state.last_recompute = now
                 rows.append(self._row_tuple(state))
-        # rows are immutable tuples → the DuckDB upsert is submitted as ONE batch
-        # op to the writer thread (heavy persist never runs on this thread, never
-        # races another handle user).
+        # The B_i math ran on the CALLER thread (under cache_lock); rows are
+        # immutable tuples, so the DuckDB upsert is submitted as ONE batch op
+        # to the writer thread — heavy compute never runs on the writer, and
+        # the persist never races another handle user.
         if rows:
             self._writer.submit(lambda: self._persist_rows(rows))
         return len(rows)
@@ -480,44 +468,22 @@ class ActivationStore:
                 state.first_access, state.base_level, state.last_recompute)
 
     def _persist_rows(self, rows: list[tuple]) -> None:
-        """SET-BASED vectorized upsert on the writer thread (INV-Syn-3 sole writer).
-
-        ROOT-CAUSE FIX (2026-06-10, verified via py-spy + microbench): DuckDB's
-        `executemany` is ROW-BY-ROW, and per-row `ON CONFLICT DO UPDATE` is its
-        columnar/OLAP pathological worst case — 1519 rows took ~10.5s on an idle
-        box / ~30s on a contended one, and since the recompute marks ALL rows
-        changed every 60s (B_i decays with `now`), it ran every pass and BLOCKED
-        the entire SynthesisWriter queue (export/tx-index/skill-drain all stacked
-        behind it → 30s submit_sync timeouts → guardian heartbeat_timeout class).
-        A pyarrow-registered set-based upsert is ONE vectorized statement: ~157ms
-        for 1519 rows (66× faster). ON CONFLICT DO UPDATE (NOT INSERT OR REPLACE —
-        that DELETE+INSERTs + churns the PK ART index, the 2026-06-01 crash class)."""
-        if not rows:
-            return
-        import pyarrow as pa
-        cols = list(zip(*rows))   # transpose row-tuples → columns (order = _row_tuple)
-        tbl = pa.table({
-            "item_id": cols[0], "last_access": cols[1], "access_log": cols[2],
-            "access_count": cols[3], "first_access": cols[4],
-            "base_level": cols[5], "last_recompute": cols[6],
-        })
-        self._conn.register("_activation_stage", tbl)
-        try:
-            self._conn.execute(
-                "INSERT INTO activation_state "
-                "(item_id, last_access, access_log, access_count, first_access, "
-                " base_level, last_recompute) "
-                "SELECT item_id, last_access, access_log, access_count, "
-                "       first_access, base_level, last_recompute "
-                "FROM _activation_stage "
-                "ON CONFLICT (item_id) DO UPDATE SET "
-                "last_access=excluded.last_access, access_log=excluded.access_log, "
-                "access_count=excluded.access_count, "
-                "first_access=excluded.first_access, "
-                "base_level=excluded.base_level, "
-                "last_recompute=excluded.last_recompute")
-        finally:
-            self._conn.unregister("_activation_stage")
+        """Batch upsert on the writer thread. ON CONFLICT DO UPDATE (NOT
+        INSERT OR REPLACE — that is DELETE+INSERT and churns the PK ART index,
+        the documented 2026-06-01 crash class). INV-Syn-3 sole writer."""
+        self._conn.executemany(
+            "INSERT INTO activation_state "
+            "(item_id, last_access, access_log, access_count, first_access, "
+            " base_level, last_recompute) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (item_id) DO UPDATE SET "
+            "last_access=excluded.last_access, access_log=excluded.access_log, "
+            "access_count=excluded.access_count, "
+            "first_access=excluded.first_access, "
+            "base_level=excluded.base_level, "
+            "last_recompute=excluded.last_recompute",
+            rows,
+        )
 
     def items_tracked(self) -> int:
         return len(self._cache)
@@ -678,21 +644,20 @@ def _tx_index_loop(tx_index_holder: dict, stop_event: threading.Event,
         stop_event.wait(interval_s)
 
 
+# EEL B1 (D-SPEC-153 / INV-Syn-29) — back off the off-hot-path skill-score drain
+# when the box is loaded. get_cpu_load() ∈ [0,1] (1 = all cores busy).
+_SKILL_DRAIN_CPU_BACKOFF = 0.75
+
+
 def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                             interval_s: float, name: str) -> None:
     """Daemon thread — drain the `skill_score_events` queue into `skill_cells`
     off the hot path (EEL Pillar B1). Its OWN cadence (like `_tx_index_loop`) so
-    a drain never delays the recompute watermark publish. All writes route through
-    the SynthesisWriter (Option C / INV-Syn-19).
-
-    NO cpu_load backoff (removed 2026-06-10): the drain is LIGHTWEIGHT — bounded to
-    DEFAULT_DRAIN_LIMIT upserts/tick, on this dedicated daemon thread, off the
-    heartbeat path. It is NOT the bulk consolidation/dream compute the cpu_load
-    gate was meant for. Gating it at cpu_load>0.75 STARVED skill formation on any
-    steadily-busy box (load>3 on 4 cores → cpu_load≈1.0 → never drained → 0 skills,
-    the soak finding). INV-EEL-1 "off-hot-path" is preserved; the per-tick BOUND is
-    the resource discipline. cpu_load is read for the log line only (observability),
-    never to gate."""
+    a drain never delays the recompute watermark publish, and **resource-gated**
+    (`system_sensor.get_cpu_load`): bulk learning backs off when the box is busy
+    — the sharpened INV-EEL-1 ("continuous-idle, score-driven, resource-gated,
+    NOT dream-only"). All writes route through the SynthesisWriter (Option C /
+    INV-Syn-19)."""
     stop_event.wait(min(interval_s, 15.0))
     try:
         from titan_hcl.utils.system_sensor import get_cpu_load
@@ -700,58 +665,21 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
         get_cpu_load = None
     while not stop_event.is_set():
         try:
-            summary = skill_store.drain_score_events()
-            if summary.get("drained"):
-                load = float(get_cpu_load()) if get_cpu_load is not None else -1.0
-                logger.info(
-                    "[synthesis_worker] skill-score drain — events=%d cells=%d "
-                    "promoted=%d (cpu_load=%.2f)",
-                    summary.get("drained", 0), summary.get("cells_touched", 0),
-                    summary.get("promoted", 0), load)
+            load = float(get_cpu_load()) if get_cpu_load is not None else 0.0
+            if load <= _SKILL_DRAIN_CPU_BACKOFF:
+                summary = skill_store.drain_score_events()
+                if summary.get("drained"):
+                    logger.info(
+                        "[synthesis_worker] skill-score drain — events=%d cells=%d "
+                        "promoted=%d (cpu_load=%.2f)",
+                        summary.get("drained", 0), summary.get("cells_touched", 0),
+                        summary.get("promoted", 0), load)
+            else:
+                logger.debug(
+                    "[synthesis_worker] skill-score drain backed off "
+                    "(cpu_load=%.2f > %.2f)", load, _SKILL_DRAIN_CPU_BACKOFF)
         except Exception as e:
             logger.debug("[synthesis_worker] skill-score drain tick failed: %s", e)
-        stop_event.wait(interval_s)
-
-
-def _skill_abstraction_loop(skill_store: Any, llm_propose, stop_event: threading.Event,
-                            interval_s: float, name: str) -> None:
-    """Daemon thread — drain the durable `skill_abstraction_queue` OFF the dream/
-    writer thread (dream-hardening 2026-06-10). The dream's miner only ENQUEUES
-    recurrent failure clusters; this loop makes the LLM abstraction call HERE
-    (off-writer — network I/O, GIL-released, never blocks the heartbeat or the
-    dream) then RECORDS the result through the writer (persist + 'done', or
-    attempts++/retry/'failed'). Save/resume: the queue is durable + this loop
-    resumes from status='pending' on every boot, so a slow/timed-out LLM never
-    blocks dreaming and a pending abstraction survives a restart/crash."""
-    stop_event.wait(min(interval_s, 20.0))
-    while not stop_event.is_set():
-        try:
-            pending = skill_store.fetch_pending_abstractions()
-            for entry in pending:
-                if stop_event.is_set():
-                    break
-                p = entry.get("payload") or {}
-                cluster_meta = {
-                    "sequence": p.get("sequence"),
-                    "occurrence_count": p.get("occurrence_count"),
-                    "kind": p.get("kind"),
-                    "members_summary": p.get("members_summary"),
-                }
-                proposal = None
-                try:
-                    # The LLM call — OFF the writer/dream thread (its whole point).
-                    proposal = llm_propose(cluster_meta, p.get("kind"))
-                except Exception as e:
-                    logger.warning(
-                        "[synthesis_worker] abstraction LLM call raised: %s", e)
-                skill_id = skill_store.record_abstraction_result(
-                    entry["cluster_id"], proposal)
-                if skill_id:
-                    logger.info(
-                        "[synthesis_worker] negative skill abstracted off-hot-path "
-                        "→ %s (cluster=%s)", skill_id, entry["cluster_id"])
-        except Exception as e:
-            logger.debug("[synthesis_worker] abstraction drain tick failed: %s", e)
         stop_event.wait(interval_s)
 
 
@@ -792,17 +720,70 @@ def _recompute_loop(store: "ActivationStore",
             with cache_lock:
                 n_touched = store.recompute_and_persist(now)
                 items = store.items_tracked()
-            # ── BREAK-THE-MONOLITH (2026-06-10) ──────────────────────────────
-            # The cross-process snapshot EXPORTS (activation/bundle/spine/fork/
-            # oracle/metrics) + the Kuzu WAL checkpoint USED to run inline here —
-            # ~34s of GIL-held work per pass that starved the 30s heartbeat thread
-            # (Python yields the GIL every ~5ms, but a long GIL-holding C call in
-            # an export blocks it) → guardian heartbeat_timeout crash-loop. They
-            # are now OFF this hot path, in `_export_loop` (its own daemon thread +
-            # cadence, per-step timed). This thread does ONLY the vectorized B_i
-            # recompute (above) + the watermark publish (below) — the fast critical
-            # path cross-process BridgeRecall freshness gates on. `bundles_exported`
-            # stays 0 here; the exporter logs the real count.
+                # Export atomic snapshot for cross-process readers
+                # (DuckDB 1.5+ lock workaround — see ACTIVATION_SNAPSHOT_NAME).
+                store.export_snapshot(snapshot_path)
+            # Bundle snapshot has its own internal lock — no need to hold
+            # cache_lock (and shouldn't, since maintain() is a separate
+            # write path with shorter critical section).
+            bundles_exported = bundle_store.export_snapshot(bundle_snapshot_path)
+            # Phase 4 FU-1 — spine snapshot for cross-process api reads.
+            # Holder pattern: synthesis_worker_main sets the exporter to
+            # EngramStore.export_snapshot AFTER kuzu_graph_obj is wired;
+            # default no-op until that completes.
+            try:
+                spine_exporter_holder["fn"]()
+            except Exception as _spine_exp_err:
+                logger.debug(
+                    "[synthesis_worker] spine_exporter call failed: %s",
+                    _spine_exp_err,
+                )
+            # Phase 5 §P5.C — push current B_i for every open fork into
+            # hypothesis_forks.activation so find_below_floor() reflects
+            # live activation. The updater is late-bound at fork-store
+            # wire time (default no-op so the loop fires before P5 wiring).
+            try:
+                fork_activation_updater_holder["fn"]()
+            except Exception as _fork_act_err:
+                logger.debug(
+                    "[synthesis_worker] fork_activation_updater call failed: "
+                    "%s", _fork_act_err,
+                )
+            # Phase 5 §P5.I — forks_snapshot.json for cross-process api reads.
+            try:
+                fork_exporter_holder["fn"]()
+            except Exception as _fork_exp_err:
+                logger.debug(
+                    "[synthesis_worker] fork_exporter call failed: %s",
+                    _fork_exp_err,
+                )
+            # Phase 6 §P6.K — oracles_snapshot.json for cross-process api reads.
+            try:
+                oracle_exporter_holder["fn"]()
+            except Exception as _ora_exp_err:
+                logger.debug(
+                    "[synthesis_worker] oracle_exporter call failed: %s",
+                    _ora_exp_err,
+                )
+            # Phase 10 §P10.B — synthesis_metrics_snapshot.json (observation-only).
+            try:
+                metrics_exporter_holder["fn"]()
+            except Exception as _met_exp_err:
+                logger.debug(
+                    "[synthesis_worker] metrics_exporter call failed: %s",
+                    _met_exp_err,
+                )
+            # WAL-hygiene (bugfix 2026-06-05) — bound the Kuzu spine WAL so its
+            # replay-on-open cost can never grow into the OOM-loop danger zone.
+            # No-op until wired (kuzu_graph_obj open) + only checkpoints past the
+            # size threshold / every ~30 passes (self-throttled inside the tick).
+            try:
+                kuzu_checkpoint_holder["fn"]()
+            except Exception as _kck_err:
+                logger.debug(
+                    "[synthesis_worker] kuzu_checkpoint call failed: %s",
+                    _kck_err,
+                )
             # G13 (AUDIT §5.3): the tx-index FAISS build (embed + add, bounded)
             # runs on its OWN `synthesis-tx-index` daemon thread now — NOT
             # inline here — so a slow embed (the embedder lazy-load is seconds)
@@ -848,74 +829,6 @@ def _recompute_loop(store: "ActivationStore",
         slept = time.monotonic() - t0
         remaining = max(interval_s - slept, 0.1)
         stop_event.wait(remaining)
-
-
-def _export_loop(store: "ActivationStore",
-                 bundle_store: "StandingBundleStore",
-                 snapshot_path: str,
-                 bundle_snapshot_path: str,
-                 spine_exporter_holder: dict,
-                 fork_exporter_holder: dict,
-                 fork_activation_updater_holder: dict,
-                 oracle_exporter_holder: dict,
-                 metrics_exporter_holder: dict,
-                 kuzu_checkpoint_holder: dict,
-                 send_queue, name: str,
-                 interval_s: float,
-                 stop_event: threading.Event,
-                 cache_lock) -> None:
-    """Daemon thread — cross-process snapshot exports + Kuzu checkpoint, run OFF
-    the recompute/heartbeat-critical path (break-the-monolith, 2026-06-10).
-
-    These USED to run inline in `_recompute_loop`, making one pass ~34s of GIL-held
-    work that starved the 30s heartbeat thread → guardian heartbeat_timeout
-    crash-loop under load. Moving them here keeps the recompute thread (watermark
-    publish) fast. Each step is INDIVIDUALLY timed + soft-failing; the breakdown is
-    logged (always on a slow pass, else hourly) so a single long GIL-holding export
-    NAMES ITSELF — the instrumentation that tells us if any one step must be further
-    chunked. Own cadence so a slow export never delays the recompute watermark.
-    Only the activation snapshot needs `cache_lock` (it reads the activation cache);
-    the rest have their own internal locks / are independent."""
-    stop_event.wait(min(interval_s, 12.0))   # settle + offset from the recompute pass
-    pass_count = 0
-    while not stop_event.is_set():
-        t0 = time.monotonic()
-        timings: dict[str, int] = {}
-        bundles = 0
-
-        def _timed(label, fn):
-            _s = time.monotonic()
-            try:
-                return fn()
-            except Exception as _e:   # per-step soft-fail (matches the old inline guards)
-                logger.debug("[synthesis_worker] export step %s failed: %s", label, _e)
-            finally:
-                timings[label] = int((time.monotonic() - _s) * 1000)
-
-        # Activation snapshot — the only step that reads the activation cache.
-        with cache_lock:
-            _timed("activation", lambda: store.export_snapshot(snapshot_path))
-
-        def _bundle():
-            nonlocal bundles
-            bundles = bundle_store.export_snapshot(bundle_snapshot_path) or 0
-        _timed("bundle", _bundle)                                  # own internal lock
-        _timed("spine", lambda: spine_exporter_holder["fn"]())     # Engram spine → JSON
-        _timed("fork_activation", lambda: fork_activation_updater_holder["fn"]())
-        _timed("fork", lambda: fork_exporter_holder["fn"]())
-        _timed("oracle", lambda: oracle_exporter_holder["fn"]())
-        _timed("metrics", lambda: metrics_exporter_holder["fn"]())
-        _timed("kuzu_checkpoint", lambda: kuzu_checkpoint_holder["fn"]())
-
-        total_ms = int((time.monotonic() - t0) * 1000)
-        pass_count += 1
-        # Per-step breakdown names the dominant GIL-holder (the diagnostic we need).
-        if total_ms > RECOMPUTE_SLOW_WARN_MS or pass_count % 60 == 1:
-            lvl = logger.warning if total_ms > RECOMPUTE_SLOW_WARN_MS else logger.info
-            lvl("[synthesis_worker] export pass #%d total=%dms bundles=%d breakdown=%s "
-                "(OFF hot path)", pass_count, total_ms, bundles, timings)
-        slept = time.monotonic() - t0
-        stop_event.wait(max(interval_s - slept, 0.1))
 
 
 def synthesis_worker_main(recv_queue, send_queue, name: str,
@@ -1184,20 +1097,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
     rc_thread.start()
-
-    # BREAK-THE-MONOLITH (2026-06-10): the cross-process snapshot exports + Kuzu
-    # WAL checkpoint run on their OWN daemon thread, OFF the recompute/heartbeat-
-    # critical path (they were ~34s of inline GIL-held work that starved the
-    # heartbeat → crash-loop). Per-step timed so the dominant GIL-holder names itself.
-    export_thread = threading.Thread(
-        target=_export_loop,
-        args=(store, bundle_store, snapshot_path, bundle_snapshot_path,
-              spine_exporter_holder, fork_exporter_holder,
-              fork_activation_updater_holder, oracle_exporter_holder,
-              metrics_exporter_holder, kuzu_checkpoint_holder,
-              send_queue, name, interval_s, stop_event, cache_lock),
-        daemon=True, name=f"synthesis-export-{name}")
-    export_thread.start()
 
     # G13 — tx-index FAISS build runs on its OWN daemon thread (off the
     # recompute/watermark thread). No-op until the builder wires the holder
@@ -2121,70 +2020,36 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         except Exception as e:
             logger.debug("[synthesis_worker] soft_retire emit failed: %s", e)
 
-    # EEL B1 (D-SPEC-153 / INV-Syn-29) — construct the skill store with RETRY +
-    # LOUD failure. The schema-init routes through the SynthesisWriter, which at
-    # boot can be backed up with the recompute/dream sequence; a single timed-out
-    # attempt MUST NOT silently disable B1 fleet-wide (2026-06-10 soak finding:
-    # one TimeoutError → "wiring failed" WARNING → B1 dead, no skills ever).
-    # The store's own SCHEMA_INIT_TIMEOUT_S (180s) covers the backlog; the retry
-    # is defence for extreme load; ultimate failure escalates on the §11.I.4
-    # cascade (visible on the kernel journal) — never swallowed.
-    _SKILL_WIRE_ATTEMPTS = 3
-    for _attempt in range(1, _SKILL_WIRE_ATTEMPTS + 1):
-        try:
-            from titan_hcl.synthesis.skill_store import ProceduralSkillStore
+    try:
+        from titan_hcl.synthesis.skill_store import ProceduralSkillStore
 
-            # Operator-closure Phase A: reuse the ONE shared embedder (no second
-            # fastembed model — RSS discipline). Same BAAI/bge-small-en-v1.5 path.
-            procedural_skill_store = ProceduralSkillStore(
-                duckdb_conn=store._conn,
-                writer=db_writer,                  # single-writer-thread (Option C)
-                faiss_path=skills_faiss_path,
-                snapshot_path=skills_snapshot_path,
-                embedder=_shared_embedder,
-                # EEL B1 — time_cost ∈ [0,1] (high=proficient); floors live in that space.
-                promote_floor=float(skill_cfg.get("promote_floor", 0.7)),
-                soft_retire_floor=float(skill_cfg.get("soft_retire_floor", 0.1)),
-                on_soft_retire=_skill_soft_retire_emit,
-            )
-            procedural_skill_store.snapshot_export()
-            logger.info(
-                "[synthesis_worker] Phase 8 ProceduralSkillStore ready (attempt %d) — "
-                "faiss=%s snapshot=%s", _attempt, skills_faiss_path, skills_snapshot_path,
-            )
-            break
-        except Exception as exc:
-            procedural_skill_store = None
-            if _attempt < _SKILL_WIRE_ATTEMPTS and not stop_event.is_set():
-                logger.warning(
-                    "[synthesis_worker] ProceduralSkillStore wiring attempt %d/%d "
-                    "failed (%s) — retrying after writer backlog drains",
-                    _attempt, _SKILL_WIRE_ATTEMPTS, exc)
-                stop_event.wait(15.0)
-                continue
-            # Final attempt failed → B1 is OFF. Escalate LOUDLY (not a swallowed
-            # WARNING) so a fleet-wide silent skill-learning outage is visible.
-            logger.error(
-                "[synthesis_worker] Phase 8 ProceduralSkillStore wiring FAILED after "
-                "%d attempts — EEL B1 skill learning DISABLED this boot: %s",
-                _SKILL_WIRE_ATTEMPTS, exc, exc_info=True)
-            try:
-                publish_module_error(send_queue, ModuleError(
-                    module_name=name, subsystem="skill_store",
-                    error_code="EEL_B1_WIRING_FAILED",
-                    severity=_phase11_sev.ERROR,
-                    message="ProceduralSkillStore wiring failed — EEL B1 skill learning disabled this boot",
-                    detail=(f"{type(exc).__name__}: {exc} (after {_SKILL_WIRE_ATTEMPTS} attempts; "
-                            f"schema-init routes through the SynthesisWriter, likely a boot-backlog "
-                            f"timeout under load). No positive skills will form until the next clean boot."),
-                    suggested_remediation="restart-module synthesis on a settled box (writer backlog clears)"))
-            except Exception:
-                pass
+        # Operator-closure Phase A: reuse the ONE shared embedder (no second
+        # fastembed model — RSS discipline). Same BAAI/bge-small-en-v1.5 path.
+        procedural_skill_store = ProceduralSkillStore(
+            duckdb_conn=store._conn,
+            writer=db_writer,                  # single-writer-thread (Option C)
+            faiss_path=skills_faiss_path,
+            snapshot_path=skills_snapshot_path,
+            embedder=_shared_embedder,
+            # EEL B1 — time_cost ∈ [0,1] (high=proficient); floors live in that space.
+            promote_floor=float(skill_cfg.get("promote_floor", 0.7)),
+            soft_retire_floor=float(skill_cfg.get("soft_retire_floor", 0.1)),
+            on_soft_retire=_skill_soft_retire_emit,
+        )
+        procedural_skill_store.snapshot_export()
+        logger.info(
+            "[synthesis_worker] Phase 8 ProceduralSkillStore ready — "
+            "faiss=%s snapshot=%s", skills_faiss_path, skills_snapshot_path,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[synthesis_worker] Phase 8 ProceduralSkillStore wiring failed: %s",
+            exc, exc_info=True,
+        )
 
-    # EEL B1 (D-SPEC-153 / INV-Syn-29) — start the off-hot-path skill-score drain
-    # daemon. Its OWN thread (like tx-index) so a drain never delays the recompute
-    # watermark; the per-tick DEFAULT_DRAIN_LIMIT bound is the resource discipline
-    # (INV-EEL-1 off-hot-path) — no cpu_load backoff (that starved it on busy boxes).
+    # EEL B1 (D-SPEC-153 / INV-Syn-29) — start the off-hot-path, resource-gated
+    # skill-score drain daemon. Its OWN thread (like tx-index) so a drain never
+    # delays the recompute watermark; backs off when the box is loaded (INV-EEL-1).
     if procedural_skill_store is not None:
         _skill_drain_thread = threading.Thread(
             target=_skill_score_drain_loop,
@@ -2386,21 +2251,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 max_skills_per_pass=int(skill_cfg.get("miner_max_skills_per_pass", 10)),
             )
             logger.info("[synthesis_worker] Phase 8 ProceduralMiner ready")
-            # Dream-hardening (2026-06-10): the negative-skill LLM abstraction runs
-            # on its OWN daemon thread, OFF the dream/writer thread, draining the
-            # durable skill_abstraction_queue the miner enqueues into. The LLM call
-            # happens off-writer (GIL-released) with retry; results persist via the
-            # writer; resumes pending entries on every boot (save/resume). So a slow
-            # /timed-out LLM never blocks the dream and the work is never lost.
-            _abstraction_thread = threading.Thread(
-                target=_skill_abstraction_loop,
-                args=(procedural_skill_store, _miner_llm_propose, stop_event,
-                      interval_s, name),
-                daemon=True, name=f"synthesis-abstraction-{name}")
-            _abstraction_thread.start()
-            logger.info(
-                "[synthesis_worker] dream-hardening: skill-abstraction daemon "
-                "started (off-hot-path LLM, durable queue, resumes on boot)")
         except Exception as exc:
             logger.warning(
                 "[synthesis_worker] Phase 8 ProceduralMiner wiring failed: %s",
