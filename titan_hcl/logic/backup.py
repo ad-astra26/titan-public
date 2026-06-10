@@ -84,7 +84,7 @@ class RebirthBackup:
     """
 
     def __init__(self, network_client, config: dict = None, titan_id: str = "T1",
-                 arweave_store=None, full_config: dict = None):
+                 arweave_store=None, full_config: dict = None, chain_provider=None):
         """
         Args:
             network_client: Solana RPC client (for ZK snapshot + NFT mint)
@@ -93,12 +93,16 @@ class RebirthBackup:
             arweave_store: injected ArweaveStore (rFP Phase 1 BUG-5 fix —
                 constructed ONCE at boot rather than rebuilt per-backup)
             full_config: optional full config dict (for mainnet_budget flag)
+            chain_provider: injected ChainProvider (RFP_chain_provider Phase A —
+                the data-plane path for Arweave put/get; tests inject a
+                FakeChainProvider). Lazily built by `_ensure_chain()` if None.
         """
         config = config or {}
         self.network = network_client
         self.current_snapshot_hash = None
         self._titan_id = titan_id
         self._arweave_store = arweave_store  # BUG-5: injected once at boot
+        self._chain_provider = chain_provider  # RFP_chain_provider Phase A
         self._full_config = full_config or {}
 
         # Will be wired by TitanHCL.__init__
@@ -2493,8 +2497,9 @@ class RebirthBackup:
         None) streams the plaintext tarball directly; Mode-B decrypts to dest. The
         staged file is ALWAYS the PLAINTEXT tarball, so its sha256 == the component
         merkle_root (restore_full verifies that streamed). Reuses the audited
-        backup_crypto helpers + the streaming ArweaveStore.fetch_to_file."""
-        store = self._ensure_arweave_store_for_unified()
+        backup_crypto helpers + the streaming `ChainProvider.get_to_file`
+        (RFP_chain_provider Phase A — the restore-fetch caller migrated here)."""
+        chain = self._ensure_chain()
         tx_meta: dict = {}
         for ev in manifest.events:
             for comp in ("personality", "timechain", "soul"):
@@ -2519,7 +2524,7 @@ class RebirthBackup:
             return cache["master"]
 
         async def _fetch_to_file(tx_id: str, dest_path: str) -> bool:
-            if store is None:
+            if chain is None:
                 return False
             meta = tx_meta.get(tx_id)
             if meta and meta.get("iv"):
@@ -2528,7 +2533,7 @@ class RebirthBackup:
                 # single read — but it's the encrypted-user fallback (T1 is
                 # Mode-A) and still far below the old all-components-in-RAM peak.
                 ct_tmp = dest_path + ".ct"
-                ok = await store.fetch_to_file(tx_id, ct_tmp)
+                ok = await chain.get_to_file(tx_id, ct_tmp)
                 if not ok:
                     return False
                 try:
@@ -2548,7 +2553,7 @@ class RebirthBackup:
                     except OSError:
                         pass
             # Mode-A: stream the plaintext tarball straight to dest (chunked).
-            return await store.fetch_to_file(tx_id, dest_path)
+            return await chain.get_to_file(tx_id, dest_path)
         return _fetch_to_file
 
     async def _recover_mirror_to_latest(self, manifest, latest_id) -> bool:
@@ -2922,6 +2927,24 @@ class RebirthBackup:
             )
             return None
 
+    def _ensure_chain(self):
+        """Lazy-init the ChainProvider data plane (RFP_chain_provider Phase A).
+        An injected provider (tests → FakeChainProvider) wins. Otherwise build a
+        real ArweaveChainProvider with the SAME keypair/network resolution as
+        `_ensure_arweave_store_for_unified` (consistency; INV-CP-1's single-signer
+        finalizes when the Solana plane moves in, Phase B). Construction does no
+        I/O (the daemon connects lazily on first put), so this never raises here."""
+        if self._chain_provider is not None:
+            return self._chain_provider
+        from titan_hcl.chain import ArweaveChainProvider
+        kp = os.path.expanduser("~/.config/solana/id.json")
+        net = "mainnet" if self._titan_id == "T1" else "devnet"
+        rpc = ((self._full_config or {}).get("network", {}) or {}).get(
+            "premium_rpc_url", "") or ""
+        self._chain_provider = ArweaveChainProvider(
+            keypair_path=kp, network=net, rpc_url=rpc)
+        return self._chain_provider
+
     async def _run_unified_event_v2(self, weekday: int) -> bool:
         """Production wiring for backup_upload_pipeline.run_unified_event.
 
@@ -3027,7 +3050,7 @@ class RebirthBackup:
                 f.write(data)
                 tmp_path = f.name
             try:
-                tx = await store.upload_file(tmp_path, tags=tags)
+                tx = await self._ensure_chain().put(tmp_path, tags=tags)  # RFP_chain_provider Phase A (streams the temp file via the Irys daemon)
                 if not tx:
                     raise RuntimeError(
                         "ArweaveStore.upload_file returned empty tx_id"
@@ -3229,7 +3252,7 @@ class RebirthBackup:
                 f.write(data)
                 tmp_path = f.name
             try:
-                tx = await store.upload_file(tmp_path, tags=tags)
+                tx = await self._ensure_chain().put(tmp_path, tags=tags)  # RFP_chain_provider Phase A (streams the temp file via the Irys daemon)
                 if not tx:
                     raise RuntimeError(
                         "ArweaveStore.upload_file returned empty tx_id")

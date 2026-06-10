@@ -97,6 +97,33 @@ def test_chain_provider_is_abstract():
 # ── real provider, devnet path (no network) ────────────────────────────────
 
 @pytest.mark.asyncio
+async def test_rebirthbackup_fetch_routes_through_chain_provider(tmp_path):
+    """Phase A tail: RebirthBackup's restore-fetch (`_build_fetch_to_file`) routes
+    through the injected ChainProvider's `get_to_file` (not ArweaveStore). Inject
+    a FakeChainProvider, point a manifest event at a tx in it, and confirm the
+    built fetcher streams that tarball back byte-identical."""
+    from titan_hcl.logic.backup import RebirthBackup
+
+    fake = FakeChainProvider()
+    backup = RebirthBackup(network_client=None, config={}, titan_id="T1",
+                           chain_provider=fake, full_config={})
+    assert backup._ensure_chain() is fake          # injection wins over lazy build
+
+    tarball = b"component-tarball-bytes" * 4096     # ~90 KB
+    tx = await fake.put(tarball)
+
+    class _Manifest:
+        events = [{"personality": {"tx_id": tx, "iv": None,
+                                   "merkle_root": "deadbeef"}}]
+
+    fetch = backup._build_fetch_to_file(_Manifest())
+    dest = tmp_path / "fetched.tar"
+    ok = await fetch(tx, str(dest))                 # Mode-A → chain.get_to_file
+    assert ok and dest.read_bytes() == tarball
+    assert tx in fake._store                        # came from the provider, not a store
+
+
+@pytest.mark.asyncio
 async def test_arweave_provider_devnet_roundtrip(tmp_path, monkeypatch):
     """The REAL ArweaveChainProvider on devnet uses the local cache — put → a
     `devnet_*` pseudo-tx → get_to_file/head read it back, no network (INV-CP-6)."""
