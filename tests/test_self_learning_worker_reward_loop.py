@@ -64,6 +64,44 @@ def test_decision_stash_then_reward_join_trains(tmp_path):
     assert len(store.recent_reward_tuples(10)) == 1
 
 
+def test_direct_reward_trains_without_stash(tmp_path):
+    # v1.1 (INV-OML-12): the C1 capture emits (features, action, reward) DIRECTLY
+    # — no decision stash, no tx join. The worker trains on it immediately.
+    store = _store(tmp_path)
+    policy = OuterMetaPolicy(lr=0.05)
+    tool = OUTER_ACTIONS.index("tool")
+    feats = _feat(has_code_signal=True)
+    updates_before = policy.total_updates
+    trained = _handle_reward(
+        {"features": feats, "action": tool, "reward": 1.0,
+         "goal_class": "combinatorics"},
+        store, policy, None, _cfg({}), _Q(), "self_learning")
+    assert trained is True
+    assert policy.total_updates == updates_before + 1
+    # recorded as a reward tuple (drives macro distillation)
+    assert len(store.recent_reward_tuples(10)) == 1
+    # no pending-decision stash was needed
+    assert store.pop_decision("anything") is None
+
+
+def test_direct_reward_distills_macro(tmp_path):
+    # enough direct verified wins of one (goal_class, action) → macro emitted.
+    store = _store(tmp_path)
+    cfg = _cfg({})
+    q = _Q()
+    policy = OuterMetaPolicy(lr=0.05)
+    tool = OUTER_ACTIONS.index("tool")
+    feats = _feat(has_code_signal=True)
+    for _ in range(int(cfg["macro_min_wins"])):
+        _handle_reward(
+            {"features": feats, "action": tool, "reward": 1.0,
+             "goal_class": "combinatorics"},
+            store, policy, None, cfg, q, "self_learning")
+    macros = [m for m in q.items if m["type"] == SELF_LEARN_MACRO_READY]
+    assert len(macros) == 1
+    assert macros[0]["payload"]["goal_class"] == "combinatorics"
+
+
 def test_reward_without_matching_decision_is_noop(tmp_path):
     store = _store(tmp_path)
     policy = OuterMetaPolicy(lr=0.05)

@@ -96,10 +96,34 @@ _NODE_TABLES: tuple[tuple[str, str], ...] = (
         "Self",
         "id STRING, created_at DOUBLE, PRIMARY KEY(id)",
     ),
+    (
+        # Learning — the OUTER self-learning hub (RFP_synthesis_self_learning_
+        # meta_reasoning v1.1 / INV-OML-11). A singleton per Titan-graph under
+        # Self (SELF_HAS_LEARNING), grouping every graphed Reasoning record so
+        # "what have I reasoned / learned to do?" resolves SELF→LEARNING→REASONING.
+        "Learning",
+        "id STRING, created_at DOUBLE, PRIMARY KEY(id)",
+    ),
+    (
+        # Reasoning — one graphed reasoning episode (INV-OML-11). kind="tool_use"
+        # = a per-use leaf record (decision+tool-call+result+score); kind=
+        # "macro_strategy" = a distilled, verified macro REASONING_COMPOSED_FROM
+        # its leaves (BRAIN §3 Idea-precursor). The rich scalars (features json,
+        # reward, {B_i,c,time_cost,use_count}) live in the DuckDB reasoning_records
+        # table keyed by reasoning_id; Kuzu holds graph identity + filter props +
+        # the FAISS signature lives in reasoning_vectors.faiss. anchor_tx = the
+        # procedural-fork TX pointer (verified macros only — INV-OML-6).
+        "Reasoning",
+        "reasoning_id STRING, kind STRING, goal_class STRING, action STRING, "
+        "oracle_id STRING, verdict STRING, anchor_tx STRING, created_at DOUBLE, "
+        "PRIMARY KEY(reasoning_id)",
+    ),
 )
 
 # Canonical id for the per-graph Self singleton (one Kuzu graph = one Titan).
 SELF_NODE_ID = "self"
+# Canonical id for the per-graph Learning singleton (one per Titan, under Self).
+LEARNING_NODE_ID = "learning"
 
 
 # (rel_name, from_table, to_table). No properties on these rels in P4 — the
@@ -114,6 +138,11 @@ _REL_TABLES: tuple[tuple[str, str, str], ...] = (
     # SELF hub edges (§7.P3a, INV-SD-16): his self-knowledge in one hop.
     ("SELF_HAS_ENGRAM", "Self", "Engram"),        # diary entries + self-about engrams
     ("SELF_HAS_SKILL", "Self", "Production"),     # what he can do (forward-compat)
+    # Outer self-learning subtree (RFP_synthesis_self_learning_meta_reasoning
+    # v1.1 / INV-OML-11): SELF → LEARNING → REASONING (+ macro ← leaves).
+    ("SELF_HAS_LEARNING", "Self", "Learning"),
+    ("LEARNING_HAS_REASONING", "Learning", "Reasoning"),
+    ("REASONING_COMPOSED_FROM", "Reasoning", "Reasoning"),  # macro ← its leaf records
 )
 
 # The 4 rel tables that reference the spine node (Concept→Engram migration must

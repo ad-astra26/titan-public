@@ -455,28 +455,43 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
 
 
 def _handle_reward(payload, store, policy, shm_writer, cfg, send_queue, name) -> bool:
-    """Join an async oracle reward to its stashed decision → one policy update."""
-    tx = payload.get("parent_tool_call_tx")
-    if not tx:
-        return False
-    decision = store.pop_decision(tx)
-    if decision is None:
-        # No matching decision (e.g. an agent-explicit tool call, or the decision
-        # was pruned). Nothing to train; not an error.
-        return False
-    features, action, goal_class = decision
-    if len(features) != OUTER_POLICY_INPUT_DIM:
-        return False
-    reward = float(payload.get("reward", 0.0))
+    """One policy update from a verdict-time reward.
+
+    v1.1 (Phase 1, INV-OML-12): the synthesis-side C1 capture emits
+    `(features, action, reward, goal_class)` DIRECTLY at verdict-time — decision
+    and outcome travel together (the per-use Reasoning record carries both), so
+    there is NO cross-process async-join. The legacy stash/join path is kept,
+    dormant, for Phase-2 genuinely-async rewards (LLM-judge / user feedback)."""
+    features = payload.get("features")
+    action = payload.get("action")
+    goal_class = str(payload.get("goal_class", "") or "")
+    if features is not None and action is not None:
+        # v1.1 direct path — decision + outcome together.
+        if len(features) != OUTER_POLICY_INPUT_DIM:
+            return False
+        action = int(action)
+        reward = float(payload.get("reward", 0.0))
+    else:
+        # Phase-2 (parked) — async reward joins a stashed decision by tx.
+        tx = payload.get("parent_tool_call_tx")
+        if not tx:
+            return False
+        decision = store.pop_decision(tx)
+        if decision is None:
+            return False  # no matching decision (pruned / not ours) — not an error
+        features, action, goal_class = decision
+        if len(features) != OUTER_POLICY_INPUT_DIM:
+            return False
+        reward = float(payload.get("reward", 0.0))
     policy.learn(features, action, reward, baseline_alpha=float(cfg["baseline_alpha"]))
     store.save_policy_flat(policy.to_flat().tolist(),
                            policy.total_updates, policy.reward_baseline)
     _publish_weights(shm_writer, policy)
     store.record_reward_tuple(features=features, action=action, reward=reward,
                               goal_class=goal_class)
-    logger.info("[self_learning] trained: tx=%s action=%s reward=%+.0f "
-                "updates=%d baseline=%.3f", str(tx)[:12], action_index_to_name(action),
-                reward, policy.total_updates, policy.reward_baseline)
+    logger.info("[self_learning] trained: action=%s reward=%+.0f goal=%s "
+                "updates=%d baseline=%.3f", action_index_to_name(action),
+                reward, goal_class or "-", policy.total_updates, policy.reward_baseline)
     # Macro distillation (S1) — a (goal_class, action) with enough verified wins.
     if reward > 0 and goal_class:
         _maybe_distill_macro(goal_class, action, store, cfg, send_queue, name)
