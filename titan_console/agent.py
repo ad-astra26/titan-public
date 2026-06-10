@@ -30,13 +30,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import __version__, backup_config, config_api, dev_endpoints, ops, proxy
+from . import __version__, backup_config, config_api, dev_endpoints, ops, pairing, proxy
 from .context import Context
 from .host import read_host_resources
 from .titan_status import titan_status
 
 _MUTATIONS = {"/console/restart", "/console/clean-hdd", "/console/config/set",
               "/console/chat", "/console/backup/config"}
+# Pairing CONTROL routes are operator-only (mint/confirm/inspect device pairings).
+# /console/pair/submit is deliberately NOT here — it's the unauthenticated bootstrap,
+# gated by the single-use pairing token inside pairing.submit_device.
+_PAIR_OPERATOR = {"/console/pair/start", "/console/pair/confirm", "/console/pair/status"}
 
 
 def _backup_options(ctx: Context) -> dict:
@@ -68,11 +72,25 @@ def _backup_options(ctx: Context) -> dict:
 def dispatch(ctx: Context, method: str, path: str, query: dict,
              body: bytes, headers: dict) -> tuple:
     """Pure router. Returns (status_int, payload) where payload is dict|bytes."""
-    # ── mutation auth gate ───────────────────────────────────────────────
-    if method == "POST" and path in _MUTATIONS and ctx.token:
-        supplied = headers.get("x-console-token") or headers.get("X-Console-Token")
-        if supplied != ctx.token:
-            return 401, {"error": "missing or invalid X-Console-Token"}
+    # ── auth gate (AG4): operator token OR a paired device's signature ────
+    # A signed request from a registered device is authorized like the operator.
+    device_authed = bool(headers.get("x-device-id")) and pairing.verify_request_signature(
+        ctx, device_id=headers.get("x-device-id", ""),
+        timestamp=headers.get("x-timestamp", ""),
+        signature_b64=headers.get("x-signature", ""),
+        method=method, path=path, body=body)
+
+    def _operator_ok() -> bool:
+        if not ctx.token:
+            return True  # no token configured = open (localhost dev)
+        return (headers.get("x-console-token") or headers.get("X-Console-Token")) == ctx.token
+
+    if path in _PAIR_OPERATOR:
+        if not _operator_ok():
+            return 401, {"error": "operator token required for pairing control"}
+    elif method == "POST" and path in _MUTATIONS and not device_authed:
+        if not _operator_ok():
+            return 401, {"error": "missing or invalid X-Console-Token (or device signature)"}
 
     def _json_body() -> dict:
         if not body:
@@ -108,6 +126,8 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             if not key:
                 return 400, {"error": "missing ?key="}
             return 200, config_api.get_config(ctx.install_root, key)
+        if path == "/console/pair/status":
+            return pairing.pair_status(ctx, query.get("pairing_token", [""])[0])
         if path.startswith("/console/api/"):
             v6 = path[len("/console/api"):]  # → "/v6/..."
             if query:
@@ -139,6 +159,12 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
         if path == "/console/backup/config":
             res = backup_config.set_backup_config(ctx, data)
             return (200 if res.get("ok") else 400), res
+        if path == "/console/pair/start":
+            return pairing.mint_pairing(ctx, public_url=data.get("public_url"))
+        if path == "/console/pair/submit":
+            return pairing.submit_device(ctx, data)
+        if path == "/console/pair/confirm":
+            return pairing.confirm_device(ctx, data.get("pairing_token", ""), data.get("code", ""))
         if ctx.dev_enabled and path == "/console/dev/log":
             return dev_endpoints.ingest_log(ctx, body)
         return 404, {"error": f"no such console route: {path}"}
