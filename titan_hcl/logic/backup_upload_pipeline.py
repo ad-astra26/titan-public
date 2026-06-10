@@ -381,6 +381,7 @@ async def upload_tier(
     event_id: str,
     event_type: str,
     encryptor: Optional[Callable[[bytes, str], tuple[bytes, str]]] = None,
+    path_uploader: Optional[Callable[[str, dict], "Awaitable[str]"]] = None,
 ) -> TierShipResult:
     """Upload a PRE-BUILT tier tarball (from build_tier) to Arweave + set tx_id.
 
@@ -392,18 +393,17 @@ async def upload_tier(
     is set; `tarball_sha256` (the memo arc) stays over the PLAINTEXT tarball so
     integrity verification + the per-backup key derivation (arc[:16]) are
     mode-independent. None ⇒ Mode A (plaintext uploaded).
+
+    `path_uploader` (RFP_backup_redesign_spine Phase B / B-2): a streamed
+    PATH→tx_id uploader (e.g. `ChainProvider.put(path)`). On **Mode-A** (no
+    encryptor) the plaintext tarball is uploaded **straight from disk** via this
+    — NO `f.read()` whole-tarball RAM load. Mode-B still buffers (the one-shot
+    AES-GCM encrypt is inherently whole-buffer, INV-MBR-13). None → legacy
+    bytes-`arweave_uploader` path (unchanged for existing callers/tests).
     """
     if result.tarball_path is None or not os.path.exists(result.tarball_path):
         result.error = f"{result.tier}: staged tarball missing at upload time"
         return result
-    with open(result.tarball_path, "rb") as f:
-        tarball_bytes = f.read()
-    if encryptor is not None:
-        try:
-            tarball_bytes, result.iv_b64 = encryptor(tarball_bytes, result.tier)
-        except Exception as e:
-            result.error = f"{result.tier}: Mode-B encryption failed: {e}"
-            return result
     tags = {
         "App-Name": "TitanBackupUnified",
         "Titan-Id": titan_id,
@@ -412,7 +412,19 @@ async def upload_tier(
         "Event-Type": event_type,
     }
     try:
-        tx_id = await arweave_uploader(tarball_bytes, tags)
+        if encryptor is None and path_uploader is not None:
+            # Mode-A streamed: upload the plaintext tarball straight from disk.
+            tx_id = await path_uploader(result.tarball_path, tags)
+        else:
+            with open(result.tarball_path, "rb") as f:
+                tarball_bytes = f.read()
+            if encryptor is not None:
+                try:
+                    tarball_bytes, result.iv_b64 = encryptor(tarball_bytes, result.tier)
+                except Exception as e:
+                    result.error = f"{result.tier}: Mode-B encryption failed: {e}"
+                    return result
+            tx_id = await arweave_uploader(tarball_bytes, tags)
     except Exception as e:
         result.error = f"Arweave upload failed: {e}"
         return result
@@ -838,6 +850,7 @@ async def ship_staged_event(
     bus_emit: Optional[Callable[[str, dict], None]] = None,
     cleanup_scratch: bool = True,
     encryptor: Optional[Callable[[bytes, str], tuple[bytes, str]]] = None,
+    path_uploader: Optional[Callable[[str, dict], "Awaitable[str]"]] = None,
 ) -> EventShipResult:
     """Phase 2 — SHIP a pre-built StagedEvent (fast, on meditation).
 
@@ -891,7 +904,8 @@ async def ship_staged_event(
                 return out
             await upload_tier(
                 r, arweave_uploader=arweave_uploader, titan_id=titan_id,
-                event_id=event_id, event_type=event_type, encryptor=encryptor)
+                event_id=event_id, event_type=event_type, encryptor=encryptor,
+                path_uploader=path_uploader)
             if r.error:
                 out.errors.append(f"{tier_name}: {r.error}")
         out.tiers = tier_results
