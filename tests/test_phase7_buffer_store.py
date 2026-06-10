@@ -1,7 +1,7 @@
 """Phase 7 — ActrBufferStore unit tests (D-SPEC-PHASE7 / INV-Syn-16/18).
 
 Covers:
-- DDL idempotent + creates indices
+- DDL idempotent + PK-only (NO secondary ART indexes — INV-Syn-30 / D-SPEC-154)
 - persist round-trips content + concept_ids + embedding_hash
 - INSERT OR REPLACE semantics (re-persist updates same row)
 - clear deletes row; idempotent on absent row
@@ -57,13 +57,100 @@ def test_schema_idempotent_on_second_construct(tmp_path):
     assert rows == [("x:y",)]
 
 
-def test_indices_present(store):
+def test_no_secondary_indexes_pk_only(store):
+    """INV-Syn-30 / D-SPEC-154: actr_buffers is PK-ONLY — no secondary ART
+    indexes (they were the runtime-corruption source behind the FATAL
+    crash-loop). `duckdb_indexes()` lists only explicit secondary indexes;
+    the PRIMARY KEY index is implicit + not reported → expect EMPTY."""
     rows = store._db.execute(
         "SELECT index_name FROM duckdb_indexes() WHERE table_name='actr_buffers'"
     ).fetchall()
     names = {r[0] for r in rows}
-    assert "idx_actr_buffers_chat" in names
-    assert "idx_actr_buffers_updated" in names
+    assert names == set(), f"expected NO secondary indexes, found {names}"
+    # The PK still enforces uniqueness (re-persist updates the same row, never
+    # a duplicate) — proves the PK index is intact even though it's unlisted.
+    store.persist(chat_id="c:s", buffer_name="goal", content="a", concept_ids=[])
+    store.persist(chat_id="c:s", buffer_name="goal", content="b", concept_ids=[])
+    cnt = store._db.execute(
+        "SELECT COUNT(*) FROM actr_buffers WHERE chat_id='c:s' AND buffer_name='goal'"
+    ).fetchone()[0]
+    assert cnt == 1
+
+
+def test_boot_self_heals_stray_secondary_indexes(tmp_path):
+    """A pre-fix fleet DB carries the two stray secondary indexes; constructing
+    the store DROPs them on boot (self-heal, no operator script — D-SPEC-154)."""
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE actr_buffers ("
+        "  chat_id TEXT NOT NULL, buffer_name TEXT NOT NULL, content TEXT,"
+        "  concept_ids TEXT, embedding_hash TEXT, updated_at DOUBLE NOT NULL,"
+        "  PRIMARY KEY (chat_id, buffer_name))"
+    )
+    conn.execute("CREATE INDEX idx_actr_buffers_chat ON actr_buffers(chat_id)")
+    conn.execute("CREATE INDEX idx_actr_buffers_updated ON actr_buffers(updated_at)")
+    before = {r[0] for r in conn.execute(
+        "SELECT index_name FROM duckdb_indexes() WHERE table_name='actr_buffers'"
+    ).fetchall()}
+    assert before == {"idx_actr_buffers_chat", "idx_actr_buffers_updated"}
+    # Boot the store on the corrupt-shaped DB → self-heal drops the indexes.
+    ActrBufferStore(duckdb_conn=conn, snapshot_path=str(tmp_path / "s.json"))
+    after = {r[0] for r in conn.execute(
+        "SELECT index_name FROM duckdb_indexes() WHERE table_name='actr_buffers'"
+    ).fetchall()}
+    assert after == set(), f"self-heal must drop stray secondary indexes, left {after}"
+
+
+def test_degradation_probe_fires_on_latency_creep(tmp_path, monkeypatch):
+    """When the rolling-avg persist latency crosses PERSIST_DEGRADE_AVG_MS the
+    store fires on_degraded once (rate-limited) → the worker emits a WARN
+    MODULE_ERROR on the SPEC cascade (D-SPEC-154 early-warning, INV-SDA-12)."""
+    import titan_hcl.synthesis.buffer_store as bs
+
+    conn = duckdb.connect(":memory:")
+    calls: list[dict] = []
+    # Monotonic clock so the cooldown logic is deterministic (start past cooldown).
+    ticks = iter(range(10_000, 100_000))
+
+    def _clock():
+        return float(next(ticks))
+
+    store = ActrBufferStore(
+        duckdb_conn=conn,
+        snapshot_path=str(tmp_path / "s.json"),
+        clock=_clock,
+        on_degraded=lambda **kw: calls.append(kw),
+    )
+    # Inject latencies above the threshold directly into the window — exercises
+    # _maybe_emit_degraded without depending on real wall-clock persist timing.
+    high = bs.PERSIST_DEGRADE_AVG_MS * 2.0
+    for _ in range(bs.PERSIST_DEGRADE_MIN_SAMPLES):
+        store._persist_latencies.append(high)
+    store._max_persist_ms = high
+    store._maybe_emit_degraded()
+    assert len(calls) == 1, "degradation must fire once over-threshold + min-samples"
+    assert calls[0]["avg_ms"] > bs.PERSIST_DEGRADE_AVG_MS
+    assert calls[0]["samples"] >= bs.PERSIST_DEGRADE_MIN_SAMPLES
+    # Rate-limited: a second immediate check inside the cooldown does NOT re-fire.
+    store._maybe_emit_degraded()
+    assert len(calls) == 1, "cooldown must suppress a second emit within the window"
+
+
+def test_degradation_probe_silent_when_healthy(tmp_path):
+    """Sub-threshold latencies never fire on_degraded (no false alarms)."""
+    import titan_hcl.synthesis.buffer_store as bs
+
+    conn = duckdb.connect(":memory:")
+    calls: list[dict] = []
+    store = ActrBufferStore(
+        duckdb_conn=conn,
+        snapshot_path=str(tmp_path / "s.json"),
+        on_degraded=lambda **kw: calls.append(kw),
+    )
+    for _ in range(bs.PERSIST_DEGRADE_MIN_SAMPLES + 5):
+        store._persist_latencies.append(0.2)  # healthy sub-ms
+    store._maybe_emit_degraded()
+    assert calls == []
 
 
 # ── persist ────────────────────────────────────────────────────────────

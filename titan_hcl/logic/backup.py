@@ -2483,6 +2483,74 @@ class RebirthBackup:
             return bytes(data)
         return _fetch
 
+    def _build_fetch_to_file(self, manifest):
+        """An async fetch_to_file(tx_id, dest_path)->bool for restore_full that
+        STREAMS each component tarball from Arweave straight to disk in fixed
+        chunks — constant memory regardless of tarball size. This is the 2026-06-09
+        RSS close: the in-RAM `_build_decrypting_fetch` held the whole ~595MB
+        compressed salvage tarball (→ ~960MB worker RSS, over the 500MB rss_limit);
+        streaming keeps the live chained reconstruction under ~100MB. Mode-A (iv
+        None) streams the plaintext tarball directly; Mode-B decrypts to dest. The
+        staged file is ALWAYS the PLAINTEXT tarball, so its sha256 == the component
+        merkle_root (restore_full verifies that streamed). Reuses the audited
+        backup_crypto helpers + the streaming ArweaveStore.fetch_to_file."""
+        store = self._ensure_arweave_store_for_unified()
+        tx_meta: dict = {}
+        for ev in manifest.events:
+            for comp in ("personality", "timechain", "soul"):
+                sub = ev.get(comp)
+                if not isinstance(sub, dict):
+                    continue
+                tx = sub.get("tx_id")
+                if tx:
+                    tx_meta[tx] = {"iv": sub.get("iv"), "component": comp,
+                                   "arc": sub.get("merkle_root")}
+        cache: dict = {"master": None}
+
+        def _master_key():
+            if cache["master"] is None:
+                from titan_hcl.logic.backup_crypto import (
+                    load_keypair_bytes, derive_master_key)
+                cfg = (self._full_config or {}).get("backup", {}) or {}
+                kp_path = cfg.get("wallet_keypair_path",
+                                  "data/titan_identity_keypair.json")
+                kp_bytes, titan_pubkey = load_keypair_bytes(kp_path)
+                cache["master"] = derive_master_key(kp_bytes, titan_pubkey)
+            return cache["master"]
+
+        async def _fetch_to_file(tx_id: str, dest_path: str) -> bool:
+            if store is None:
+                return False
+            meta = tx_meta.get(tx_id)
+            if meta and meta.get("iv"):
+                # Mode-B: stream the CIPHERTEXT to a temp, then decrypt to dest.
+                # GCM auth needs the whole ciphertext so the decrypt itself is a
+                # single read — but it's the encrypted-user fallback (T1 is
+                # Mode-A) and still far below the old all-components-in-RAM peak.
+                ct_tmp = dest_path + ".ct"
+                ok = await store.fetch_to_file(tx_id, ct_tmp)
+                if not ok:
+                    return False
+                try:
+                    from titan_hcl.logic.backup_crypto import (
+                        decrypt_component_tarball)
+                    with open(ct_tmp, "rb") as f:
+                        ct = f.read()
+                    pt = decrypt_component_tarball(
+                        ct, meta["iv"], _master_key(),
+                        meta["component"], meta["arc"])
+                    with open(dest_path, "wb") as f:
+                        f.write(pt)
+                    return True
+                finally:
+                    try:
+                        os.unlink(ct_tmp)
+                    except OSError:
+                        pass
+            # Mode-A: stream the plaintext tarball straight to dest (chunked).
+            return await store.fetch_to_file(tx_id, dest_path)
+        return _fetch_to_file
+
     async def _recover_mirror_to_latest(self, manifest, latest_id) -> bool:
         """Reconstruct the rolling mirror to the LATEST shipped event's state via
         the chain-aware restore_full (decrypting fetch for Mode-B). Small per-link
@@ -2508,9 +2576,24 @@ class RebirthBackup:
                 manifest=manifest, target_dir=base_dir,
                 arweave_fetch=fetch, memo_fetch=_memo_noop,
                 arc_to_target=_arc_to_mirror, target_event_id=latest_id,
-                # bytes are sha-verified vs the manifest; the weekly §24.12 test
-                # does the full on-chain ZK walk (R4).
-                verify_zk_chain=False)
+                # STREAM each tarball to disk (constant memory) — keeps the live
+                # reconstruction under backup's 500MB rss_limit. The in-RAM
+                # `fetch` stays as the fallback for any tx the streamer can't
+                # handle; bytes are sha-verified vs the manifest, and the weekly
+                # §24.12 test does the full on-chain ZK walk (R4).
+                arweave_fetch_to_file=self._build_fetch_to_file(manifest),
+                verify_zk_chain=False,
+                # T1's baseline (560d, packed 2026-05-29) predates the ed5f4d0c
+                # copy-snapshot truncation-race fix (2026-05-31), so some per-file
+                # patch_bytes_sha256 / post-apply merkle values are STALE — the data
+                # is intact (the component tarball's sha256 IS verified above vs the
+                # manifest merkle_root, INV-MBR-4), but the per-file hash is a
+                # false-positive. Same situation the sovereign restore handles
+                # (mainnet §R4/INV-MBR-12, v0.4.6): downgrade per-file/post-apply
+                # mismatches to advisory once the component arc is verified. The
+                # xdelta3 baseline_merkle_root check STAYS strict (wrong source =
+                # garbage) — only the redundant per-file hashes go advisory.
+                verify_patch_hash=False)
             if result.status != "success":
                 logger.warning("[Backup] §24 Phase B recover: restore_full "
                                "status=%s halt=%s", result.status,
