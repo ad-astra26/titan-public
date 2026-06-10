@@ -809,6 +809,15 @@ class MetaReasoningEngine:
         self._grounded_v_epsilon_floor = float(
             cfg.get("grounded_v_epsilon_floor", 0.05))
         self._g_sel_fires = 0
+        # ── §3/§7.B redesign-escalation gains (2026-06-10) — strengthen the
+        # grounded-V blend so concept-carrying chains break the +3..+5 FORMULATE
+        # policy advantage (driven-soak: seeded chains stalled at 0.54-0.66, not
+        # <0.50). temp<1 sharpens the grounded-V preference; concept_authority is
+        # the grounded-V floor for concept-carrying chains (they walk the matrix,
+        # §1.3). Config GAINS — V still decides WHICH primitive (INV-EMERGENCE).
+        self._grounded_v_temp = float(cfg.get("grounded_v_temperature", 0.5))
+        self._grounded_v_concept_authority = float(
+            cfg.get("grounded_v_concept_authority", 0.7))
         # ── AUDIT_cgn_trigger_wiring_design_20260610 M3 (SPEC §5.4 matrix-seed)
         # — when a mechanical trigger fires with no pending consumer-grounding,
         # seed the chain with a recent matured CGN-matrix concept so it walks a
@@ -1475,8 +1484,25 @@ class MetaReasoningEngine:
                 _scores = self.meta_policy.forward(np.array(meta_input, dtype=np.float32))
                 _unbiased_argmax = int(np.argmax(_scores))
                 _policy_logits = _scores + _entry_bias + _teacher_bias
-                _final = (_g_conf * _softmax(_g_composed_V)
-                          + (1.0 - _g_conf) * _softmax(_policy_logits, temperature))
+                # ── §3/§7.B redesign-escalation (2026-06-10, Maker-greenlit) ──
+                # Driven-soak proof: matrix-seeded chains DID drop FORMULATE
+                # (0.75→0.54-0.66) but not below G1's 0.50 — at current grounded-V
+                # CONFIDENCE the +3..+5 FORMULATE policy logit still leaks through
+                # the blend (RFP §6 Q1: "grounded V MUST enter at full authority
+                # when confident"). Two emergence-safe config GAINS (V still decides
+                # WHICH primitive — INV-EMERGENCE intact):
+                #  (1) SHARPEN the grounded-V distribution (temp<1) so the overused
+                #      FORMULATE's low V is decisively suppressed (softmax over the
+                #      [0,1] V range is otherwise near-flat → weak signal).
+                #  (2) For a concept-carrying chain (it SHOULD walk the populated
+                #      matrix, §1.3), RAISE the grounded-V authority floor so V leads
+                #      the walk rather than deferring to the FORMULATE attractor.
+                _sv = _softmax(_g_composed_V, self._grounded_v_temp)
+                _sp = _softmax(_policy_logits, temperature)
+                _conf_eff = _g_conf
+                if self.state.grounding_concept and self._grounded_v_concept_authority > 0:
+                    _conf_eff = np.maximum(_g_conf, self._grounded_v_concept_authority)
+                _final = _conf_eff * _sv + (1.0 - _conf_eff) * _sp
                 _final = _final / (_final.sum() + 1e-8)
                 prim_idx = int(np.random.choice(NUM_META_ACTIONS, p=_final))
                 self._g_sel_fires += 1

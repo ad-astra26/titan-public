@@ -1159,6 +1159,18 @@ gate_introspect_chains = 20         # meta-chains before INTROSPECT unlocks
 # independent-rollback switch (set false to restore the legacy biased policy).
 grounded_v_selection_enabled = true
 grounded_v_epsilon_floor = 0.05     # minimal ε backstop kept until B soak-proven
+# ── §3/§7.B redesign-escalation (2026-06-10, Maker-greenlit) — strengthen the
+# grounded-V blend so concept-carrying chains break the +3..+5 FORMULATE policy
+# advantage (driven-soak proof: matrix-seeded chains dropped FORMULATE 0.75→
+# 0.54-0.66 but not <0.50; at current grounded-V confidence the FORMULATE logit
+# still leaked through). grounded_v_temperature<1 SHARPENS the grounded-V
+# distribution (overused-FORMULATE's low V decisively suppressed; softmax over
+# the [0,1] V range is otherwise near-flat). grounded_v_concept_authority = the
+# grounded-V authority FLOOR for concept-carrying chains (they walk the populated
+# matrix per §1.3 → V leads). Config GAINS — V still decides WHICH primitive
+# (INV-EMERGENCE intact). Tune toward 1.0/0.0 to soften if over-suppressing.
+grounded_v_temperature = 0.5
+grounded_v_concept_authority = 0.7
 
 # ── AUDIT_cgn_trigger_wiring_design_20260610 M3 (SPEC §5.4 matrix-seed) — when a
 # mechanical trigger (experience_pressure 89.7%) fires with no pending consumer-

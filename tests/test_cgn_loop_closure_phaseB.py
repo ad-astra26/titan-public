@@ -118,6 +118,39 @@ def test_unproven_grounded_v_defers_to_policy():
     assert int(np.argmax(final)) == META_PRIMITIVES.index("SYNTHESIZE")
 
 
+def test_escalation_suppresses_formulate_for_concept_chains():
+    """§3/§7.B redesign-escalation: for a concept-carrying chain, sharpening
+    (grounded_v_temperature<1) + the concept authority floor drives FORMULATE's
+    blended probability below 0.50 even at MODERATE confidence + a +5 FORMULATE
+    policy attractor — what the basic blend (test above) couldn't do. V still
+    decides WHICH primitive (INV-EMERGENCE)."""
+    eng = _make_engine()
+    assert eng._grounded_v_temp < 1.0                      # sharpening on
+    assert eng._grounded_v_concept_authority > 0.0         # authority floor on
+    f = META_PRIMITIVES.index("FORMULATE")
+    # FORMULATE proven-low (overused), others proven-moderate; moderate conf.
+    composed_V = np.full(NUM_META_ACTIONS, 0.55, dtype=np.float32)
+    composed_V[f] = 0.15
+    conf = np.full(NUM_META_ACTIONS, 0.3, dtype=np.float32)
+    policy = np.zeros(NUM_META_ACTIONS, dtype=np.float32)
+    policy[f] = 5.0
+
+    # Basic blend (temp=1, no authority) leaks FORMULATE high...
+    basic = _blend(composed_V, conf, policy)
+    assert basic[f] > 0.5
+    # ...escalated blend (engine params) drops FORMULATE's SAMPLED share below
+    # 0.50 (the engine samples final, not argmax) → dominant_share<0.50 → the
+    # monoculture metric breaks. (FORMULATE may still be the single largest
+    # bucket while the other 8 split the remainder — that's a healthy spread,
+    # not a monoculture.)
+    conf_eff = np.maximum(conf, eng._grounded_v_concept_authority)
+    esc = conf_eff * _softmax(composed_V, eng._grounded_v_temp) \
+        + (1.0 - conf_eff) * _softmax(policy, 1.0)
+    esc = esc / (esc.sum() + 1e-8)
+    assert esc[f] < 0.5
+    assert esc[f] < basic[f] - 0.3       # a large, decisive suppression
+
+
 def test_grounded_v_selection_flag_default_on():
     eng = _make_engine()
     assert eng._grounded_v_selection_enabled is True
