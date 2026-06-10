@@ -71,10 +71,14 @@ class FakeChainProvider(ChainProvider):
     async def balance(self) -> float:
         return self._balance_sol
 
-    async def fund(self, lamports_sol: float) -> Optional[str]:
-        self._balance_sol += lamports_sol
-        self.fund_log.append(lamports_sol)
-        return "fakefund_" + hashlib.sha256(str(lamports_sol).encode()).hexdigest()[:32]
+    async def fund(self, amount_sol: float, *, daily_cap_sol: float = 0.0) -> Optional[str]:
+        if daily_cap_sol > 0:
+            amount_sol = min(amount_sol, daily_cap_sol)   # mimic the real cap trim
+        if amount_sol <= 0:
+            return None
+        self._balance_sol += amount_sol
+        self.fund_log.append(amount_sol)
+        return "fakefund_" + hashlib.sha256(str(amount_sol).encode()).hexdigest()[:32]
 
     # ── helpers ──
     @staticmethod

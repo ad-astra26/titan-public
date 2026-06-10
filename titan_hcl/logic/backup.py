@@ -326,11 +326,11 @@ class RebirthBackup:
                         today, self._meditation_count)
                     return
 
-                # Irys auto-fund (re-homed 2026-05-31) — top up before the upload,
-                # same caps (auto_fund_enabled / daily cap / runway / reserve).
+                # Irys auto-fund via ChainProvider (RFP Phase C tail) — top up
+                # before the upload; bounded by the daily cap inside chain.fund.
                 # Best-effort; a fund hiccup never blocks the backup.
                 try:
-                    self._auto_fund_irys_before_upload()
+                    await self._auto_fund_irys_before_upload()
                 except Exception as _af_err:
                     logger.warning(
                         "[Backup] §24 Irys auto-fund check raised: %s", _af_err)
@@ -3323,20 +3323,25 @@ class RebirthBackup:
             if getattr(staged, "scratch_dir", None) and os.path.isdir(staged.scratch_dir):
                 shutil.rmtree(staged.scratch_dir, ignore_errors=True)
 
-    def _auto_fund_irys_before_upload(self) -> None:
-        """Re-homed Irys auto-fund (2026-05-31). The auto-fund hook lived only in
-        the legacy BackupCascade.run() path, which the unified_v2 migration
-        retired — so it stopped firing after 2026-05-19 and the deposit went red.
-        Re-invoke it from the unified_v2 daily path, before the upload, with the
-        SAME caps (config-gated by [backup].auto_fund_enabled + daily cap +
-        runway floor + wallet reserve; the audit log + Telegram alert are emitted
-        inside auto_fund_irys_if_needed). No-op when disabled / runway sufficient.
-        """
-        bcfg = (self._full_config or {}).get("backup", {}) or {}
-        if not bcfg.get("auto_fund_enabled", False):
+    async def _auto_fund_irys_before_upload(self) -> None:
+        """Irys auto-fund via the ChainProvider (RFP_chain_provider Phase C tail) —
+        `chain.balance()` + the BOUNDED `chain.fund()` replace the
+        `BackupCascade` subprocess-`node` path (INV-CP-3). Config moves to
+        `[chain.fund]` (Q-CP-3 clean cut). No-op when disabled / runway sufficient
+        / devnet. The runway→amount DECISION here is contained; it moves to the
+        BackupOrchestrator in the next redesign step (which will also enforce the
+        wallet-reserve floor against the live wallet balance)."""
+        fcfg = ((self._full_config or {}).get("chain", {}) or {}).get("fund", {}) or {}
+        if not fcfg.get("enabled", False):
             return
-        from titan_hcl.logic.backup_cascade import BackupCascade
-        cascade = BackupCascade(full_config=self._full_config)
+        chain = self._ensure_chain()
+        try:
+            irys_sol = await chain.balance()
+        except Exception as e:
+            logger.warning("[Backup] §24 Irys auto-fund: balance query failed: %s", e)
+            return
+        if irys_sol == float("inf"):
+            return  # devnet — no real deposit
         # Runway estimator needs a representative upload size — use the staged
         # event's total tarball size when available, else a sane daily default.
         size_mb = 35.0
@@ -3351,18 +3356,24 @@ class RebirthBackup:
                     size_mb = total / 1048576.0
         except Exception:
             pass
-        result = cascade.auto_fund_irys_if_needed(size_mb)
-        action = (result or {}).get("action")
-        if action == "funded":
-            logger.info(
-                "[Backup] §24 Irys auto-fund: FUNDED %.4f SOL (runway was %.2fd) "
-                "tx=%s", result.get("amount_sol", 0.0),
-                result.get("runway_before_days", 0.0),
-                str(result.get("tx_id", ""))[:16])
-        elif action and action != "no_action":
-            logger.info(
-                "[Backup] §24 Irys auto-fund: %s (%s)",
-                action, result.get("reason", ""))
+        avg_cost = max(size_mb, 1.0) * 0.0002 * 2.0  # 2× safety margin (match S4)
+        daily_burn = avg_cost * float(fcfg.get("avg_uploads_per_day", 3.0))
+        runway = irys_sol / daily_burn if daily_burn > 0 else 1e9
+        if runway >= float(fcfg.get("min_runway_days", 3.0)):
+            return  # runway sufficient
+        target_sol = float(fcfg.get("target_runway_days", 14.0)) * daily_burn
+        amount = max(0.0, target_sol - irys_sol)
+        if amount <= 0:
+            return
+        try:
+            tx = await chain.fund(
+                amount, daily_cap_sol=float(fcfg.get("daily_cap_sol", 0.05)))
+        except Exception as e:
+            logger.warning("[Backup] §24 Irys auto-fund: fund failed: %s", e)
+            return
+        if tx:
+            logger.info("[Backup] §24 Irys auto-fund: FUNDED ~%.4f SOL (runway was "
+                        "%.2fd) tx=%s", amount, runway, str(tx)[:16])
 
     # ── Local diff/baseline event (L5, 2026-05-14) ─────────────────────────
     #

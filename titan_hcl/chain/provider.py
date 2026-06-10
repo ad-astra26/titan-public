@@ -86,7 +86,7 @@ class ChainProvider(abc.ABC):
     async def balance(self) -> float:
         raise NotImplementedError("ChainProvider.balance — RFP Phase C")
 
-    async def fund(self, lamports_sol: float) -> Optional[str]:
+    async def fund(self, amount_sol: float, *, daily_cap_sol: float = 0.0) -> Optional[str]:
         raise NotImplementedError("ChainProvider.fund — RFP Phase C")
 
 
