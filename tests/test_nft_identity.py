@@ -478,13 +478,15 @@ class TestEvolveSoulWithNFT:
 class TestEpochNFTMinting:
     """Test epoch NFT minting in RebirthBackup."""
 
+    # RFP_backup_redesign_spine Phase E (INV-BRS-10): mint_epoch_nft evicted from
+    # RebirthBackup → titan_hcl.logic.daily_nft.mint_epoch_nft(network, ...).
     def test_mint_epoch_nft(self):
         from titan_hcl.utils.solana_client import is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
         from solders.keypair import Keypair
-        from titan_hcl.logic.backup import RebirthBackup
+        from titan_hcl.logic import daily_nft
 
         network = MagicMock()
         kp = Keypair()
@@ -492,10 +494,9 @@ class TestEpochNFTMinting:
         network.pubkey = kp.pubkey()
         network.send_sovereign_transaction = AsyncMock(return_value="5epochTx123")
 
-        backup = RebirthBackup(network)
-
         result = asyncio.get_event_loop().run_until_complete(
-            backup.mint_epoch_nft(
+            daily_nft.mint_epoch_nft(
+                network,
                 epoch=1710000000,
                 sovereignty_idx=85.5,
                 diary_entry="A day of growth and discovery.",
@@ -511,15 +512,14 @@ class TestEpochNFTMinting:
         assert "extra_signers" in call_args.kwargs
 
     def test_mint_epoch_nft_no_keypair(self):
-        from titan_hcl.logic.backup import RebirthBackup
+        from titan_hcl.logic import daily_nft
 
         network = MagicMock()
         network.keypair = None
 
-        backup = RebirthBackup(network)
-
         result = asyncio.get_event_loop().run_until_complete(
-            backup.mint_epoch_nft(
+            daily_nft.mint_epoch_nft(
+                network,
                 epoch=1710000000,
                 sovereignty_idx=50.0,
                 diary_entry="Test",

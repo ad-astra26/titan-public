@@ -852,3 +852,49 @@ class SovereignSoul:
 
         logger.info("[Soul] %s", result)
         return result
+
+
+def update_titan_frontmatter(sovereignty_milestone: float,
+                             epochs_completed: int) -> None:
+    """Update the YAML frontmatter in titan.md with current epoch/sovereignty
+    stats (sovereignty_milestone, epochs_completed, last_rebirth).
+
+    RFP_backup_redesign_spine Phase E (INV-BRS-10): evicted from the RebirthBackup
+    god-class — the titan.md narrative frontmatter is a SOUL concern, not a backup
+    concern (audit §1.1: "frontmatter updates have no business living in a backup
+    class"). Best-effort; never raises. (Dormant pending a re-wire from the
+    epoch/rebirth owner — its old backup caller was deleted in Phase B-1.)"""
+    import os
+    import re
+    from datetime import datetime, timezone
+
+    titan_path = os.path.join(os.path.dirname(__file__), "..", "..", "titan.md")
+    try:
+        with open(titan_path, "r") as f:
+            content = f.read()
+        fm_match = re.match(r'^---\n(.*?)\n---\n', content, re.DOTALL)
+        if not fm_match:
+            logger.debug("[Soul] No YAML frontmatter in titan.md, skipping update.")
+            return
+        frontmatter = fm_match.group(1)
+        rest = content[fm_match.end():]
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        updates = {
+            "sovereignty_milestone": f"{sovereignty_milestone:.1f}",
+            "epochs_completed": str(epochs_completed),
+            "last_rebirth": now_iso,
+        }
+        for key, value in updates.items():
+            pattern = rf'^{key}:.*$'
+            replacement = f'{key}: {value}'
+            if re.search(pattern, frontmatter, re.MULTILINE):
+                frontmatter = re.sub(pattern, replacement, frontmatter,
+                                     flags=re.MULTILINE)
+            else:
+                frontmatter += f"\n{key}: {value}"
+        with open(titan_path, "w") as f:
+            f.write(f"---\n{frontmatter}\n---\n{rest}")
+        logger.info("[Soul] Updated titan.md frontmatter: sovereignty=%.1f, "
+                    "epochs=%d", sovereignty_milestone, epochs_completed)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[Soul] Failed to update titan.md frontmatter: %s", e)

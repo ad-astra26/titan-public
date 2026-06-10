@@ -166,3 +166,63 @@ def store_daily_nft_record(
 
     logger.info("[DailyNFT] Day #%d record stored at %s", day_count, filepath)
     return str(filepath)
+
+
+async def mint_epoch_nft(network, *, epoch: int, sovereignty_idx: float,
+                         diary_entry: str, total_nodes: int,
+                         art_path: Optional[str] = None,
+                         permanent_url: Optional[str] = None) -> Optional[str]:
+    """Mint a MyDay Epoch NFT via Metaplex Core.
+
+    RFP_backup_redesign_spine Phase E (INV-BRS-10): evicted from the RebirthBackup
+    god-class (audit §1.1: "NFT minting has no business living in a backup
+    class") to its proper owner. `network` is the in-process HybridNetworkClient
+    (holds the keypair); `permanent_url` is the metadata URI (the latest
+    personality backup's Arweave URL, else an ar://titan/epoch_<epoch>.json
+    placeholder). Returns the asset pubkey string on success, else None. (Dormant
+    pending a re-wire from the epoch owner — its old backup caller, the legacy
+    on_meditation_complete tail, was deleted in Phase B-1.)"""
+    from datetime import datetime
+
+    if getattr(network, "keypair", None) is None:
+        logger.debug("[DailyNFT] Cannot mint epoch NFT — no wallet keypair.")
+        return None
+    try:
+        from solders.keypair import Keypair as SoldersKeypair
+        from titan_hcl.utils.solana_client import (
+            build_mpl_core_create_v1, is_available,
+        )
+        if not is_available():
+            return None
+
+        asset_kp = SoldersKeypair()
+        asset_pubkey = asset_kp.pubkey()
+        date_str = datetime.fromtimestamp(epoch).strftime("%Y-%m-%d")
+        name = f"Titan Epoch {date_str}"
+        uri = permanent_url or f"ar://titan/epoch_{epoch}.json"
+        attributes = {
+            "Type": "Epoch",
+            "Date": date_str,
+            "Sovereignty": f"{sovereignty_idx:.1f}%",
+            "Memory_Nodes": str(total_nodes),
+            "Diary": diary_entry[:64],
+        }
+        ix = build_mpl_core_create_v1(
+            asset_pubkey=asset_pubkey,
+            payer_pubkey=network.pubkey,
+            name=name[:32],
+            uri=uri,
+            attributes=attributes,
+        )
+        if ix is None:
+            return None
+        sig = await network.send_sovereign_transaction(
+            [ix], priority="MEDIUM", extra_signers=[asset_kp],
+        )
+        if sig:
+            addr = str(asset_pubkey)
+            logger.info("[DailyNFT] Epoch NFT minted: %s (TX: %s)", addr, sig)
+            return addr
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[DailyNFT] Epoch NFT mint failed: %s", e)
+    return None
