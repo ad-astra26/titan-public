@@ -455,12 +455,8 @@ def create_tools(plugin):
 
         Args:
             query: Natural-language query (free text).
-            granularity: One of {"concept", "turn", "topic", "session", "self"}.
-                Default "concept" (best for semantic recall). Use "self" for
-                self-reflective questions about your OWN path / identity /
-                abilities ("what have I learned about myself", "who am I",
-                "what can I do") — it traverses your SELF hub (your diary arc +
-                skills) in one hop instead of scanning all of memory.
+            granularity: One of {"concept", "turn", "topic", "session"}.
+                Default "concept" (best for semantic recall).
 
         Returns:
             String summary of the top result, or "no match" if nothing found.

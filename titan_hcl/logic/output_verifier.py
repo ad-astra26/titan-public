@@ -271,15 +271,6 @@ def _compile_context_patterns() -> list[tuple[re.Pattern, str]]:
 # OVG mechanic" to stop hallucinated figures from reaching X).
 _EXTERNAL_POST_CHANNELS = frozenset({"x_post", "x_reply"})
 
-# Channels where a numeric (context) inconsistency HARD-blocks instead of being
-# the soft chat warning: the external public timelines above PLUS the soul diary.
-# The diary is a permanent, hash-chained, on-chain-anchored, memory-enriched
-# narrative-SELF record — no LLM-hallucinated figure may enter it; a prose number
-# diverging from the grounded gather must block authoring (→ the worker soft-falls
-# to its numbers-only minimal entry). Maker 2026-06-10: "no LLM hallucinations in
-# Titan's diary; the OVG post-hook must catch it."
-_STRICT_CONSISTENCY_CHANNELS = _EXTERNAL_POST_CHANNELS | frozenset({"soul_diary"})
-
 
 def _compile_qualia_patterns() -> dict[str, list[re.Pattern]]:
     """Patterns for Proof of Qualia — authenticity sub-checks."""
@@ -732,18 +723,17 @@ class OutputVerifier:
         """Severity policy shared by verify_safety + verify_and_sign.
 
         Directives, injection, and HARD-tagged qualia always block. Context
-        consistency is a soft warning everywhere EXCEPT the strict-consistency
-        channels (x_post / x_reply — public timelines; soul_diary — the permanent
-        hash-chained/on-chain SELF record), where a prose figure that diverges
-        from the injected ground-truth state must NOT be committed (Maker
-        2026-06-02 for X; 2026-06-10 for the diary).
+        consistency is a soft warning everywhere EXCEPT external-publish
+        channels (x_post / x_reply), where a prose figure that diverges from
+        the injected ground-truth state must NOT reach the public timeline
+        (Maker 2026-06-02).
         """
         hard_qualia = any(isinstance(v, str) and v.startswith("HARD:")
                           for v in violations)
         hard = (not checks.get("directives", True)
                 or not checks.get("injection", True)
                 or hard_qualia)
-        if channel in _STRICT_CONSISTENCY_CHANNELS and not checks.get("consistency", True):
+        if channel in _EXTERNAL_POST_CHANNELS and not checks.get("consistency", True):
             hard = True
         return hard
 

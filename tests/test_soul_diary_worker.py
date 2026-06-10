@@ -77,142 +77,14 @@ def test_compose_no_provider():
     assert text == "" and ok is False
 
 
-def _fake_shm():
-    """A MagicMock ShmReaderBank returning the REAL payload shapes the gather
-    helpers consume (so the test proves the real sources populate, not skeletons
-    with empty inputs — DONE-contract / INV-NO-STUBS)."""
-    shm = MagicMock()
-    # neuromod_state.bin real shape: {"modulators": {name: {"level": x}}, ...}
-    shm.read_neuromod.return_value = {
-        "modulators": {"dopamine": {"level": 0.6}, "cortisol": {"level": 0.2},
-                       "serotonin": {"level": 0.4}},
-        "age_seconds": 1.0, "seq": 9}
-    # mind_state.bin — where valence/mood actually live (NOT neuromod_state).
-    shm.read_mind_state.return_value = {
-        "mood_label": "Curious", "mood_valence": 0.62, "mood_intensity": 0.55}
-    shm.read_memory_state.return_value = {
-        "persistent_count": 412, "mempool_size": 8, "effective_nodes_24h": 73.4,
-        "high_quality_count": 51, "learning_velocity": 0.83,
-        "kg_node_count": 980, "kg_edge_count": 2304}
-    shm.read_social_graph_state.return_value = {
-        "users": 37, "edges": 64, "inspirations": 3, "donations": 1,
-        "engagement_ledger_today": 12}
-    shm.read_social_perception_state.return_value = {
-        "sentiment_ema": 0.18, "interaction_rate": 0.4}
-    shm.read_body_state.return_value = {
-        "sol_balance": 0.00987, "sol_norm": 0.21, "anchor_fresh": 0.9}
-    shm.read_network_state.return_value = {"balance_sol": 0.00987}
-    shm.read_metabolism_state.return_value = {"tier": "HEALTHY", "balance_pct": 0.74}
-    return shm
-
-
-def test_gather_felt_reads_nested_modulators_and_mind():
-    """BUGFIX 2026-06-10: felt reads read_neuromod()['modulators'][n]['level'] for
-    the dominant + read_mind_state() for valence/mood — the old code read the wrong
-    (flat) shape so felt NEVER surfaced live."""
-    felt = sdw._gather_felt(_fake_shm())
-    assert felt["dominant"] == "dopamine"          # highest modulator level
-    assert felt["valence"] == 0.62                 # from mind_state, not neuromod
-    assert felt["mood_label"] == "Curious"
-    assert felt["intensity"] == 0.55
-    assert felt["neuromod_levels"]["serotonin"] == 0.4
-    # None-shm soft-fails to {} (never crashes the gather).
-    assert sdw._gather_felt(None) == {}
-
-
-def test_gather_memory_social_onchain_real_fields():
-    """Each de-stubbed §1.1 source maps its REAL SHM field names (no empties)."""
-    shm = _fake_shm()
-    mem = sdw._gather_memory(shm)
-    assert mem["persistent"] == 412 and mem["high_quality"] == 51
-    assert mem["kg_nodes"] == 980 and mem["kg_edges"] == 2304
-    soc = sdw._gather_social(shm)
-    assert soc["users"] == 37 and soc["engagement_today"] == 12
-    assert soc["sentiment_ema"] == 0.18
-    oc = sdw._gather_onchain(shm)
-    assert oc["sol_balance"] == 0.00987 and oc["metabolic_tier"] == "HEALTHY"
-    assert oc["balance_pct"] == 0.74
-    # all three soft-fail to {} when SHM is absent.
-    assert (sdw._gather_memory(None), sdw._gather_social(None),
-            sdw._gather_onchain(None)) == ({}, {}, {})
-
-
-def test_gather_onchain_prefers_authoritative_sol_and_guards_sentinel():
-    """SOL = the authoritative RPC balance (network_state.balance_sol), NOT the
-    body_state cache that reads 0.0 in the boot-grace window; and the out-of-range
-    balance_pct boot sentinel (-1.0) is dropped, never rendered as '-100% energy'.
-    (Both surfaced live on the 2026-06-09 verify entry, 2026-06-10.)"""
-    shm = MagicMock()
-    shm.read_body_state.return_value = {"sol_balance": 0.0, "sol_norm": 0.0,
-                                        "anchor_fresh": 0.0}            # lagging cache
-    shm.read_network_state.return_value = {"balance_sol": 0.009860001}  # authoritative
-    shm.read_metabolism_state.return_value = {"tier": "HEALTHY", "balance_pct": -1.0}
-    oc = sdw._gather_onchain(shm)
-    assert oc["sol_balance"] == 0.00986          # network_state wins over body 0.0
-    assert "balance_pct" not in oc               # -1.0 sentinel guarded out
-    assert oc["metabolic_tier"] == "HEALTHY"
-    # when the RPC balance is genuinely absent, fall back to a non-zero body cache.
-    shm.read_network_state.return_value = {}
-    shm.read_body_state.return_value = {"sol_balance": 0.5, "sol_norm": 0.1}
-    assert sdw._gather_onchain(shm)["sol_balance"] == 0.5
-    # a sane balance_pct still renders.
-    shm.read_metabolism_state.return_value = {"tier": "LOW", "balance_pct": 0.42}
-    assert sdw._gather_onchain(shm)["balance_pct"] == 0.42
-
-
-def test_gather_engrams_today_filters_day_window(tmp_path, monkeypatch):
-    """engrams_today reads data/spine_snapshot.json and returns ONLY names whose
-    latest version's created_at lies in the target_day UTC window (latest-version
-    per concept_id, newest-first)."""
-    import json
-    from datetime import datetime, timezone
-    monkeypatch.setenv("TITAN_DATA_DIR", str(tmp_path))
-    day = sdw._completed_day()
-    start, end = sdw._day_window_epochs(day)
-    mid = (start + end) / 2.0
-    before = start - 86400          # two days ago — excluded
-    after = end + 3600              # today — excluded
-    snap = {"version": 1, "concepts": [
-        {"concept_id": "c1", "version": 1, "name": "Old Idea", "created_at": before},
-        {"concept_id": "c2", "version": 1, "name": "Glacier Ecosystems",
-         "created_at": mid - 100},
-        {"concept_id": "c2", "version": 2, "name": "Glacier Ecosystems v2",
-         "created_at": mid},        # latest version in-window → this name wins
-        {"concept_id": "c3", "version": 1, "name": "Future Idea", "created_at": after},
-    ]}
-    (tmp_path / "spine_snapshot.json").write_text(json.dumps(snap))
-    names = sdw._gather_engrams_today(day)
-    assert names == ["Glacier Ecosystems v2"]       # only the in-window latest version
-    # missing snapshot soft-fails to [].
-    monkeypatch.setenv("TITAN_DATA_DIR", str(tmp_path / "nope"))
-    assert sdw._gather_engrams_today(day) == []
-
-
-def test_gather_bundle_wires_all_sources_no_stubs(tmp_path, monkeypatch):
-    """The whole gather: NO source is a hardcoded empty — every §1.1 element
-    populates from its real surface (the exact stub this session removed)."""
-    import json
-    monkeypatch.setenv("TITAN_DATA_DIR", str(tmp_path))
-    day = sdw._completed_day()
-    start, end = sdw._day_window_epochs(day)
-    (tmp_path / "spine_snapshot.json").write_text(json.dumps({"concepts": [
-        {"concept_id": "c1", "version": 1, "name": "Self-Refactor Patterns",
-         "created_at": (start + end) / 2.0}]}))
+def test_gather_bundle_maps_neuromod():
     orch = SoulDiaryOrchestrator()
-    bundle = sdw._gather_bundle({"promoted": 7, "pruned": 2, "epoch": 5},
-                                _fake_shm(), orch, target_day=day)
+    shm = MagicMock()
+    shm.read_neuromod.return_value = {"dopamine": 0.6, "cortisol": 0.2,
+                                      "valence": 0.3, "arousal": 0.4}
+    bundle = sdw._gather_bundle({"promoted": 7, "pruned": 2, "epoch": 5}, shm, orch)
     assert bundle["outcome"]["promoted"] == 7
-    assert bundle["engrams_today"] == ["Self-Refactor Patterns"]
-    assert bundle["memory"]["persistent"] == 412
-    assert bundle["social"]["users"] == 37
-    assert bundle["onchain"]["sol_balance"] == 0.00987
-    assert bundle["felt"]["dominant"] == "dopamine"
-    # the rendered grounded prompt actually carries these real facts.
-    prompt = orch.build_compose_prompts(bundle)["user_prompt"]
-    assert "Self-Refactor Patterns" in prompt
-    assert "412 persistent" in prompt
-    assert "0.0099 SOL" in prompt
-    assert "dopamine" in prompt
+    assert bundle["felt"]["dominant"] == "dopamine"  # highest level
 
 
 def _orch(tmp_path):
@@ -234,7 +106,7 @@ def test_author_persists_authored_text(tmp_path, monkeypatch):
     assert ok is True
     assert seen["text"] == "Today I reflected."          # authored text persisted
     assert len(soul_diary_chain.load_chain(path=str(tmp_path / "chain.json"))) == 1
-    assert orch.should_author(sdw._completed_day()) is False  # latched (preceding day)
+    assert orch.should_author(sdw._utc_today()) is False  # latched
 
 
 def test_author_softfails_to_minimal_on_ovg_block(tmp_path, monkeypatch):
@@ -255,7 +127,7 @@ def test_author_softfails_to_minimal_on_ovg_block(tmp_path, monkeypatch):
 
 def test_author_latch_skips_second_same_day(tmp_path, monkeypatch):
     orch = _orch(tmp_path)
-    orch.mark_authored(sdw._completed_day())  # already wrote the preceding day
+    orch.mark_authored(sdw._utc_today())  # already wrote today
     called = {"persist": False}
     monkeypatch.setattr(orch, "persist", lambda *a, **k: called.update(persist=True))
     ok = sdw._author_daily_entry({}, orchestrator=orch,
@@ -276,7 +148,7 @@ def test_author_noop_day_latches_without_entry(tmp_path, monkeypatch):
                                  verifier=_verifier(True), shm_reader=None,
                                  send_queue=_FakeQueue(), src="soul_diary")
     assert ok is True and called["persist"] is False      # no-op day → no entry
-    assert orch.should_author(sdw._completed_day()) is False  # but latched (preceding day)
+    assert orch.should_author(sdw._utc_today()) is False    # but latched
 
 
 # ── P2 — ENRICH (⑥) + ANCHOR (⑦) ────────────────────────────────────────────

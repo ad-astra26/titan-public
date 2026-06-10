@@ -7,9 +7,10 @@ The weeks-old monoculture root cause: mechanical triggers (experience_pressure
 matured CGN-matrix concept (_pending_concept_grounded, ≥2-consumer-grounded) so
 they walk a real concept (§1.3). These tests pin:
   1. flag default-on, configurable off (§5 rollback).
-  2. a matrix-seeded chain gets grounding_concept + entry RECALL (the §5.1 first
-     stage) and NO grounding_request_id → the ARC-4 outcome emit stays gated
-     (correct: no consumer request to attribute).
+  2. a matrix-seeded chain gets grounding_concept + NO hardcoded entry primitive
+     (the first step EMERGES from grounded V per-Titan — INV-EMERGENCE; a fixed
+     entry would suppress sovereign divergence + reinforce T2's RECALL) and NO
+     grounding_request_id → the ARC-4 outcome emit stays gated.
   3. round-robin walks the buffer for breadth.
   4. an active consumer-grounding (Path#0) is NOT displaced by matrix-seed.
 
@@ -32,7 +33,7 @@ def _seed_payload_from_buffer(eng):
     seed = buf[eng._matrix_seed_idx % len(buf)]
     eng._matrix_seed_idx += 1
     cid = str((seed or {}).get("concept_id", ""))[:128]
-    return {"consumer": "", "concept_id": cid, "entry_primitive": "RECALL"}
+    return {"consumer": "", "concept_id": cid, "entry_primitive": ""}
 
 
 def test_matrix_seed_flag_default_on_and_configurable():
@@ -52,8 +53,10 @@ def test_matrix_seeded_chain_walks_concept_no_arc4_emit():
     # The chain now WALKS the concept (§1.3) instead of collapsing to FORMULATE.
     assert eng.state.grounding_concept == "epigenetic inheritance"
     assert eng.state.entity_refs.get("current_topic") == "epigenetic inheritance"
-    assert eng.state.entry_primitive == "RECALL"            # §5.1 first stage
-    assert eng.state.entry_primitive in META_PRIMITIVES
+    # NO hardcoded entry primitive — the walk (incl. step 1) emerges from
+    # grounded V per-Titan (INV-EMERGENCE; a fixed entry would suppress
+    # sovereign divergence + reinforce a Titan's own monoculture).
+    assert eng.state.entry_primitive == ""
     # No consumer request → grounding_request_id empty → ARC-4 emit stays gated
     # (matrix-seed breaks monoculture; it does NOT feed the α-ramp).
     assert eng.state.grounding_request_id == ""

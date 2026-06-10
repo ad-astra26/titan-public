@@ -1469,30 +1469,22 @@ def agno_worker_main(recv_queue, send_queue, name: str,
 
         from titan_hcl.synthesis.bridge_recall import BridgeRecall
         from titan_hcl.synthesis.recall_reader import build_recall_reader
-        from titan_hcl.synthesis.spine_snapshot_reader import SnapshotSpineReader
         from titan_hcl.synthesis.synthesis_vector_index import FaissReader
         from titan_hcl.synthesis.tx_index_builder import TxContentDeref
 
         _faiss_reader = FaissReader(data_dir=_data_dir_ag)
-        # RFP §7.P4 — a snapshot-backed Kuzu reader so the CHAT path runs concept-
-        # AND self-granularity recall (the live Kuzu spine can't be opened here —
-        # single-writer lock; this reads the atomic spine_snapshot.json, G18-pure).
-        # Without it kuzu_reader=None, so BOTH concept + self recall silently fell
-        # back in chat. Self-recall = the "chat resolves from the SELF node" goal.
-        _snapshot_spine_reader = SnapshotSpineReader(_data_dir_ag)
         worker_plugin.engine_recall = build_recall_reader(
             data_dir=_data_dir_ag,
             bridge_recall=BridgeRecall(),
             embedder=_agno_embedder,
             faiss_reader=_faiss_reader,
-            kuzu_reader=_snapshot_spine_reader,
         )
         worker_plugin.synthesis_tx_deref = TxContentDeref(data_dir=_data_dir_ag)
         if not hasattr(worker_plugin, "_last_surfaced_items"):
             worker_plugin._last_surfaced_items = {}
         logger.info(
-            "[AgnoWorker] EngineRecall wired (canonical thought-recall, Phase E; "
-            "concept+self granularity via snapshot kuzu_reader) — engine=%s",
+            "[AgnoWorker] EngineRecall wired (canonical thought-recall, Phase E) "
+            "— engine=%s",
             "ready" if worker_plugin.engine_recall is not None else "none")
     except Exception as _er_err:
         logger.warning(

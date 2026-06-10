@@ -1370,8 +1370,10 @@ class MetaReasoningEngine:
                 # (§1.3 "walk the populated matrix") — decoupled from the sparse
                 # external producer trigger. Round-robin for breadth. No
                 # request_id → no ARC-4 outcome emit (correct: no consumer
-                # request to attribute); entry RECALL = the §5.1 first stage
-                # ("recall the concept's neighborhood"). Flag-gated (§5 rollback).
+                # request to attribute); NO hardcoded entry primitive — the walk
+                # (incl. step 1) EMERGES from grounded V per-Titan (a fixed entry
+                # would suppress sovereign divergence + reinforce a monoculture).
+                # Flag-gated (§5 rollback).
                 if (should and self._matrix_seed_enabled
                         and not self.state.is_active
                         and self._pending_concept_grounded):
@@ -1383,7 +1385,15 @@ class MetaReasoningEngine:
                         self._active_grounding = {
                             "consumer": "",          # self-driven matrix walk
                             "concept_id": _seed_cid,
-                            "entry_primitive": "RECALL",
+                            # entry_primitive EMPTY (no hardcoded first-step) —
+                            # the grounded-V selection picks the first step from
+                            # the concept's matrix neighbourhood, so the walk
+                            # (incl. step 1) EMERGES per-Titan from its own V
+                            # (INV-EMERGENCE). A hardcoded entry (e.g. RECALL)
+                            # would (a) be a common cross-Titan nudge → suppress
+                            # the sovereign divergence we WANT, and (b) reinforce
+                            # T2's RECALL-monoculture. Let it emerge.
+                            "entry_primitive": "",
                             # no request_id/question_type → ARC-4 emit stays gated
                         }
                         self._matrix_seed_fires += 1
