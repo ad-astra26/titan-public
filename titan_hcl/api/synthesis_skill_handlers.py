@@ -130,6 +130,36 @@ def _load_snapshot_with_status(path: Optional[str] = None) -> tuple[Optional[dic
 # ── GET handlers ──────────────────────────────────────────────────
 
 
+def _resolve_reasoning_snapshot_path() -> str:
+    data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+    return os.path.join(data_dir, "reasoning_snapshot.json")
+
+
+async def get_v6_synthesis_reasoning(request: Request):
+    """RFP_synthesis_self_learning_meta_reasoning v1.1 — the graphed outer
+    chain-of-thought readout (SELF → LEARNING → REASONING). Reads
+    `data/reasoning_snapshot.json` (written by synthesis_worker's ReasoningStore,
+    sole writer; the api never opens synthesis.duckdb — INV-Syn-8).
+
+    Response: {ok, snapshot, ts, count, records_written, macros_written,
+               by_kind, by_goal_class:[{goal_class,count,wins}], recent:[...]}"""
+    payload, status = _load_snapshot_with_status(_resolve_reasoning_snapshot_path())
+    if payload is None:
+        return {"ok": True, "snapshot": status, "ts": 0.0, "count": 0,
+                "records_written": 0, "macros_written": 0, "by_kind": {},
+                "by_goal_class": [], "recent": []}
+    return {
+        "ok": True, "snapshot": status,
+        "ts": float(payload.get("ts") or 0.0),
+        "count": int(payload.get("count") or 0),
+        "records_written": int(payload.get("records_written") or 0),
+        "macros_written": int(payload.get("macros_written") or 0),
+        "by_kind": payload.get("by_kind") or {},
+        "by_goal_class": payload.get("by_goal_class") or [],
+        "recent": (payload.get("recent") or [])[:50],
+    }
+
+
 async def get_v6_synthesis_skills_list(request: Request):
     """Return list of compiled skills.
 

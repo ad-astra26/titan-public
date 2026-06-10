@@ -514,6 +514,11 @@ _T = (
     ("/v6/synthesis/skills/coverage", "GET",
      "get_v6_synthesis_skills_coverage", "synthesis", "readout",
      None, None, (), ("synthesis_worker",), False, None),
+    # RFP_synthesis_self_learning_meta_reasoning v1.1 — the graphed outer
+    # chain-of-thought (SELF → LEARNING → REASONING). Reads reasoning_snapshot.json.
+    ("/v6/synthesis/reasoning", "GET",
+     "get_v6_synthesis_reasoning", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
     # Phase 10 (D-SPEC-PHASE10) — observatory + metrics. Read-only over
     # data/synthesis_metrics_snapshot.json (INV-Syn-25, observation-only).
     ("/v6/synthesis/metrics", "GET",

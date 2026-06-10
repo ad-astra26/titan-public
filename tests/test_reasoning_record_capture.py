@@ -96,6 +96,25 @@ def test_write_macro(tmp_path):
     assert s.macros_written == 1
 
 
+def test_snapshot_export_readable(tmp_path):
+    # the snapshot is the read-path past the writer-lock (the /v6 endpoint reads it).
+    import json
+    s = _store(tmp_path)
+    s.record_tool_use(
+        reasoning_id="tx_snap", goal_class="combinatorics", action="tool",
+        oracle_id="coding_sandbox", verdict="true", reward=1.0, features=_feat(),
+        signature_text="snap")
+    snap_path = tmp_path / "reasoning_snapshot.json"
+    assert snap_path.exists()  # written on the write
+    snap = json.loads(snap_path.read_text())
+    assert snap["count"] == 1
+    assert snap["records_written"] == 1
+    assert snap["by_kind"].get("tool_use") == 1
+    assert any(g["goal_class"] == "combinatorics" and g["wins"] == 1
+               for g in snap["by_goal_class"])
+    assert snap["recent"][0]["reasoning_id"] == "tx_snap"
+
+
 def test_no_embedder_still_persists_scalars(tmp_path):
     # no embedder → no FAISS signature, but the DuckDB record still lands (deref ok).
     conn = duckdb.connect(str(tmp_path / "synth2.duckdb"))

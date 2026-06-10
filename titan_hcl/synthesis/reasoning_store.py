@@ -44,6 +44,7 @@ class ReasoningStore:
         graph: Any = None,
         embedder: Optional[Callable[[str], Any]] = None,
         writer: Any = None,
+        snapshot_path: Optional[str] = None,
         clock: Callable[[], float] = time.time,
     ):
         self._db = duckdb_conn
@@ -51,6 +52,8 @@ class ReasoningStore:
         self._graph = graph                 # core.direct_memory KnowledgeGraph (Kuzu)
         self._embedder = embedder
         self._writer = resolve_writer(writer)
+        self._snapshot_path = str(snapshot_path) if snapshot_path else os.path.join(
+            os.path.dirname(self._faiss_path) or ".", "reasoning_snapshot.json")
         self._clock = clock
         self._faiss = None
         self._faiss_dim = EMBEDDING_DIM
@@ -219,6 +222,8 @@ class ReasoningStore:
             ok = bool(self._writer.submit_sync(_do_write))
             if ok and kind == "tool_use":
                 self.records_written += 1
+            if ok:
+                self.snapshot_export()   # bounded payload — readable past the writer-lock
             return ok
         except Exception as e:  # noqa: BLE001
             logger.warning("[ReasoningStore] record write failed: %s", e)
@@ -306,6 +311,62 @@ class ReasoningStore:
             return int(row[0]) if row else 0
         except Exception:  # noqa: BLE001
             return 0
+
+    # ── Snapshot (atomic JSON; the api/analysis reads this past the writer-lock,
+    # mirroring skills_snapshot.json — INV-Syn-8: readers never open the db) ──
+    def _build_snapshot_payload(self) -> dict:
+        import json
+        try:
+            total = self.count()
+            by_kind = self._db.execute(
+                "SELECT kind, COUNT(*) FROM reasoning_records GROUP BY kind").fetchall()
+            by_goal = self._db.execute(
+                "SELECT goal_class, COUNT(*), SUM(CASE WHEN reward>0 THEN 1 ELSE 0 END) "
+                "FROM reasoning_records GROUP BY goal_class ORDER BY 2 DESC LIMIT 30"
+            ).fetchall()
+            recent = self._db.execute(
+                "SELECT reasoning_id, kind, goal_class, action, oracle_id, verdict, "
+                "reward, created_at FROM reasoning_records ORDER BY created_at DESC "
+                "LIMIT 50").fetchall()
+            return {
+                "version": 1, "ts": float(self._clock()), "count": int(total),
+                "records_written": int(self.records_written),
+                "macros_written": int(self.macros_written),
+                "by_kind": {str(k): int(n) for k, n in by_kind},
+                "by_goal_class": [
+                    {"goal_class": g, "count": int(n), "wins": int(w or 0)}
+                    for g, n, w in by_goal],
+                "recent": [
+                    {"reasoning_id": r[0], "kind": r[1], "goal_class": r[2],
+                     "action": r[3], "oracle_id": r[4], "verdict": r[5],
+                     "reward": float(r[6]) if r[6] is not None else 0.0,
+                     "created_at": r[7]}
+                    for r in recent],
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[ReasoningStore] snapshot payload failed: %s", e)
+            return {"version": 1, "ts": float(self._clock()), "count": 0,
+                    "by_kind": {}, "by_goal_class": [], "recent": []}
+
+    def snapshot_export(self) -> str:
+        """Atomically write the read-snapshot (on the writer thread)."""
+        import json
+
+        def _export() -> str:
+            payload = self._build_snapshot_payload()
+            try:
+                os.makedirs(os.path.dirname(self._snapshot_path) or ".", exist_ok=True)
+                tmp = self._snapshot_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+                os.replace(tmp, self._snapshot_path)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[ReasoningStore] snapshot write failed: %s", e)
+            return self._snapshot_path
+        try:
+            return str(self._writer.submit_sync(_export))
+        except Exception:  # noqa: BLE001
+            return self._snapshot_path
 
 
 __all__ = ["ReasoningStore", "EMBEDDING_DIM"]

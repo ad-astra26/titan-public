@@ -12402,6 +12402,7 @@ from titan_hcl.api.synthesis_skill_handlers import (
     get_v6_synthesis_skills_detail,
     get_v6_synthesis_skills_recent,
     get_v6_synthesis_skills_coverage,
+    get_v6_synthesis_reasoning,   # RFP v1.1 — SELF→LEARNING→REASONING readout
 )
 # Re-exports from synthesis_metrics_handlers.py (P10.C, D-SPEC-PHASE10) —
 # JSON-snapshot-backed reads of `data/synthesis_metrics_snapshot.json`
