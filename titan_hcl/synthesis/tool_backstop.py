@@ -110,7 +110,8 @@ def _get_router(plugin: Any, cfg: dict) -> Optional[ToolRouter]:
         return None
 
 
-def _invoke_sandbox(plug: Any, code: str, parent_goal: Optional[str] = None):
+def _invoke_sandbox(plug: Any, code: str, parent_goal: Optional[str] = None,
+                    decision=None):
     """Run the coding_sandbox ToolPlug synchronously (called via to_thread).
     The plug's invoke() anchors the tool_call_tx with scored_by='oracle'.
 
@@ -125,8 +126,10 @@ def _invoke_sandbox(plug: Any, code: str, parent_goal: Optional[str] = None):
     `goal` buffer; the backstop sources it from the turn's prompt — the
     same user request, so both paths key the same goal_class."""
     from titan_hcl.synthesis.plugs import ToolCall
+    _feats, _action = (decision if decision else (None, None))
     return plug.invoke(ToolCall(tool_id="coding_sandbox", args={"code": code},
-                                parent_goal=parent_goal))
+                                parent_goal=parent_goal,
+                                decision_features=_feats, decision_action=_action))
 
 
 async def run_tool_backstop(
@@ -150,9 +153,21 @@ async def run_tool_backstop(
     if not cfg.get("enabled", True):
         return BackstopResult(reason="disabled")
 
-    # 1) cheap regex gate — exits on ~95% of (pure-conversation) turns.
+    # 1) cheap regex gate — exits on ~95% of (pure-conversation) turns. BUT the
+    #    learned OuterMetaPolicy may have chosen `tool` even ABSENT the regex
+    #    trigger (RFP_synthesis_self_learning_meta_reasoning v1.1, §1.3: the policy
+    #    learned that computational-shaped prompts reward the tool) → honor that
+    #    decision and proceed to the router, which synthesizes the code.
     intent = detect_tool_intent(prompt, response)
-    if not intent.requires_tool:
+    _policy_wants_tool = False
+    try:
+        _dec = getattr(plugin, "_last_outer_decision", None)
+        if _dec is not None and len(_dec) == 2:
+            from titan_hcl.synthesis.outer_meta_policy import OUTER_ACTIONS
+            _policy_wants_tool = (int(_dec[1]) == OUTER_ACTIONS.index("tool"))
+    except Exception:  # noqa: BLE001
+        _policy_wants_tool = False
+    if not intent.requires_tool and not _policy_wants_tool:
         return BackstopResult(fired=False, reason="no_intent")
 
     # 2) fast-model router — reliable code on gated turns. The router also
@@ -189,8 +204,13 @@ async def run_tool_backstop(
     # prompt IS the user's request; falls back to the response text only if the
     # prompt is empty (post-phase salvage). None → unchanged drop behaviour.
     parent_goal = (prompt or "").strip() or (response or "").strip() or None
+    # v1.1 — the OuterMetaPolicy decision that chose to fire this tool (set on the
+    # plugin by the agno DECIDE block when the policy is enabled; None otherwise).
+    # Carried so synthesis's verdict-time C1 capture trains the policy.
+    decision = getattr(plugin, "_last_outer_decision", None)
     try:
-        result = await asyncio.to_thread(_invoke_sandbox, plug, code, parent_goal)
+        result = await asyncio.to_thread(_invoke_sandbox, plug, code, parent_goal,
+                                         decision)
     except Exception as e:  # noqa: BLE001
         logger.warning("[ToolBackstop] sandbox invoke failed (soft): %s", e)
         return BackstopResult(fired=True, executed=False, reason=f"exec_error:{e}",

@@ -945,19 +945,27 @@ def _build_local_tool_plugs(send_queue) -> dict:
     # (→ §A.6 coverage). Fire-and-forget; never re-executes the sandbox.
     def _companion_verdict_sink(*, parent_tool_call_tx, oracle_id, verdict,
                                 evidence_ref="", latency_ms=0,
-                                parent_goal="", tool_id=""):
+                                parent_goal="", tool_id="",
+                                decision_features=None, decision_action=None):
         try:
+            _payload = {
+                "parent_tool_call_tx": parent_tool_call_tx,
+                "oracle_id": oracle_id, "verdict": verdict,
+                "evidence_ref": evidence_ref, "latency_ms": latency_ms,
+                # EEL B1 — goal+tool so synthesis can form the (outcome,
+                # task-shape) skill-score event (INV-Syn-29).
+                "parent_goal": parent_goal, "tool_id": tool_id,
+            }
+            # v1.1 — the OuterMetaPolicy decision (only set on the policy-driven
+            # ToolBackstop path) → synthesis's verdict-time C1 capture writes the
+            # Reasoning record + trains the policy (INV-OML-11/12).
+            if decision_features is not None and decision_action is not None:
+                _payload["features"] = list(decision_features)
+                _payload["action"] = int(decision_action)
             send_queue.put_nowait({
                 "type": bus.TOOL_CALL_VERDICT_RECORD,
                 "src": "agno_worker", "dst": "synthesis", "ts": time.time(),
-                "payload": {
-                    "parent_tool_call_tx": parent_tool_call_tx,
-                    "oracle_id": oracle_id, "verdict": verdict,
-                    "evidence_ref": evidence_ref, "latency_ms": latency_ms,
-                    # EEL B1 — goal+tool so synthesis can form the (outcome,
-                    # task-shape) skill-score event (INV-Syn-29).
-                    "parent_goal": parent_goal, "tool_id": tool_id,
-                },
+                "payload": _payload,
             })
         except Exception:
             pass

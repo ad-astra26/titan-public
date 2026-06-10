@@ -164,6 +164,65 @@ def _synthesis_decision_authority_enabled(plugin) -> bool:
         return False
 
 
+def _self_learning_enabled(plugin) -> bool:
+    """RFP_synthesis_self_learning_meta_reasoning v1.1 — the LEARNED outer-decision
+    flag. ON → the `OuterMetaPolicy` (trained from oracle outcomes, read from SHM)
+    picks the action, overriding the static `grounded_route` (EXPLOIT only on a live
+    turn — INV-OML-9). OFF (default) → grounded_route stands, byte-identical. Config:
+    `[synthesis.self_learning] enabled`."""
+    try:
+        cfg = (getattr(plugin, "_full_config", {}) or {}).get("synthesis", {}) or {}
+        return bool((cfg.get("self_learning", {}) or {}).get("enabled", False))
+    except Exception:
+        return False
+
+
+def _outer_policy_decide(plugin, readout, requires_tool, prompt_text):
+    """Read the SHM-published `OuterMetaPolicy`, build the Phase-1 feature vector
+    from locally-available signals, and EXPLOIT (argmax) → `(MODE, features_list,
+    action_idx)`. Returns None on any miss → caller keeps `grounded_route`.
+
+    No sync RPC: the weights come from SHM (INV-OML-7). The 3 MSL slots are RESERVED
+    0.0 (Phase 3 / Q4 — `_v5` is not available at this decision point); `skill_utility`
+    / `engram_ground` ride the GroundedReadout (live or reserved per the §1.2 D5 note)."""
+    try:
+        from titan_hcl.synthesis.outer_meta_policy import (
+            OUTER_META_POLICY_STATE_SPEC, OuterFeatures, OuterMetaPolicy,
+            action_index_to_mode)
+        from titan_hcl.core.state_registry import StateRegistryReader, resolve_shm_root
+        from titan_hcl.synthesis.tool_intent import detect_tool_intent
+    except Exception:
+        return None
+    reader = getattr(plugin, "_outer_policy_reader", None)
+    if reader is None:
+        try:
+            reader = StateRegistryReader(OUTER_META_POLICY_STATE_SPEC, resolve_shm_root())
+            plugin._outer_policy_reader = reader
+        except Exception:
+            return None
+    flat = reader.read()
+    if flat is None:
+        return None  # worker not publishing yet → grounded_route stands
+    try:
+        policy = OuterMetaPolicy.from_flat(flat)
+    except Exception:
+        return None
+    try:
+        _has_code = bool(getattr(detect_tool_intent(prompt_text or ""), "code", "") or "")
+    except Exception:
+        _has_code = False
+    feats = OuterFeatures(
+        recall_top_cosine=float(getattr(readout, "recall_score", 0.0) or 0.0),
+        skill_utility=float(getattr(readout, "skill_utility", 0.0) or 0.0),
+        engram_ground=float(getattr(readout, "engram_ground", 0.0) or 0.0),
+        requires_tool=bool(requires_tool),
+        has_code_signal=_has_code,
+    )
+    vec = feats.to_vector()
+    action = policy.exploit_action(vec)
+    return (action_index_to_mode(action), vec.tolist(), action)
+
+
 def _p2_router_thresholds(plugin):
     """RouterThresholds with the recall floors SELF-CALIBRATED to the embedder's
     gibberish noise floor (P2). The engram/skill floors keep their static config
@@ -1114,6 +1173,28 @@ def create_pre_hook(plugin):
                 logger.warning(
                     "[PreHook] grounded router failed (keeping mode '%s'): %s",
                     mode, _gr_err)
+        # ── RFP_synthesis_self_learning_meta_reasoning v1.1 — the LEARNED outer
+        # decision. Flag-gated; OFF or no SHM policy → grounded_route stands
+        # (byte-identical, INV-OML-7). The decision is stashed on the plugin so the
+        # ToolBackstop carries it → verdict-time training (INV-OML-12). EXPLOIT only
+        # on a live user turn (no experiments on the user — INV-OML-9).
+        plugin._last_outer_decision = None
+        if _router_active and _self_learning_enabled(plugin):
+            try:
+                _readout_for_policy = locals().get("_readout")
+                _req_tool = bool(locals().get("_requires_tool", False))
+                if _readout_for_policy is not None:
+                    _outer = _outer_policy_decide(
+                        plugin, _readout_for_policy, _req_tool, prompt_text)
+                    if _outer is not None:
+                        _mode_override, _features, _action = _outer
+                        mode = _mode_override
+                        plugin._last_outer_decision = (_features, _action)
+                        logger.info(
+                            "[PreHook] outer-policy → %s (action=%d) — overrides "
+                            "grounded_route", mode, _action)
+            except Exception as _oml_err:
+                logger.debug("[PreHook] outer-policy decide skipped: %s", _oml_err)
         plugin._last_execution_mode = mode
 
         # ── EEL Pillar A / A2 — learn-on-confirm (RFP §7.A2; INV-EEL-2/6) ─────

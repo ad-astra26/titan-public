@@ -352,6 +352,13 @@ class ToolCall:
     parent_chat_tx: Optional[str] = None   # links the call to the chat turn that issued it
     parent_goal: Optional[str] = None      # the goal-buffer entry driving the call
     parent_skill_id: Optional[str] = None  # set when invoked through procedural_skill_match
+    # RFP_synthesis_self_learning_meta_reasoning v1.1 — the OuterMetaPolicy decision
+    # that chose to fire this tool, carried so the verdict-time C1 capture can write
+    # the per-use Reasoning record + train the policy (decision+outcome together,
+    # INV-OML-12). IN-MEMORY ONLY — NOT written to the on-chain tool_call TX content
+    # (the chain stays a lean pointer; features live in the DuckDB Reasoning record).
+    decision_features: Optional[list] = None   # the 11-D OuterFeatures vector
+    decision_action: Optional[int] = None      # the chosen action index
 
 
 @dataclass

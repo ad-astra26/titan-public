@@ -90,10 +90,14 @@ class _StubPlug:
     def __init__(self):
         self.invoked_with = None
         self.parent_goal = "__unset__"   # capture the EEL-B1 goal threading
+        self.decision_action = None
+        self.decision_features = None
 
     def invoke(self, call):
         self.invoked_with = call.args.get("code", "")
         self.parent_goal = getattr(call, "parent_goal", None)
+        self.decision_action = getattr(call, "decision_action", None)
+        self.decision_features = getattr(call, "decision_features", None)
         ok = "FAIL" not in self.invoked_with
         return _StubResult(ok, "stub-output")
 
@@ -219,6 +223,33 @@ def test_backstop_parent_goal_never_none_on_real_fire():
         p, prompt="verify 7*7 in your sandbox", phase="pre"))
     assert res.executed
     assert plug.parent_goal and plug.parent_goal.strip()
+
+
+# ── v1.1 — the learned policy makes the tool fire + carries its decision ────
+def test_backstop_fires_when_policy_wants_tool_without_regex():
+    # RFP v1.1 §1.3: the policy chose `tool` on a prompt the regex gate skips →
+    # the backstop fires anyway, and threads the decision onto the ToolCall.
+    from titan_hcl.synthesis.outer_meta_policy import OUTER_ACTIONS
+    plug = _StubPlug()
+    p = _Plugin(plug=plug, provider=_StubProvider(code="print(40320)"))
+    feats = [1.0] * 11
+    p._last_outer_decision = (feats, OUTER_ACTIONS.index("tool"))
+    res = _run(run_tool_backstop(
+        p, prompt="how many ways can I order my 8 climbing routes?", phase="pre"))
+    assert res.fired and res.executed and res.success
+    # the decision rode the ToolCall → reaches synthesis's verdict-time C1 capture
+    assert plug.decision_action == OUTER_ACTIONS.index("tool")
+    assert plug.decision_features == feats
+    assert plug.parent_goal  # the goal (prompt) carried too
+
+
+def test_backstop_no_decision_no_regex_still_skips():
+    # without a policy decision AND no regex intent → unchanged skip (parity).
+    plug = _StubPlug()
+    p = _Plugin(plug=plug, provider=_StubProvider())
+    res = _run(run_tool_backstop(p, prompt="I feel calm by the sea", phase="pre"))
+    assert res.fired is False and res.reason == "no_intent"
+    assert plug.decision_action is None
 
 
 def test_backstop_router_declines_no_response():

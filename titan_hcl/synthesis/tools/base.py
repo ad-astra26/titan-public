@@ -173,6 +173,10 @@ class ToolPlugBase:
                         verdict=_verdict_str, evidence_ref=_ev_ref,
                         latency_ms=latency_ms,
                         parent_goal=call.parent_goal, tool_id=self.tool_id,
+                        # v1.1 — carry the OuterMetaPolicy decision so synthesis's
+                        # verdict-time C1 capture writes the Reasoning record + trains.
+                        decision_features=call.decision_features,
+                        decision_action=call.decision_action,
                     )
             except Exception:
                 logger.exception(

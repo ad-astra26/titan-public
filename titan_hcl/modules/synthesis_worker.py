@@ -78,6 +78,7 @@ from titan_hcl.bus import (
     MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
     RETRIEVAL_SAMPLE,
+    SELF_LEARN_REWARD,
     SYNTHESIS_FORK_COMMAND,
     TOOL_CALL_VERDICT_RECORD,
     SYNTHESIS_FORK_COMMAND_RESULT,
@@ -2978,6 +2979,32 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     logger.debug(
                         "[synthesis_worker] tool-call verdict record failed: %s",
                         _tcv_err)
+                # ── RFP_synthesis_self_learning_meta_reasoning v1.1 / C1 ──
+                # If this verdict carries an OuterMetaPolicy decision (the
+                # policy-driven ToolBackstop path), emit the reward to the
+                # self_learning worker AT VERDICT-TIME (continuous, NOT
+                # dream-gated — INV-OML-12). The verdict is already final here
+                # (the tool executed); decision+outcome travel together so no
+                # cross-process join is needed.
+                _decision_feats = payload.get("features")
+                _decision_action = payload.get("action")
+                if _decision_feats is not None and _decision_action is not None:
+                    try:
+                        from titan_hcl.synthesis.goal_class import goal_class as _goal_class_fn
+                        _gc = _goal_class_fn(str(payload.get("parent_goal", "") or ""))
+                        _reward = 1.0 if str(payload.get("verdict", "")) == "true" else -1.0
+                        _send(send_queue, SELF_LEARN_REWARD, name, "self_learning", {
+                            "features": list(_decision_feats),
+                            "action": int(_decision_action),
+                            "reward": _reward,
+                            "goal_class": _gc,
+                            "oracle_id": str(payload.get("oracle_id", "") or ""),
+                            "parent_tool_call_tx": _ptx,
+                        })
+                    except Exception as _sl_err:
+                        logger.debug(
+                            "[synthesis_worker] self-learn reward emit failed: %s",
+                            _sl_err)
                 continue
 
             if msg_type == USER_FEEDBACK_SIGNAL:
