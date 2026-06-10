@@ -91,6 +91,7 @@ from titan_hcl.synthesis.activation import (
     DEFAULT_WINDOW_N,
     ActivationState,
     base_level,
+    base_level_batch,
     record_access,
 )
 from titan_hcl.synthesis.standing_store import (
@@ -421,19 +422,30 @@ class ActivationStore:
         """Recompute every cached state's B_i and persist to DuckDB.
         Returns the count of rows actually upserted (states that changed).
         """
+        states = list(self._cache.values())
+        if not states:
+            return 0
+        # VECTORIZED B_i (GIL-RELEASING) — the per-item pure-Python loop over
+        # ~1500 items held the GIL ~50s and STARVED the synthesis heartbeat →
+        # guardian heartbeat_timeout crash-loop (root-caused 2026-06-10;
+        # feedback_no_bulk_cpu_on_worker_thread_gil_starves_heartbeat). numpy
+        # releases the GIL during the C-level reduction, so the separate
+        # heartbeat thread runs while B_i is computed. base_level_batch is
+        # numerically identical to base_level (test_activation_vectorized_
+        # recompute) — only the GIL behaviour + wall-time change (50s → sub-s).
+        bis = base_level_batch(states, now, d=d, window_n=window_n)
         rows: list[tuple] = []
-        for state in self._cache.values():
-            new_bi = base_level(state, now, d=d, window_n=window_n)
-            changed = (new_bi != state.base_level
-                       or state.last_recompute == 0.0)
-            if changed:
+        # Residual loop is cheap (float compares + tuple packing, no pow/log) —
+        # microseconds, not the old 50s; the heavy math is now the vectorized op.
+        for state, new_bi in zip(states, bis):
+            new_bi = float(new_bi)
+            if new_bi != state.base_level or state.last_recompute == 0.0:
                 state.base_level = new_bi
                 state.last_recompute = now
                 rows.append(self._row_tuple(state))
-        # The B_i math ran on the CALLER thread (under cache_lock); rows are
-        # immutable tuples, so the DuckDB upsert is submitted as ONE batch op
-        # to the writer thread — heavy compute never runs on the writer, and
-        # the persist never races another handle user.
+        # rows are immutable tuples → the DuckDB upsert is submitted as ONE batch
+        # op to the writer thread (heavy persist never runs on this thread, never
+        # races another handle user).
         if rows:
             self._writer.submit(lambda: self._persist_rows(rows))
         return len(rows)
