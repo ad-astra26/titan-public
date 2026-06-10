@@ -50,8 +50,19 @@ def _mk_skill(graph, skill_id, name):
 
 # ── Self singleton ──────────────────────────────────────────────────
 
-def test_self_node_created_at_init(graph):
-    """The Self hub singleton exists right after graph init (boot ensure)."""
+def test_self_node_not_auto_created_in_generic_graph(graph):
+    """The generic TitanKnowledgeGraph.__init__ must NOT create the Self node —
+    spine DATA writes are synthesis-owned (G21/INV-Syn-7); a fresh graph (e.g. the
+    memory worker's knowledge_graph.kuzu) gets the empty Self TABLE only, no node.
+    The hub is bootstrapped in synthesis_worker's boot / lazily via the link hooks."""
+    qr = graph._conn.execute("MATCH (s:Self) RETURN COUNT(s)")
+    assert qr.get_next()[0] == 0
+
+
+def test_ensure_self_node_creates_it(graph):
+    """spine_ensure_self_node (called by synthesis boot / the link hooks) creates
+    the singleton."""
+    assert graph.spine_ensure_self_node() is True
     qr = graph._conn.execute("MATCH (s:Self) RETURN COUNT(s)")
     assert qr.get_next()[0] == 1
 

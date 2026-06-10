@@ -414,11 +414,14 @@ class TitanKnowledgeGraph:
             )
             migrate_concept_to_engram(self)
             bootstrap_spine_schema(self)
-            # §7.P3a — the Self hub: ensure the singleton + (idempotent) backfill
-            # links to existing domain="self" engrams + skills, so one-hop self-
-            # recall is complete from boot (INV-SD-16). Single-threaded here.
-            self.spine_ensure_self_node()
-            self.spine_backfill_self_links()
+            # NOTE: the SELF-hub DATA bootstrap (spine_ensure_self_node +
+            # spine_backfill_self_links) is NOT done here — this __init__ runs in
+            # EVERY process that opens a graph (incl. the memory worker's
+            # knowledge_graph.kuzu), and Kuzu spine *writes* are synthesis-owned
+            # (G21/INV-Syn-7, single SynthesisWriter). The Self hub is bootstrapped
+            # once in synthesis_worker's single-threaded boot, on the synthesis
+            # spine ONLY. Schema (the empty Self table + rels) is idempotent and
+            # safe in every graph; the DATA writes are not. (§7.P3a fix 2026-06-10.)
         except Exception as exc:
             logger.warning(
                 "[KnowledgeGraph] synthesis spine bootstrap/migration skipped: %s",

@@ -1237,6 +1237,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             logger.info(
                 "[synthesis_worker] Kuzu spine boot checkpoint — WAL %.1fMB → cleared",
                 _boot_wal)
+        # §7.P3a — the SELF hub lives on the synthesis spine ONLY (G21/INV-Syn-7:
+        # Kuzu spine writes are synthesis-owned). Ensure the singleton + backfill
+        # links to existing domain="self" engrams/skills HERE — single-threaded
+        # boot, before the SynthesisWriter thread starts — NOT in the generic
+        # TitanKnowledgeGraph.__init__ (which also runs in the memory worker; spine
+        # DATA writes must not happen there). Idempotent; soft within this try.
+        kuzu_graph_obj.spine_ensure_self_node()
+        _self_links = kuzu_graph_obj.spine_backfill_self_links()
+        logger.info("[synthesis_worker] SELF hub ready — %d engram(s) + %d skill(s) "
+                    "linked (§7.P3a)", _self_links.get("engrams", 0),
+                    _self_links.get("skills", 0))
     except Exception as exc:
         logger.warning(
             "[synthesis_worker] Kuzu spine graph open failed: %s — spine "
