@@ -41,16 +41,21 @@ def test_substrate_bus_events_exist():
 
 
 def test_emot_cgn_broadcast_topics_includes_substrate_events():
-    """plugin.py must register emot_cgn with all 5 §8 events in
+    """The emot_cgn ModuleSpec must register the substrate §8 events in
     broadcast_topics — otherwise the broker won't fanout the substrate
-    updates to the emot_cgn subscriber and DEAD-DIM persists."""
-    # Resolve via static read of the plugin.py file — instantiating the
-    # full TitanHCL from a unit test would require config + bus + SHM
-    # boot, which is out of scope for this regression. Static check
-    # mirrors `_register_emot_cgn_module()` register call.
+    updates to the emot_cgn subscriber and DEAD-DIM persists.
+
+    2026-06-10: repointed `plugin.py` → `module_catalog.py` (the emot_cgn
+    ModuleSpec moved there), matched against `_bus_constants.<EVT>` (the symbol
+    module_catalog actually uses), and dropped TRAJECTORY_UPDATE — RETIRED
+    v1.14.0 / D-SPEC-69, now flows via the trajectory_state.bin SHM slot, NOT
+    broadcast_topics (module_catalog.py:2078)."""
+    # Static read of module_catalog.py — instantiating the full TitanHCL from a
+    # unit test would require config + bus + SHM boot, out of scope here. Static
+    # check mirrors the emot_cgn ModuleSpec(...) registration.
     import re
     from pathlib import Path
-    src = Path("titan_hcl/core/plugin.py").read_text()
+    src = Path("titan_hcl/module_catalog.py").read_text()
     # Locate the emot_cgn ModuleSpec block.
     spec_block_match = re.search(
         r'name="emot_cgn".*?broadcast_topics=\[(.*?)\]',
@@ -59,12 +64,12 @@ def test_emot_cgn_broadcast_topics_includes_substrate_events():
     )
     assert spec_block_match, "could not locate emot_cgn ModuleSpec block"
     topics_str = spec_block_match.group(1)
+    # The 4 LIVE substrate events (TRAJECTORY_UPDATE retired → SHM slot).
     for evt in (
-        "bus.TRAJECTORY_UPDATE",
-        "bus.NS_URGENCIES_UPDATE",
-        "bus.SPACE_TOPOLOGY_UPDATE",
-        "bus.NEUROMOD_LEVELS_UPDATE",
-        "bus.PI_PHASE_UPDATE",
+        "NS_URGENCIES_UPDATE",
+        "SPACE_TOPOLOGY_UPDATE",
+        "NEUROMOD_LEVELS_UPDATE",
+        "PI_PHASE_UPDATE",
     ):
         assert evt in topics_str, (
             f"emot_cgn ModuleSpec broadcast_topics missing {evt}")
