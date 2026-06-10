@@ -397,6 +397,20 @@ class GeneralizedHAOVTracker:
         self._stats["used_for_action"] += 1
         return best.action_context
 
+    def mark_used_for_action(self, n: int = 1) -> int:
+        """RFP_cgn_loop_closure §7.D — record that a verified rule from THIS
+        tracker was applied to a real action by a (cross-process) consumer.
+
+        The consumer applies the rule in its own process (C2 language teaching /
+        C3 social engage-bias) then emits CGN_HAOV_RULE_APPLIED; cgn_worker (the
+        G21 owner of these trackers) calls this so used_for_action — published in
+        cgn_engine_state.bin.haov_stats (the G7 readout) — reflects real
+        behaviour. Distinct from suggest(), which both selects AND counts for
+        in-process callers (arc/session); here selection already happened in the
+        consumer, so this only counts. Returns the new total."""
+        self._stats["used_for_action"] += max(1, int(n))
+        return self._stats["used_for_action"]
+
     def get_verified_concepts(self) -> List[dict]:
         """Return verified hypotheses as concept candidates for CGN grounding."""
         return [

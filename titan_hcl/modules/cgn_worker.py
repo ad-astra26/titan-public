@@ -1163,6 +1163,38 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 swallow_warn('[CGNWorker] HAOV verify error', e,
                              key="modules.cgn_worker.haov_verify_error", throttle=100)
 
+        # ── CGN_HAOV_RULE_APPLIED — a verified rule influenced an action ─
+        # RFP_cgn_loop_closure §7.D (INV-LOOP-6): closes learning → behaviour.
+        # A consumer (C2 language teaching / C3 social engage-bias) applied a
+        # verified haov rule in its own process, then emitted this. We own the
+        # trackers (G21), so we bump the SOURCE consumer's used_for_action — the
+        # rule's author gets the credit (social acting on language's rule →
+        # language.used_for_action++). Published in cgn_engine_state.bin.haov_stats
+        # → /v6/cognition/cgn-haov-stats (G7). Monotonic + restart-safe (we own
+        # the counter; consumer restarts don't reset it).
+        elif msg_type == bus.CGN_HAOV_RULE_APPLIED:
+            try:
+                _src = payload.get("source_consumer") or payload.get("consumer")
+                _tracker = cgn._haov_trackers.get(_src) if _src else None
+                if _tracker is not None:
+                    _n = max(1, int(payload.get("count", 1) or 1))
+                    _new_total = _tracker.mark_used_for_action(_n)
+                    _stats["haov_rules_applied"] = (
+                        _stats.get("haov_rules_applied", 0) + _n)
+                    _write_incremental_shm(cgn, shm_writer)
+                    logger.info(
+                        "[CGNWorker] HAOV rule APPLIED — source=%s by=%s "
+                        "used_for_action=%d (rule=%s)", _src,
+                        payload.get("applying_consumer", "?"), _new_total,
+                        str(payload.get("rule", ""))[:60])
+                else:
+                    logger.debug(
+                        "[CGNWorker] CGN_HAOV_RULE_APPLIED for unknown source "
+                        "consumer=%s — dropped", _src)
+            except Exception as e:
+                swallow_warn('[CGNWorker] HAOV rule-applied error', e,
+                             key="modules.cgn_worker.haov_rule_applied_error", throttle=100)
+
         # ── CGN_INFERENCE_REQ — policy inference for remote processes ─
         # API_STUB: handler ready, awaits remote process senders (T2/T3
         # delegate path). Tracked I-003.

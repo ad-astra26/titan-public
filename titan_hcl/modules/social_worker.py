@@ -980,6 +980,15 @@ def _init_social_x_gateway(config: dict, name: str, send_queue) -> dict:
     gateway.set_post_success_callback(_x_post_published_callback)
     logger.info("[SocialWorker] X_POST_PUBLISHED bus publisher injected")
 
+    # RFP_cgn_loop_closure §7.D (C3, INV-LOOP-6) — when a verified HAOV rule
+    # influences a social engage decision, tell cgn_worker to credit the rule's
+    # source consumer (used_for_action). cgn owns the trackers (G21); we signal.
+    def _haov_rule_applied_emitter(source_consumer: str, rule: str) -> None:
+        _send_msg(send_queue, bus.CGN_HAOV_RULE_APPLIED, name, "cgn",
+                  {"source_consumer": source_consumer,
+                   "applying_consumer": "social", "rule": rule, "count": 1})
+    gateway.set_haov_apply_emitter(_haov_rule_applied_emitter)
+
     state_refs["social_x_gateway"] = gateway
     logger.info("[SocialWorker] SocialXGateway v3 booted: db=%s/social_x.db",
                 data_dir)

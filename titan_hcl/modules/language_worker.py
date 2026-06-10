@@ -1983,6 +1983,20 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                         "source_reward": float(
                                             _di.get("confidence", 0.5)),
                                     })
+                                    # RFP_cgn_loop_closure §7.D (C2, INV-LOOP-6):
+                                    # a verified rule from _di_source just drove a
+                                    # teaching action → tell cgn_worker to credit
+                                    # its used_for_action (the learning→behaviour
+                                    # close; cgn owns the tracker, G21).
+                                    try:
+                                        _send_msg(
+                                            send_queue, bus.CGN_HAOV_RULE_APPLIED,
+                                            name, "cgn",
+                                            {"source_consumer": _di_source,
+                                             "applying_consumer": "language",
+                                             "rule": _hv_rule, "count": 1})
+                                    except Exception:
+                                        pass
                                     break
                             continue
                         for _di_concept in _di.get("top_concepts", [])[:3]:

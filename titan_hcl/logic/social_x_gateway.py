@@ -261,6 +261,11 @@ class SocialXGateway:
         # crystallizes (today's verified rules are all impasse-type), so the bias
         # is 0 and live behaviour is unchanged — interface-complete per the design.
         self._verified_haov_concepts: list[dict] = []
+        # RFP_cgn_loop_closure §7.D (C3, INV-LOOP-6) — optional emitter wired by
+        # social_worker to report "a verified rule influenced this reply" to
+        # cgn_worker (→ used_for_action). Signature: (source_consumer, rule).
+        # None until wired; the gateway stays import-free (callback injection).
+        self._haov_apply_emitter = None
         # Metabolism gate callable (set externally via set_metabolism_gate).
         # Mainnet Lifecycle Wiring rFP (2026-04-20). Signature:
         #   (feature: str, caller: str) -> (should_proceed: bool, rate: float)
@@ -437,6 +442,38 @@ class SocialXGateway:
             if len(tok) >= 3 and tok in tl:
                 best = max(best, float(c.get("confidence", 0.0)))
         return round(min(0.2, best * 0.2), 4)
+
+    @staticmethod
+    def _matched_haov_source(concepts: list, text: str) -> Optional[tuple]:
+        """RFP_cgn_loop_closure §7.D — which verified rule the engage-bias
+        matched, for used_for_action attribution. Returns (source_consumer,
+        rule) of the highest-confidence matched concept-grounding rule, or None.
+        Mirrors _verified_concept_engage_bias's matching (kept separate so that
+        method's float contract + the 7 C3 tests are untouched)."""
+        if not concepts or not text:
+            return None
+        tl = text.lower()
+        best_c, best_conf = None, -1.0
+        for c in concepts:
+            if str(c.get("effect", "")).startswith("resolve_"):
+                continue
+            rule = str(c.get("rule", ""))
+            tok = (rule.split("_", 1)[-1] if "_" in rule else rule).replace(
+                "arc_", "").replace("pattern_", "").replace("_", " ").strip()
+            if len(tok) >= 3 and tok in tl:
+                conf = float(c.get("confidence", 0.0))
+                if conf > best_conf:
+                    best_conf, best_c = conf, c
+        if best_c is None:
+            return None
+        return (str(best_c.get("source_consumer", "")),
+                str(best_c.get("rule", "")))
+
+    def set_haov_apply_emitter(self, callback) -> None:
+        """Inject the C3 apply-emitter (RFP_cgn_loop_closure §7.D). Called by
+        social_worker with a (source_consumer, rule) -> None callback that
+        emits CGN_HAOV_RULE_APPLIED so cgn_worker credits used_for_action."""
+        self._haov_apply_emitter = callback
 
     def set_context_builder(self, vcb) -> None:
         """Inject VerifiedContextBuilder for memory-enriched replies."""
@@ -3632,6 +3669,17 @@ class SocialXGateway:
             # until a concept-grounding verified rule exists → no live change today.
             _haov_bias = self._verified_concept_engage_bias(
                 self._verified_haov_concepts, context.mention_text or "")
+            # RFP_cgn_loop_closure §7.D (C3, INV-LOOP-6) — a verified rule just
+            # influenced this engage decision → credit its source's
+            # used_for_action via cgn_worker (the learning→behaviour close).
+            if _haov_bias > 0.0 and self._haov_apply_emitter is not None:
+                try:
+                    _m = self._matched_haov_source(
+                        self._verified_haov_concepts, context.mention_text or "")
+                    if _m is not None:
+                        self._haov_apply_emitter(_m[0], _m[1])
+                except Exception:
+                    pass
             _eff_disengage_conf = _cgn_conf - _haov_bias
             # Hard gate: suppress reply if disengage + high confidence + high weight
             if (_cgn_action == "disengage" and _eff_disengage_conf > 0.6

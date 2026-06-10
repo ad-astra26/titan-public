@@ -1824,6 +1824,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             "CGN_CONSOLIDATE", "CGN_SURPRISE",
             _bus_constants.CGN_HAOV_VERIFY_RSP, _bus_constants.CGN_INFERENCE_REQ,
             _bus_constants.CGN_KNOWLEDGE_REQ,
+            # RFP_cgn_loop_closure §7.D — consumers emit CGN_HAOV_RULE_APPLIED
+            # when a verified rule influences an action; cgn_worker (G21 tracker
+            # owner) increments used_for_action. Subscribed so the broker doesn't
+            # drop it (feedback_bus_dst_must_have_subscriber).
+            _bus_constants.CGN_HAOV_RULE_APPLIED,
             # Phase 8 fold-in (P8.Y): CGN_LEXICON_UPDATED — cgn_worker
             # is the SOLE emitter. Listed here so the bus broker doesn't
             # silently drop the topic. Payload: {ts, lexicon_size, snapshot_path}.
