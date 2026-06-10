@@ -916,43 +916,15 @@ def _handle_manual(state: dict, msg: dict) -> None:
                                         "clean no-op: nothing changed or arweave gate off")},
                 }, rid=rid)
             return
-        if backup_type == "personality":
-            result = loop.run_until_complete(backup.upload_personality_to_arweave())
-        elif backup_type == "soul":
-            result = loop.run_until_complete(backup.upload_soul_package_to_arweave())
-        elif backup_type == "timechain":
-            # TimeChain uses its own path; requires TimeChainBackup wrapper
-            from titan_hcl.logic.timechain_backup import TimeChainBackup
-            tcb = TimeChainBackup(
-                data_dir="data/timechain",
-                titan_id=state["titan_id"],
-                arweave_store=backup._arweave_store,
-            )
-            tx_id = loop.run_until_complete(tcb.snapshot_to_arweave())
-            result = {"arweave_tx": tx_id} if tx_id else None
-        else:
-            raise ValueError(f"Unknown backup type: {backup_type}")
-
-        dur = time.time() - t0
-        if result:
-            _send(send_queue, "BACKUP_SUCCEEDED", name, "all", {
-                "trigger": "manual", "type": backup_type,
-                "arweave_tx": result.get("arweave_tx"),
-                "size_mb": result.get("size_mb"),
-                "archive_hash": (result.get("archive_hash") or "")[:16],
-                "duration_s": round(dur, 2),
-            })
-            if rid:
-                _send(send_queue, "RESPONSE", name, src,
-                      {"ok": True, "result": result}, rid=rid)
-        else:
-            err = "upload returned None"
-            _send(send_queue, "BACKUP_FAILED", name, "all", {
-                "trigger": "manual", "type": backup_type, "error": err,
-                "duration_s": round(dur, 2),
-            })
-            if rid:
-                _send(send_queue, "RESPONSE", name, src, {"ok": False, "error": err}, rid=rid)
+        # Legacy per-type full-tarball Arweave upload (the SOL-drain) is RETIRED
+        # (RFP_backup_redesign_spine Phase B / B-1, no-shim). unified_v2 is
+        # fleet-wide (the branch above handles a Maker-forced trigger as ONE
+        # atomic unified event + returns); a non-unified_v2 install must ENABLE
+        # it, never fall back to the per-type ~50 MB drain. The except below
+        # turns this into a clean BACKUP_FAILED + RESPONSE.
+        raise RuntimeError(
+            "manual backup requires [backup].unified_v2_enabled=true — the "
+            "legacy per-type Arweave upload is retired (RFP_backup_redesign_spine B-1)")
     except Exception as e:
         dur = time.time() - t0
         logger.error("[BackupWorker] Manual trigger failed: %s", e, exc_info=True)
