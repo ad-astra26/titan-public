@@ -988,6 +988,10 @@ class MetaReasoningEngine:
         self.save_dir = cfg.get("save_dir", "./data/reasoning")
         self._delegate_bias_strength = cfg.get("delegate_bias_strength", 0.5)
         self._delegate_max_bias = cfg.get("delegate_max_bias", 3.0)
+        # Bounded DELEGATE wait (2026-06-10 fix): a normal delegate resolves in ~1
+        # tick; this is the watchdog for the pathological case (stale baseline /
+        # chronically-stuck reasoning) that wedged meta-reasoning for weeks.
+        self._delegate_max_wait_ticks = cfg.get("delegate_max_wait_ticks", 12)
         self._config = cfg
 
         # Maturity gates
@@ -4541,6 +4545,30 @@ class MetaReasoningEngine:
                     int(getattr(reasoning_engine, "_total_chains", -1)),
                     int(self.state.delegate_start_chains),
                     len(self.state.chain))
+            # FIX (2026-06-10): bound the wait so a stale baseline or a stuck/slow
+            # reasoning engine can NEVER wedge the whole meta-chain again (the
+            # weeks-long freeze). Abandon the delegate gracefully and CONTINUE on:
+            #   - chains_since < 0 : the reasoning lifetime counter was restored/reset
+            #     BELOW delegate_start_chains → the +1 condition is UNREACHABLE
+            #     (the exact stuck-chain wedge confirmed on T2); OR
+            #   - delegate_wait_ticks >= max : a chronically-slow/stuck reasoning
+            #     engine (a normal delegate resolves in ~1 tick).
+            if (chains_since < 0
+                    or self.state.delegate_wait_ticks
+                    >= self._delegate_max_wait_ticks):
+                logger.warning(
+                    "[META] DELEGATE wait ABANDONED (ticks=%d chains_since=%d) — "
+                    "stale baseline or stuck reasoning; continuing chain with empty "
+                    "delegate result", self.state.delegate_wait_ticks, chains_since)
+                self.state.delegate_results.append({
+                    "confidence": 0.0, "gut_agreement": 0.0,
+                    "chains_completed": 0, "abandoned": True})
+                self.state.awaiting_delegate = False
+                self.state.delegate_wait_ticks = 0
+                return {"action": "CONTINUE", "primitive": "DELEGATE",
+                        "delegate_done": True, "abandoned": True,
+                        "result_confidence": 0.0,
+                        "confidence": self.state.confidence}
             return {"action": "WAITING", "primitive": "DELEGATE",
                     "chains_since": chains_since}
 
