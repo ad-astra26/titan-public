@@ -51,12 +51,6 @@ class TierConfig:
     # uses ~60-80 (no need for 1200-char replies to "Hi"); reasoning uses
     # the default (no cap). None = leave the model's default in place.
     max_tokens: int | None
-    # ζ.7 (2026-06-11) — per-tier reply-length GUIDANCE injected into the
-    # agent's instructions so the model PLANS a complete reply within budget
-    # (and finishes its thought) instead of being hard-cut at max_tokens.
-    # max_tokens stays the safety ceiling ABOVE the guided length. None = no
-    # guidance (model unconstrained beyond the ceiling).
-    reply_guidance: str | None = None
 
     def matches(self, prompt: str) -> bool:
         """True if this tier's detection criteria apply to `prompt`."""
@@ -104,7 +98,6 @@ def _build_tier(spec: dict[str, Any], default_model_class: str) -> TierConfig:
         regex_any=_compile_regex_list(detect.get("regex_any", ())),
         topic_memory_regex=_compile_regex_list(detect.get("topic_memory_regex", ())),
         max_tokens=int(_mt) if _mt is not None else None,
-        reply_guidance=(str(_rg).strip() or None) if (_rg := spec.get("reply_guidance")) is not None else None,
     )
 
 

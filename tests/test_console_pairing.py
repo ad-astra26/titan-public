@@ -232,3 +232,134 @@ def test_dispatch_device_signed_mutation_bypasses_token(tmp_path):
     s, _ = dispatch(ctx, "POST", "/console/config/set", {}, body,
                     {"x-device-id": "dev-1", "x-timestamp": ts, "x-signature": sig})
     assert s != 401  # device signature alone satisfied the gate
+
+
+# ── AD-5: beyond-localhost gates EVERY route (is_local=False) ─────────────────
+def test_ad5_nonlocal_unsigned_any_route_rejected(tmp_path):
+    ctx = _ctx(tmp_path)  # NO operator token configured
+    # local default: a GET read is open …
+    assert dispatch(ctx, "GET", "/console/health", {}, b"", {})[0] == 200
+    # … but NON-local unsigned → 401 even for a read (AD-5)
+    assert dispatch(ctx, "GET", "/console/health", {}, b"", {}, False)[0] == 401
+    # non-local unsigned mutation → 401
+    assert dispatch(ctx, "POST", "/console/restart", {}, b"{}", {}, False)[0] == 401
+    # /console/pair/submit is the bootstrap exemption → reaches the handler (400, not gate-401)
+    assert dispatch(ctx, "POST", "/console/pair/submit", {}, b"{}", {}, False)[0] == 400
+
+
+def test_ad5_nonlocal_signed_device_accepted(tmp_path):
+    import time as _t
+    ctx = _ctx(tmp_path)
+    seed, _ = _register_signed_device(ctx)
+    ts = str(int(_t.time()))
+    sig = _sign_request(seed, "GET", "/console/device/me", ts, b"")
+    s, rec = dispatch(ctx, "GET", "/console/device/me", {}, b"",
+                      {"x-device-id": "dev-1", "x-timestamp": ts, "x-signature": sig}, False)
+    assert s == 200 and rec["device_id"] == "dev-1"
+
+
+def test_ad5_nonlocal_operator_token_strict(tmp_path):
+    ctx = Context(install_root=tmp_path, titan_id="T1",
+                  secrets_path=tmp_path / "secrets.toml", token="OP")
+    # valid operator token → past the AD-5 gate
+    assert dispatch(ctx, "GET", "/console/health", {}, b"", {"x-console-token": "OP"}, False)[0] == 200
+    # no token (the "open when no token" escape MUST NOT apply remotely) → 401
+    assert dispatch(ctx, "GET", "/console/health", {}, b"", {}, False)[0] == 401
+
+
+# ── mint modes + endpoint + tls pin (AD-8/AG-TLS) ────────────────────────────
+def test_mint_mode_remote_normalizes_https(tmp_path):
+    s, p = pairing.mint_pairing(_ctx(tmp_path), mode="remote", public_url="203.0.113.9:7799")
+    assert s == 200 and p["mode"] == "remote" and p["endpoint_url"] == "https://203.0.113.9:7799"
+
+
+def test_mint_mode_remote_http_upgraded_to_https(tmp_path):
+    _, p = pairing.mint_pairing(_ctx(tmp_path), mode="remote", public_url="http://203.0.113.10:7799")
+    assert p["endpoint_url"] == "https://203.0.113.10:7799"
+
+
+def test_mint_mode_install_has_no_endpoint(tmp_path):
+    _, p = pairing.mint_pairing(_ctx(tmp_path), mode="install")
+    assert p["mode"] == "install" and "endpoint_url" not in p
+
+
+def test_mint_mode_local_uses_detected_lan_ip(tmp_path, monkeypatch):
+    ctx = _ctx(tmp_path)
+    ctx.console_port = 7799
+    monkeypatch.setattr(pairing, "_detect_lan_ip", lambda: "203.0.113.10")
+    _, p = pairing.mint_pairing(ctx, mode="local")
+    assert p["endpoint_url"] == "https://203.0.113.10:7799"
+
+
+def test_mint_invalid_mode_rejected(tmp_path):
+    assert pairing.mint_pairing(_ctx(tmp_path), mode="bogus")[0] == 400
+
+
+def test_mint_includes_tls_pin_when_set(tmp_path):
+    ctx = _ctx(tmp_path)
+    ctx.tls_pin = "deadbeef"
+    _, p = pairing.mint_pairing(ctx, mode="install")
+    assert p["server_tls_pin"] == "deadbeef"
+
+
+def test_mint_omits_tls_pin_and_mode_by_default(tmp_path):
+    # back-compat: no mode + no pin set → the original payload shape (tests/CLI legacy)
+    _, p = pairing.mint_pairing(_ctx(tmp_path))
+    assert "mode" not in p and "server_tls_pin" not in p and "endpoint_url" not in p
+
+
+# ── confirm_device wallet-binding (AG-MAKER-BIND/AD-10) ──────────────────────
+def test_confirm_records_wallet_binding(tmp_path):
+    ctx = _ctx(tmp_path)
+    token, seed, pub, _s, _r = _mint_and_submit(ctx)
+    code = pairing.code6(base64.b64decode(token), pub)
+    mk_seed, mk_pub = _ed25519.keygen()
+    device_pubkey_b64 = _b64(pub)
+    mk_sig = _ed25519.sign(device_pubkey_b64.encode(), mk_seed)  # wallet signs the device pubkey
+    sc, _ = pairing.confirm_device(ctx, token, code, now=1003,
+                                   maker_pubkey=_b64(mk_pub), maker_sig=_b64(mk_sig))
+    assert sc == 200
+    assert pairing._find_device(ctx, "dev-1")["authorized_by"] == {
+        "method": "wallet", "maker_pubkey": _b64(mk_pub)}
+
+
+def test_confirm_bad_wallet_sig_rejected_and_not_registered(tmp_path):
+    ctx = _ctx(tmp_path)
+    token, seed, pub, *_ = _mint_and_submit(ctx)
+    code = pairing.code6(base64.b64decode(token), pub)
+    _, mk_pub = _ed25519.keygen()
+    sc, _ = pairing.confirm_device(ctx, token, code, now=1003,
+                                   maker_pubkey=_b64(mk_pub), maker_sig=_b64(b"\x00" * 64))
+    assert sc == 403
+    assert pairing._find_device(ctx, "dev-1") is None  # never registered on a bad binding
+
+
+def test_confirm_default_operator_token_binding(tmp_path):
+    ctx = _ctx(tmp_path)
+    token, seed, pub, *_ = _mint_and_submit(ctx)
+    code = pairing.code6(base64.b64decode(token), pub)
+    sc, _ = pairing.confirm_device(ctx, token, code, now=1003)
+    assert sc == 200
+    assert pairing._find_device(ctx, "dev-1")["authorized_by"] == {"method": "operator_token"}
+
+
+# ── self-signed TLS pin (AG-TLS/AD-9) ────────────────────────────────────────
+def test_tls_cert_gen_pin_and_context(tmp_path):
+    import hashlib
+    import shutil
+    import ssl as _ssl
+
+    from titan_console import tls
+    if not shutil.which("openssl"):
+        pytest.skip("openssl not available")
+    cert, key = tls.ensure_console_tls(tmp_path)
+    assert cert.exists() and key.exists()
+    pin = tls.cert_pin(cert)
+    # the pin the QR carries = sha256 of the cert DER (what Kotlin sha256(cert.encoded) hashes)
+    assert pin == hashlib.sha256(_ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
+    assert len(pin) == 64
+    # the cert is loadable into a real TLS-server context (FS via TLS1.2+ ECDHE)
+    assert isinstance(tls.server_ssl_context(cert, key), _ssl.SSLContext)
+    # idempotent: a second call reuses the same cert (sole-writer, no churn)
+    cert2, _ = tls.ensure_console_tls(tmp_path)
+    assert tls.cert_pin(cert2) == pin

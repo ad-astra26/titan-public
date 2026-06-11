@@ -5362,37 +5362,6 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
     _msl_pub = state_refs.get("_msl_state_publisher")
     if _msl_pub is not None:
         _msl_pub.publish(state_refs.get("msl"))
-    # Phase C (OML §7.C piece 2) — publish the FULL MSL distilled_context[20]
-    # to a DEDICATED fixed float32 SHM slot so the agno DECIDE path reads it
-    # O(1) AT decision-time (the `_v5["msl"]` overlay is fetched AFTER the
-    # decision — Q4). ADDITIVE: reads the engine's stored `_last_output`
-    # (msl.py:2256) — does NOT touch MSLStatePublisher / msl_state.bin or any
-    # inner behavior; publish failures never break the tick. G21 single-writer.
-    _msl_for_ctx = state_refs.get("msl")
-    if _msl_for_ctx is not None:
-        try:
-            _lo = getattr(_msl_for_ctx, "_last_output", None)
-            _ctx = _lo.get("distilled_context") if isinstance(_lo, dict) else None
-            if _ctx is not None:
-                from titan_hcl.synthesis.outer_meta_policy import (
-                    OUTER_MSL_CONTEXT_STATE_SPEC, msl_context_to_fixed)
-                _ctx_writer = state_refs.get("_msl_context_writer")
-                if _ctx_writer is None:
-                    from titan_hcl.core.state_registry import (
-                        StateRegistryWriter, ensure_shm_root, resolve_titan_id)
-                    _ctx_writer = StateRegistryWriter(
-                        OUTER_MSL_CONTEXT_STATE_SPEC,
-                        ensure_shm_root(resolve_titan_id()))
-                    state_refs["_msl_context_writer"] = _ctx_writer
-                    logger.info(
-                        "[CognitiveWorker] outer_msl_context_state.bin writer "
-                        "attached (Phase C — full MSL context[20] for the agno "
-                        "DECIDE path, O(1) read; G18/G20 single-writer)")
-                _ctx_writer.write(msl_context_to_fixed(_ctx))
-        except Exception as _msl_ctx_err:
-            logger.debug(
-                "[CognitiveWorker] msl_context publish soft-fail: %s",
-                _msl_ctx_err)
     # D-SPEC-85 v1.25.0 — consciousness_age slot publish (lifetime
     # self-observation tick counter from consciousness.db). G21
     # single-writer = cognitive_worker; surfaces Titan's "main age" to

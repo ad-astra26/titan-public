@@ -11,11 +11,8 @@ import numpy as np
 import pytest
 
 from titan_hcl.synthesis.outer_meta_policy import (
-    MSL_CONTEXT_DIM,
     NUM_OUTER_ACTIONS,
     OUTER_ACTIONS,
-    OUTER_FEATURE_NAMES,
-    OUTER_META_POLICY_STATE_SCHEMA_VERSION,
     OUTER_POLICY_FLAT_DIM,
     OUTER_POLICY_INPUT_DIM,
     OuterFeatures,
@@ -167,74 +164,3 @@ def test_seed_prior_biases_action():
     p.seed_prior(tool, strength=3.0)
     after = float(p.action_probs(x)[tool])
     assert after > before
-
-
-# ── Phase-C schema: full MSL context[20] + parametric retrieval prior ──
-
-def test_schema_is_30_full_msl():
-    assert OUTER_POLICY_INPUT_DIM == 30
-    assert len(OUTER_FEATURE_NAMES) == 30
-    assert MSL_CONTEXT_DIM == 20
-    # composition: 8 base + 20 MSL + 2 retrieval
-    assert OUTER_FEATURE_NAMES[:8] == (
-        "bias", "recall_top_cosine", "recall_count_norm", "skill_utility",
-        "skill_matched", "engram_ground", "requires_tool", "has_code_signal")
-    assert OUTER_FEATURE_NAMES[8:28] == tuple(f"msl_ctx_{i}" for i in range(20))
-    assert OUTER_FEATURE_NAMES[28:] == (
-        "composite_match_score", "composite_match_action_norm")
-    # schema bumped so the live 11-D policy / SHM slot is detected as stale
-    assert OUTER_META_POLICY_STATE_SCHEMA_VERSION == 2
-
-
-def test_msl_context_flows_into_slots_clamped():
-    # full 20D context with out-of-range values → exercise the [-1,1] clamp
-    ctx = [(-3.0 if i % 2 else 3.0) for i in range(20)]
-    v = OuterFeatures(msl_context=tuple(ctx)).to_vector()
-    msl = v[8:28]
-    assert msl.shape == (20,)
-    assert float(msl.min()) == -1.0 and float(msl.max()) == 1.0
-    # a NaN in the context → 0.0 (guard)
-    v2 = OuterFeatures(msl_context=(float("nan"),) + tuple([0.0] * 19)).to_vector()
-    assert v2[8] == 0.0
-
-
-def test_msl_context_padded_and_trimmed():
-    # short context → zero-padded to 20
-    v_short = OuterFeatures(msl_context=(0.5, -0.5)).to_vector()
-    assert v_short[8] == pytest.approx(0.5) and v_short[9] == pytest.approx(-0.5)
-    assert float(np.abs(v_short[10:28]).sum()) == 0.0
-    # over-long context → trimmed (vector stays 30D)
-    v_long = OuterFeatures(msl_context=tuple([0.1] * 50)).to_vector()
-    assert v_long.shape == (OUTER_POLICY_INPUT_DIM,)
-    # empty (cold-start) → zeros
-    assert float(np.abs(OuterFeatures().to_vector()[8:28]).sum()) == 0.0
-
-
-def test_retrieval_prior_slots():
-    v = OuterFeatures(composite_match_score=0.7,
-                      composite_match_action_norm=2.0).to_vector()  # 2.0 clips→1.0
-    assert v[28] == pytest.approx(0.7)
-    assert v[29] == 1.0
-
-
-def test_deprecated_msl_scalars_accepted_but_ignored():
-    # the agno caller still passes the 3 reserved scalars — must be accepted
-    # (no TypeError) and IGNORED (superseded by msl_context, wired in piece 7).
-    base = OuterFeatures(recall_top_cosine=0.5).to_vector()
-    with_dep = OuterFeatures(recall_top_cosine=0.5,
-                             msl_i_confidence=0.9,
-                             msl_attention_entropy=0.8,
-                             msl_concept_confidence=0.7).to_vector()
-    np.testing.assert_array_equal(base, with_dep)
-
-
-def test_feature_contributions_grouped():
-    p = OuterMetaPolicy()
-    v = OuterFeatures(recall_top_cosine=0.8,
-                      msl_context=tuple([0.5] * 20),
-                      composite_match_score=0.6).to_vector()
-    fc = p.feature_contributions(v)
-    assert set(fc["groups"]) == {"base", "msl_context", "retrieval"}
-    assert abs(sum(fc["groups"].values()) - 1.0) < 1e-5
-    assert len(fc["per_feature"]) == OUTER_POLICY_INPUT_DIM
-    assert fc["total"] > 0.0

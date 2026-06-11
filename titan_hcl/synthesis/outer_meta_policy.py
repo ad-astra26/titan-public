@@ -72,14 +72,13 @@ def action_index_to_name(idx: int) -> str:
     return "direct"
 
 
-# ── Phase-C feature schema (FULL MSL — Q4 RESOLVED 2026-06-11) ────────
-# 8 local base features (recall/skill/engram/tool-intent) + the FULL 20D MSL
-# `distilled_context` (Titan's OWN emergent inner signal — NOT a curated subset;
-# distilling it would pre-impose our limits on Titan, Maker Ad-3 — instrumented
-# via feature_contributions() so full-vs-curated can be assessed over time) + 2
-# parametric retrieval-prior features (the matched Reasoning composite, D4/Q3).
-# Slot 0 is a constant bias. The MSL block is [-1,1] (tanh); base/retrieval [0,1].
-_BASE_FEATURE_NAMES: tuple[str, ...] = (
+# ── Phase-1 feature schema (curated LOCAL subset) ────────────────────
+# Phase 1 uses ONLY what is locally available on the agno hot path — recall /
+# skill / engram match signals + the published MSL identity scalars. The FULL
+# MSL `context[20]` vector (msl.py infer()) is NOT on the agno path today; its
+# consumption is Phase 3 (Q4). Keep this layout stable (it is the policy input
+# dim). Slot 0 is a constant bias term.
+OUTER_FEATURE_NAMES: tuple[str, ...] = (
     "bias",                    # 0  constant 1.0
     "recall_top_cosine",       # 1  [0,1] top recall similarity (D3)
     "recall_count_norm",       # 2  [0,1] min(n_recalled,10)/10
@@ -88,16 +87,11 @@ _BASE_FEATURE_NAMES: tuple[str, ...] = (
     "engram_ground",           # 5  [0,1] matched Engram groundedness (D5)
     "requires_tool",           # 6  {0,1} tool-intent regex (D5)
     "has_code_signal",         # 7  {0,1} computational shape (intent.code present)
+    "msl_i_confidence",        # 8  [0,1] published MSL identity confidence
+    "msl_attention_entropy",   # 9  [0,1] published MSL attention entropy (normalized)
+    "msl_concept_confidence",  # 10 [0,1] mean published MSL concept confidences
 )
-MSL_CONTEXT_DIM = 20  # msl.infer()["distilled_context"] = tanh(raw[17:37]) ∈ [-1,1]
-_MSL_FEATURE_NAMES: tuple[str, ...] = tuple(f"msl_ctx_{i}" for i in range(MSL_CONTEXT_DIM))
-_RETRIEVAL_FEATURE_NAMES: tuple[str, ...] = (
-    "composite_match_score",        # [0,1] top reasoning-composite SC-search cosine (D4)
-    "composite_match_action_norm",  # [0,1] matched composite action idx / (NUM_OUTER_ACTIONS-1)
-)
-OUTER_FEATURE_NAMES: tuple[str, ...] = (
-    _BASE_FEATURE_NAMES + _MSL_FEATURE_NAMES + _RETRIEVAL_FEATURE_NAMES)
-OUTER_POLICY_INPUT_DIM = len(OUTER_FEATURE_NAMES)  # 30 (8 base + 20 MSL + 2 retrieval)
+OUTER_POLICY_INPUT_DIM = len(OUTER_FEATURE_NAMES)  # 11
 
 # Hidden layer widths (small input → small net; cf. MetaPolicy 80→40→20→6).
 _H1 = 16
@@ -112,7 +106,7 @@ _W3_N = _H2 * NUM_OUTER_ACTIONS
 OUTER_POLICY_FLAT_DIM = (_W1_N + _H1 + _W2_N + _H2 + _W3_N + NUM_OUTER_ACTIONS) + 2
 
 OUTER_META_POLICY_STATE_SLOT = "outer_meta_policy_state"
-OUTER_META_POLICY_STATE_SCHEMA_VERSION = 2  # v2 (Phase C): 11→30 (full MSL context[20] + retrieval prior)
+OUTER_META_POLICY_STATE_SCHEMA_VERSION = 1
 OUTER_META_POLICY_STATE_SPEC = RegistrySpec(
     name=OUTER_META_POLICY_STATE_SLOT,
     dtype=np.dtype("float32"),
@@ -122,52 +116,6 @@ OUTER_META_POLICY_STATE_SPEC = RegistrySpec(
     variable_size=False,
 )
 
-# ── MSL distilled_context[20] SHM slot (Phase C piece 2 — Q4 full MSL) ─
-# A DEDICATED fixed float32(20) slot so the agno DECIDE path reads the full
-# `distilled_context` O(1) AT decision-time. The existing `msl_state.bin`
-# (MSLStatePublisher) is a variable-size msgpack of identity/depth telemetry,
-# read via the `_v5["msl"]` overlay fetched AFTER the decision (Q4) — this slot
-# closes that timing gap with a minimal fixed-vector read.
-# Producer = cognitive_worker (additive publish; G18/G20 single-writer).
-OUTER_MSL_CONTEXT_STATE_SLOT = "outer_msl_context_state"
-OUTER_MSL_CONTEXT_STATE_SCHEMA_VERSION = 1
-OUTER_MSL_CONTEXT_STATE_SPEC = RegistrySpec(
-    name=OUTER_MSL_CONTEXT_STATE_SLOT,
-    dtype=np.dtype("float32"),
-    shape=(MSL_CONTEXT_DIM,),
-    feature_flag="",
-    schema_version=OUTER_MSL_CONTEXT_STATE_SCHEMA_VERSION,
-    variable_size=False,
-)
-
-
-def msl_context_to_fixed(ctx) -> np.ndarray:
-    """Coerce a distilled_context (list/ndarray, normally 20D) → the fixed
-    float32 `(MSL_CONTEXT_DIM,)` array the SHM slot requires — pad/trim/NaN-safe
-    so a malformed/short context never breaks the publish."""
-    arr = np.asarray(list(ctx) if ctx is not None else [], dtype=np.float32).ravel()
-    fixed = np.zeros(MSL_CONTEXT_DIM, dtype=np.float32)
-    n = min(MSL_CONTEXT_DIM, arr.shape[0])
-    if n:
-        fixed[:n] = np.nan_to_num(arr[:n], nan=0.0, posinf=0.0, neginf=0.0)
-    return fixed
-
-
-def read_msl_context(shm_root=None) -> Optional[np.ndarray]:
-    """Read the published MSL `distilled_context[20]` from SHM (O(1), G18/G20).
-    Returns a length-`MSL_CONTEXT_DIM` float32 ndarray, or None if the slot is
-    not yet published / unreadable (cold-start — caller treats as zeros)."""
-    try:
-        from titan_hcl.core.state_registry import (
-            StateRegistryReader, resolve_shm_root)
-        root = shm_root if shm_root is not None else resolve_shm_root()
-        arr = StateRegistryReader(OUTER_MSL_CONTEXT_STATE_SPEC, root).read()
-        if arr is None:
-            return None
-        return np.asarray(arr, dtype=np.float32).ravel()
-    except Exception:
-        return None
-
 
 def _clip01(v: float) -> float:
     if v != v:  # NaN guard
@@ -175,19 +123,12 @@ def _clip01(v: float) -> float:
     return 0.0 if v < 0.0 else (1.0 if v > 1.0 else float(v))
 
 
-def _clip_pm1(v: float) -> float:
-    """Clamp to [-1, 1] (the MSL distilled_context range; tanh-bounded)."""
-    if v != v:  # NaN guard
-        return 0.0
-    return -1.0 if v < -1.0 else (1.0 if v > 1.0 else float(v))
-
-
 @dataclass
 class OuterFeatures:
-    """The decision feature bundle, built on the agno path (D2-D5).
+    """The Phase-1 decision feature bundle, built on the agno path (D2-D5).
 
     Every field is sourced from what is ALREADY computed locally per turn —
-    no new sync RPC (INV-OML-7). Missing signals default to 0 / empty (the
+    no new sync RPC (INV-OML-7). Missing signals default to 0 / False (the
     cold-start, which the policy learns to weight)."""
 
     recall_top_cosine: float = 0.0
@@ -197,65 +138,40 @@ class OuterFeatures:
     engram_ground: float = 0.0
     requires_tool: bool = False
     has_code_signal: bool = False
-    # Q4 (full MSL, Phase C): the 20D `distilled_context` ∈ [-1,1]; empty →
-    # zeros (cold-start / not-yet-published — wired in the prehook piece).
-    msl_context: tuple = ()
-    # D4 parametric retrieval prior — the top reasoning-composite SC-search hit.
-    composite_match_score: float = 0.0
-    composite_match_action_norm: float = 0.0
-    # DEPRECATED — the 3 reserved MSL identity scalars; superseded by
-    # `msl_context` (full MSL). Accepted-but-IGNORED so the agno caller does not
-    # break until it is migrated to `msl_context` (Phase-C prehook piece).
     msl_i_confidence: float = 0.0
     msl_attention_entropy: float = 0.0
     msl_concept_confidence: float = 0.0
 
     def to_vector(self) -> np.ndarray:
-        ctx = list(self.msl_context or ())
-        if len(ctx) < MSL_CONTEXT_DIM:
-            ctx = ctx + [0.0] * (MSL_CONTEXT_DIM - len(ctx))
-        else:
-            ctx = ctx[:MSL_CONTEXT_DIM]
-        base = [
-            1.0,  # bias
-            _clip01(self.recall_top_cosine),
-            min(max(int(self.recall_count), 0), 10) / 10.0,
-            _clip01(self.skill_utility),
-            1.0 if self.skill_matched else 0.0,
-            _clip01(self.engram_ground),
-            1.0 if self.requires_tool else 0.0,
-            1.0 if self.has_code_signal else 0.0,
-        ]
-        msl = [_clip_pm1(c) for c in ctx]
-        retrieval = [
-            _clip01(self.composite_match_score),
-            _clip01(self.composite_match_action_norm),
-        ]
-        return np.array(base + msl + retrieval, dtype=np.float32)
+        return np.array(
+            [
+                1.0,  # bias
+                _clip01(self.recall_top_cosine),
+                min(max(int(self.recall_count), 0), 10) / 10.0,
+                _clip01(self.skill_utility),
+                1.0 if self.skill_matched else 0.0,
+                _clip01(self.engram_ground),
+                1.0 if self.requires_tool else 0.0,
+                1.0 if self.has_code_signal else 0.0,
+                _clip01(self.msl_i_confidence),
+                _clip01(self.msl_attention_entropy),
+                _clip01(self.msl_concept_confidence),
+            ],
+            dtype=np.float32,
+        )
 
 
 class OuterMetaPolicy:
-    """Numpy ReLU MLP (30 → 16 → 8 → 5) trained by REINFORCE-with-baseline.
+    """Numpy ReLU MLP (11 → 16 → 8 → 5) trained by REINFORCE-with-baseline.
 
     Mirrors `MetaPolicy` (logic/meta_reasoning.py): forward / select_action /
     train_step / save / load — plus the EMA reward baseline, SHM flat
     (de)serialization, and a grounded-route prior seed for cold-start.
     """
 
-    def __init__(self, input_dim: int = OUTER_POLICY_INPUT_DIM, lr: float = 0.01,
-                 weight_decay: float = 0.001, max_weight_norm: float = 6.0):
+    def __init__(self, input_dim: int = OUTER_POLICY_INPUT_DIM, lr: float = 0.01):
         self.input_dim = input_dim
         self.lr = lr
-        # Anti-runaway regularization (2026-06-11). The original train_step
-        # clipped the per-step GRADIENT but had NO weight decay, so repeated
-        # same-direction REINFORCE updates (the off-policy `tool` attribution
-        # credits `tool` on EVERY verified tool-use) let `tool`'s weights grow
-        # unbounded → scores ~1100 vs ~24 → argmax collapsed to always-`tool`,
-        # feature-independent (verified live T3). weight_decay pulls weights
-        # toward 0 each step (bounded equilibrium); max_weight_norm is a hard
-        # per-matrix Frobenius cap (backstop). 0 disables either.
-        self.weight_decay = float(weight_decay)
-        self.max_weight_norm = float(max_weight_norm)
         s1 = math.sqrt(2.0 / input_dim)
         s2 = math.sqrt(2.0 / _H1)
         s3 = math.sqrt(2.0 / _H2)
@@ -295,29 +211,6 @@ class OuterMetaPolicy:
         experiments on the user, INV-OML-9)."""
         return int(np.argmax(self.forward(np.asarray(x, dtype=np.float32))))
 
-    # -- instrumentation (full-MSL-vs-curated assessment, Maker Ad-3) ----
-    def feature_contributions(self, x) -> dict:
-        """Per-feature influence proxy = |x_i| · ‖w1_row_i‖₁ (input magnitude ×
-        first-layer fan-out) + the BASE / MSL / RETRIEVAL grouped shares. Logged
-        periodically (NOT on the hot path) so we can assess over time whether the
-        full 20D MSL block earns its keep vs a curated subset — and fall back to
-        the curated subset only if the data says so (Q4 / Maker Ad-3)."""
-        x = np.asarray(x, dtype=np.float32)
-        w1_fanout = np.sum(np.abs(self.w1), axis=1)  # (input_dim,)
-        contrib = np.abs(x) * w1_fanout
-        total = float(contrib.sum()) + 1e-8
-        n_base = len(_BASE_FEATURE_NAMES)
-        n_msl = MSL_CONTEXT_DIM
-        groups = {
-            "base": float(contrib[:n_base].sum()) / total,
-            "msl_context": float(contrib[n_base:n_base + n_msl].sum()) / total,
-            "retrieval": float(contrib[n_base + n_msl:].sum()) / total,
-        }
-        per_feature = {
-            name: float(contrib[i]) for i, name in enumerate(OUTER_FEATURE_NAMES)
-        }
-        return {"groups": groups, "per_feature": per_feature, "total": total}
-
     # -- learning (off hot path) -------------------------------------
     def train_step(self, x, action: int, advantage: float) -> float:
         scores = self.forward(np.asarray(x, dtype=np.float32))
@@ -343,42 +236,8 @@ class OuterMetaPolicy:
         self.b2 -= self.lr * d_z2
         self.w3 -= self.lr * d_w3
         self.b3 -= self.lr * d_z3
-        # Anti-runaway (2026-06-11): decoupled L2 weight decay (weights only,
-        # not biases) + a hard per-matrix Frobenius cap. Without these the
-        # off-policy `tool` attribution drove the weights to ~1100 → always-tool.
-        if self.weight_decay:
-            self.w1 *= (1.0 - self.weight_decay)
-            self.w2 *= (1.0 - self.weight_decay)
-            self.w3 *= (1.0 - self.weight_decay)
-        self._clip_weight_norms()
         self.total_updates += 1
         return float(-np.log(probs[action] + 1e-8) * abs(advantage))
-
-    def _clip_weight_norms(self) -> None:
-        """Hard backstop against runaway: cap each weight matrix's Frobenius
-        norm at max_weight_norm (rescale if exceeded). Biases are untouched."""
-        cap = self.max_weight_norm
-        if cap <= 0:
-            return
-        for attr in ("w1", "w2", "w3"):
-            w = getattr(self, attr)
-            n = float(np.linalg.norm(w))
-            if n > cap:
-                w *= (cap / n)
-
-    def is_pathological(self, max_abs_score: float = 100.0) -> bool:
-        """Detect a runaway/collapsed policy (the unregularized-REINFORCE
-        failure mode): a sane policy produces bounded scores on a neutral
-        input; a collapsed one (e.g. `tool` ~1100) blows past max_abs_score.
-        Used at worker load to SELF-HEAL (re-init) a persisted runaway."""
-        try:
-            x = np.full(self.input_dim, 0.3, dtype=np.float32)
-            x[0] = 1.0  # bias
-            s = self.forward(x)
-            return bool((not np.all(np.isfinite(s)))
-                        or float(np.max(np.abs(s))) > float(max_abs_score))
-        except Exception:
-            return False
 
     def learn(self, x, action: int, reward: float, baseline_alpha: float = 0.05) -> float:
         """One REINFORCE-with-baseline update: advantage uses the CURRENT EMA
@@ -475,12 +334,9 @@ class OuterMetaPolicy:
 
 __all__ = (
     "OUTER_ACTIONS", "NUM_OUTER_ACTIONS", "OUTER_FEATURE_NAMES",
-    "OUTER_POLICY_INPUT_DIM", "OUTER_POLICY_FLAT_DIM", "MSL_CONTEXT_DIM",
+    "OUTER_POLICY_INPUT_DIM", "OUTER_POLICY_FLAT_DIM",
     "OUTER_META_POLICY_STATE_SLOT", "OUTER_META_POLICY_STATE_SPEC",
     "OUTER_META_POLICY_STATE_SCHEMA_VERSION",
-    "OUTER_MSL_CONTEXT_STATE_SLOT", "OUTER_MSL_CONTEXT_STATE_SPEC",
-    "OUTER_MSL_CONTEXT_STATE_SCHEMA_VERSION",
-    "msl_context_to_fixed", "read_msl_context",
     "OuterFeatures", "OuterMetaPolicy",
     "action_index_to_mode", "action_index_to_name",
 )

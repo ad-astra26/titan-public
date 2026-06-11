@@ -160,15 +160,8 @@ async def _route_model_for_tier(agent, worker_plugin, prompt_text: str):
         and target_max_tokens != original_max_tokens
     )
     needs_model_swap = target_id != original_id
-    # ζ.7 — inject the tier's reply-length GUIDANCE into the agent instructions so
-    # the model plans a complete reply within budget (finishes its thought) rather
-    # than being hard-cut at max_tokens. Only when instructions is a plain list (the
-    # factory shape); restored in finally. max_tokens remains the safety ceiling.
-    target_guidance = result.tier.reply_guidance
-    original_instructions = getattr(agent, "instructions", None)
-    needs_guidance = bool(target_guidance) and isinstance(original_instructions, list)
 
-    if not needs_model_swap and not needs_tokens_swap and not needs_guidance:
+    if not needs_model_swap and not needs_tokens_swap:
         # No swap needed. Log once for observability + return without
         # taking the lock — fast path for heavy tiers that match the
         # constructed agent.
@@ -185,16 +178,11 @@ async def _route_model_for_tier(agent, worker_plugin, prompt_text: str):
                 agent.model.id = target_id
             if needs_tokens_swap:
                 agent.model.max_tokens = target_max_tokens
-            if needs_guidance:
-                agent.instructions = original_instructions + [
-                    f"RESPONSE LENGTH — {target_guidance} Write a complete reply that "
-                    f"finishes its thought within that length; never stop mid-sentence."
-                ]
             logger.info(
-                "[AgnoWorker] tier=%s model_class=%s model_swap %s→%s max_tokens %s→%s guidance=%s",
+                "[AgnoWorker] tier=%s model_class=%s model_swap %s→%s max_tokens %s→%s",
                 result.tier.name, model_class,
                 original_id, target_id,
-                original_max_tokens, target_max_tokens, bool(needs_guidance),
+                original_max_tokens, target_max_tokens,
             )
             yield
         finally:
@@ -203,8 +191,6 @@ async def _route_model_for_tier(agent, worker_plugin, prompt_text: str):
                     agent.model.id = original_id
                 if needs_tokens_swap:
                     agent.model.max_tokens = original_max_tokens
-                if needs_guidance:
-                    agent.instructions = original_instructions
             except Exception:
                 pass
 
