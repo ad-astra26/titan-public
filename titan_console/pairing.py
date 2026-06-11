@@ -221,6 +221,9 @@ def pair_status(ctx: Context, pairing_token: str, *, now: float | None = None) -
     if pend.get("state") in ("submitted", "confirmed"):
         out["code6"] = pend.get("code6")
         out["label"] = pend.get("label")
+        # The device pubkey (public, not secret) so the Maker panel can wallet-sign it
+        # for the additive on-chain Maker-binding (AG-MAKER-BIND).
+        out["device_pubkey"] = pend.get("device_pubkey")
     return 200, out
 
 

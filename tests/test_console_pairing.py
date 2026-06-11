@@ -84,6 +84,7 @@ def test_pairing_happy_path(tmp_path):
     expected = pairing.code6(base64.b64decode(token), pub)
     st, status = pairing.pair_status(ctx, token, now=1002)
     assert status["state"] == "submitted" and status["code6"] == expected
+    assert status["device_pubkey"] == _b64(pub)  # surfaced for the wallet-binding sign
     sc, conf = pairing.confirm_device(ctx, token, expected, now=1003)
     assert sc == 200 and conf["device_id"] == "dev-1"
     # device persisted; pending cleared (single-use)
@@ -363,3 +364,35 @@ def test_tls_cert_gen_pin_and_context(tmp_path):
     # idempotent: a second call reuses the same cert (sole-writer, no churn)
     cert2, _ = tls.ensure_console_tls(tmp_path)
     assert tls.cert_pin(cert2) == pin
+
+
+# Cross-language pin fixture — the SAME cert + pin baked into the Kotlin
+# CertPinningTest.kt. Both languages hash the leaf DER → they MUST agree.
+_PIN_FIXTURE_PEM = """-----BEGIN CERTIFICATE-----
+MIIDGTCCAgGgAwIBAgIUIKogW0I9+vMciONn2Bwfke78Mz4wDQYJKoZIhvcNAQEL
+BQAwHDEaMBgGA1UEAwwRdGl0YW4tcGluLWZpeHR1cmUwHhcNMjYwNjExMTkwMTM3
+WhcNMzYwNjA4MTkwMTM3WjAcMRowGAYDVQQDDBF0aXRhbi1waW4tZml4dHVyZTCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKtjMSORK1gK0FixAAXZlI+A
+qwsxk89MXVq1ygnKVI/4hQvKGtiopzGfRAq7keLOPWZgvK93fOrqbjLnJU8ZYaaa
+GGVphoblHK9H0tjF6EHp4bGg0A3BodizFGu3NmtCvGi1Bpc9Os9Rn/QOP/JRngcp
+oz6omdGWdilP7+t/FQGhcSUFXhdI9Fu9rsK2VdAQizs98AsFnyagl0U0sxI0WadS
+5inDHuHbvRAbWGhhzM4nR3SXXMMqN+y7do8XW2moQmeCo5dJcz6F4+Qh1QeAZ2UX
+8bndwIuY3pHmS09oYL+e/t0T+1evHWf+lCO7BtO9U/zd1Y1SdgYJ6+q/vkLiRHkC
+AwEAAaNTMFEwHQYDVR0OBBYEFGua3RmJPBwm+jl8Ecc5MZl2IyWnMB8GA1UdIwQY
+MBaAFGua3RmJPBwm+jl8Ecc5MZl2IyWnMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZI
+hvcNAQELBQADggEBAKJb/bsA0257AXnoGzfns01HTTx0EkmqqO/WaA/ItIZHTyNH
+H77TgWdcgdKgDUaZBOgQ0sTgiXCcR7fT9aIB1tqaSmiEph2ylYfVBsuGfBGxe/e6
+wF820dUXtRftWKy4aNFbuGhpCyvPD7g5P+AbE9pMNRRyR336IfVW7kanqhWFX+2/
+7INnoxQ44ZVlu11l0ZGsO5LLKrSxafnM96WQjZYmfZQFpA3NpSd6k5/WlZl63Bfj
+N8YPVteNbhlaSbyS7aJWQaItlfMjUTYL2lAiytk6Qbs6DfF6XkKa+KheRAfhDm77
+Rd3Wl+qPFOvy2WB/5g/cwlJsr37l1Ms2rIXGklg=
+-----END CERTIFICATE-----"""
+_PIN_FIXTURE_EXPECTED = "48efea7ab78df9a63d0e78e7628b89d2999b4a4dbd0e9eb67bb5bd5b1e719b68"
+
+
+def test_pin_fixture_cross_language(tmp_path):
+    from titan_console import tls
+    p = tmp_path / "fixture.pem"
+    p.write_text(_PIN_FIXTURE_PEM)
+    # MUST equal the value baked into shared/src/jvmTest/.../CertPinningTest.kt
+    assert tls.cert_pin(p) == _PIN_FIXTURE_EXPECTED
