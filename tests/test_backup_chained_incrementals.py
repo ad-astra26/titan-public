@@ -126,7 +126,7 @@ class _FakeManifest:
         self.current_baseline_event_id = baseline_id
         self.events: list = []
 
-    def should_rebase(self, now=None):
+    def should_rebase(self, now=None, *, cadence="monthly", depth_cap=30):
         return (self._rebase, None)
 
     def get_latest_event(self):

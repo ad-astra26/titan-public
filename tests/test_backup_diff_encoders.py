@@ -263,9 +263,35 @@ def test_xdelta3_full_event_no_baseline(tmp_path):
     src.write_bytes(b"SQLITE_DATA" * 100)
     diff = xdelta3.encode_diff(str(src), baseline_path=None)
     assert diff["diff_mode"] == "full"
+    # §24.5.a fix (2026-06-11): the full-ship fallback now ships a STABLE,
+    # OWNED snapshot — NEVER the live source path — so the encode→pack size
+    # race (OSError "unexpected end of data" on a large live JSON that shrank
+    # mid-pack) is structurally impossible.
+    assert diff["patch_owned"] is True
+    assert diff["patch_path"] != str(src), "must be a snapshot, not the live source"
     # Phase 5 — bytes live on disk at patch_path (streaming refactor)
     with open(diff["patch_path"], "rb") as f:
         assert f.read() == b"SQLITE_DATA" * 100
+    # The snapshot is immune to a concurrent source mutation between encode + pack.
+    src.write_bytes(b"X")                       # source shrinks 1100B → 1B
+    with open(diff["patch_path"], "rb") as f:
+        assert f.read() == b"SQLITE_DATA" * 100, "snapshot must not track the source"
+
+
+def test_xdelta3_large_json_no_baseline_snapshots(tmp_path):
+    """The captured pack-OSError culprit class: a large (≥10KB) live JSON routes
+    to xdelta3; with no baseline it full-ships — and MUST snapshot (owned), not
+    read the live path, so a mid-pack rewrite can't truncate the tar source."""
+    src = tmp_path / "filter_down_v5_buffer.json"
+    src.write_text("[" + ",".join(str(i) for i in range(5000)) + "]")  # >10KB
+    original = src.read_bytes()
+    diff = xdelta3.encode_diff(str(src), baseline_path=None)
+    assert diff["diff_mode"] == "full"
+    assert diff["patch_owned"] is True and diff["patch_path"] != str(src)
+    src.write_text("[]")                        # live rewrite (shrink) after encode
+    with open(diff["patch_path"], "rb") as f:
+        assert f.read() == original             # snapshot holds the encode-time bytes
+    assert diff["patch_size_bytes"] == len(original)  # recorded size matches the snapshot
 
 
 @pytest.mark.skipif(not xdelta3._xdelta3_available(),

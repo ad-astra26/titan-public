@@ -77,38 +77,53 @@ def encode_diff(current_path: str, baseline_path: Optional[str] = None,
     pathological environments. Production hosts (T1/T2/T3) have xdelta3
     installed per CLAUDE.md.
     """
-    current_size = os.path.getsize(current_path)
-    current_root = _sha256_file(current_path)
+    # §24.5.a / INV-BR-11 (2026-06-11): encode the SNAPSHOT, never the live source.
+    # A large live JSON (≥ SMALL_JSON_THRESHOLD → routed here) previously full-
+    # shipped from the LIVE path (patch_owned=False); if it changed between encode
+    # and pack, the tar read fewer bytes than the recorded size → OSError
+    # "unexpected end of data" (2026-06-10: filter_down_*/neuromodulator_state).
+    # full_ship._race_safe_snapshot gives a stable inode (copy for .json/.jsonl +
+    # ≤64MB; hardlink for big binary). For the full-ship branches it IS the payload
+    # (owned → pack unlinks); for the vcdiff branch it's a transient diff INPUT
+    # (unlinked after the patch is written). The shipped bytes + merkle are
+    # identical to the old live-path full-ship (a point-in-time copy of the same
+    # content). NOTE: when the caller already passed a SQLite online-backup image
+    # (consistent + stable), this is a cheap zero-copy hardlink of it.
+    from . import full_ship
+    snap_path, snap_owned = full_ship._race_safe_snapshot(current_path)
+    src_size = os.path.getsize(snap_path)
+    src_root = _sha256_file(snap_path)
+
+    def _full_ship_from_snapshot() -> dict:
+        return {
+            "diff_mode": "full",
+            "patch_path": snap_path,
+            "patch_owned": snap_owned,
+            "patch_size_bytes": src_size,
+            "merkle_root": src_root,
+            "size_bytes": src_size,
+            "baseline_merkle_root": None,
+            "encoder": "xdelta3",
+        }
+
+    def _drop_snapshot_input() -> None:
+        if snap_owned:
+            try:
+                os.unlink(snap_path)
+            except OSError:
+                pass
 
     if not _xdelta3_available():
         logger.warning(
             "[diff_encoders.xdelta3] xdelta3 binary unavailable at %s — "
             "falling back to full-ship for %s",
             XDELTA3_BIN, current_path)
-        return {
-            "diff_mode": "full",
-            "patch_path": current_path,
-            "patch_owned": False,
-            "patch_size_bytes": current_size,
-            "merkle_root": current_root,
-            "size_bytes": current_size,
-            "baseline_merkle_root": None,
-            "encoder": "xdelta3",
-        }
+        return _full_ship_from_snapshot()
 
     if (baseline_path is None
             or not os.path.exists(baseline_path)
             or os.path.getsize(baseline_path) == 0):
-        return {
-            "diff_mode": "full",
-            "patch_path": current_path,
-            "patch_owned": False,
-            "patch_size_bytes": current_size,
-            "merkle_root": current_root,
-            "size_bytes": current_size,
-            "baseline_merkle_root": None,
-            "encoder": "xdelta3",
-        }
+        return _full_ship_from_snapshot()
 
     baseline_root = _sha256_file(baseline_path)
 
@@ -121,9 +136,10 @@ def encode_diff(current_path: str, baseline_path: Optional[str] = None,
     try:
         # xdelta3 -e -f -<level> -s <source> <input> <output>
         # -e encode, -f force overwrite, -9 max compression
+        # Diff the SNAPSHOT (snap_path), never the live source.
         cmd = [
             XDELTA3_BIN, "-e", "-f", f"-{XDELTA3_COMPRESSION_LEVEL}",
-            "-s", baseline_path, current_path, patch_path,
+            "-s", baseline_path, snap_path, patch_path,
         ]
         result = subprocess.run(cmd, capture_output=True, timeout=600)
         if result.returncode != 0:
@@ -138,20 +154,24 @@ def encode_diff(current_path: str, baseline_path: Optional[str] = None,
             )
         patch_size = os.path.getsize(patch_path)
     except Exception:
-        # Any failure path: drop the temp file before re-raising.
+        # Any failure path: drop the temp file + the snapshot input before re-raising.
         try:
             os.unlink(patch_path)
         except OSError:
             pass
+        _drop_snapshot_input()
         raise
+
+    # The vcdiff is the payload; the snapshot was only the diff INPUT → drop it.
+    _drop_snapshot_input()
 
     return {
         "diff_mode": "incremental",
         "patch_path": patch_path,
         "patch_owned": True,
         "patch_size_bytes": patch_size,
-        "merkle_root": current_root,
-        "size_bytes": current_size,
+        "merkle_root": src_root,
+        "size_bytes": src_size,
         "baseline_merkle_root": baseline_root,
         "encoder": "xdelta3",
     }

@@ -214,3 +214,63 @@ async def test_auto_fund_via_chain_provider(tmp_path, monkeypatch):
                           full_config={"chain": {"fund": {"enabled": False}}})
     await b_off._auto_fund_irys_before_upload()
     assert fake2.fund_log == []
+
+
+def test_prune_old_local_backups_devnet_vs_mainnet(tmp_path, monkeypatch):
+    """devnet/local RETENTION (RFP_backup_redesign_spine 1b, 2026-06-11):
+    _prune_old_local_backups (cadence=weekly when no birth cert) drops manifest
+    events + their devnet-cache tarballs OLDER than the current baseline, keeping
+    the baseline + after. mainnet (birth cert present → cadence none) is a no-op
+    (indefinite retention — the on-chain chain is the sovereign record)."""
+    monkeypatch.chdir(tmp_path)
+    from titan_hcl.logic.backup import RebirthBackup
+    from titan_hcl.logic.backup_unified_manifest import (
+        UnifiedManifest, make_event, new_event_id)
+
+    cache = tmp_path / "data" / "arweave_devnet"
+    cache.mkdir(parents=True)
+
+    def _tier(txid):
+        return {"tx_id": txid, "merkle_root": "r" * 64, "size_bytes": 7,
+                "diff_mode": "full"}
+
+    def _ev(etype, prev, trigger, pers_tx, tc_tx):
+        for tx in (pers_tx, tc_tx):
+            (cache / f"{tx}.data").write_bytes(b"tar")
+            (cache / f"{tx}.tags.json").write_text("{}")
+        return make_event(
+            event_id=new_event_id(), event_type=etype, prev_event_id=prev,
+            baseline_trigger=trigger, personality=_tier(pers_tx),
+            timechain={**_tier(tc_tx), "block_range": [0, 1],
+                       "prev_offset_bytes": 0})
+
+    def _two_baseline_manifest(base_dir):
+        m = UnifiedManifest(titan_id="T1", base_dir=str(base_dir))
+        b1 = _ev("baseline", None, "first_event", "devnet_p1", "devnet_t1")
+        m.append_event(b1)
+        b2 = _ev("baseline", b1["event_id"], "week_boundary", "devnet_p2", "devnet_t2")
+        m.append_event(b2)
+        m.save()
+        return m, b2["event_id"]
+
+    b = RebirthBackup(network_client=None, titan_id="T1")
+
+    # ── devnet (no data/genesis_record.json → cadence weekly) → PRUNES b1 ──
+    m, b2_id = _two_baseline_manifest(tmp_path / "data")
+    n = b._prune_old_local_backups(m)
+    assert n == 1, "the pre-baseline event (b1) should be pruned"
+    assert not (cache / "devnet_p1.data").exists()      # b1's cache deleted
+    assert not (cache / "devnet_p1.tags.json").exists()
+    assert not (cache / "devnet_t1.data").exists()
+    assert (cache / "devnet_p2.data").exists()          # current baseline kept
+    assert [e["event_id"] for e in m.events] == [b2_id]
+    assert m.current_baseline_event_id == b2_id
+
+    # ── mainnet (birth cert present → cadence none) → NO-OP (indefinite) ──
+    (tmp_path / "data" / "genesis_record.json").write_text('{"nft_address": "x"}')
+    m2, _ = _two_baseline_manifest(tmp_path / "data2")
+    before = len(m2.events)
+    n2 = b._prune_old_local_backups(m2)
+    assert n2 == 0, "mainnet must keep indefinite retention"
+    assert len(m2.events) == before                     # manifest untouched
+    assert (cache / "devnet_p1.data").exists()           # nothing deleted

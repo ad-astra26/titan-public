@@ -1503,6 +1503,77 @@ class RebirthBackup:
                 return False
         return True
 
+    def _rebase_params(self) -> tuple[str, int]:
+        """Backup CADENCE by mode (RFP_backup_redesign_spine, 2026-06-11).
+
+        Discriminator = the MAINNET BIRTH CERTIFICATE (data/genesis_record.json —
+        the on-chain genesis-NFT ceremony record). A mainnet-born Titan has it;
+        devnet/local installs do NOT (verified: T1 has it, T3 doesn't). This is the
+        RELIABLE signal — `self._arweave_store is not None` is NOT, because
+        `_ensure_arweave_store_for_unified` lazy-inits a *devnet* ArweaveStore (the
+        local arweave_devnet/ cache) on devnet too, so it goes non-None there.
+          • mainnet (birth cert present) → ("none", 90): incremental AS LONG AS
+            POSSIBLE; a full baseline (expensive on Arweave) fires only on
+            first_event / self_heal / the depth_cap-90 restore-chain safety. No
+            calendar trigger → a missed daily incremental (low SOL) is NOT a rebase;
+            the next incremental covers the gap.
+          • devnet/local (no birth cert) → ("weekly", 30): re-baseline once the
+            baseline is ≥7d old, then prune older events (local disk is cheap)."""
+        if os.path.exists(os.path.join("data", "genesis_record.json")):
+            return ("none", 90)
+        return ("weekly", 30)
+
+    def _configure_manifest_cadence(self, manifest) -> None:
+        """Apply this Titan's mode cadence to a freshly-loaded manifest so every
+        should_rebase() call on it is mode-aware (the one configured object covers
+        the precheck, plan_build, and build_unified_event callers). Defensive: a
+        test double without configure_rebase is left at the legacy default."""
+        if hasattr(manifest, "configure_rebase"):
+            manifest.configure_rebase(*self._rebase_params())
+
+    def _prune_old_local_backups(self, manifest) -> int:
+        """devnet/local RETENTION (Maker 2026-06-11): after a weekly baseline lands,
+        delete BOTH the manifest events AND their local devnet-cache tarballs that
+        PRECEDE the current baseline. mainnet keeps INDEFINITE retention (the on-chain
+        chain is the sovereign record — never prune it). Safe to call after every
+        ship: it no-ops unless the current baseline has older events before it (i.e.
+        right after a fresh weekly baseline). Returns the number of events pruned."""
+        cadence, _ = self._rebase_params()
+        if cadence != "weekly":          # mainnet/none → indefinite retention
+            return 0
+        if not hasattr(manifest, "prune_before_current_baseline"):
+            return 0
+        pruned = manifest.prune_before_current_baseline()
+        if not pruned:
+            return 0
+        cache = os.path.join("data", "arweave_devnet")
+        deleted = 0
+        for ev in pruned:
+            for tier in ("personality", "timechain", "soul"):
+                t = ev.get(tier)
+                tx = t.get("tx_id") if isinstance(t, dict) else None
+                if not tx:
+                    continue
+                # devnet cache: file://data/arweave_devnet/<tx>.data (+ .tags.json)
+                txid = (tx.replace("file://data/arweave_devnet/", "")
+                          .replace(".data", ""))
+                for suffix in (".data", ".tags.json"):
+                    p = os.path.join(cache, f"{txid}{suffix}")
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                            deleted += 1
+                        except OSError as e:
+                            logger.warning(
+                                "[Backup] §24 retention: could not delete %s: %s",
+                                p, e)
+        logger.info(
+            "[Backup] §24 retention (devnet/local): pruned %d pre-baseline event(s) "
+            "+ %d local cache file(s) older than baseline %s",
+            len(pruned), deleted,
+            (manifest.current_baseline_event_id or "?")[:8])
+        return len(pruned)
+
     async def _precheck_diff_base(self, manifest):
         """RFP Phase B integrity precheck — runs BEFORE the tier build in BOTH ship
         paths. Returns (force_event_type, force_trigger, known_arcs).
@@ -1521,7 +1592,8 @@ class RebirthBackup:
                            "after a failed weekly restore-test")
             return ("baseline", "self_heal", set())
         # A baseline full-ships regardless — nothing to pre-check.
-        should_rebase, _ = manifest.should_rebase()
+        _cad, _depth = self._rebase_params()
+        should_rebase, _ = manifest.should_rebase(cadence=_cad, depth_cap=_depth)
         base_dir = self._baseline_working_dir()
         if should_rebase:
             return (None, None, set())
@@ -2123,6 +2195,7 @@ class RebirthBackup:
             manifest = UnifiedManifest.load(
                 titan_id=self._titan_id, base_dir="data",
             )
+            self._configure_manifest_cadence(manifest)  # mode-aware §24.2
         except ValueError as e:
             logger.error(
                 "[Backup] §24 unified_v2: manifest load failed: %s "
@@ -2142,7 +2215,8 @@ class RebirthBackup:
         # soul tier without an Arweave baseline (so every Sunday full-shipped
         # consciousness.db). _refresh_baseline_working_dir then keeps the
         # baseline-dir soul == the shipped soul, so weekly Sundays diff.
-        _should_rebase, _ = manifest.should_rebase()
+        _cad, _depth = self._rebase_params()
+        _should_rebase, _ = manifest.should_rebase(cadence=_cad, depth_cap=_depth)
         s_specs = (
             self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
             if (weekday == 6 or _should_rebase) else None
@@ -2274,6 +2348,7 @@ class RebirthBackup:
             from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
             manifest = UnifiedManifest.load(
                 titan_id=self._titan_id, base_dir="data")
+            self._configure_manifest_cadence(manifest)  # mode-aware §24.2
         except Exception as e:
             logger.warning(
                 "[Backup] §24 gate: manifest load failed (%s) — treating as "
@@ -2318,6 +2393,7 @@ class RebirthBackup:
         try:
             manifest = UnifiedManifest.load(
                 titan_id=self._titan_id, base_dir="data")
+            self._configure_manifest_cadence(manifest)  # mode-aware §24.2
         except ValueError as e:
             logger.error("[Backup] §24 build-stage: manifest load failed: %s", e)
             return None
@@ -2326,7 +2402,8 @@ class RebirthBackup:
             self.TIMECHAIN_PATHS, format_hint="timechain_bin")
         # §24.4.C conformance (see _run_unified_event_v2): soul ships on weekly
         # Sundays AND on every baseline event (full snapshot of all paths).
-        _should_rebase, _ = manifest.should_rebase()
+        _cad, _depth = self._rebase_params()
+        _should_rebase, _ = manifest.should_rebase(cadence=_cad, depth_cap=_depth)
         s_specs = (self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
                    if (weekday == 6 or _should_rebase) else None)
         base_dir = self._baseline_working_dir()
@@ -2412,6 +2489,7 @@ class RebirthBackup:
         try:
             manifest = UnifiedManifest.load(
                 titan_id=self._titan_id, base_dir="data")
+            self._configure_manifest_cadence(manifest)  # mode-aware §24.2
         except ValueError as e:
             logger.error("[Backup] §24 ship-stage: manifest load failed: %s", e)
             return False
@@ -2470,6 +2548,15 @@ class RebirthBackup:
                         logger.warning(
                             "[Backup] §24 ship-stage: source-copy fallback also "
                             "failed: %s (next event may self-heal to a baseline)", e2)
+            # devnet/local RETENTION: a fresh weekly baseline supersedes the prior
+            # chain → drop manifest events + local cache tarballs older than it
+            # (Maker 2026-06-11). No-op on mainnet (indefinite) + on incrementals.
+            if result.event_type == "baseline":
+                try:
+                    self._prune_old_local_backups(manifest)
+                except Exception as e:
+                    logger.warning(
+                        "[Backup] §24 retention prune failed: %s (non-fatal)", e)
             return True
         finally:
             import shutil

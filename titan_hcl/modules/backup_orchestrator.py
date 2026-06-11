@@ -165,6 +165,21 @@ def backup_orchestrator_main(recv_queue, send_queue, name: str, config: dict) ->
             solana_network or "(unset)"
         )
         mode = "local_only"
+    # Birth-certificate HARD GUARD (Maker 2026-06-11): mainnet_arweave additionally
+    # requires the on-chain mainnet birth certificate — data/genesis_record.json,
+    # the genesis-NFT ceremony record (titan_pubkey/genesis_tx/vault_tx/nft_address/
+    # arweave_birth_certificate). A mainnet-NETWORK box that was never BORN (no
+    # genesis_record) must NEVER attempt a paid Arweave ship (wastes real SOL). A
+    # devnet/local install has no such record (and the devnet-guard above already
+    # forces local_only on devnet). This also pins the backup CADENCE: only a truly
+    # mainnet-born Titan runs incremental-forever; everything else is weekly+prune.
+    if mode == "mainnet_arweave" and not os.path.exists(
+            os.path.join("data", "genesis_record.json")):
+        logger.warning(
+            "[BackupWorker] mode=mainnet_arweave but data/genesis_record.json is "
+            "ABSENT (no mainnet birth certificate — Titan not born on mainnet) — "
+            "forcing local_only; will NOT attempt a paid Arweave ship.")
+        mode = "local_only"
     logger.info("[BackupWorker] mode=%s titan_id=%s solana_network=%s",
                 mode, titan_id, solana_network or "(unset)")
 

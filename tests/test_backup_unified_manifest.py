@@ -370,6 +370,100 @@ def test_should_rebase_month_boundary_wins_over_depth(tmp_path):
     assert reason == "month_boundary"
 
 
+# ── Mode-aware cadence (RFP_backup_redesign_spine, 2026-06-11) ────────────
+
+
+def test_should_rebase_mainnet_none_no_calendar_baseline(tmp_path):
+    """mainnet (cadence='none'): NO calendar trigger — even an old baseline on the
+    1st of the month must NOT rebase. Incrementals run as long as possible; a full
+    Arweave baseline fires only on depth_cap/self_heal (don't waste SOL)."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event",
+                         ts=datetime(2026, 4, 1, 12, tzinfo=timezone.utc).timestamp())
+    m.append_event(b1)
+    for _ in range(10):
+        m.append_event(_incremental_event(prev_id=m.get_latest_event()["event_id"]))
+    # 1st of a later month + a 2-month-old baseline → 'monthly' WOULD rebase here;
+    # 'none' must NOT.
+    do, reason = m.should_rebase(
+        now=datetime(2026, 6, 1, 12, tzinfo=timezone.utc),
+        cadence="none", depth_cap=90)
+    assert do is False and reason is None
+
+
+def test_should_rebase_mainnet_depth_cap_90(tmp_path):
+    """mainnet depth_cap=90 — 89 incrementals stay incremental; the 90th rebases
+    (the restore-chain-length safety, not a calendar churn)."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event",
+                         ts=datetime(2026, 6, 1, 12, tzinfo=timezone.utc).timestamp())
+    m.append_event(b1)
+    for _ in range(89):
+        m.append_event(_incremental_event(prev_id=m.get_latest_event()["event_id"]))
+    do, _ = m.should_rebase(now=datetime(2026, 6, 30, 12, tzinfo=timezone.utc),
+                            cadence="none", depth_cap=90)
+    assert do is False, "89 < 90 depth cap → still incremental"
+    m.append_event(_incremental_event(prev_id=m.get_latest_event()["event_id"]))  # 90th
+    do, reason = m.should_rebase(now=datetime(2026, 6, 30, 12, tzinfo=timezone.utc),
+                                 cadence="none", depth_cap=90)
+    assert do is True and reason == "depth_cap"
+
+
+def test_should_rebase_weekly_cadence(tmp_path):
+    """devnet/local (cadence='weekly'): re-baseline once the baseline is ≥7d old;
+    a fresh (<7d) baseline stays incremental."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event",
+                         ts=datetime(2026, 6, 1, 12, tzinfo=timezone.utc).timestamp())
+    m.append_event(b1)
+    # 3 days old → no weekly rebase
+    do, _ = m.should_rebase(now=datetime(2026, 6, 4, 12, tzinfo=timezone.utc),
+                            cadence="weekly", depth_cap=30)
+    assert do is False, "3d-old baseline (<7d) → no weekly rebase"
+    # 7 days old → week_boundary
+    do, reason = m.should_rebase(now=datetime(2026, 6, 8, 12, tzinfo=timezone.utc),
+                                 cadence="weekly", depth_cap=30)
+    assert do is True and reason == "week_boundary"
+
+
+# ── devnet/local retention: prune_before_current_baseline (2026-06-11) ────
+
+
+def test_prune_before_current_baseline_keeps_baseline_and_after(tmp_path):
+    """Drops events PRECEDING the current baseline; keeps the baseline + its
+    incrementals + the latest. Returns the pruned events for tarball cleanup."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event")
+    m.append_event(b1)
+    i1 = _incremental_event(prev_id=b1["event_id"]); m.append_event(i1)
+    b2 = _baseline_event(prev=i1["event_id"], trigger="week_boundary"); m.append_event(b2)
+    i2 = _incremental_event(prev_id=b2["event_id"]); m.append_event(i2)
+    assert m.current_baseline_event_id == b2["event_id"]
+
+    pruned = m.prune_before_current_baseline()
+    pruned_ids = [e["event_id"] for e in pruned]
+    assert pruned_ids == [b1["event_id"], i1["event_id"]]          # everything before b2
+    kept_ids = [e["event_id"] for e in m.events]
+    assert kept_ids == [b2["event_id"], i2["event_id"]]            # baseline + after kept
+    assert m.current_baseline_event_id == b2["event_id"]           # baseline untouched
+    # persisted
+    m2 = UnifiedManifest.load(titan_id="T1", base_dir=str(tmp_path))
+    assert [e["event_id"] for e in m2.events] == kept_ids
+
+
+def test_prune_before_current_baseline_noop_when_baseline_is_oldest(tmp_path):
+    """No-op (returns []) when the current baseline is already the first event —
+    can never remove the baseline or leave zero backups."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event"); m.append_event(b1)
+    m.append_event(_incremental_event(prev_id=b1["event_id"]))
+    assert m.prune_before_current_baseline() == []
+    assert len(m.events) == 2
+    # fresh manifest (no baseline) → also a no-op
+    empty = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path / "e"))
+    assert empty.prune_before_current_baseline() == []
+
+
 # ── make_event validation ────────────────────────────────────────────────
 
 

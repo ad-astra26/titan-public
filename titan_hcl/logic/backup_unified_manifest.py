@@ -159,6 +159,20 @@ class UnifiedManifest:
         self.base_dir = base_dir
         self.path = os.path.join(base_dir, f"backup_unified_manifest_{titan_id}.json")
         self._data: dict = self._empty_skeleton()
+        # Rebase-cadence policy (mode-aware §24.2, 2026-06-11). Default = legacy
+        # monthly; RebirthBackup calls configure_rebase() right after load to set
+        # the per-mode policy (mainnet "none"/90 = incremental-forever; devnet/local
+        # "weekly"/30). Stored on the manifest so EVERY should_rebase() caller
+        # (precheck, plan_build, build_unified_event) is mode-aware via the one
+        # configured object — no per-callsite threading to miss.
+        self._rebase_cadence: str = "monthly"
+        self._rebase_depth_cap: int = BACKUP_INCREMENTAL_MAX_CHAIN_DEPTH
+
+    def configure_rebase(self, cadence: str, depth_cap: int) -> None:
+        """Set the rebase-cadence policy (the backup MODE's params). Called by
+        RebirthBackup after load so should_rebase() reflects the mode fleet-wide."""
+        self._rebase_cadence = cadence
+        self._rebase_depth_cap = int(depth_cap)
 
     # ── construction / IO ────────────────────────────────────────────────
 
@@ -306,6 +320,30 @@ class UnifiedManifest:
         incs.reverse()
         return incs
 
+    def prune_before_current_baseline(self) -> list:
+        """devnet/local RETENTION (Maker 2026-06-11): drop events that PRECEDE the
+        current baseline — the new weekly baseline supersedes them. Returns the
+        pruned events (chronological) so the caller can delete their local tarballs.
+        Persists on a non-empty prune.
+
+        SAFETY (memory-preservation): events are chronological (oldest first); the
+        current baseline sits at index `idx` and everything from `idx` onward (the
+        baseline + its incrementals + the latest event) is KEPT. No-op when there's
+        no baseline, the baseline isn't found, or it's already the first event — so
+        the prune can NEVER remove the current baseline or leave zero backups."""
+        base_id = self.current_baseline_event_id
+        if not base_id:
+            return []
+        events = self._data.get("events", [])
+        idx = next((i for i, e in enumerate(events)
+                    if e.get("event_id") == base_id), None)
+        if idx is None or idx == 0:
+            return []   # baseline not present, or already the oldest → nothing older
+        pruned = events[:idx]
+        self._data["events"] = events[idx:]
+        self.save()
+        return pruned
+
     # ── append / rebase ──────────────────────────────────────────────────
 
     def append_event(self, event: dict) -> None:
@@ -338,47 +376,63 @@ class UnifiedManifest:
                 ts, tz=timezone.utc).strftime("%Y-%m-%d")
         self._data["events"].append(event)
 
-    def should_rebase(self, now: Optional[datetime] = None) -> tuple[bool, Optional[str]]:
-        """Per SPEC §24.2 FIRST-WINS of (1st of UTC month) OR
-        (chain depth ≥ BACKUP_INCREMENTAL_MAX_CHAIN_DEPTH).
+    def should_rebase(self, now: Optional[datetime] = None, *,
+                      cadence: Optional[str] = None,
+                      depth_cap: Optional[int] = None
+                      ) -> tuple[bool, Optional[str]]:
+        """MODE-AWARE baseline-vs-incremental decision (§24.2; mode-aware 2026-06-11).
 
-        Returns (should_rebase: bool, reason: str | None). Reason is one of
-        "month_boundary" / "depth_cap" / None.
+        The caller (RebirthBackup) maps the backup MODE → (cadence, depth_cap):
+          • mainnet_arweave → cadence="none", depth_cap=90 — incrementals run AS
+            LONG AS POSSIBLE; a full baseline (expensive on Arweave) fires ONLY on
+            first_event, self_heal (integrity-fail, decided in _precheck_diff_base),
+            or the depth_cap restore-chain-length safety. NO calendar trigger — a
+            missed daily incremental (e.g. low Irys SOL) is NOT a rebase reason; the
+            next incremental diffs against the last SHIPPED state and covers the gap.
+          • devnet/local     → cadence="weekly", depth_cap=30 — re-baseline once the
+            current baseline is ≥7 days old (then prune older events); local disk is
+            cheap so a weekly full baseline + retention is fine.
+          • legacy default   → cadence="monthly" — 1st-of-UTC-month, grace-suppressed.
 
-        First-ever event (no current baseline) → (True, "first_event").
+        Returns (should_rebase, reason ∈ {first_event, week_boundary, month_boundary,
+        depth_cap, None}). first-ever event → (True, "first_event").
 
-        §24.2 fresh-baseline guard (2026-06-01): the month-boundary trigger is
-        SUPPRESSED when the current baseline is younger than
-        BACKUP_BASELINE_MIN_AGE_DAYS. Without it, a first_event/depth-cap
-        baseline that lands a few days before the 1st (as the T1 first_event
-        did on 05-29) immediately re-baselines on the 1st — a full re-ship of
-        barely-changed multi-hundred-MB tiers for ~nothing. The depth-cap
-        still forces a rebase after 30 incrementals; the NEXT month boundary
-        rebases once the baseline has aged past the grace. Monthly cadence is
-        preserved in steady state (a ~30-day-old baseline always clears the
-        grace on the 1st).
+        cadence/depth_cap default to the manifest's configured policy
+        (configure_rebase, set by RebirthBackup per mode); explicit args override
+        (tests). So every caller is mode-aware via the one configured manifest.
         """
+        if cadence is None:
+            cadence = self._rebase_cadence
+        if depth_cap is None:
+            depth_cap = self._rebase_depth_cap
         if not self.current_baseline_event_id:
             return (True, "first_event")
 
         now = now or datetime.now(timezone.utc)
         today_str = now.strftime("%Y-%m-%d")
 
-        # Month-boundary check: today is the 1st AND we haven't already
-        # rebased today AND the current baseline has aged past the grace.
-        if now.day == 1 and self.current_baseline_date != today_str:
-            age_days = self._baseline_age_days(now)
-            if age_days is None or age_days >= BACKUP_BASELINE_MIN_AGE_DAYS:
-                return (True, "month_boundary")
-            logger.info(
-                "[UnifiedManifest] month-boundary rebase SUPPRESSED — baseline "
-                "%s is %.1fd old (< %dd grace); staying incremental (depth-cap "
-                "and next month boundary still apply)",
-                self.current_baseline_date, age_days, BACKUP_BASELINE_MIN_AGE_DAYS)
+        if cadence == "weekly":
+            # devnet/local: re-baseline when the baseline has aged ≥7d (once/day).
+            if self.current_baseline_date != today_str:
+                age_days = self._baseline_age_days(now)
+                if age_days is None or age_days >= 7:
+                    return (True, "week_boundary")
+        elif cadence == "monthly":
+            # legacy: 1st of UTC month, baseline aged past the grace.
+            if now.day == 1 and self.current_baseline_date != today_str:
+                age_days = self._baseline_age_days(now)
+                if age_days is None or age_days >= BACKUP_BASELINE_MIN_AGE_DAYS:
+                    return (True, "month_boundary")
+                logger.info(
+                    "[UnifiedManifest] month-boundary rebase SUPPRESSED — baseline "
+                    "%s is %.1fd old (< %dd grace); staying incremental",
+                    self.current_baseline_date, age_days, BACKUP_BASELINE_MIN_AGE_DAYS)
+        # cadence == "none" (mainnet_arweave) → NO calendar trigger; incremental
+        # forever until the depth_cap safety or a self_heal integrity-fail.
 
-        # Depth-cap check
+        # Depth-cap restore-chain-length safety (mode-tuned: mainnet ~90, else 30).
         depth = len(self.incrementals_since_baseline())
-        if depth >= BACKUP_INCREMENTAL_MAX_CHAIN_DEPTH:
+        if depth >= depth_cap:
             return (True, "depth_cap")
 
         return (False, None)
@@ -426,11 +480,12 @@ def make_event(
     if event_type not in ("baseline", "incremental"):
         raise ValueError(f"event_type must be 'baseline' or 'incremental', got {event_type!r}")
     if event_type == "baseline" and baseline_trigger not in (
-        "month_boundary", "depth_cap", "first_event", "self_heal",
+        "month_boundary", "week_boundary", "depth_cap", "first_event", "self_heal",
     ):
         raise ValueError(
             f"baseline event must have baseline_trigger ∈ "
-            f"{{month_boundary, depth_cap, first_event, self_heal}}, got {baseline_trigger!r}"
+            f"{{month_boundary, week_boundary, depth_cap, first_event, self_heal}}, "
+            f"got {baseline_trigger!r}"
         )
     if event_type == "incremental" and baseline_trigger is not None:
         raise ValueError("incremental events must have baseline_trigger=None")
