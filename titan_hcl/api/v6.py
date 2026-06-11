@@ -539,6 +539,11 @@ _T = (
     ("/v6/synthesis/feedback", "POST",
      "post_v6_synthesis_feedback", "synthesis", "write",
      None, None, (), ("synthesis_worker",), False, None),
+    # §7.B (B.3) — per-turn user/Maker rating (non-verifiable lane). Publishes
+    # SELF_LEARN_REWARD (source: maker|user) + a MakerAssessment bond for the Maker.
+    ("/v6/synthesis/turn_feedback", "POST",
+     "post_v6_synthesis_turn_feedback", "synthesis", "write",
+     None, None, (), ("synthesis_worker",), False, None),
 )
 
 

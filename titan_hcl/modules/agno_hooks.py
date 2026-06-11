@@ -223,6 +223,89 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text):
     return (action_index_to_mode(action), vec.tolist(), action)
 
 
+# RFP §7.B (B.1) — the non-verifiable lane. A `direct`/`research`/`IDK` turn has NO
+# synchronous oracle, so its `(features, action)` is stashed (keyed by a fresh
+# reasoning_id) for an ASYNC reward — the turn-judge (B.2) or the user/Maker rating
+# (B.3) — to join + train later. The verifiable lane (`tool`/`skill_delegate`) is
+# unchanged (Phase 1 trains it directly at the oracle verdict).
+_NONVERIFIABLE_ACTIONS = frozenset({"direct", "research", "IDK"})
+
+# RFP §7.B (B.4) — OUR-logic progress phases (safe string metadata; NOT OVG- or
+# PreHook-gated — they are our own codebase strings). Agno streams them live as the
+# turn progresses; the source/timing is OURS (the decided action), not agno's
+# native run-events. mode (a MODE_* string) → the phase the user sees.
+_MODE_TO_PHASE = {
+    "MODE_RESEARCH": "researching",
+    "MODE_TOOL_ORACLE": "running-tool",
+    "MODE_SKILL_DELEGATE": "using-skill",
+    "MODE_SOVEREIGN": "reasoning",   # direct — answering from himself
+    "MODE_SHADOW": "reasoning",      # IDK
+}
+
+
+def _phase_for_mode(mode) -> str:
+    return _MODE_TO_PHASE.get(str(mode or ""), "reasoning")
+
+
+def _emit_stream_progress(plugin, phase: str, detail: str = "") -> None:
+    """§7.B (B.4) — stream ONE our-logic progress phase live over the chat stream,
+    IF this is a streaming turn (the agno worker set `_stream_progress_ctx` with the
+    send_queue + request_id). Safe metadata (no chunk, done=False); the SSE relay
+    forwards it as `event: progress`. No-op on a non-streaming turn / any error —
+    must never break chat (INV-OML-7)."""
+    ctx = getattr(plugin, "_stream_progress_ctx", None)
+    if not ctx:
+        return
+    try:
+        import time as _t
+        from titan_hcl.bus import CHAT_STREAM_CHUNK, make_msg
+        sq = ctx.get("send_queue")
+        if sq is None:
+            return
+        sq.put_nowait(make_msg(
+            CHAT_STREAM_CHUNK, ctx.get("name", "agno"), ctx.get("src", ""), {
+                "request_id": ctx.get("request_id", ""),
+                "phase": str(phase), "detail": str(detail or "")[:120],
+                "chunk": "", "done": False, "ts": _t.time(),
+            }, rid=ctx.get("rid")))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _emit_nonverifiable_decision(plugin, features, action, prompt_text, user_id):
+    """Stash a non-verifiable decision for async reward. Returns the reasoning_id
+    (the caller hands it to the client so a rating can attach) or None. Never raises
+    — must not break chat (hot path; INV-OML-7)."""
+    try:
+        import uuid
+        from titan_hcl import bus as _bus_mod
+        from titan_hcl.bus import make_msg as _mk
+        from titan_hcl.synthesis.outer_meta_policy import OUTER_ACTIONS
+        if OUTER_ACTIONS[int(action)] not in _NONVERIFIABLE_ACTIONS:
+            return None  # verifiable lane → Phase 1 handles the reward
+        _bus = getattr(plugin, "bus", None)
+        if _bus is None:
+            return None
+        try:
+            from titan_hcl.synthesis.goal_class import goal_class as _gc_fn
+            gc = _gc_fn(prompt_text or "")
+        except Exception:
+            gc = ""
+        reasoning_id = uuid.uuid4().hex
+        _bus.publish(_mk(
+            _bus_mod.SELF_LEARN_DECISION, "pre_hook", "self_learning", {
+                "parent_tool_call_tx": reasoning_id,  # generic stash key = reasoning_id
+                "features": list(features),
+                "action": int(action),
+                "goal_class": gc,
+                "turn_id": str(user_id or ""),
+            }))
+        return reasoning_id
+    except Exception as e:  # noqa: BLE001 — never break chat
+        logger.debug("[PreHook] B.1 decision emit skipped: %s", e)
+        return None
+
+
 def _p2_router_thresholds(plugin):
     """RouterThresholds with the recall floors SELF-CALIBRATED to the embedder's
     gibberish noise floor (P2). The engram/skill floors keep their static config
@@ -1179,6 +1262,7 @@ def create_pre_hook(plugin):
         # ToolBackstop carries it → verdict-time training (INV-OML-12). EXPLOIT only
         # on a live user turn (no experiments on the user — INV-OML-9).
         plugin._last_outer_decision = None
+        plugin._last_reasoning_id = None  # RFP §7.B (B.1) — set for non-verifiable turns
         if _router_active and _self_learning_enabled(plugin):
             try:
                 _readout_for_policy = locals().get("_readout")
@@ -1190,12 +1274,19 @@ def create_pre_hook(plugin):
                         _mode_override, _features, _action = _outer
                         mode = _mode_override
                         plugin._last_outer_decision = (_features, _action)
+                        # RFP §7.B (B.1) — non-verifiable lane: stash the decision
+                        # for an async reward (turn-judge / user / Maker rating).
+                        plugin._last_reasoning_id = _emit_nonverifiable_decision(
+                            plugin, _features, _action, prompt_text, user_id)
                         logger.info(
                             "[PreHook] outer-policy → %s (action=%d) — overrides "
                             "grounded_route", mode, _action)
             except Exception as _oml_err:
                 logger.debug("[PreHook] outer-policy decide skipped: %s", _oml_err)
         plugin._last_execution_mode = mode
+        # RFP §7.B (B.4) — stream the decided phase live (researching / running-tool
+        # / using-skill / reasoning) on a streaming turn. Our logic is the source.
+        _emit_stream_progress(plugin, _phase_for_mode(mode))
 
         # ── EEL Pillar A / A2 — learn-on-confirm (RFP §7.A2; INV-EEL-2/6) ─────
         # If this user has a researched node still awaiting confirmation, classify
@@ -2469,6 +2560,33 @@ def create_post_hook(plugin):
 
         # 0. Identify user for social tracking
         user_id = getattr(plugin, '_current_user_id', None) or "anonymous"
+
+        # ── RFP §7.B (C1′) — non-verifiable turn record ──────────────────────
+        # The PreHook (B.1) stashed a decision + minted a reasoning_id for a
+        # direct/research/IDK turn. Now that the response exists, ship the turn to
+        # synthesis → it graphs a Reasoning(kind='turn') record (reward=NULL), which
+        # the turn-judge (B.2) / a user-Maker rating (B.3) scores later. Never raises.
+        try:
+            _rid = getattr(plugin, "_last_reasoning_id", None)
+            _dec = getattr(plugin, "_last_outer_decision", None)
+            _bus_tr = getattr(plugin, "bus", None)
+            if _rid and _dec and _bus_tr is not None:
+                from titan_hcl import bus as _bus_mod2
+                from titan_hcl.bus import make_msg as _mk2
+                from titan_hcl.synthesis.goal_class import goal_class as _gc_fn2
+                _feats_tr, _action_tr = _dec
+                _bus_tr.publish(_mk2(
+                    _bus_mod2.TURN_REASONING_RECORD, "post_hook", "synthesis", {
+                        "reasoning_id": _rid,
+                        "prompt": (user_prompt or "")[:2000],
+                        "response": (response_text or "")[:2000],
+                        "action": int(_action_tr),
+                        "goal_class": _gc_fn2(user_prompt or ""),
+                        "features": list(_feats_tr),
+                        "user_id": user_id,
+                    }))
+        except Exception as _trr_err:
+            logger.debug("[PostHook] §7.B turn record emit skipped: %s", _trr_err)
 
         # 0b. V5 Post-Hook: Emotional coherence validation (soft logging only)
         try:

@@ -68,6 +68,10 @@ class ChatResponse(BaseModel):
     # salvaged}. Lets the UI show "Titan verified this via its sandbox" + explain
     # the extra latency. (2026-06-01 tool-backstop.)
     tool_activity: Optional[dict] = None
+    # §7.B (B.4): non-null on a NON-verifiable turn (direct/research/IDK). The UI
+    # returns it to POST /v6/synthesis/turn_feedback so a user/Maker rating attaches
+    # to this turn's stashed decision (the teaching loop). None otherwise.
+    reasoning_id: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -235,6 +239,15 @@ async def chat_stream(req: ChatRequest, request: Request,
                 if err:
                     yield f"event: error\ndata: {_json.dumps({'error': err, 'detail': payload.get('detail', '')})}\n\n"
                     break
+                # §7.B (B.4) — live progress phase (our-logic metadata, not content):
+                # "thinking" / "reasoning" / "researching" / "running-tool" /
+                # "using-skill" / "writing-reply". The client renders it + a live
+                # timer + an op icon. Carries no chunk → forward + move on.
+                phase = payload.get("phase")
+                if phase:
+                    yield (f"event: progress\ndata: "
+                           f"{_json.dumps({'phase': phase, 'detail': payload.get('detail', '')})}\n\n")
+                    continue
                 chunk_text = payload.get("chunk", "")
                 if chunk_text:
                     yield f"data: {_json.dumps({'chunk': chunk_text})}\n\n"
@@ -242,6 +255,20 @@ async def chat_stream(req: ChatRequest, request: Request,
                 if ovg_headers:
                     yield f"event: ovg-headers\ndata: {_json.dumps(ovg_headers)}\n\n"
                 if payload.get("done"):
+                    # §7.B (B.4) — closing meta frame: the non-verifiable turn's
+                    # reasoning_id (→ the voluntary rating footer posts against it)
+                    # + the execution mode (→ the client picks the per-lane rating
+                    # scale: research3 for the research lane, else stars5). Only
+                    # the done-frame carries these (agno_worker stream path).
+                    meta = {}
+                    _rid = payload.get("reasoning_id")
+                    if _rid:
+                        meta["reasoning_id"] = _rid
+                    _mode = payload.get("mode")
+                    if _mode:
+                        meta["mode"] = _mode
+                    if meta:
+                        yield f"event: meta\ndata: {_json.dumps(meta)}\n\n"
                     break
             yield "data: [DONE]\n\n"
         except Exception as e:
