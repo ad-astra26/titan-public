@@ -817,6 +817,35 @@ class TitanKnowledgeGraph:
         self.spine_ensure_self_node()
         return self._spine_link_self("SELF_HAS_SKILL", "Production", "skill_id", skill_id)
 
+    def spine_create_maker_assessment_node(
+        self, reasoning_id: str, score: float, scale: str, reward: float,
+        turn_summary: str, created_at: float,
+    ) -> bool:
+        """§7.B (B.3) — INSERT one MakerAssessment node (the Maker↔Titan bond).
+        Idempotent — returns False if the row already exists (safe on replay)."""
+        try:
+            self._conn.execute(
+                "CREATE (m:MakerAssessment {reasoning_id: $rid, score: $sc, "
+                "scale: $scl, reward: $rw, turn_summary: $ts, created_at: $at})",
+                {"rid": reasoning_id, "sc": float(score), "scl": str(scale or ""),
+                 "rw": float(reward), "ts": str(turn_summary or "")[:280],
+                 "at": float(created_at)})
+            return True
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if any(k in msg for k in ("primary key", "duplicate", "constraint", "violates")):
+                return False
+            logger.warning("[KnowledgeGraph] spine_create_maker_assessment_node(%s) "
+                           "failed: %s", reasoning_id, e)
+            raise
+
+    def spine_link_self_maker_assessment(self, reasoning_id: str) -> bool:
+        """Link a MakerAssessment to the Self hub (SELF_HAS_MAKER_ASSESSMENT; the
+        Maker↔Titan bond). Idempotent; ensures the hub exists first."""
+        self.spine_ensure_self_node()
+        return self._spine_link_self(
+            "SELF_HAS_MAKER_ASSESSMENT", "MakerAssessment", "reasoning_id", reasoning_id)
+
     # ── LEARNING → REASONING subtree (RFP_synthesis_self_learning_meta_reasoning
     # v1.1 / INV-OML-11). SELF → LEARNING → REASONING: the graphed outer
     # chain-of-thought. Real scalars live in DuckDB reasoning_records + the FAISS

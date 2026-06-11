@@ -83,6 +83,7 @@ from titan_hcl.bus import (
     SYNTHESIS_FORK_COMMAND,
     TOOL_CALL_VERDICT_RECORD,
     TURN_REASONING_RECORD,
+    MAKER_ASSESSMENT_RECORD,
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
@@ -3170,6 +3171,26 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 except Exception as _tr_err:
                     logger.debug("[synthesis_worker] turn record/judge-enqueue "
                                  "failed: %s", _tr_err)
+                continue
+
+            if msg_type == MAKER_ASSESSMENT_RECORD:
+                # §7.B (B.3): a MAKER rating → graph a MakerAssessment bond record
+                # under SELF (SELF_HAS_MAKER_ASSESSMENT) + DuckDB scalars, via the
+                # single writer. The reward itself already rode SELF_LEARN_REWARD to
+                # self_learning (with the maker weight). Maker-only (endpoint-gated).
+                try:
+                    if reasoning_store is not None:
+                        _mrid = str(payload.get("reasoning_id", "") or "")
+                        if _mrid:
+                            reasoning_store.record_maker_assessment(
+                                reasoning_id=_mrid,
+                                score=float(payload.get("score", 0.0) or 0.0),
+                                scale=str(payload.get("scale", "") or ""),
+                                reward=float(payload.get("reward", 0.0) or 0.0),
+                                turn_summary=str(payload.get("turn_summary", "") or ""))
+                except Exception as _ma_err:
+                    logger.debug("[synthesis_worker] maker_assessment write failed: %s",
+                                 _ma_err)
                 continue
 
             if msg_type == SELF_LEARN_MACRO_READY:
