@@ -688,6 +688,12 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
     # the extra latency. None on ordinary turns. Pop so it never leaks forward.
     tool_activity = getattr(worker_plugin, "_last_tool_activity", None)
     worker_plugin._last_tool_activity = None
+    # §7.B (B.4) — the reasoning_id of a NON-verifiable turn (direct/research/IDK;
+    # None otherwise). The client returns it to POST /v6/synthesis/turn_feedback so
+    # a user/Maker rating attaches to THIS turn's stashed decision. Pop so it never
+    # leaks forward to the next turn.
+    reasoning_id = getattr(worker_plugin, "_last_reasoning_id", None)
+    worker_plugin._last_reasoning_id = None
 
     response_payload = {
         "request_id": request_id,
@@ -699,6 +705,7 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         "state_snapshot": None,
         "ovg_data": ovg_data,
         "tool_activity": tool_activity,
+        "reasoning_id": reasoning_id,
         "error": error_str,
         "ts": time.time(),
     }

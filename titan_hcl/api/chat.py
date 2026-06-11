@@ -68,6 +68,10 @@ class ChatResponse(BaseModel):
     # salvaged}. Lets the UI show "Titan verified this via its sandbox" + explain
     # the extra latency. (2026-06-01 tool-backstop.)
     tool_activity: Optional[dict] = None
+    # §7.B (B.4): non-null on a NON-verifiable turn (direct/research/IDK). The UI
+    # returns it to POST /v6/synthesis/turn_feedback so a user/Maker rating attaches
+    # to this turn's stashed decision (the teaching loop). None otherwise.
+    reasoning_id: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────
