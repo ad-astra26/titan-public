@@ -408,3 +408,71 @@ def test_restore_test_single_flight_guarded(tmp_path, monkeypatch):
     finally:
         o.state["_backup_lock"].release()
     assert backup.restore_test_calls == 0   # guarded — did not run
+
+
+# ── manual trigger (Maker-forced) — shared bounded ship path ─────────────────
+# RFP_backup_redesign_spine (2026-06-11): _handle_manual now ships via the SAME
+# _ship_daily_event_v2 the meditation path uses (prefers the staged drip, else a
+# bounded inline build). The heavy whole-file _run_unified_event_v2 was DELETED,
+# so a Maker-forced trigger can no longer re-trip BUG-BACKUP-RSS-FLAP.
+class _FakeManualBackup:
+    """Minimal backup for _handle_manual: unified_v2 on, records the shared
+    daily-ship call, and explicitly LACKS the deleted heavy path."""
+
+    def __init__(self, *, shipped=True):
+        self._shipped = shipped
+        self.daily_calls = []
+
+    def _unified_v2_enabled(self):
+        return True
+
+    async def _ship_daily_event_v2(self, today, weekday):
+        self.daily_calls.append((today, weekday))
+        return self._shipped
+
+
+def _run_manual(backup):
+    import asyncio
+    from titan_hcl.modules.backup_orchestrator import _handle_manual
+    loop = asyncio.new_event_loop()
+    q = _Q()
+    state = {"backup": backup, "loop": loop, "send_queue": q,
+             "name": "backup", "titan_id": "T1"}
+    try:
+        _handle_manual(state, {"type": "BACKUP_TRIGGER_MANUAL",
+                               "payload": {"type": "personality"},
+                               "rid": "r1", "src": "api"})
+    finally:
+        loop.close()
+    return q
+
+
+def test_manual_trigger_ships_via_shared_daily_path():
+    """A Maker-forced manual trigger ships via the SHARED _ship_daily_event_v2
+    (bounded), NOT the deleted heavy _run_unified_event_v2."""
+    bk = _FakeManualBackup(shipped=True)
+    # Guard: the RSS-flap footgun is GONE and must never be re-introduced/called.
+    assert not hasattr(bk, "_run_unified_event_v2")
+    q = _run_manual(bk)
+    # shipped exactly once via the shared bounded path, with (today, weekday)
+    assert len(bk.daily_calls) == 1
+    today, weekday = bk.daily_calls[0]
+    assert isinstance(today, str) and len(today) == 10   # YYYY-MM-DD
+    assert 0 <= weekday <= 6
+    # RESPONSE carries ok + shipped=True; success telemetry emitted
+    resp = [m for m in q.msgs if m.get("type") == "RESPONSE"]
+    assert resp, "manual trigger must emit a RESPONSE for the rid"
+    assert resp[0]["payload"]["ok"] is True
+    assert resp[0]["payload"]["result"]["shipped"] is True
+    assert any(m.get("type") == "BACKUP_SUCCEEDED" for m in q.msgs)
+
+
+def test_manual_trigger_clean_noop_when_nothing_to_ship():
+    """When the shared path declines (today already landed / gate off), the
+    manual trigger returns a clean shipped=False RESPONSE — never a rebuild."""
+    bk = _FakeManualBackup(shipped=False)
+    q = _run_manual(bk)
+    assert len(bk.daily_calls) == 1
+    resp = [m for m in q.msgs if m.get("type") == "RESPONSE"]
+    assert resp and resp[0]["payload"]["ok"] is True
+    assert resp[0]["payload"]["result"]["shipped"] is False

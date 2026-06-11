@@ -1237,15 +1237,23 @@ def _handle_manual(state: dict, msg: dict) -> None:
     t0 = time.time()
     try:
         # Maker policy 2026-05-23 (D-SPEC-123 follow-up): when unified_v2 owns
-        # backups, a Maker-forced trigger runs ONE unified diff/baseline event
-        # (atomic personality+timechain, +soul on Sunday) — NOT the legacy
-        # per-type full-tarball upload (~50MB), which is the SOL-drain path now
-        # retired everywhere unified_v2 is enabled. The `type` param is
+        # backups, a Maker-forced trigger ships ONE atomic unified event
+        # (personality+timechain, +soul on Sunday) — NOT the legacy per-type
+        # full-tarball upload (~50MB SOL-drain, retired). The `type` param is
         # informational under unified_v2 (events are atomic, not per-type).
+        #
+        # 2026-06-11: routes through the SAME shared `_ship_daily_event_v2` the
+        # meditation path uses — prefers the pre-staged finalized drip
+        # (bounded ship), else a bounded inline build. The heavy whole-file
+        # `_run_unified_event_v2` is DELETED, so a Maker-forced trigger can no
+        # longer re-trip BUG-BACKUP-RSS-FLAP. The manifest-as-truth daily gate
+        # inside makes a 2nd same-day trigger a clean no-op (no duplicate ship).
         if backup._unified_v2_enabled():
-            weekday = datetime.now(timezone.utc).weekday()
+            now = datetime.now(timezone.utc)
+            today = now.strftime("%Y-%m-%d")
+            weekday = now.weekday()
             shipped = loop.run_until_complete(
-                backup._run_unified_event_v2(weekday=weekday))
+                backup._ship_daily_event_v2(today, weekday))
             dur = time.time() - t0
             _send(send_queue, "BACKUP_SUCCEEDED", name, "all", {
                 "trigger": "manual", "type": "unified_v2",
@@ -1261,7 +1269,7 @@ def _handle_manual(state: dict, msg: dict) -> None:
                     "ok": True,
                     "result": {"unified_v2": True, "shipped": bool(shipped),
                                "note": ("event shipped" if shipped else
-                                        "clean no-op: nothing changed or arweave gate off")},
+                                        "clean no-op: already landed today / nothing changed / arweave gate off")},
                 }, rid=rid)
             return
         # Legacy per-type full-tarball Arweave upload (the SOL-drain) is RETIRED

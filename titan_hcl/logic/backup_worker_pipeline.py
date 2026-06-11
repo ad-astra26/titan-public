@@ -1,9 +1,10 @@
 """BackupWorker — the carved build→ship→anchor pipeline.
 
-RFP_backup_redesign_spine Phase B (§7.B). Consolidates the THREE overlapping
-god-class entrypoints (`backup.py:_run_unified_event_v2` / `_build_staged_event_v2`
-/ `_ship_staged_event_v2`) into ONE gate-free, resumable pipeline of three
-methods, built on the Phase-A snapshot (via `_build_*_payload`) + ChainProvider:
+RFP_backup_redesign_spine Phase B (§7.B). Consolidates the overlapping
+god-class entrypoints (`backup.py:_build_staged_event_v2` / `_ship_staged_event_v2`;
+the legacy whole-file `_run_unified_event_v2` was deleted 2026-06-11) into ONE
+gate-free, resumable pipeline of three methods, built on the Phase-A snapshot
+(via `_build_*_payload`) + ChainProvider:
 
     plan_build()    → decide event_type/id/prev/baseline; seed the pending specs
     build_slice()   → encode the next ≤byte_budget batch → patch artifacts (RESUMABLE)

@@ -203,11 +203,13 @@ def test_cas_locks_are_lazy_constructed():
 
 
 # ── §24 unified_v2 — daily (1st-meditation-of-day) gate ──────────────────
-# Regression guard (2026-05-30): pre-fix, _run_unified_event_v2 fired on EVERY
-# meditation (the per-tier daily CAS gates below it were dead code for the
-# unified_v2 path), shipping 2+ Arweave backups/day (observed on T1). The fix
-# claims the calendar day with the same personality CAS gate the legacy path
-# uses, so the unified event ships exactly once per UTC day.
+# Regression guard (2026-05-30): pre-fix, the unified ship fired on EVERY
+# meditation (the per-tier daily CAS gates were dead code for the unified_v2
+# path), shipping 2+ Arweave backups/day (observed on T1). The fix gates on the
+# manifest-as-truth daily check + the personality CAS lock, so the unified event
+# ships exactly once per UTC day. (2026-06-11: the ship + this gate live in the
+# shared `_ship_daily_event_v2`, driven by both meditation + the manual trigger;
+# the legacy whole-file `_run_unified_event_v2` was deleted.)
 
 
 def _unified_v2_rb(monkeypatch, ship_counter, tmp_path, *, shipped=True, raises=False):
