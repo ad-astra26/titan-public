@@ -482,7 +482,11 @@ class TestPublicAPIStubs:
         assert desc is None
         assert err is not None and err.status == "no_catalyst"
 
-    def test_post_rate_limited(self, gateway):
+    def test_post_rate_limited(self, gateway, monkeypatch):
+        # Rate limits run AFTER archetype selection (2026-06-11 must-post bypass);
+        # fire a NON-must-post archetype so the budget cap is reached.
+        monkeypatch.setattr(gateway, "_select_post_type",
+                            lambda *a, **k: "world_mirror")
         # Max out hourly posts
         db = gateway._db()
         for _ in range(2):
@@ -733,7 +737,11 @@ class TestPostFullFlow:
         err, desc = gateway.prepare_post(ctx, consumer="test_consumer")
         assert desc is None and err.status == "no_catalyst"
 
-    def test_post_rate_limited_hourly(self, gateway):
+    def test_post_rate_limited_hourly(self, gateway, monkeypatch):
+        # Rate limits now run AFTER archetype selection (2026-06-11 must-post
+        # bypass) — fire a NON-must-post archetype so the budget cap is reached.
+        monkeypatch.setattr(gateway, "_select_post_type",
+                            lambda *a, **k: "world_mirror")
         db = gateway._db()
         for _ in range(2):
             db.execute(
@@ -746,7 +754,9 @@ class TestPostFullFlow:
         err, desc = gateway.prepare_post(ctx, consumer="test_consumer")
         assert desc is None and err.status == "hourly_limit"
 
-    def test_post_rate_limited_interval(self, gateway):
+    def test_post_rate_limited_interval(self, gateway, monkeypatch):
+        monkeypatch.setattr(gateway, "_select_post_type",
+                            lambda *a, **k: "world_mirror")
         db = gateway._db()
         db.execute(
             "INSERT INTO actions (action_type, status, created_at) "
@@ -757,6 +767,35 @@ class TestPostFullFlow:
                           catalysts=[{"type": "test", "significance": 0.5}])
         err, desc = gateway.prepare_post(ctx, consumer="test_consumer")
         assert desc is None and err.status == "too_soon"
+
+    def test_must_post_archetype_bypasses_budget(self, gateway):
+        """A must-post archetype (``bypass_rate_limit``) skips the hourly/daily
+        budget caps + min-interval so the daily soul-diary always publishes even
+        over budget (Maker 2026-06-11) — MAX_PENDING is still enforced."""
+        config = gateway._load_config()
+        db = gateway._db()
+        for _ in range(20):  # blow past every hourly/daily cap
+            db.execute(
+                "INSERT INTO actions (action_type, status, created_at) "
+                "VALUES ('post', 'posted', ?)", (time.time(),))
+        db.commit()
+        db.close()
+        # routine post → blocked by a budget cap
+        blocked = gateway._check_rate_limits("post", config, titan_id="T1")
+        assert blocked is not None and blocked.status in (
+            "hourly_limit", "daily_limit", "too_soon")
+        # must-post → allowed through
+        assert gateway._check_rate_limits(
+            "post", config, titan_id="T1", bypass_caps=True) is None
+        # …but a post mid-transport (MAX_PENDING) still blocks even a must-post
+        db = gateway._db()
+        db.execute("INSERT INTO actions (action_type, status, created_at) "
+                   "VALUES ('post', 'pending', ?)", (time.time(),))
+        db.commit()
+        db.close()
+        pend = gateway._check_rate_limits(
+            "post", config, titan_id="T1", bypass_caps=True)
+        assert pend is not None and pend.status == "pending_exists"
 
 
 # ── Stats ───────────────────────────────────────────────────────────

@@ -704,11 +704,18 @@ class SocialXGateway:
                 "post": "posts", "like": "likes"}
 
     def _check_rate_limits(self, action_type: str, config: dict,
-                          titan_id: str = "") -> ActionResult | None:
+                          titan_id: str = "", *,
+                          bypass_caps: bool = False) -> ActionResult | None:
         """Check all rate limits for an action type.
 
         Checks both per-Titan hourly limits AND global daily limits.
         Returns None if all checks pass, or ActionResult with rejection reason.
+
+        ``bypass_caps=True`` (a must-post archetype — ``soul_diary`` / ``proof_day``,
+        ``bypass_rate_limit``) skips the hourly + daily budget caps AND the
+        min-interval, so the once-per-day soul-diary always publishes even when
+        the Titan is over its routine X budget (Maker 2026-06-11). MAX_PENDING is
+        STILL enforced (never double-fire a post whose transport is in flight).
         """
         db = self._db()
         try:
@@ -728,6 +735,13 @@ class SocialXGateway:
             if pending > 0:
                 return ActionResult(status="pending_exists",
                                     reason=f"{pending} pending {action_type}(s)")
+
+            # Must-post archetypes bypass the budget caps + min-interval below —
+            # but only AFTER MAX_PENDING above, so a post mid-transport is never
+            # double-fired (the daily soul-diary is itself once/day via the
+            # archetype's already_posted_today gate).
+            if bypass_caps:
+                return None
 
             # 2. Per-Titan hourly limit (from [social_x.limits.T1] etc.)
             if titan_id:
@@ -3207,21 +3221,13 @@ class SocialXGateway:
             })
             return consumer_result, None
 
-        # 3. Rate limits FIRST
-        limit_result = self._check_rate_limits(
-            self.A_POST, config, titan_id=context.titan_id)
-        if limit_result:
-            self._log_telemetry({
-                "event": "post_blocked", "reason": limit_result.status,
-                "detail": limit_result.reason, "titan_id": context.titan_id,
-            })
-            return limit_result, None
-
-        # 4. Catalyst check
+        # 3. Catalyst check
         if not context.catalysts:
             return ActionResult(status="no_catalyst"), None
 
-        # 5. Select best catalyst + post type
+        # 4. Select best catalyst + post type (sets context.archetype_candidate,
+        #    so the rate-limit step below can honor a must-post archetype's
+        #    bypass — archetype selection MUST run before the budget caps).
         catalyst = max(context.catalysts, key=lambda c: c.get("significance", 0))
         post_type = self._select_post_type(catalyst, context)
         if post_type is None:
@@ -3237,6 +3243,24 @@ class SocialXGateway:
                 reason="no archetype candidate this cycle — only registered "
                        "archetypes in logic/social_x/archetypes/ may fire "
                        "posts (Maker rule, 2026-05-23)"), None
+
+        # 5. Rate limits — AFTER archetype selection so a must-post archetype
+        #    (soul_diary / proof_day; bypass_rate_limit=True) skips the hourly +
+        #    daily budget caps. The daily soul-diary is a once-per-day must-post
+        #    (its own already_posted_today gates it) and MUST publish even when
+        #    the Titan is over its routine X budget (Maker 2026-06-11). The slot
+        #    still commits atomically in post(); MAX_PENDING is never bypassed.
+        _cand = getattr(context, "archetype_candidate", None)
+        limit_result = self._check_rate_limits(
+            self.A_POST, config, titan_id=context.titan_id,
+            bypass_caps=bool(getattr(_cand, "bypass_rate_limit", False)))
+        if limit_result:
+            self._log_telemetry({
+                "event": "post_blocked", "reason": limit_result.status,
+                "detail": limit_result.reason, "titan_id": context.titan_id,
+                "post_type": post_type,
+            })
+            return limit_result, None
 
         # 5b. Grounding gate
         voice_cfg = config.get("voice", {})
