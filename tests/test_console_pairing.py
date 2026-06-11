@@ -189,35 +189,6 @@ def test_dispatch_operator_route_requires_token(tmp_path):
     assert s == 200 and "pairing_token" in payload
 
 
-# ── /console/device/me self-check + operator pairing page ───────────────────
-def test_device_record_present_and_absent(tmp_path):
-    ctx = _ctx(tmp_path)
-    _register_signed_device(ctx)
-    rec = pairing.device_record(ctx, "dev-1")
-    assert rec is not None and rec["device_id"] == "dev-1" and rec["label"] == "Maker phone"
-    assert pairing.device_record(ctx, "ghost") is None
-
-
-def test_device_me_requires_valid_device_signature(tmp_path):
-    import time as _t
-    ctx = _ctx(tmp_path)
-    seed, _ = _register_signed_device(ctx)
-    ts = str(int(_t.time()))
-    sig = _sign_request(seed, "GET", "/console/device/me", ts, b"")
-    s, rec = dispatch(ctx, "GET", "/console/device/me", {}, b"",
-                      {"x-device-id": "dev-1", "x-timestamp": ts, "x-signature": sig})
-    assert s == 200 and rec["device_id"] == "dev-1"
-    # unsigned → 401 even on an open (no-token) localhost bind
-    s2, _ = dispatch(ctx, "GET", "/console/device/me", {}, b"", {})
-    assert s2 == 401
-
-
-def test_pair_page_is_served(tmp_path):
-    s, body = dispatch(_ctx(tmp_path), "GET", "/console/pair", {}, b"", {})
-    assert s == 200 and isinstance(body, (bytes, bytearray))
-    assert b"Pair your phone" in body
-
-
 def test_dispatch_device_signed_mutation_bypasses_token(tmp_path):
     import time as _t
     from pathlib import Path

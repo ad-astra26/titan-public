@@ -54,7 +54,8 @@ def test_fires_on_unposted_entry(tmp_path, monkeypatch):
     assert cand is not None
     assert cand.archetype == "soul_diary"
     assert cand.bypass_spacing and cand.bypass_rate_limit      # sole daily must-post
-    assert "generated_art" in cand.layers                      # art layer present
+    assert "generated_art" not in cand.layers                  # P11: X post is text-only (art web-only)
+    assert cand.layers == ["identity"]
     # composes from the rich public entry (falls back to distillation if absent)
     assert cand.prompt_values["entry"] == "clean"
     assert cand.prompt_values["archive_url"] == "example.com/t/T2/diary/2026-06-09"
@@ -86,16 +87,18 @@ def test_abstains_when_no_public_projection(tmp_path, monkeypatch):
     assert arch.find_candidate(_Ctx("T2")) is None
 
 
-def test_prepare_media_uploads_existing_art_not_rerender(tmp_path, monkeypatch):
+def test_prepare_media_always_text_only_p11(tmp_path, monkeypatch):
+    """P11: soul-diary X posts are TEXT-ONLY — prepare_media ALWAYS returns ""
+    regardless of art_path. The felt-art is shown only on the web archive page,
+    never attached to the tweet. (See BUGS: worker-loads-stale-titan_hcl — the
+    live worker rendered stale art, so we stopped attaching it to the timeline.)"""
     art = tmp_path / "felt.jpg"
     art.write_bytes(b"\xff\xd8\xff art")
     arch = _arch()
     cand = MagicMock()
+    # even with a perfectly valid art file present, nothing is uploaded
     cand.metadata = {"art_path": str(art)}
-    monkeypatch.setattr(
-        "titan_hcl.logic.social_x.image_pipeline.upload_media_via_gateway",
-        lambda gateway, path: "MEDIA_123")
-    assert arch.prepare_media(cand, neuromods={}, titan_id="T2") == "MEDIA_123"
-    # no art file → text-only (soft-fail, empty media_id)
+    assert arch.prepare_media(cand, neuromods={}, titan_id="T2") == ""
+    # and obviously empty/missing art_path is also text-only
     cand.metadata = {"art_path": "/nonexistent/x.jpg"}
     assert arch.prepare_media(cand, neuromods={}, titan_id="T2") == ""
