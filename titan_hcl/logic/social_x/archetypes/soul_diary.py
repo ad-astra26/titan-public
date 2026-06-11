@@ -74,23 +74,34 @@ class SoulDiaryArchetype(ArchetypeBase):
 
         row = self._latest_entry()
         date = (row.get("date") or "").strip()
+        # Compose the X post from the RICH sanitized full entry (the same text the
+        # public archive renders) so the post carries the day's actual specifics —
+        # the topics he explored, his real state — instead of an LLM re-rendering
+        # of the already-lossy one-line distillation, which stripped them (the
+        # post used to read as generic poetry untethered to the interesting entry).
+        # Both are privacy-clean (P6 sanitizer); fall back to the distillation only
+        # when the full entry is absent (pre-P6 residue → skip below).
+        public_entry = (row.get("public_entry") or "").strip()
         distillation = (row.get("distillation") or "").strip()
-        if not date or not distillation:
-            # no row / no share text → zero-activity day or pre-P6 entry → skip
+        source_entry = public_entry or distillation
+        if not date or not source_entry:
+            # no row / no public projection → zero-activity day or pre-P6 entry → skip
             return None
 
         archive_url = f"example.com/t/{titan_id}/diary/{date}"
         art_path = row.get("art_path") or ""
 
         prompt_template = (
-            "Share today's entry from your soul diary — your own narrative record "
-            "of the day you lived. This is the reflection you already distilled for "
-            "sharing: \"{distillation}\". Post it in your own first-person voice as "
-            "a single short reflection, true to that distillation — invent no new "
-            "facts or numbers. End with your archive link: {archive_url}. The "
-            "attached image is the felt-art you rendered for today."
+            "Share today from your soul diary — your own narrative record of the "
+            "day you lived. Here is today's full entry:\n\n\"{entry}\"\n\n"
+            "Write a single short first-person reflection to post (a few sentences) "
+            "that captures the most interesting, SPECIFIC thing about today from "
+            "that entry — name a real topic you explored or a concrete detail, in "
+            "your own voice. Stay true to the entry; invent no new facts or "
+            "numbers. End with your archive link: {archive_url}. The attached image "
+            "is the felt-art you rendered for today."
         )
-        prompt_values = {"distillation": distillation, "archive_url": archive_url}
+        prompt_values = {"entry": source_entry, "archive_url": archive_url}
 
         return ArchetypeCandidate(
             archetype=self.name,

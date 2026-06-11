@@ -130,13 +130,22 @@ def normalize_felt(raw: dict | None) -> dict | None:
     return out
 
 
-def felt_to_render_params(felt: dict) -> dict:
+def felt_to_render_params(felt: dict, hue_rotation_deg: float = 0.0) -> dict:
     """The combined circumplex + neuromod mapping → concrete render knobs.
 
     Expects a canonical felt dict (see ``normalize_felt``). Returns:
       ``bg_color``/``line_color``/``accent_color`` (RGB) · ``particle_mult`` ·
       ``steps`` · ``turbulence_freq`` · ``turbulence_amp`` · ``jitter`` ·
       ``order`` (0..1) · ``base_hue``/``accent_hue`` (debug/sidecar).
+
+    ``hue_rotation_deg`` (default 0) rotates the felt-derived base + accent hue
+    around the wheel — seeded per-entry by the caller from the diary's
+    cumulative_hash (``expressive/art.py``). It exists because the felt valence
+    sits near-neutral most days, which collapses every entry to the same green;
+    a deterministic per-entry rotation spreads the palette so distinct days read
+    as distinct colors while the felt signal (saturation←arousal, accent←the
+    neuromod profile, order←coherence) still shapes the render (INV-SD-4: same
+    ``(felt, rotation)`` → same art).
     """
     v = _clamp(float(felt.get("valence", 0.0)), -1.0, 1.0)
     a = _clamp(float(felt.get("arousal", 0.5)), 0.0, 1.0)
@@ -144,10 +153,12 @@ def felt_to_render_params(felt: dict) -> dict:
     neuromods = felt.get("neuromods") or {}
 
     vn = (v + 1.0) / 2.0                       # 0..1 (positive valence → warm)
-    base_hue = 255.0 - vn * 210.0              # -1→indigo(255) · 0→green(150) · +1→gold(45)
+    base_hue = (255.0 - vn * 210.0 + hue_rotation_deg) % 360.0  # valence hue, seed-rotated
 
     weighted = [(_hue_for_modulator(n), float(lv)) for n, lv in neuromods.items()]
     accent_hue = _circular_mean_hue(weighted)
+    if accent_hue is not None:
+        accent_hue = (accent_hue + hue_rotation_deg) % 360.0    # rotate with the base
     activation = (_clamp(sum(float(lv) for lv in neuromods.values())
                          / max(1, len(neuromods)), 0.0, 1.0) if neuromods else 0.0)
 

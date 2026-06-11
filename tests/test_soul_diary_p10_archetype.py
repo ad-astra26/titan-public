@@ -26,12 +26,13 @@ def _arch():
     return SoulDiaryArchetype(gateway=MagicMock(), social_x_db_path="/tmp/none.db")
 
 
-def _seed_ledger(tmp_path, monkeypatch, *, distillation="Today I grew.", art=None):
+def _seed_ledger(tmp_path, monkeypatch, *, distillation="Today I grew.",
+                 public_entry="clean", art=None):
     monkeypatch.setenv("TITAN_DATA_DIR", str(tmp_path))
     from titan_hcl.core.shadow_data_dir import resolve_data_path
     ledger = resolve_data_path("data/soul_diary_chain.json")
     soul_diary_chain.append_entry("2026-06-09", "private text",
-                                  distillation=distillation, public_entry="clean",
+                                  distillation=distillation, public_entry=public_entry,
                                   redactions=0, path=ledger)
     if art:
         soul_diary_chain.update_refs("2026-06-09", art_path=art, path=ledger)
@@ -54,7 +55,8 @@ def test_fires_on_unposted_entry(tmp_path, monkeypatch):
     assert cand.archetype == "soul_diary"
     assert cand.bypass_spacing and cand.bypass_rate_limit      # sole daily must-post
     assert "generated_art" in cand.layers                      # art layer present
-    assert cand.prompt_values["distillation"] == "Today I grew."
+    # composes from the rich public entry (falls back to distillation if absent)
+    assert cand.prompt_values["entry"] == "clean"
     assert cand.prompt_values["archive_url"] == "example.com/t/T2/diary/2026-06-09"
     assert cand.metadata["art_path"] == "/tmp/art.jpg"
     assert cand.metadata["date"] == "2026-06-09"
@@ -75,9 +77,10 @@ def test_abstains_on_zero_activity_day(tmp_path, monkeypatch):
     assert arch.find_candidate(_Ctx("T2")) is None             # empty ledger → abstain
 
 
-def test_abstains_when_no_distillation(tmp_path, monkeypatch):
-    """A pre-P6 row with no distillation → nothing public to share → abstain."""
-    _seed_ledger(tmp_path, monkeypatch, distillation="")
+def test_abstains_when_no_public_projection(tmp_path, monkeypatch):
+    """A pre-P6 row with no distillation AND no public entry → nothing public to
+    share → abstain. (A row with only one of the two still fires.)"""
+    _seed_ledger(tmp_path, monkeypatch, distillation="", public_entry="")
     arch = _arch()
     monkeypatch.setattr(arch, "already_posted_today", lambda **kw: False)
     assert arch.find_candidate(_Ctx("T2")) is None

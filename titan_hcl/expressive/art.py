@@ -55,8 +55,25 @@ class ProceduralArtGen:
         random.seed(state_root)
         width = height = resolution
 
-        # Pseudo-noise from seed (flow-field phase).
-        seed_val = int(hashlib.md5(state_root.encode()).hexdigest()[:8], 16) / 100000.0
+        # ── seed → STRUCTURE (RFP §7.P7): the cumulative_hash drives a distinct
+        # flow TOPOLOGY per entry — global rotation, anisotropic frequency warp,
+        # and a set of swirl vortices — not merely a phase shift of one fixed grid
+        # (the pre-fix renderer made every diary day the same spiral grid). sha256
+        # gives independent 8-hex slices; the vortices come from the seeded RNG, so
+        # the same (seed, felt) still renders identically (INV-SD-4).
+        _sh = hashlib.sha256(state_root.encode()).hexdigest()
+        seed_val = int(_sh[0:8], 16) / 100000.0                     # base flow-field phase
+        field_rot = (int(_sh[8:16], 16) % 360) * math.pi / 180.0    # global flow rotation
+        warp_x = 0.6 + (int(_sh[16:24], 16) % 1000) / 1000.0 * 1.3  # 0.6..1.9× x-frequency
+        warp_y = 0.6 + (int(_sh[24:32], 16) % 1000) / 1000.0 * 1.3  # 0.6..1.9× y-frequency
+        hue_rotation = float(int(_sh[32:40], 16) % 360)             # palette spread (neutral days)
+        n_vortices = 2 + (int(_sh[40:48], 16) % 4)                  # 2..5 swirl centers
+        vortices = [
+            (random.uniform(0, width), random.uniform(0, height),
+             1.0 if random.random() < 0.5 else -1.0,                # spin direction
+             random.uniform(0.6, 1.6))                              # swirl strength
+            for _ in range(n_vortices)
+        ]
 
         # Auto-scaled base density/length (complexity from age_nodes).
         base_particles = num_particles if num_particles > 0 else min(5000, 100 + (age_nodes * 20))
@@ -69,7 +86,7 @@ class ProceduralArtGen:
             )
             canon = normalize_felt(felt)
             if canon is not None:
-                fp = felt_to_render_params(canon)
+                fp = felt_to_render_params(canon, hue_rotation_deg=hue_rotation)
         if fp is not None:
             bg_color = fp["bg_color"]
             line_color_base = fp["line_color"]
@@ -103,10 +120,16 @@ class ProceduralArtGen:
 
             for _ in range(steps):
                 angle = (
-                    math.sin(x * freq + seed_val)
-                    * math.cos(y * freq + seed_val)
+                    math.sin(x * freq * warp_x + seed_val)
+                    * math.cos(y * freq * warp_y + seed_val)
                     * math.pi * 2 * turb_amp
-                )
+                ) + field_rot
+                # seed-placed swirl vortices warp the base field into a unique
+                # composition per entry (localized, distance-decaying influence).
+                for cx, cy, spin, vstr in vortices:
+                    dx, dy = x - cx, y - cy
+                    angle += spin * vstr * math.atan2(dy, dx) * (
+                        9000.0 / (dx * dx + dy * dy + 9000.0))
                 if order < 1.0:    # coherence < 1 → fragment the flow (felt path)
                     angle += random.uniform(-1.0, 1.0) * (1.0 - order) * math.pi
                 x_next = x + math.cos(angle) * step_len
