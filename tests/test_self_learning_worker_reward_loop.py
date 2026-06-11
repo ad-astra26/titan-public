@@ -58,8 +58,10 @@ def test_decision_stash_then_reward_join_trains(tmp_path):
     assert trained is True
     assert policy.total_updates == updates_before + 1
     assert float(np.linalg.norm(policy.to_flat())) != w_before  # weights moved (G3)
-    # the decision was consumed (one-shot join)
-    assert store.pop_decision("tx_abc") is None
+    # Phase B (§7.B): the join no longer POPS the decision — it MARKS it rewarded
+    # (kept so a higher-authority reward can correct it; TTL-pruned otherwise).
+    peeked = store.peek_decision("tx_abc")
+    assert peeked is not None and peeked[4] == "llm_judge"  # applied_source set
     # the reward tuple was recorded
     assert len(store.recent_reward_tuples(10)) == 1
 
@@ -124,6 +126,65 @@ def test_negative_reward_trains(tmp_path):
         None, _cfg({}), _Q(), "self_learning")
     assert trained is True
     assert policy.reward_baseline < 0.0  # EMA tracked the −1
+
+
+# ── Phase B (§7.B) — source weights + corrective-delta ───────────────────────
+
+def test_maker_weight_larger_than_user(tmp_path):
+    # Same raw rating (+1), but Maker carries a larger weight → larger effective
+    # reward (the "bigger delta for Maker" mechanic). applied_reward = raw×weight.
+    def _effective(source, db):
+        store = _SelfLearningStore(path=str(tmp_path / db))
+        policy = OuterMetaPolicy(lr=0.05)
+        direct = OUTER_ACTIONS.index("direct")
+        store.stash_decision(tx="tx", features=_feat(), action=direct,
+                             goal_class="philosophy", turn_id="t")
+        _handle_reward({"parent_tool_call_tx": "tx", "reward": 1.0, "source": source},
+                       store, policy, None, _cfg({}), _Q(), "self_learning")
+        return store.peek_decision("tx")[3]  # applied_reward = raw × source weight
+    assert _effective("user", "u.duckdb") == pytest.approx(1.0)
+    assert _effective("maker", "m.duckdb") == pytest.approx(2.0)
+
+
+def test_corrective_delta_user_after_judge(tmp_path):
+    # Judge says good (+1); the user later disagrees (★1 → −1). The higher-
+    # authority user applies a CORRECTIVE DELTA over the judge's prior, retrains
+    # once, and the decision is re-marked as user-sourced + net-negative.
+    store = _store(tmp_path)
+    policy = OuterMetaPolicy(lr=0.05)
+    direct = OUTER_ACTIONS.index("direct")
+    store.stash_decision(tx="tx", features=_feat(), action=direct,
+                         goal_class="philosophy", turn_id="t")
+    _handle_reward({"parent_tool_call_tx": "tx", "reward": 1.0, "source": "llm_judge"},
+                   store, policy, None, _cfg({}), _Q(), "self_learning")
+    upd_after_judge = policy.total_updates
+    assert store.peek_decision("tx")[4] == "llm_judge"
+    trained = _handle_reward(
+        {"parent_tool_call_tx": "tx", "reward": -1.0, "source": "user"},
+        store, policy, None, _cfg({}), _Q(), "self_learning")
+    assert trained is True
+    assert policy.total_updates == upd_after_judge + 1   # the correction retrained
+    peeked = store.peek_decision("tx")
+    assert peeked[4] == "user" and peeked[3] < 0.0       # re-marked user, net negative
+
+
+def test_lower_authority_reward_after_higher_is_ignored(tmp_path):
+    # The user rates first (+1); the judge runs later (lower authority) → ignored,
+    # no double-train, the decision stays user-sourced.
+    store = _store(tmp_path)
+    policy = OuterMetaPolicy(lr=0.05)
+    direct = OUTER_ACTIONS.index("direct")
+    store.stash_decision(tx="tx", features=_feat(), action=direct,
+                         goal_class="philosophy", turn_id="t")
+    _handle_reward({"parent_tool_call_tx": "tx", "reward": 1.0, "source": "user"},
+                   store, policy, None, _cfg({}), _Q(), "self_learning")
+    upd = policy.total_updates
+    trained = _handle_reward(
+        {"parent_tool_call_tx": "tx", "reward": -1.0, "source": "llm_judge"},
+        store, policy, None, _cfg({}), _Q(), "self_learning")
+    assert trained is False
+    assert policy.total_updates == upd                   # no training
+    assert store.peek_decision("tx")[4] == "user"        # still user-sourced
 
 
 def test_macro_distilled_after_enough_wins(tmp_path):

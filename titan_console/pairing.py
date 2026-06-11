@@ -209,19 +209,6 @@ def _find_device(ctx: Context, device_id: str):
     return None
 
 
-def device_record(ctx: Context, device_id: str) -> dict | None:
-    """Public registration view for the signed /console/device/me self-check.
-
-    The app polls this (signed) after submit; a 200 means the operator confirmed
-    the code-match and this device is now in devices.json. None ⇒ not registered.
-    """
-    d = _find_device(ctx, device_id)
-    if not d:
-        return None
-    return {"device_id": d.get("device_id"), "label": d.get("label", "phone"),
-            "paired_at": d.get("paired_at")}
-
-
 def _prune_seen(now: float) -> None:
     for sig, exp in list(_seen_sigs.items()):
         if exp < now:

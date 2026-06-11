@@ -14,8 +14,6 @@ Routes (all under /console; live cognition is proxied under /console/api):
   GET  /console/backup/config     off-site convenience-copy config (secrets redacted)
   GET  /console/config[?section=] settings list (value+help+editable)
   GET  /console/config/get?key=   one setting
-  GET  /console/pair              operator pairing GUI (stdlib HTML)
-  GET  /console/device/me         signed device self-check (paired? → 200/401)
   GET  /console/api/<v6 path>     proxied live readout (allow-listed)
   POST /console/restart           {force}            (token-gated)
   POST /console/clean-hdd         {confirm}          (token-gated)
@@ -43,88 +41,6 @@ _MUTATIONS = {"/console/restart", "/console/clean-hdd", "/console/config/set",
 # /console/pair/submit is deliberately NOT here — it's the unauthenticated bootstrap,
 # gated by the single-use pairing token inside pairing.submit_device.
 _PAIR_OPERATOR = {"/console/pair/start", "/console/pair/confirm", "/console/pair/status"}
-
-# Self-contained (stdlib, no deps) operator pairing page served at GET /console/pair.
-# The richer graphical-QR experience lives in the Observatory panel (bundled npm qrcode);
-# this page uses copy-paste so the crash-decoupled agent keeps zero third-party deps.
-_PAIR_PAGE_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>Pair phone · Titan Command Center</title>
-<style>
- :root{--ink:#0B0E14;--sf:#141A24;--sfh:#1C2433;--cy:#4DD0E1;--vi:#9C7BFF;--tx:#E6EAF2;--mu:#8A93A6;--ok:#5BD9A6;--wn:#E7B450}
- *{box-sizing:border-box}body{margin:0;background:var(--ink);color:var(--tx);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
- .wrap{max-width:560px;margin:0 auto;padding:32px 20px}
- .orb{width:64px;height:64px;border-radius:50%;background:radial-gradient(circle at 35% 30%,var(--cy),var(--vi) 55%,var(--ink));margin:0 auto 18px}
- h1{font-size:22px;text-align:center;margin:0 0 4px}p.sub{color:var(--mu);text-align:center;margin:0 0 26px}
- .card{background:var(--sf);border:1px solid var(--sfh);border-radius:16px;padding:20px;margin:14px 0}
- label{display:block;color:var(--mu);font-size:13px;margin:0 0 6px}
- input{width:100%;background:var(--ink);border:1px solid var(--sfh);color:var(--tx);border-radius:10px;padding:11px 12px;font-size:15px}
- button{width:100%;border:0;border-radius:12px;padding:13px;font-size:15px;font-weight:600;cursor:pointer;margin-top:12px}
- .primary{background:var(--cy);color:var(--ink)}.violet{background:var(--vi);color:var(--ink)}.ghost{background:var(--sfh);color:var(--tx)}
- pre{background:var(--ink);border:1px dashed var(--sfh);border-radius:10px;padding:12px;white-space:pre-wrap;word-break:break-all;color:var(--cy);font-size:12px;max-height:170px;overflow:auto}
- .code{font-size:40px;font-weight:800;letter-spacing:6px;color:var(--cy);text-align:center;margin:8px 0}
- .muted{color:var(--mu);font-size:13px}.hide{display:none}.ok{color:var(--ok)}.warn{color:var(--wn)}
- .step{display:flex;gap:9px;align-items:flex-start;margin:8px 0;color:var(--mu);font-size:14px}.step b{color:var(--tx)}
-</style></head><body><div class=wrap>
- <div class=orb></div><h1>Pair your phone</h1>
- <p class=sub>Carry Titan in your pocket — a signed, private remote.</p>
-
- <div class=card id=authCard>
-   <label>Operator token <span class=muted>(from <code>~/.titan/console_token</code>; blank if local)</span></label>
-   <input id=tok type=password placeholder="X-Console-Token" autocomplete=off>
-   <button class=primary id=startBtn>Start pairing</button>
-   <p class=muted id=err></p>
- </div>
-
- <div class="card hide" id=qrCard>
-   <div class=step><span>1️⃣</span><div>On your phone open <b>Titan → Paste pairing code</b> and paste this:</div></div>
-   <pre id=payload></pre>
-   <button class=ghost id=copyBtn>Copy pairing code</button>
-   <p class=muted id=waiting>Waiting for your phone to submit its key…</p>
- </div>
-
- <div class="card hide" id=confirmCard>
-   <div class=step><span>2️⃣</span><div>Your phone shows a 6-digit code. The Console computed:</div></div>
-   <div class=code id=agentCode>— — —</div>
-   <label>Type the code shown on <b>your phone</b> to confirm it matches</label>
-   <input id=codeIn inputmode=numeric maxlength=6 placeholder="000000">
-   <button class=violet id=confirmBtn>Confirm pairing</button>
-   <p class=muted id=cErr></p>
- </div>
-
- <div class="card hide" id=doneCard>
-   <h1 class=ok>✓ Paired</h1>
-   <p class=sub id=doneMsg></p>
- </div>
-</div>
-<script>
- const $=id=>document.getElementById(id); let token="",poll=null;
- const hdr=()=>{const h={'Content-Type':'application/json'};if(token)h['X-Console-Token']=token;return h};
- async function jpost(p,b){const r=await fetch(p,{method:'POST',headers:hdr(),body:JSON.stringify(b||{})});return[r.status,await r.json().catch(()=>({}))]}
- async function jget(p){const r=await fetch(p,{headers:hdr()});return[r.status,await r.json().catch(()=>({}))]}
- $('startBtn').onclick=async()=>{
-   token=$('tok').value.trim();$('err').textContent='';
-   const[s,d]=await jpost('/console/pair/start',{});
-   if(s!==200){$('err').className='warn';$('err').textContent=d.error||('error '+s);return}
-   $('payload').textContent=JSON.stringify(d);
-   $('authCard').classList.add('hide');$('qrCard').classList.remove('hide');
-   const tok=d.pairing_token;
-   poll=setInterval(async()=>{
-     const[ps,pd]=await jget('/console/pair/status?pairing_token='+encodeURIComponent(tok));
-     if(ps===200&&pd.state==='submitted'){
-       clearInterval(poll);$('agentCode').textContent=(pd.code6||'').replace(/(\\d{3})(\\d{3})/,'$1 $2');
-       $('confirmCard').classList.remove('hide');$('waiting').textContent='Phone submitted ✓ — confirm below.';
-       $('confirmBtn').onclick=async()=>{
-         const[cs,cd]=await jpost('/console/pair/confirm',{pairing_token:tok,code:$('codeIn').value.trim()});
-         if(cs===200){$('confirmCard').classList.add('hide');$('qrCard').classList.add('hide');
-           $('doneCard').classList.remove('hide');$('doneMsg').textContent='“'+(cd.label||'phone')+'” can now talk to your Titan.';}
-         else{$('cErr').className='warn';$('cErr').textContent=cd.error||('error '+cs)}
-       };
-     } else if(ps===200&&pd.state==='expired'){clearInterval(poll);$('waiting').className='warn';$('waiting').textContent='Pairing expired — reload to start again.'}
-   },2000);
- };
- $('copyBtn').onclick=()=>navigator.clipboard.writeText($('payload').textContent).then(()=>$('copyBtn').textContent='Copied ✓');
-</script></body></html>"""
 
 
 def _backup_options(ctx: Context) -> dict:
@@ -212,17 +128,6 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             return 200, config_api.get_config(ctx.install_root, key)
         if path == "/console/pair/status":
             return pairing.pair_status(ctx, query.get("pairing_token", [""])[0])
-        if path == "/console/pair":
-            # Operator pairing GUI (stdlib, no deps). The page itself is open; the
-            # pair/start|status|confirm calls it makes stay operator-token-gated.
-            return 200, _PAIR_PAGE_HTML.encode()
-        if path == "/console/device/me":
-            # Signed self-check: the app polls this to learn the operator confirmed
-            # the code-match (device now in devices.json). 401 until registered.
-            if not device_authed:
-                return 401, {"error": "valid device signature required"}
-            rec = pairing.device_record(ctx, headers.get("x-device-id", ""))
-            return (200, rec) if rec else (404, {"error": "device not registered"})
         if path.startswith("/console/api/"):
             v6 = path[len("/console/api"):]  # → "/v6/..."
             if query:
