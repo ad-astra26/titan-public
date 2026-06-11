@@ -223,6 +223,48 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text):
     return (action_index_to_mode(action), vec.tolist(), action)
 
 
+# RFP §7.B (B.1) — the non-verifiable lane. A `direct`/`research`/`IDK` turn has NO
+# synchronous oracle, so its `(features, action)` is stashed (keyed by a fresh
+# reasoning_id) for an ASYNC reward — the turn-judge (B.2) or the user/Maker rating
+# (B.3) — to join + train later. The verifiable lane (`tool`/`skill_delegate`) is
+# unchanged (Phase 1 trains it directly at the oracle verdict).
+_NONVERIFIABLE_ACTIONS = frozenset({"direct", "research", "IDK"})
+
+
+def _emit_nonverifiable_decision(plugin, features, action, prompt_text, user_id):
+    """Stash a non-verifiable decision for async reward. Returns the reasoning_id
+    (the caller hands it to the client so a rating can attach) or None. Never raises
+    — must not break chat (hot path; INV-OML-7)."""
+    try:
+        import uuid
+        from titan_hcl import bus as _bus_mod
+        from titan_hcl.bus import make_msg as _mk
+        from titan_hcl.synthesis.outer_meta_policy import OUTER_ACTIONS
+        if OUTER_ACTIONS[int(action)] not in _NONVERIFIABLE_ACTIONS:
+            return None  # verifiable lane → Phase 1 handles the reward
+        _bus = getattr(plugin, "bus", None)
+        if _bus is None:
+            return None
+        try:
+            from titan_hcl.synthesis.goal_class import goal_class as _gc_fn
+            gc = _gc_fn(prompt_text or "")
+        except Exception:
+            gc = ""
+        reasoning_id = uuid.uuid4().hex
+        _bus.publish(_mk(
+            _bus_mod.SELF_LEARN_DECISION, "pre_hook", "self_learning", {
+                "parent_tool_call_tx": reasoning_id,  # generic stash key = reasoning_id
+                "features": list(features),
+                "action": int(action),
+                "goal_class": gc,
+                "turn_id": str(user_id or ""),
+            }))
+        return reasoning_id
+    except Exception as e:  # noqa: BLE001 — never break chat
+        logger.debug("[PreHook] B.1 decision emit skipped: %s", e)
+        return None
+
+
 def _p2_router_thresholds(plugin):
     """RouterThresholds with the recall floors SELF-CALIBRATED to the embedder's
     gibberish noise floor (P2). The engram/skill floors keep their static config
@@ -1179,6 +1221,7 @@ def create_pre_hook(plugin):
         # ToolBackstop carries it → verdict-time training (INV-OML-12). EXPLOIT only
         # on a live user turn (no experiments on the user — INV-OML-9).
         plugin._last_outer_decision = None
+        plugin._last_reasoning_id = None  # RFP §7.B (B.1) — set for non-verifiable turns
         if _router_active and _self_learning_enabled(plugin):
             try:
                 _readout_for_policy = locals().get("_readout")
@@ -1190,6 +1233,10 @@ def create_pre_hook(plugin):
                         _mode_override, _features, _action = _outer
                         mode = _mode_override
                         plugin._last_outer_decision = (_features, _action)
+                        # RFP §7.B (B.1) — non-verifiable lane: stash the decision
+                        # for an async reward (turn-judge / user / Maker rating).
+                        plugin._last_reasoning_id = _emit_nonverifiable_decision(
+                            plugin, _features, _action, prompt_text, user_id)
                         logger.info(
                             "[PreHook] outer-policy → %s (action=%d) — overrides "
                             "grounded_route", mode, _action)
