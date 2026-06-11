@@ -82,6 +82,7 @@ from titan_hcl.bus import (
     SELF_LEARN_REWARD,
     SYNTHESIS_FORK_COMMAND,
     TOOL_CALL_VERDICT_RECORD,
+    TURN_REASONING_RECORD,
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
@@ -3047,6 +3048,34 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         logger.debug(
                             "[synthesis_worker] self-learn reward/record emit failed: %s",
                             _sl_err)
+                continue
+
+            if msg_type == TURN_REASONING_RECORD:
+                # §7.B (C1′): a NON-verifiable turn (direct/research/IDK; no oracle)
+                # → graph a `Reasoning(kind='turn')` record under SELF → LEARNING →
+                # REASONING with reward=NULL (pending). The turn-judge (B.2) / a
+                # user-Maker rating (B.3) scores it later, keyed by reasoning_id.
+                # Single-writer (INV-Syn-19/28); deref-able thought (INV-OML-11).
+                try:
+                    if reasoning_store is not None:
+                        _rid = str(payload.get("reasoning_id", "") or "")
+                        _act_idx = payload.get("action")
+                        try:
+                            from titan_hcl.synthesis.outer_meta_policy import OUTER_ACTIONS
+                            _act = (OUTER_ACTIONS[int(_act_idx)]
+                                    if _act_idx is not None else "")
+                        except Exception:
+                            _act = ""
+                        if _rid:
+                            reasoning_store.record_turn(
+                                reasoning_id=_rid,
+                                goal_class=str(payload.get("goal_class", "") or ""),
+                                action=_act,
+                                features=list(payload.get("features") or []),
+                                signature_text=str(payload.get("prompt", "") or ""))
+                except Exception as _tr_err:
+                    logger.debug("[synthesis_worker] turn record write failed: %s",
+                                 _tr_err)
                 continue
 
             if msg_type == SELF_LEARN_MACRO_READY:

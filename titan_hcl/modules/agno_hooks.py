@@ -2517,6 +2517,33 @@ def create_post_hook(plugin):
         # 0. Identify user for social tracking
         user_id = getattr(plugin, '_current_user_id', None) or "anonymous"
 
+        # ── RFP §7.B (C1′) — non-verifiable turn record ──────────────────────
+        # The PreHook (B.1) stashed a decision + minted a reasoning_id for a
+        # direct/research/IDK turn. Now that the response exists, ship the turn to
+        # synthesis → it graphs a Reasoning(kind='turn') record (reward=NULL), which
+        # the turn-judge (B.2) / a user-Maker rating (B.3) scores later. Never raises.
+        try:
+            _rid = getattr(plugin, "_last_reasoning_id", None)
+            _dec = getattr(plugin, "_last_outer_decision", None)
+            _bus_tr = getattr(plugin, "bus", None)
+            if _rid and _dec and _bus_tr is not None:
+                from titan_hcl import bus as _bus_mod2
+                from titan_hcl.bus import make_msg as _mk2
+                from titan_hcl.synthesis.goal_class import goal_class as _gc_fn2
+                _feats_tr, _action_tr = _dec
+                _bus_tr.publish(_mk2(
+                    _bus_mod2.TURN_REASONING_RECORD, "post_hook", "synthesis", {
+                        "reasoning_id": _rid,
+                        "prompt": (user_prompt or "")[:2000],
+                        "response": (response_text or "")[:2000],
+                        "action": int(_action_tr),
+                        "goal_class": _gc_fn2(user_prompt or ""),
+                        "features": list(_feats_tr),
+                        "user_id": user_id,
+                    }))
+        except Exception as _trr_err:
+            logger.debug("[PostHook] §7.B turn record emit skipped: %s", _trr_err)
+
         # 0b. V5 Post-Hook: Emotional coherence validation (soft logging only)
         try:
             def _fetch_post_state():

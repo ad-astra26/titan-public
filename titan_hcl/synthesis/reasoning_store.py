@@ -147,6 +147,20 @@ class ReasoningStore:
             b_i=b_i, c=c, time_cost=time_cost, anchor_tx=reasoning_id,
             composed_from=None)
 
+    def record_turn(
+        self, *, reasoning_id: str, goal_class: str, action: str,
+        features: list, signature_text: str,
+    ) -> bool:
+        """§7.B (C1′) — persist a `Reasoning(kind='turn')` episode for a NON-
+        verifiable turn (direct/research/IDK). `reward` is NULL (pending) until the
+        turn-judge (B.2) or a user/Maker rating (B.3) scores it; the record is the
+        deref-able graphed thought (INV-OML-11). Idempotent on reasoning_id. Soft."""
+        return self._write_record(
+            reasoning_id=reasoning_id, kind="turn", goal_class=goal_class,
+            action=action, oracle_id="", verdict="", reward=None,
+            features=features, signature_text=signature_text,
+            b_i=1, c=0.0, time_cost=1.0, anchor_tx=reasoning_id, composed_from=None)
+
     def write_macro(
         self, *, reasoning_id: str, goal_class: str, action: str,
         signature: list, b_i: float, c: float, time_cost: float, use_count: int,
@@ -196,7 +210,8 @@ class ReasoningStore:
                     "ON CONFLICT (reasoning_id) DO NOTHING",
                     [str(reasoning_id), str(kind), str(goal_class or ""),
                      str(action or ""), str(oracle_id or ""), str(verdict or ""),
-                     float(reward), json.dumps(list(features or [])),
+                     (None if reward is None else float(reward)),  # §7.B turn = NULL (pending)
+                     json.dumps(list(features or [])),
                      int(b_i), float(c), float(time_cost), int(use_count),
                      int(emb_id), str(anchor_tx or ""), float(self._clock())])
             except Exception as e:  # noqa: BLE001
