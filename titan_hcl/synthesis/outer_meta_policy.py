@@ -122,6 +122,52 @@ OUTER_META_POLICY_STATE_SPEC = RegistrySpec(
     variable_size=False,
 )
 
+# ── MSL distilled_context[20] SHM slot (Phase C piece 2 — Q4 full MSL) ─
+# A DEDICATED fixed float32(20) slot so the agno DECIDE path reads the full
+# `distilled_context` O(1) AT decision-time. The existing `msl_state.bin`
+# (MSLStatePublisher) is a variable-size msgpack of identity/depth telemetry,
+# read via the `_v5["msl"]` overlay fetched AFTER the decision (Q4) — this slot
+# closes that timing gap with a minimal fixed-vector read.
+# Producer = cognitive_worker (additive publish; G18/G20 single-writer).
+OUTER_MSL_CONTEXT_STATE_SLOT = "outer_msl_context_state"
+OUTER_MSL_CONTEXT_STATE_SCHEMA_VERSION = 1
+OUTER_MSL_CONTEXT_STATE_SPEC = RegistrySpec(
+    name=OUTER_MSL_CONTEXT_STATE_SLOT,
+    dtype=np.dtype("float32"),
+    shape=(MSL_CONTEXT_DIM,),
+    feature_flag="",
+    schema_version=OUTER_MSL_CONTEXT_STATE_SCHEMA_VERSION,
+    variable_size=False,
+)
+
+
+def msl_context_to_fixed(ctx) -> np.ndarray:
+    """Coerce a distilled_context (list/ndarray, normally 20D) → the fixed
+    float32 `(MSL_CONTEXT_DIM,)` array the SHM slot requires — pad/trim/NaN-safe
+    so a malformed/short context never breaks the publish."""
+    arr = np.asarray(list(ctx) if ctx is not None else [], dtype=np.float32).ravel()
+    fixed = np.zeros(MSL_CONTEXT_DIM, dtype=np.float32)
+    n = min(MSL_CONTEXT_DIM, arr.shape[0])
+    if n:
+        fixed[:n] = np.nan_to_num(arr[:n], nan=0.0, posinf=0.0, neginf=0.0)
+    return fixed
+
+
+def read_msl_context(shm_root=None) -> Optional[np.ndarray]:
+    """Read the published MSL `distilled_context[20]` from SHM (O(1), G18/G20).
+    Returns a length-`MSL_CONTEXT_DIM` float32 ndarray, or None if the slot is
+    not yet published / unreadable (cold-start — caller treats as zeros)."""
+    try:
+        from titan_hcl.core.state_registry import (
+            StateRegistryReader, resolve_shm_root)
+        root = shm_root if shm_root is not None else resolve_shm_root()
+        arr = StateRegistryReader(OUTER_MSL_CONTEXT_STATE_SPEC, root).read()
+        if arr is None:
+            return None
+        return np.asarray(arr, dtype=np.float32).ravel()
+    except Exception:
+        return None
+
 
 def _clip01(v: float) -> float:
     if v != v:  # NaN guard
@@ -429,9 +475,12 @@ class OuterMetaPolicy:
 
 __all__ = (
     "OUTER_ACTIONS", "NUM_OUTER_ACTIONS", "OUTER_FEATURE_NAMES",
-    "OUTER_POLICY_INPUT_DIM", "OUTER_POLICY_FLAT_DIM",
+    "OUTER_POLICY_INPUT_DIM", "OUTER_POLICY_FLAT_DIM", "MSL_CONTEXT_DIM",
     "OUTER_META_POLICY_STATE_SLOT", "OUTER_META_POLICY_STATE_SPEC",
     "OUTER_META_POLICY_STATE_SCHEMA_VERSION",
+    "OUTER_MSL_CONTEXT_STATE_SLOT", "OUTER_MSL_CONTEXT_STATE_SPEC",
+    "OUTER_MSL_CONTEXT_STATE_SCHEMA_VERSION",
+    "msl_context_to_fixed", "read_msl_context",
     "OuterFeatures", "OuterMetaPolicy",
     "action_index_to_mode", "action_index_to_name",
 )
