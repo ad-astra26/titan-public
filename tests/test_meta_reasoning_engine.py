@@ -419,3 +419,24 @@ class TestExternalRewardRouting:
         engine._start_chain("trigger", state_132d)
         assert engine.state.chain_id > 0
         assert engine.state.is_active is True
+
+
+class TestMetaExposesReasoningCommitTelemetry:
+    """Regression (2026-06-11): MetaReasoningEngine.get_stats() must expose the
+    LOWER reasoning layer's real commit telemetry (cached each tick), not the
+    old always-0 getattr(self, '_total_commits') stub. self_reasoning Layer A
+    reads commit_rate for novelty-gap detection (rFP coding_explorer §4.1)."""
+
+    def test_get_stats_reports_cached_reasoning_commit_rate(
+            self, engine, state_132d, neuromods):
+        mock_re = MockReasoningEngine()
+        mock_re._total_chains = 100
+        mock_re._total_commits = 86
+        # Before any tick the cache is unset → 0 (not an AttributeError).
+        assert engine.get_stats()["total_commits"] == 0
+        assert engine.get_stats()["commit_rate"] == 0.0
+        # tick() caches the reasoning engine's lifetime commit telemetry.
+        engine.tick(state_132d, neuromods, mock_re, None, None, None, None)
+        stats = engine.get_stats()
+        assert stats["total_commits"] == 86
+        assert stats["commit_rate"] == 0.86  # 86/100 — the REAL reasoning rate

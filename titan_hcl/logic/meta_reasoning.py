@@ -1164,6 +1164,11 @@ class MetaReasoningEngine:
 
         # Stats
         self._total_meta_chains = 0
+        # Lower reasoning-layer lifetime commit telemetry, cached each tick (the
+        # counter lives on reasoning_engine, not here) so get_stats() can expose
+        # it for self_reasoning Layer A novelty-gap detection.
+        self._last_reasoning_commits = 0
+        self._last_reasoning_chains = 0
         self._total_meta_steps = 0
         self._total_wisdom_saved = 0
         self._total_eurekas = 0
@@ -1319,6 +1324,14 @@ class MetaReasoningEngine:
     def tick(self, state_132d, neuromods, reasoning_engine,
              chain_archive, meta_wisdom, exp_orchestrator, meta_autoencoder) -> dict:
         """One meta-reasoning step per epoch."""
+        # Cache the lower reasoning layer's lifetime commit telemetry — the
+        # counter lives on reasoning_engine, and tick() is where we hold the
+        # reference. get_stats() exposes it (was always 0 via getattr(self,…)).
+        if reasoning_engine is not None:
+            self._last_reasoning_commits = int(
+                getattr(reasoning_engine, "_total_commits", 0) or 0)
+            self._last_reasoning_chains = int(
+                getattr(reasoning_engine, "_total_chains", 0) or 0)
 
         sv = list(state_132d) if state_132d else []
         if len(sv) < 132:
@@ -2121,18 +2134,15 @@ class MetaReasoningEngine:
             "total_eurekas": self._total_eurekas,
             # commit telemetry — additively exposed for self_reasoning Layer A
             # novelty-gap detection (rFP_coding_explorer_activation.md §4.1)
-            # 2026-04-21 hotfix: the reasoning commit counter lives on
-            # reasoning_engine (renamed _total_conclusions → _total_commits
-            # 2026-06-11), not on MetaReasoningEngine. getattr fallback keeps
-            # get_stats() from AttributeError-ing (which once returned {} every
-            # tick → META CHAINS/WISDOM all 0; 1310 errors on T1).
-            # ⚠ KNOWN-STILL-STUBBED: `self` has no _total_commits, so these two
-            # meta fields read 0. Proper fix = wire reasoning_engine._total_commits
-            # through to here (separate from the reasoning readout fix). Follow-up.
-            "total_commits": getattr(self, "_total_commits", 0),
-            "commit_rate": (
-                getattr(self, "_total_commits", 0) / self._total_meta_chains
-                if self._total_meta_chains > 0 else 0.0),
+            # Lower reasoning-layer commit telemetry (the counter lives on
+            # reasoning_engine, the layer meta delegates to), cached each tick
+            # — see tick(). self_reasoning Layer A reads this for novelty-gap
+            # detection (rFP coding_explorer §4.1). The 2026-04-21 hotfix read
+            # getattr(self, …) → always 0; properly wired 2026-06-11.
+            "total_commits": self._last_reasoning_commits,
+            "commit_rate": round(
+                self._last_reasoning_commits
+                / max(1, self._last_reasoning_chains), 4),
             "baseline_confidence": round(self._baseline_confidence, 4),
             "buffer_size": self.buffer.size(),
             "policy_updates": self.meta_policy.total_updates,
