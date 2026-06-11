@@ -288,20 +288,6 @@ SELF_LEARN_MACRO_READY = "SELF_LEARN_MACRO_READY"
 # so its reward flows back through the normal join (exploration never on a live
 # user turn — INV-OML-9). Payload: {goal_class, prompt_hint, ts}.
 SELF_LEARN_EXPLORE_REQUEST = "SELF_LEARN_EXPLORE_REQUEST"
-# ── Phase B (§7.B, C1′) — the NON-verifiable lane. agno PostHook → synthesis_worker
-# AFTER the response is generated (a direct/research/IDK turn has no oracle). The
-# synthesis single-writer graphs a `Reasoning(kind='turn')` record under SELF →
-# LEARNING → REASONING with reward=NULL (pending); the turn-judge (B.2) / a user-
-# Maker rating (B.3) scores it later, keyed by the same reasoning_id. Payload:
-# {reasoning_id, prompt, response, action (int index), goal_class, features (float
-# list), lane, user_id, ts}.
-TURN_REASONING_RECORD = "TURN_REASONING_RECORD"
-# §7.B (B.3) — the feedback endpoint → synthesis_worker, MAKER ONLY. A Maker rating
-# of a non-verifiable turn is graphed as a `MakerAssessment` node under `Self`
-# (SELF_HAS_MAKER_ASSESSMENT) — the searchable Maker↔Titan bond (ordinary-user
-# feedback is reward-only, NOT graphed). The reward itself rides SELF_LEARN_REWARD
-# (source: maker|user). Payload: {reasoning_id, score, scale, reward, turn_summary, ts}.
-MAKER_ASSESSMENT_RECORD = "MAKER_ASSESSMENT_RECORD"
 
 # Phase 2 standing-contract event (PLAN_synthesis_engine_Phase2.md 2B,
 # D-P2-4): emitted by the post-seal contract hook in

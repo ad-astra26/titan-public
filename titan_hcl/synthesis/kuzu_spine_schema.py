@@ -118,16 +118,6 @@ _NODE_TABLES: tuple[tuple[str, str], ...] = (
         "oracle_id STRING, verdict STRING, anchor_tx STRING, created_at DOUBLE, "
         "PRIMARY KEY(reasoning_id)",
     ),
-    (
-        # MakerAssessment — §7.B (B.3). The Maker↔Titan bond: a Maker rating of a
-        # non-verifiable turn, graphed under Self (SELF_HAS_MAKER_ASSESSMENT) so
-        # Titan can later discern Maker feedback from anyone else (ordinary-user
-        # feedback is reward-only — NOT graphed). Scalars live alongside in the
-        # DuckDB maker_assessments table keyed by reasoning_id.
-        "MakerAssessment",
-        "reasoning_id STRING, score DOUBLE, scale STRING, reward DOUBLE, "
-        "turn_summary STRING, created_at DOUBLE, PRIMARY KEY(reasoning_id)",
-    ),
 )
 
 # Canonical id for the per-graph Self singleton (one Kuzu graph = one Titan).
@@ -153,8 +143,6 @@ _REL_TABLES: tuple[tuple[str, str, str], ...] = (
     ("SELF_HAS_LEARNING", "Self", "Learning"),
     ("LEARNING_HAS_REASONING", "Learning", "Reasoning"),
     ("REASONING_COMPOSED_FROM", "Reasoning", "Reasoning"),  # macro ← its leaf records
-    # §7.B (B.3) — the Maker↔Titan bond: Maker ratings graphed under Self.
-    ("SELF_HAS_MAKER_ASSESSMENT", "Self", "MakerAssessment"),
 )
 
 # The 4 rel tables that reference the spine node (Concept→Engram migration must

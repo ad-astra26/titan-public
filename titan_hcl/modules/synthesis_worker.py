@@ -82,8 +82,6 @@ from titan_hcl.bus import (
     SELF_LEARN_REWARD,
     SYNTHESIS_FORK_COMMAND,
     TOOL_CALL_VERDICT_RECORD,
-    TURN_REASONING_RECORD,
-    MAKER_ASSESSMENT_RECORD,
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
@@ -714,58 +712,6 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                     summary.get("promoted", 0), load)
         except Exception as e:
             logger.debug("[synthesis_worker] skill-score drain tick failed: %s", e)
-        stop_event.wait(interval_s)
-
-
-def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
-                     stop_event: threading.Event, interval_s: float,
-                     per_pass_cap: int = 20) -> None:
-    """§7.B (B.2) — the metered turn-judge daemon. Drains the bounded queue of
-    recent NON-verifiable turns (FRESH prompt/response held there by the
-    TURN_REASONING_RECORD handler), scores each via the LLM `TurnJudge` (capped per
-    pass = the 'metered' trustButVerify tier), and emits
-    `SELF_LEARN_REWARD{source:llm_judge}` → the self_learning worker joins it to the
-    stashed decision + trains. OFF the recv loop (LLM is network I/O on its own
-    thread → no GIL/heartbeat starvation; INV-OML-12 continuous, NOT dream-gated).
-    Late user/Maker feedback supersedes via the self_learning corrective-delta. Soft."""
-    from titan_hcl.bus import SELF_LEARN_REWARD
-    stop_event.wait(min(interval_s, 25.0))   # settle; offset from the recompute pass
-    while not stop_event.is_set():
-        scored = 0
-        try:
-            # No cpu_load gate (the B1 lesson — gating at load>X STARVED the skill
-            # drain on the steadily-busy 2-Titan box). The judge call is NETWORK-
-            # bound (Ollama Cloud), releases the GIL, and is bounded to per_pass_cap
-            # LLM calls per interval — that cap + the interval ARE the resource
-            # discipline (the metered tier), so it never starves on a busy box.
-            for _ in range(int(per_pass_cap)):
-                if stop_event.is_set():
-                    break
-                try:
-                    item = turn_queue.popleft()
-                except IndexError:
-                    break
-                try:
-                    out = judge.score(
-                        prompt=item.get("prompt", ""),
-                        action=item.get("action", "direct"),
-                        response=item.get("response", ""))
-                except Exception:  # noqa: BLE001
-                    out = None
-                if out is None:
-                    continue  # LLM miss → the turn simply stays untrained
-                _send(send_queue, SELF_LEARN_REWARD, name, "self_learning", {
-                    "parent_tool_call_tx": item.get("reasoning_id", ""),
-                    "reward": float(out["reward"]),
-                    "goal_class": item.get("goal_class", ""),
-                    "source": "llm_judge",
-                })
-                scored += 1
-            if scored:
-                logger.info("[synthesis_worker] §7.B turn-judge scored %d "
-                            "(queue=%d)", scored, len(turn_queue))
-        except Exception as e:  # noqa: BLE001
-            logger.debug("[synthesis_worker] turn-judge pass failed: %s", e)
         stop_event.wait(interval_s)
 
 
@@ -2281,41 +2227,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         logger.warning("[synthesis_worker] ReasoningStore wiring failed (graphed records "
                        "off; reward loop unaffected): %s", _rs_err)
 
-    # ── §7.B (B.2) — the turn-judge daemon: reward NON-verifiable turns. The
-    # TURN_REASONING_RECORD handler pushes FRESH (reasoning_id, prompt, response,
-    # action, goal_class) into this bounded queue; the daemon scores them via the
-    # LLM TurnJudge (capped per pass = metered) → SELF_LEARN_REWARD{source:llm_judge}.
-    # No durable raw-text storage. Idle (zero LLM) where the self_learning flag is
-    # off elsewhere — no turns are emitted there, so the queue stays empty.
-    import collections as _collections
-    turn_judge_queue = _collections.deque(maxlen=512)  # bounded — drops oldest if flooded
-    _turn_judge = None
-    try:
-        _tj_provider = locals().get("provider")
-        if _tj_provider is not None:
-            import asyncio as _tj_asyncio
-
-            from titan_hcl.synthesis.turn_judge import TurnJudge
-
-            def _turn_judge_llm(prompt, timeout_s, _p=_tj_provider):
-                return _tj_asyncio.run(_p.complete(
-                    prompt=prompt,
-                    system="You are a strict, fair judge. Output only JSON.",
-                    temperature=0.2, max_tokens=200, timeout=float(timeout_s))) or ""
-
-            _tj_model = (inference_cfg.get("ollama_cloud_model", "") or "ollama_cloud")
-            _turn_judge = TurnJudge(llm_provider=_turn_judge_llm, model_id=str(_tj_model))
-    except Exception as _tj_err:  # noqa: BLE001
-        _turn_judge = None
-        logger.warning("[synthesis_worker] TurnJudge wiring failed (B.2 off): %s", _tj_err)
-    if _turn_judge is not None:
-        threading.Thread(
-            target=_turn_judge_loop,
-            args=(turn_judge_queue, _turn_judge, send_queue, name, stop_event,
-                  interval_s),
-            daemon=True, name=f"synthesis-turn-judge-{name}").start()
-        logger.info("[synthesis_worker] §7.B TurnJudge daemon started (B.2)")
-
     # EEL B1 (D-SPEC-153 / INV-Syn-29) — wire the OracleRouter's skill-score
     # capture to the store. At each companion-batch flush, every canonical
     # verdict naming its (goal, tool) is forwarded here → derive (outcome,
@@ -3136,61 +3047,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         logger.debug(
                             "[synthesis_worker] self-learn reward/record emit failed: %s",
                             _sl_err)
-                continue
-
-            if msg_type == TURN_REASONING_RECORD:
-                # §7.B (C1′ + B.2): a NON-verifiable turn (direct/research/IDK; no
-                # oracle). (1) graph a Reasoning(kind='turn') record (reward=NULL,
-                # a deref-able thought — INV-OML-11); (2) enqueue the FRESH (prompt,
-                # response) for the turn-judge daemon (B.2) → SELF_LEARN_REWARD,
-                # scored off the recv loop. Single-writer (INV-Syn-19/28).
-                try:
-                    _rid = str(payload.get("reasoning_id", "") or "")
-                    _act_idx = payload.get("action")
-                    try:
-                        from titan_hcl.synthesis.outer_meta_policy import OUTER_ACTIONS
-                        _act = (OUTER_ACTIONS[int(_act_idx)]
-                                if _act_idx is not None else "")
-                    except Exception:
-                        _act = ""
-                    if _rid and reasoning_store is not None:
-                        reasoning_store.record_turn(
-                            reasoning_id=_rid,
-                            goal_class=str(payload.get("goal_class", "") or ""),
-                            action=_act,
-                            features=list(payload.get("features") or []),
-                            signature_text=str(payload.get("prompt", "") or ""))
-                    if _rid:
-                        turn_judge_queue.append({
-                            "reasoning_id": _rid,
-                            "prompt": str(payload.get("prompt", "") or ""),
-                            "response": str(payload.get("response", "") or ""),
-                            "action": _act or "direct",
-                            "goal_class": str(payload.get("goal_class", "") or ""),
-                        })
-                except Exception as _tr_err:
-                    logger.debug("[synthesis_worker] turn record/judge-enqueue "
-                                 "failed: %s", _tr_err)
-                continue
-
-            if msg_type == MAKER_ASSESSMENT_RECORD:
-                # §7.B (B.3): a MAKER rating → graph a MakerAssessment bond record
-                # under SELF (SELF_HAS_MAKER_ASSESSMENT) + DuckDB scalars, via the
-                # single writer. The reward itself already rode SELF_LEARN_REWARD to
-                # self_learning (with the maker weight). Maker-only (endpoint-gated).
-                try:
-                    if reasoning_store is not None:
-                        _mrid = str(payload.get("reasoning_id", "") or "")
-                        if _mrid:
-                            reasoning_store.record_maker_assessment(
-                                reasoning_id=_mrid,
-                                score=float(payload.get("score", 0.0) or 0.0),
-                                scale=str(payload.get("scale", "") or ""),
-                                reward=float(payload.get("reward", 0.0) or 0.0),
-                                turn_summary=str(payload.get("turn_summary", "") or ""))
-                except Exception as _ma_err:
-                    logger.debug("[synthesis_worker] maker_assessment write failed: %s",
-                                 _ma_err)
                 continue
 
             if msg_type == SELF_LEARN_MACRO_READY:

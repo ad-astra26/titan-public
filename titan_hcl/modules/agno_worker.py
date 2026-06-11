@@ -688,12 +688,6 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
     # the extra latency. None on ordinary turns. Pop so it never leaks forward.
     tool_activity = getattr(worker_plugin, "_last_tool_activity", None)
     worker_plugin._last_tool_activity = None
-    # §7.B (B.4) — the reasoning_id of a NON-verifiable turn (direct/research/IDK;
-    # None otherwise). The client returns it to POST /v6/synthesis/turn_feedback so
-    # a user/Maker rating attaches to THIS turn's stashed decision. Pop so it never
-    # leaks forward to the next turn.
-    reasoning_id = getattr(worker_plugin, "_last_reasoning_id", None)
-    worker_plugin._last_reasoning_id = None
 
     response_payload = {
         "request_id": request_id,
@@ -705,7 +699,6 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         "state_snapshot": None,
         "ovg_data": ovg_data,
         "tool_activity": tool_activity,
-        "reasoning_id": reasoning_id,
         "error": error_str,
         "ts": time.time(),
     }
@@ -817,16 +810,6 @@ async def _handle_chat_stream_request(msg: dict, agent, worker_plugin,
         worker_plugin._current_user_id = user_id
         worker_plugin._pre_chat_user_id = user_id
 
-        # ── §7.B (B.4) — live progress: stash the emit-context so OUR PreHook (which
-        # runs live inside arun) can stream the decided phase, and emit "thinking"
-        # now. Safe metadata only (not OVG-gated); the verified content still flows
-        # post-OVG below (D-SPEC-78 truth-gate untouched).
-        from titan_hcl.modules.agno_hooks import _emit_stream_progress
-        worker_plugin._stream_progress_ctx = {
-            "send_queue": send_queue, "src": src, "rid": rid,
-            "name": name, "request_id": request_id}
-        _emit_stream_progress(worker_plugin, "thinking")
-
         # ── 1. Run agent to completion (Pre+LLM+Post-with-OVG) ──
         # ζ.5 per-tier model routing (D-SPEC-79) — see _route_model_for_tier
         async with _route_model_for_tier(agent, worker_plugin, message_text):
@@ -852,9 +835,6 @@ async def _handle_chat_stream_request(msg: dict, agent, worker_plugin,
             _od = getattr(ovg_result, "ovg_data", None)
             if isinstance(_od, dict) and _od:
                 ovg_data = _od
-
-        # ── §7.B (B.4) — the turn is verified; Titan is now writing the reply. ──
-        _emit_stream_progress(worker_plugin, "writing-reply")
 
         # ── 3. Segment the verified response for progressive UX ──
         segments = _segment_for_stream(response_text)
@@ -890,7 +870,6 @@ async def _handle_chat_stream_request(msg: dict, agent, worker_plugin,
         }, rid=rid)
     finally:
         stats_ref["in_flight"] = max(0, stats_ref.get("in_flight", 0) - 1)
-        worker_plugin._stream_progress_ctx = None  # §7.B (B.4) — never leak forward
 
 
 def _segment_for_stream(text: str, target_len: int = 200) -> list[str]:
