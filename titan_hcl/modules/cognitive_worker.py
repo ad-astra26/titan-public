@@ -3762,20 +3762,31 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                 except Exception:
                     pass
 
-            # observables source: prefer coordinator.observable_engine if available
+            # Observables source — the live 30D inner/outer-trinity observables
+            # the coordinator recomputes EVERY tick (observe_all →
+            # inner.update_observables; inner_coordinator.py:159,163) and stores
+            # on coordinator.inner.observables, keyed by the 6 body parts each
+            # carrying {coherence,magnitude,velocity,direction,polarity} —
+            # exactly the tier1 layout _build_tier1 consumes.
+            #
+            # 2026-06-11 — closes BUG-REASONING-TIER1-OBSERVABLES-STARVED. The
+            # Phase C NNS-loop migration read observables via
+            # `coordinator.observable_engine.get_observables()`, but the
+            # coordinator stores the engine as `.observables` (NOT
+            # `.observable_engine`) AND ObservableEngine exposes no
+            # get_observables/snapshot method — so _nn_obs was ALWAYS {} →
+            # tier1 (observation[:30]) all-zeros → COMPARE (inner[:15] vs
+            # outer[15:30]) never `significant` → the +0.1 confidence boost
+            # never fired → reasoning never crossed the 0.6 commit threshold
+            # (commit_rate=0 fleet-wide / 231k conclusions, 0 commits). Read the
+            # live dict the coordinator already maintains.
             _nn_obs: dict = {}
-            obs_eng = getattr(coordinator, "observable_engine", None) if (
+            _inner_ref = getattr(coordinator, "inner", None) if (
                 coordinator is not None) else None
-            if obs_eng is not None:
-                try:
-                    get_obs = getattr(obs_eng, "get_observables", None) or getattr(
-                        obs_eng, "snapshot", None)
-                    if callable(get_obs):
-                        _maybe_obs = get_obs()
-                        if isinstance(_maybe_obs, dict):
-                            _nn_obs = _maybe_obs
-                except Exception:
-                    pass
+            if _inner_ref is not None:
+                _maybe_obs = getattr(_inner_ref, "observables", None)
+                if isinstance(_maybe_obs, dict) and _maybe_obs:
+                    _nn_obs = _maybe_obs
 
             update_obs_fn = getattr(neural_nervous_system, "update_observation_space", None)
             if callable(update_obs_fn):
