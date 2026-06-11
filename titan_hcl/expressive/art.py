@@ -67,11 +67,17 @@ class ProceduralArtGen:
         warp_x = 0.6 + (int(_sh[16:24], 16) % 1000) / 1000.0 * 1.3  # 0.6..1.9× x-frequency
         warp_y = 0.6 + (int(_sh[24:32], 16) % 1000) / 1000.0 * 1.3  # 0.6..1.9× y-frequency
         hue_rotation = float(int(_sh[32:40], 16) % 360)             # palette spread (neutral days)
-        n_vortices = 2 + (int(_sh[40:48], 16) % 4)                  # 2..5 swirl centers
+        # Seed-driven DOMAIN WARP — displaces the (x,y) lattice with a turbulent
+        # field BEFORE the flow, so the base pattern is no longer a regular grid
+        # (this is what turns a low-arousal day from square spirals into organic
+        # forms; without it the sin·cos base stays grid-shaped regardless of seed).
+        warp_amp = 18.0 + (int(_sh[48:56], 16) % 1000) / 1000.0 * 40.0     # 18..58 px
+        warp_freq = 0.004 + (int(_sh[56:64], 16) % 1000) / 1000.0 * 0.014  # 0.004..0.018
+        n_vortices = 3 + (int(_sh[40:48], 16) % 5)                  # 3..7 swirl centers
         vortices = [
             (random.uniform(0, width), random.uniform(0, height),
              1.0 if random.random() < 0.5 else -1.0,                # spin direction
-             random.uniform(0.6, 1.6))                              # swirl strength
+             random.uniform(1.3, 2.8))                              # swirl strength (dominant)
             for _ in range(n_vortices)
         ]
 
@@ -119,17 +125,21 @@ class ProceduralArtGen:
             y = random.randint(0, height)
 
             for _ in range(steps):
+                # domain warp first — bend the lattice so the base flow is organic,
+                # not a square grid (seed-driven turbulent coordinate displacement).
+                wx = x + warp_amp * math.sin(y * warp_freq + field_rot)
+                wy = y + warp_amp * math.cos(x * warp_freq + seed_val)
                 angle = (
-                    math.sin(x * freq * warp_x + seed_val)
-                    * math.cos(y * freq * warp_y + seed_val)
+                    math.sin(wx * freq * warp_x + seed_val)
+                    * math.cos(wy * freq * warp_y + seed_val)
                     * math.pi * 2 * turb_amp
                 ) + field_rot
-                # seed-placed swirl vortices warp the base field into a unique
-                # composition per entry (localized, distance-decaying influence).
+                # seed-placed swirl vortices (dominant strength, wide radius) warp
+                # the base field into a unique composition per entry.
                 for cx, cy, spin, vstr in vortices:
                     dx, dy = x - cx, y - cy
                     angle += spin * vstr * math.atan2(dy, dx) * (
-                        9000.0 / (dx * dx + dy * dy + 9000.0))
+                        24000.0 / (dx * dx + dy * dy + 24000.0))
                 if order < 1.0:    # coherence < 1 → fragment the flow (felt path)
                     angle += random.uniform(-1.0, 1.0) * (1.0 - order) * math.pi
                 x_next = x + math.cos(angle) * step_len
