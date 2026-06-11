@@ -28,7 +28,76 @@ def _read_token() -> str | None:
     return None
 
 
+def _pair_cli(argv: list) -> int:
+    """`python -m titan_console pair` — headless operator pairing (no browser).
+
+    Mints a QR pairing session, prints the payload to paste into the phone's
+    "Paste pairing code" dialog, waits for the phone to submit, then confirms the
+    mutual code-match. Pure-stdlib; calls the pairing functions directly (no HTTP).
+    """
+    import json as _json
+    import time as _time
+
+    from . import pairing
+    from .context import Context, resolve_titan_id
+
+    ap = argparse.ArgumentParser(prog="titan_console pair",
+                                 description="Pair a phone with this Titan (headless).")
+    ap.add_argument("--install-root", default=str(Path(__file__).resolve().parents[1]))
+    ap.add_argument("--titan-id", default=None)
+    ap.add_argument("--public-url", default=None,
+                    help="Endpoint URL to embed in the QR (e.g. the Tailscale URL). "
+                         "Omit for a localhost/emulator test.")
+    ap.add_argument("--ttl", type=int, default=300, help="Seconds the code stays valid.")
+    args = ap.parse_args(argv)
+
+    install_root = Path(args.install_root).resolve()
+    titan_id = args.titan_id or resolve_titan_id(install_root)
+    ctx = Context(install_root=install_root, titan_id=titan_id)
+
+    status, payload = pairing.mint_pairing(ctx, ttl=args.ttl, public_url=args.public_url)
+    if status != 200:
+        print(f"[pair] mint failed: {payload}", file=sys.stderr)
+        return 1
+    token = payload["pairing_token"]
+    print("\n── Pair your phone ─────────────────────────────────────────")
+    print("On the phone: Titan → “Paste pairing code”, then paste EXACTLY:\n")
+    print(_json.dumps(payload))
+    try:
+        import qrcode  # optional: a scannable QR if the operator has it installed
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(_json.dumps(payload))
+        qr.print_ascii(invert=True)
+    except Exception:
+        print("\n(install `qrcode` for a scannable QR; paste works without it)")
+
+    print(f"\nWaiting up to {args.ttl}s for the phone to submit…", flush=True)
+    deadline = _time.time() + args.ttl
+    while _time.time() < deadline:
+        _, st = pairing.pair_status(ctx, token)
+        if st.get("state") == "submitted":
+            phone_code = st.get("code6", "")
+            print(f"\nPhone submitted. Console computed code: {phone_code}")
+            entered = input("Type the 6-digit code shown ON YOUR PHONE to confirm: ").strip()
+            cstatus, cres = pairing.confirm_device(ctx, token, entered)
+            if cstatus == 200:
+                print(f"✓ Paired “{cres.get('label', 'phone')}”. The phone can now talk to your Titan.")
+                return 0
+            print(f"✗ Confirm failed: {cres.get('error', cstatus)}", file=sys.stderr)
+            return 1
+        if st.get("state") == "expired":
+            print("✗ Pairing expired before the phone submitted.", file=sys.stderr)
+            return 1
+        _time.sleep(2)
+    print("✗ Timed out waiting for the phone.", file=sys.stderr)
+    return 1
+
+
 def main(argv: list | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
+    if raw and raw[0] == "pair":
+        return _pair_cli(raw[1:])
+
     repo_root = Path(__file__).resolve().parents[1]
     ap = argparse.ArgumentParser(prog="titan_console",
                                  description="Titan Command Center — Console Agent")

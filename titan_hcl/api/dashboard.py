@@ -12394,5 +12394,4 @@ from titan_hcl.api.synthesis_metrics_handlers import (
     get_v6_synthesis_metrics_retrieval,
     get_v6_synthesis_metrics_chain_growth,
     post_v6_synthesis_feedback,
-    post_v6_synthesis_turn_feedback,
 )

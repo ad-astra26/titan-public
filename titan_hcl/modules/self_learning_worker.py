@@ -71,15 +71,7 @@ _DEFAULTS = {
     "explore_replay_batch": 16,        # experience-replay batch size
     "explore_request_enabled": False,  # active idle problem-gen (Phase 2 consumer)
     "macro_min_wins": 5,               # verified wins of one (goal_class,action) → distil
-    # ── Phase B (§7.B) — non-verifiable reward source weights (the "bigger delta
-    #    for Maker" mechanic). reward × weight → bigger advantage → bigger nudge.
-    "judge_reward_weight": 1.0,        # LLM turn-judge (metered tier)
-    "user_reward_weight": 1.0,         # ordinary user rating (reward-only nudge)
-    "maker_reward_weight": 2.0,        # Maker rating — more authority over his own Titan
 }
-# Reward-source authority rank (Phase B corrective-delta): a higher-rank source
-# may correct a lower-rank applied reward; same-or-lower is ignored (no double-train).
-_REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2}
 _SURVIVAL_STATES = frozenset({"SURVIVAL", "STARVATION"})
 
 
@@ -97,17 +89,7 @@ class _SelfLearningStore:
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS pending_decisions ("
             " parent_tool_call_tx VARCHAR PRIMARY KEY, features_json VARCHAR,"
-            " action INTEGER, goal_class VARCHAR, turn_id VARCHAR, ts DOUBLE,"
-            " applied_reward DOUBLE, applied_source VARCHAR)")
-        # Back-compat: existing fleet dbs (created pre-§7.B) lack the corrective-
-        # delta columns — add them idempotently so a deployed worker self-migrates.
-        for _col, _ty in (("applied_reward", "DOUBLE"), ("applied_source", "VARCHAR")):
-            try:
-                self._conn.execute(
-                    f"ALTER TABLE pending_decisions ADD COLUMN IF NOT EXISTS "
-                    f"{_col} {_ty}")
-            except Exception as e:  # noqa: BLE001
-                logger.debug("[self_learning] pending_decisions ALTER %s: %s", _col, e)
+            " action INTEGER, goal_class VARCHAR, turn_id VARCHAR, ts DOUBLE)")
         self._conn.execute(
             "CREATE SEQUENCE IF NOT EXISTS seq_reward_tuples START 1")
         self._conn.execute(
@@ -160,37 +142,11 @@ class _SelfLearningStore:
                 "action, goal_class, turn_id, ts) VALUES (?,?,?,?,?,?) "
                 "ON CONFLICT (parent_tool_call_tx) DO UPDATE SET "
                 "features_json=excluded.features_json, action=excluded.action, "
-                "goal_class=excluded.goal_class, turn_id=excluded.turn_id, ts=excluded.ts, "
-                "applied_reward=NULL, applied_source=NULL",
+                "goal_class=excluded.goal_class, turn_id=excluded.turn_id, ts=excluded.ts",
                 [str(tx), json.dumps(list(features)), int(action),
                  str(goal_class or ""), str(turn_id or ""), time.time()])
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] stash_decision soft-fail: %s", e)
-
-    # -- Phase B (§7.B): peek (no delete) + mark, so a 2nd higher-authority reward
-    #    (user/Maker after the judge) can apply a corrective delta vs the prior.
-    def peek_decision(self, tx):
-        try:
-            row = self._conn.execute(
-                "SELECT features_json, action, goal_class, applied_reward, applied_source "
-                "FROM pending_decisions WHERE parent_tool_call_tx=?", [str(tx)]).fetchone()
-            if not row:
-                return None
-            return (json.loads(row[0]), int(row[1]), str(row[2] or ""),
-                    (None if row[3] is None else float(row[3])),
-                    (None if row[4] is None else str(row[4])))
-        except Exception as e:  # noqa: BLE001
-            logger.debug("[self_learning] peek_decision soft-fail: %s", e)
-            return None
-
-    def mark_rewarded(self, tx, applied_reward, applied_source) -> None:
-        try:
-            self._conn.execute(
-                "UPDATE pending_decisions SET applied_reward=?, applied_source=?, ts=? "
-                "WHERE parent_tool_call_tx=?",
-                [float(applied_reward), str(applied_source), time.time(), str(tx)])
-        except Exception as e:  # noqa: BLE001
-            logger.debug("[self_learning] mark_rewarded soft-fail: %s", e)
 
     def pop_decision(self, tx):
         try:
@@ -499,68 +455,45 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
 
 
 def _handle_reward(payload, store, policy, shm_writer, cfg, send_queue, name) -> bool:
-    """One policy update from a verdict-time OR genuinely-async reward.
+    """One policy update from a verdict-time reward.
 
     v1.1 (Phase 1, INV-OML-12): the synthesis-side C1 capture emits
-    `(features, action, reward, goal_class)` DIRECTLY at verdict-time (verifiable
-    tool lane) — decision and outcome travel together, no join.
-
-    Phase B (§7.B): non-verifiable turns reward LATER (LLM turn-judge / user /
-    Maker), keyed on `tx`(=reasoning_id) → join the stashed decision. The reward
-    is scaled by its SOURCE WEIGHT (Maker > user → bigger delta), and a higher-
-    authority second reward (user/Maker after the judge) applies a CORRECTIVE
-    DELTA over the prior — a refinement of the same turn, never a double-train."""
+    `(features, action, reward, goal_class)` DIRECTLY at verdict-time — decision
+    and outcome travel together (the per-use Reasoning record carries both), so
+    there is NO cross-process async-join. The legacy stash/join path is kept,
+    dormant, for Phase-2 genuinely-async rewards (LLM-judge / user feedback)."""
     features = payload.get("features")
     action = payload.get("action")
     goal_class = str(payload.get("goal_class", "") or "")
-    source = str(payload.get("source", "") or "")
-    record_tuple = True
-    macro_reward = 0.0
     if features is not None and action is not None:
-        # v1.1 direct path — verifiable lane, decision + outcome together.
+        # v1.1 direct path — decision + outcome together.
         if len(features) != OUTER_POLICY_INPUT_DIM:
             return False
         action = int(action)
-        train_reward = float(payload.get("reward", 0.0))
-        macro_reward = train_reward
+        reward = float(payload.get("reward", 0.0))
     else:
-        # Phase B async path — join a stashed decision by reasoning_id (tx).
+        # Phase-2 (parked) — async reward joins a stashed decision by tx.
         tx = payload.get("parent_tool_call_tx")
         if not tx:
             return False
-        decision = store.peek_decision(tx)
+        decision = store.pop_decision(tx)
         if decision is None:
             return False  # no matching decision (pruned / not ours) — not an error
-        features, action, goal_class, applied_reward, applied_source = decision
+        features, action, goal_class = decision
         if len(features) != OUTER_POLICY_INPUT_DIM:
             return False
-        src = source or "llm_judge"
-        effective = float(payload.get("reward", 0.0)) * float(
-            cfg.get(f"{src}_reward_weight", 1.0))
-        if applied_source is None:
-            train_reward = effective                 # first reward for this turn
-            macro_reward = effective
-        elif (_REWARD_SOURCE_RANK.get(src, 0)
-              > _REWARD_SOURCE_RANK.get(applied_source, 0)):
-            train_reward = effective - float(applied_reward or 0.0)  # higher-auth correction
-            record_tuple = False                     # refine the policy, not a new sample
-        else:
-            return False                             # same-or-lower authority → ignore
-        store.mark_rewarded(tx, effective, src)
-    policy.learn(features, action, train_reward,
-                 baseline_alpha=float(cfg["baseline_alpha"]))
+        reward = float(payload.get("reward", 0.0))
+    policy.learn(features, action, reward, baseline_alpha=float(cfg["baseline_alpha"]))
     store.save_policy_flat(policy.to_flat().tolist(),
                            policy.total_updates, policy.reward_baseline)
     _publish_weights(shm_writer, policy)
-    if record_tuple:
-        store.record_reward_tuple(features=features, action=action,
-                                  reward=train_reward, goal_class=goal_class)
-    logger.info("[self_learning] trained: action=%s reward=%+.2f src=%s goal=%s "
+    store.record_reward_tuple(features=features, action=action, reward=reward,
+                              goal_class=goal_class)
+    logger.info("[self_learning] trained: action=%s reward=%+.0f goal=%s "
                 "updates=%d baseline=%.3f", action_index_to_name(action),
-                train_reward, source or "direct", goal_class or "-",
-                policy.total_updates, policy.reward_baseline)
+                reward, goal_class or "-", policy.total_updates, policy.reward_baseline)
     # Macro distillation (S1) — a (goal_class, action) with enough verified wins.
-    if macro_reward > 0 and goal_class:
+    if reward > 0 and goal_class:
         _maybe_distill_macro(goal_class, action, store, cfg, send_queue, name)
     return True
 

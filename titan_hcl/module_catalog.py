@@ -1264,11 +1264,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # RFP_synthesis_self_learning_meta_reasoning v1.1 (S2) — the self_learning
             # worker's distilled macro-strategy → write the Reasoning node under Self.
             _bus_constants.SELF_LEARN_MACRO_READY,
-            # §7.B (C1′) — agno PostHook's non-verifiable turn (direct/research/IDK)
-            # → graph a Reasoning(kind='turn') record (reward=NULL, judged later).
-            _bus_constants.TURN_REASONING_RECORD,
-            # §7.B (B.3) — a Maker rating → graph a MakerAssessment bond node under Self.
-            _bus_constants.MAKER_ASSESSMENT_RECORD,
             # Operator-closure telemetry (2026-06-01): recall latency + chi from
             # agno/cognitive (their own evaluator/ring) → synthesis §18 metrics
             # so retrieval.samples + chi reflect the real cross-process loop.

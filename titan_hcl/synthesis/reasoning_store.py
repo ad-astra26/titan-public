@@ -82,17 +82,6 @@ class ReasoningStore:
                 "  anchor_tx     TEXT,"
                 "  created_at    DOUBLE  NOT NULL"
                 ")")
-            # §7.B (B.3) — the Maker↔Titan bond scalars (the MakerAssessment Kuzu
-            # node carries the graph identity; the rating scalars live here). PK-only.
-            self._db.execute(
-                "CREATE TABLE IF NOT EXISTS maker_assessments ("
-                "  reasoning_id TEXT PRIMARY KEY,"
-                "  score        DOUBLE,"
-                "  scale        TEXT,"
-                "  reward       DOUBLE,"
-                "  turn_summary TEXT,"
-                "  created_at   DOUBLE NOT NULL"
-                ")")
         try:
             self._writer.submit_sync(_create)
         except Exception as e:  # noqa: BLE001
@@ -158,60 +147,6 @@ class ReasoningStore:
             b_i=b_i, c=c, time_cost=time_cost, anchor_tx=reasoning_id,
             composed_from=None)
 
-    def record_turn(
-        self, *, reasoning_id: str, goal_class: str, action: str,
-        features: list, signature_text: str,
-    ) -> bool:
-        """§7.B (C1′) — persist a `Reasoning(kind='turn')` episode for a NON-
-        verifiable turn (direct/research/IDK). `reward` is NULL (pending) until the
-        turn-judge (B.2) or a user/Maker rating (B.3) scores it; the record is the
-        deref-able graphed thought (INV-OML-11). Idempotent on reasoning_id. Soft."""
-        return self._write_record(
-            reasoning_id=reasoning_id, kind="turn", goal_class=goal_class,
-            action=action, oracle_id="", verdict="", reward=None,
-            features=features, signature_text=signature_text,
-            b_i=1, c=0.0, time_cost=1.0, anchor_tx=reasoning_id, composed_from=None)
-
-    def record_maker_assessment(
-        self, *, reasoning_id: str, score: float, scale: str, reward: float,
-        turn_summary: str = "",
-    ) -> bool:
-        """§7.B (B.3) — persist a Maker assessment (the Maker↔Titan bond): DuckDB
-        scalars + a `MakerAssessment` Kuzu node under `Self` (SELF_HAS_MAKER_
-        ASSESSMENT). Maker-only (ordinary-user feedback is reward-only). Idempotent
-        on reasoning_id. Single-writer (INV-Syn-19/28). Soft."""
-        if not reasoning_id:
-            return False
-
-        def _do() -> bool:
-            try:
-                self._db.execute(
-                    "INSERT INTO maker_assessments (reasoning_id, score, scale, "
-                    "reward, turn_summary, created_at) VALUES (?,?,?,?,?,?) "
-                    "ON CONFLICT (reasoning_id) DO NOTHING",
-                    [str(reasoning_id), float(score), str(scale or ""), float(reward),
-                     str(turn_summary or "")[:280], float(self._clock())])
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[ReasoningStore] maker_assessment insert failed: %s", e)
-                return False
-            if self._graph is not None:
-                try:
-                    self._graph.spine_create_maker_assessment_node(
-                        reasoning_id=str(reasoning_id), score=float(score),
-                        scale=str(scale or ""), reward=float(reward),
-                        turn_summary=str(turn_summary or ""),
-                        created_at=float(self._clock()))
-                    self._graph.spine_link_self_maker_assessment(str(reasoning_id))
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("[ReasoningStore] maker_assessment kuzu soft-fail: %s", e)
-            return True
-
-        try:
-            return bool(self._writer.submit_sync(_do))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[ReasoningStore] maker_assessment write failed: %s", e)
-            return False
-
     def write_macro(
         self, *, reasoning_id: str, goal_class: str, action: str,
         signature: list, b_i: float, c: float, time_cost: float, use_count: int,
@@ -261,8 +196,7 @@ class ReasoningStore:
                     "ON CONFLICT (reasoning_id) DO NOTHING",
                     [str(reasoning_id), str(kind), str(goal_class or ""),
                      str(action or ""), str(oracle_id or ""), str(verdict or ""),
-                     (None if reward is None else float(reward)),  # §7.B turn = NULL (pending)
-                     json.dumps(list(features or [])),
+                     float(reward), json.dumps(list(features or [])),
                      int(b_i), float(c), float(time_cost), int(use_count),
                      int(emb_id), str(anchor_tx or ""), float(self._clock())])
             except Exception as e:  # noqa: BLE001
