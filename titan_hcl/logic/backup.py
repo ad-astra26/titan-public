@@ -75,6 +75,23 @@ def _l5_cleanup_old_local_tarballs(local_dir: str, retention_days: int = 30) -> 
     return deleted
 
 
+class BackupReconstructDeferred(Exception):
+    """The chained-mirror reconstruct failed for a TRANSIENT reason — the chain
+    provider isn't ready yet (early boot) or a fetch was unreachable — while the
+    chain is verifiably still on-chain (head=present) or unproven-gone
+    (head=unverified). The orchestrator SKIPS planning this tick and retries;
+    it must NEVER fall to an expensive self_heal baseline on a transient.
+
+    Maker rule (RFP_backup_redesign_spine, 2026-06-11): on mainnet a full baseline
+    fires ONLY on a genuine integrity failure (chain DATA corrupt, or a chain tx
+    DEFINITIVELY missing on-chain) — never because the incrementals couldn't run
+    (low Irys SOL / provider warming at boot). The 7-day-gap false self_heal
+    baseline on T1 (2026-06-11) was exactly this: the reconstruct ran during early
+    boot before the chain provider was ready → fetch failed → baseline. Now it
+    defers until the (free-to-read) chain is reachable, then ships a cheap
+    catch-up incremental."""
+
+
 class RebirthBackup:
     """
     Manages sovereign backup triggered by meditation cycles:
@@ -1630,7 +1647,11 @@ class RebirthBackup:
 
         # Reconstruct ladder — rebuild the mirror to the LATEST event's state from
         # the chain (also performs the Q2 flag-flip BRIDGE when the mirror lags).
-        if latest_id and await self._recover_mirror_to_latest(manifest, latest_id):
+        recovered, halt_reason = (False, None)
+        if latest_id:
+            recovered, halt_reason = await self._recover_mirror_to_latest(
+                manifest, latest_id)
+        if recovered:
             state = self._load_mirror_state()
             known_arcs = set(state.get("arcs", {}).keys()) if state else known_arcs
             if self._mirror_verifies(base_dir, known_arcs, state, latest_id):
@@ -1638,10 +1659,51 @@ class RebirthBackup:
                             "chained incremental", (latest_id or "?")[:8])
                 return (None, None, known_arcs)
 
-        # Unrecoverable → labeled baseline + alarm (lineage-preserving).
-        self._alarm_self_heal_baseline(
-            "chained mirror drift unrecoverable (reconstruct from chain failed)")
-        return ("baseline", "self_heal", known_arcs)
+        # Reconstruct FAILED → classify GENUINE corruption vs TRANSIENT unreachable
+        # before ever paying for a baseline (Maker rule: baseline only on a real
+        # integrity failure, never because the chain couldn't be fetched right now).
+        from titan_hcl.logic.backup_restore import (
+            HALT_BROKEN_CHAIN, HALT_TARBALL_HASH_MISMATCH,
+            HALT_EVENT_MERKLE_MISMATCH, HALT_ZK_MEMO_MISMATCH, HALT_ZK_DISCONNECT,
+            HALT_APPLY_FAILED, HALT_POST_RESTORE_HASH_MISMATCH)
+        _GENUINE_CORRUPTION = {
+            HALT_BROKEN_CHAIN, HALT_TARBALL_HASH_MISMATCH, HALT_EVENT_MERKLE_MISMATCH,
+            HALT_ZK_MEMO_MISMATCH, HALT_ZK_DISCONNECT, HALT_APPLY_FAILED,
+            HALT_POST_RESTORE_HASH_MISMATCH}
+        if halt_reason == "no_store":
+            # No chain store/infra at all — a STRUCTURAL failure (not a transient
+            # fetch), and we can't even probe; self_heal is the only path.
+            self._alarm_self_heal_baseline(
+                "chained mirror reconstruct: no chain store available")
+            return ("baseline", "self_heal", known_arcs)
+        if halt_reason in _GENUINE_CORRUPTION:
+            # The chain is reachable but its DATA is corrupt — self_heal is the
+            # honest, lineage-preserving recovery.
+            self._alarm_self_heal_baseline(
+                f"chained mirror reconstruct: chain DATA corrupt ({halt_reason})")
+            return ("baseline", "self_heal", known_arcs)
+
+        # Fetch/connectivity failure (or unknown) — only self_heal if the chain is
+        # DEFINITIVELY gone. A cheap daemon-independent gateway HEAD distinguishes:
+        head = await self._probe_latest_chain_head(manifest, latest_id)
+        if head == "missing":
+            self._alarm_self_heal_baseline(
+                "chained mirror reconstruct: latest chain tx DEFINITIVELY missing "
+                "on-chain (chain genuinely gone)")
+            return ("baseline", "self_heal", known_arcs)
+
+        # head=present (chain reachable → transient fetch) or head=unverified
+        # (uncertain → never self_heal on uncertainty): DEFER + retry next tick.
+        # This is the boot-ordering root-cause fix — the reconstruct ran before the
+        # chain provider was ready; it must NOT manufacture a self_heal baseline.
+        logger.warning(
+            "[Backup] §24 Phase B: chained mirror reconstruct DEFERRED — chain is "
+            "reachable/unproven-gone (head=%s, halt=%s); the provider is likely "
+            "still warming at boot. Skipping the plan this tick (NO self_heal "
+            "baseline on a transient); will retry + ship a cheap catch-up "
+            "incremental once the chain is fetchable.", head, halt_reason)
+        raise BackupReconstructDeferred(
+            f"reconstruct transient (head={head}, halt={halt_reason})")
 
     def _build_decrypting_fetch(self, manifest):
         """An async arweave_fetch(tx_id)->PLAINTEXT bytes for restore_full that
@@ -1754,16 +1816,19 @@ class RebirthBackup:
             return await chain.get_to_file(tx_id, dest_path)
         return _fetch_to_file
 
-    async def _recover_mirror_to_latest(self, manifest, latest_id) -> bool:
+    async def _recover_mirror_to_latest(self, manifest, latest_id):
         """Reconstruct the rolling mirror to the LATEST shipped event's state via
         the chain-aware restore_full (decrypting fetch for Mode-B). Small per-link
-        patches, NO new full upload. Also performs the Q2 flag-flip bridge. True on
-        success."""
+        patches, NO new full upload. Also performs the Q2 flag-flip bridge.
+
+        Returns (recovered: bool, halt_reason: Optional[str]). On failure the
+        halt_reason lets the precheck classify GENUINE corruption (→ self_heal)
+        vs a TRANSIENT fetch/connectivity failure (→ defer, never self_heal)."""
         base_dir = self._baseline_working_dir()
         store = self._ensure_arweave_store_for_unified()
         if store is None:
             logger.warning("[Backup] §24 Phase B recover: no ArweaveStore")
-            return False
+            return (False, "no_store")
         try:
             from titan_hcl.logic.backup_restore import restore_full
             os.makedirs(base_dir, exist_ok=True)
@@ -1798,17 +1863,55 @@ class RebirthBackup:
                 # garbage) — only the redundant per-file hashes go advisory.
                 verify_patch_hash=False)
             if result.status != "success":
+                halt = getattr(result, "halt_reason", None)
                 logger.warning("[Backup] §24 Phase B recover: restore_full "
-                               "status=%s halt=%s", result.status,
-                               getattr(result, "halt_reason", None))
-                return False
+                               "status=%s halt=%s", result.status, halt)
+                return (False, halt)
             self._write_mirror_state(latest_id, self._hash_mirror_dir(base_dir))
             logger.info("[Backup] §24 Phase B: mirror RECONSTRUCTED to latest %s "
                         "(%d files)", (latest_id or "?")[:8], result.restored_files)
-            return True
+            return (True, None)
         except Exception as e:
             logger.warning("[Backup] §24 Phase B recover: reconstruct raised: %s", e)
-            return False
+            return (False, "exception")
+
+    async def _probe_latest_chain_head(self, manifest, latest_id) -> str:
+        """Cheap reachability probe used to gate self_heal: HEAD the LATEST event's
+        component tx_ids via the gateway (a direct HTTP HEAD — daemon-INDEPENDENT,
+        so it works even when the fetch path's Irys daemon is still warming at
+        boot). Returns:
+          • 'present'    — ANY component tx is on the gateway (HTTP 200): the chain
+                           is reachable, so the reconstruct's fetch failure was
+                           TRANSIENT → DEFER, never self_heal.
+          • 'missing'    — EVERY probed tx is a DEFINITIVE 404/410: the chain is
+                           genuinely gone → self_heal is the honest recovery.
+          • 'unverified' — timeouts / no tx_ids / uncertain: never proven gone →
+                           treated as transient (DEFER). INV: self_heal needs
+                           POSITIVE proof the chain is gone, never a guess."""
+        latest = manifest.get_latest_event()
+        if not latest:
+            return "unverified"
+        txs = []
+        for comp in ("personality", "timechain", "soul"):
+            sub = latest.get(comp)
+            if isinstance(sub, dict) and sub.get("tx_id"):
+                txs.append(sub["tx_id"])
+        if not txs:
+            return "unverified"
+        chain = self._ensure_chain()
+        statuses = []
+        for tx in txs:
+            try:
+                statuses.append(await chain.head(tx))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[Backup] §24 Phase B head probe raised for %s: %s",
+                             str(tx)[:16], e)
+                statuses.append("unverified")
+        if any(s == "present" for s in statuses):
+            return "present"
+        if statuses and all(s == "missing" for s in statuses):
+            return "missing"
+        return "unverified"
 
     def _advance_mirror_from_tarballs(self, tarball_paths, event_id) -> int:
         """RFP Phase B mirror ADVANCE — make the rolling mirror equal the just-shipped
@@ -2206,8 +2309,18 @@ class RebirthBackup:
         # here — so the Orchestrator runs this ONCE per plan and persists
         # `known_arcs`; on a drip RESUME it rebuilds the resolver from the
         # persisted known_arcs (NOT a re-precheck), preserving the force-baseline.
-        _force_et, _force_trig, _known_arcs = asyncio.run(
-            self._precheck_diff_base(manifest))
+        try:
+            _force_et, _force_trig, _known_arcs = asyncio.run(
+                self._precheck_diff_base(manifest))
+        except BackupReconstructDeferred as e:
+            # Transient: the chained mirror couldn't be reconstructed because the
+            # chain provider isn't fetch-ready yet (early boot) — NOT a genuine
+            # integrity failure. Skip planning this tick; the orchestrator retries
+            # and ships a cheap catch-up incremental once the chain is reachable.
+            # NEVER manufacture a self_heal baseline on a transient (Maker rule).
+            logger.warning("[Backup] §24 build-stage DEFERRED — no plan this tick "
+                           "(chain provider warming): %s", e)
+            return None
         _baseline_resolver = self._make_diff_base_resolver(base_dir, _known_arcs)
 
         if scratch_dir is None:

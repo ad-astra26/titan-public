@@ -322,6 +322,132 @@ async def test_precheck_chained_drift_no_store_falls_back_to_baseline(tmp_path):
     assert (force_et, force_trig) == ("baseline", "self_heal")
 
 
+# ── D2. boot-ordering: a TRANSIENT reconstruct failure DEFERS, never self_heals ─
+# RFP_backup_redesign_spine (2026-06-11): the T1 false self_heal baseline — the
+# chained mirror reconstruct ran at early boot before the chain provider was
+# fetch-ready → fetch failed → expensive 2.4GB baseline. Fix: classify the
+# reconstruct failure. GENUINE corruption / definitively-missing chain → self_heal;
+# a transient fetch failure while the chain is reachable/unproven-gone → DEFER
+# (retry next tick → cheap catch-up incremental). Maker rule: baseline only on a
+# real integrity failure, never because the chain couldn't be fetched right now.
+from titan_hcl.logic.backup import BackupReconstructDeferred  # noqa: E402
+from titan_hcl.logic.backup_restore import (  # noqa: E402
+    HALT_TARBALL_FETCH_FAILED, HALT_TARBALL_HASH_MISMATCH)
+
+
+class _ReconCtl(_PhaseBBackup):
+    """Drives the chained reconstruct + head-probe outcomes to exercise the
+    transient-vs-genuine self_heal classification (the boot-ordering fix)."""
+
+    def __init__(self, mirror_dir, *, recon, head="present"):
+        super().__init__(mirror_dir, chained=True, store=_FakeArweave())
+        self._recon = recon              # (recovered: bool, halt_reason)
+        self._head_status = head         # 'present' | 'missing' | 'unverified'
+        self._recover_ran = False
+
+    async def _recover_mirror_to_latest(self, manifest, latest_id):
+        self._recover_ran = True
+        return self._recon
+
+    async def _probe_latest_chain_head(self, manifest, latest_id):
+        return self._head_status
+
+    def _mirror_verifies(self, *a, **k):
+        # steady-state (pre-recover) → False to force the reconstruct path;
+        # post-recover → True iff the (mocked) reconstruct succeeded.
+        return self._recover_ran and self._recon[0]
+
+
+def _drift_backup(tmp_path, *, recon, head="present"):
+    mirror = str(tmp_path / "mirror")
+    os.makedirs(mirror)
+    backup = _ReconCtl(mirror, recon=recon, head=head)
+    Path(mirror, "config.txt").write_bytes(b"DRIFTED")
+    backup._write_mirror_state("evtOLD", {"config.txt": "expected_other_sha"})
+    return backup
+
+
+@pytest.mark.asyncio
+async def test_precheck_transient_fetch_chain_reachable_DEFERS(tmp_path, monkeypatch):
+    """Reconstruct fails to FETCH but the chain is reachable (head=present) →
+    DEFER (raise), NEVER self_heal. This is the T1 early-boot case."""
+    backup = _drift_backup(tmp_path, recon=(False, HALT_TARBALL_FETCH_FAILED),
+                           head="present")
+    monkeypatch.setattr("titan_hcl.logic.backup.send_maker_alert",
+                        lambda text, *a, **k: backup.alerts.append(text))
+    with pytest.raises(BackupReconstructDeferred):
+        await backup._precheck_diff_base(_FakeManifest(latest_id="evtNEW"))
+    assert not backup.alerts, "a DEFER must NOT alarm a self_heal baseline"
+
+
+@pytest.mark.asyncio
+async def test_precheck_transient_fetch_head_unverified_DEFERS(tmp_path):
+    """Reconstruct raised + head=unverified (uncertain, not proven gone) →
+    DEFER. INV: never self_heal on uncertainty."""
+    backup = _drift_backup(tmp_path, recon=(False, "exception"), head="unverified")
+    with pytest.raises(BackupReconstructDeferred):
+        await backup._precheck_diff_base(_FakeManifest(latest_id="evtNEW"))
+
+
+@pytest.mark.asyncio
+async def test_precheck_fetch_failed_but_chain_DEFINITIVELY_gone_self_heals(tmp_path, monkeypatch):
+    """Reconstruct fetch failed AND head=missing (definitive 404 → genuinely
+    gone) → self_heal baseline (legit) + alarm."""
+    backup = _drift_backup(tmp_path, recon=(False, HALT_TARBALL_FETCH_FAILED),
+                           head="missing")
+    monkeypatch.setattr("titan_hcl.logic.backup.send_maker_alert",
+                        lambda text, *a, **k: backup.alerts.append(text))
+    et, trig, _ = await backup._precheck_diff_base(_FakeManifest(latest_id="evtNEW"))
+    assert (et, trig) == ("baseline", "self_heal")
+    assert backup.alerts, "a genuine self_heal must alarm"
+
+
+@pytest.mark.asyncio
+async def test_precheck_genuine_corruption_self_heals_without_probe(tmp_path, monkeypatch):
+    """Reconstruct failed on DATA corruption (hash mismatch) → self_heal
+    immediately (the chain is reachable but its bytes are bad); no head probe."""
+    backup = _drift_backup(tmp_path, recon=(False, HALT_TARBALL_HASH_MISMATCH),
+                           head="present")  # head would say present, but corruption wins
+
+    async def _boom(*a, **k):  # the probe must NOT be consulted for corruption
+        raise AssertionError("head probe must not run for genuine corruption")
+    backup._probe_latest_chain_head = _boom
+    monkeypatch.setattr("titan_hcl.logic.backup.send_maker_alert",
+                        lambda text, *a, **k: backup.alerts.append(text))
+    et, trig, _ = await backup._precheck_diff_base(_FakeManifest(latest_id="evtNEW"))
+    assert (et, trig) == ("baseline", "self_heal")
+    assert backup.alerts
+
+
+@pytest.mark.asyncio
+async def test_precheck_reconstruct_success_stays_incremental(tmp_path):
+    """Reconstruct succeeds → mirror at latest → incremental (no baseline)."""
+    backup = _drift_backup(tmp_path, recon=(True, None))
+    et, trig, _ = await backup._precheck_diff_base(_FakeManifest(latest_id="evtNEW"))
+    assert et is None and trig is None
+
+
+def test_plan_staged_build_v2_returns_none_on_defer(tmp_path, monkeypatch):
+    """The orchestrator-facing plan returns None on a DEFER (skip this tick) —
+    so NO drip is built (no baseline), and it retries next tick."""
+    backup = _drift_backup(tmp_path, recon=(False, HALT_TARBALL_FETCH_FAILED),
+                           head="present")
+    # gate on: backup_arweave_enabled so _plan_staged_build_v2 proceeds to precheck
+    backup._full_config = {"backup": {"chained_incrementals": True},
+                           "mainnet_budget": {"backup_arweave_enabled": True}}
+    monkeypatch.setattr(backup, "_baseline_working_dir", lambda: backup._mirror)
+    monkeypatch.setattr(backup, "_tier_specs_from_paths", lambda *a, **k: [])
+    monkeypatch.setattr(backup, "_rebase_params", lambda: ("none", 90))
+
+    class _M(_FakeManifest):
+        def __init__(self):
+            super().__init__(latest_id="evtNEW")
+    monkeypatch.setattr(
+        "titan_hcl.logic.backup_unified_manifest.UnifiedManifest.load",
+        classmethod(lambda cls, **k: _M()))
+    assert backup._plan_staged_build_v2(weekday=0) is None
+
+
 # ── E. Mode-B decrypting fetch ─────────────────────────────────────────────
 
 
