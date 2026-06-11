@@ -17,7 +17,7 @@ class MockReasoningEngine:
     """Mock for testing DELEGATE integration."""
     def __init__(self):
         self._total_chains = 100
-        self._total_conclusions = 45
+        self._total_commits = 45
         self.confidence = 0.6
         self.gut_agreement = 0.5
         self._strategy_bias = None
@@ -169,7 +169,7 @@ class TestMetaReasoningEngine:
     def test_tick_idle_no_trigger(self, engine, state_132d, neuromods):
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 97  # Not a multiple of periodic interval
-        mock_re._total_conclusions = 80  # High commit rate = no trigger
+        mock_re._total_commits = 80  # High commit rate = no trigger
         result = engine.tick(state_132d, neuromods, mock_re, None, None, None, None)
         assert result["action"] == "IDLE"
 
@@ -179,7 +179,7 @@ class TestMetaReasoningEngine:
 
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 100
-        mock_re._total_conclusions = 20  # 20% commit rate → trigger
+        mock_re._total_commits = 20  # 20% commit rate → trigger
 
         result = engine.tick(state_132d, neuromods, mock_re, archive, None, None, None)
         assert result["action"] == "CONTINUE"
@@ -194,7 +194,7 @@ class TestMetaReasoningEngine:
         wisdom = MetaWisdomStore(db_path=str(tmp_path / "test.db"))
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 100
-        mock_re._total_conclusions = 20
+        mock_re._total_commits = 20
 
         # Run chain until conclusion
         results = []
@@ -228,7 +228,7 @@ class TestMetaReasoningEngine:
         archive = ChainArchive(db_path=str(tmp_path / "test.db"))
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 100
-        mock_re._total_conclusions = 20
+        mock_re._total_commits = 20
 
         # Run a few steps to populate buffer
         for _ in range(5):
@@ -261,7 +261,7 @@ class TestTriggerConditions:
         from titan_hcl.logic.meta_reasoning import should_trigger_meta
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 100
-        mock_re._total_conclusions = 20
+        mock_re._total_commits = 20
         should, reason = should_trigger_meta(mock_re, {}, None, {})
         assert should is True
         assert "low_commit_rate" in reason
@@ -270,7 +270,7 @@ class TestTriggerConditions:
         from titan_hcl.logic.meta_reasoning import should_trigger_meta
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 100
-        mock_re._total_conclusions = 80
+        mock_re._total_commits = 80
         should, reason = should_trigger_meta(mock_re, {"REFLECTION": 0.85}, None,
                                              {"trigger_reflection_threshold": 0.75})
         assert should is True
@@ -280,7 +280,7 @@ class TestTriggerConditions:
         from titan_hcl.logic.meta_reasoning import should_trigger_meta
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 50
-        mock_re._total_conclusions = 40
+        mock_re._total_commits = 40
         should, reason = should_trigger_meta(mock_re, {}, None,
                                              {"trigger_periodic_interval": 50})
         assert should is True
@@ -290,7 +290,7 @@ class TestTriggerConditions:
         from titan_hcl.logic.meta_reasoning import should_trigger_meta
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 97  # Not a multiple of 50 (periodic interval)
-        mock_re._total_conclusions = 80
+        mock_re._total_commits = 80
         should, _ = should_trigger_meta(mock_re, {}, None, {})
         assert should is False
 

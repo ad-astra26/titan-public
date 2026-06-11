@@ -43,7 +43,7 @@ def mock_reasoning():
     """Mock reasoning engine with controllable state."""
     class MockReasoning:
         _total_chains = 20
-        _total_conclusions = 12
+        _total_commits = 12
         confidence = 0.6
         gut_agreement = 0.5
         _strategy_bias = None
@@ -94,7 +94,7 @@ def wisdom_store(tmp_dir, monkeypatch):
 def _start_chain(engine, mock_reasoning):
     """Helper to start a chain via tick with low commit rate trigger."""
     mock_reasoning._total_chains = 20
-    mock_reasoning._total_conclusions = 4  # 20% commit rate < 30% threshold
+    mock_reasoning._total_commits = 4  # 20% commit rate < 30% threshold
     sv = [0.5] * 132
     nm = {"DA": 0.5, "5HT": 0.5, "NE": 0.5, "ACh": 0.5, "Endorphin": 0.5, "GABA": 0.3}
     result = engine.tick(sv, nm, mock_reasoning, None, None, None, None)
@@ -359,7 +359,7 @@ class TestM10Parallel:
         sv = [0.5] * 132
         nm = {"DA": 0.5, "5HT": 0.5, "NE": 0.5, "ACh": 0.5, "Endorphin": 0.5, "GABA": 0.3}
         mock_reasoning._total_chains = 20
-        mock_reasoning._total_conclusions = 4
+        mock_reasoning._total_commits = 4
         result = engine.tick(sv, nm, mock_reasoning, None, None, None, None)
         assert result["action"] in ("CONTINUE", "CONCLUDE", "IDLE", "WAITING")
 

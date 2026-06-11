@@ -1529,17 +1529,17 @@ def test_wisdom_growth_renders_numbers_when_populated(tmp_path):
 # ── A1 (2026-04-13) reasoning totals persistence ────────────────────────
 
 def test_reasoning_totals_persist_across_restart():
-    """A1: _total_chains / _total_conclusions survive save_all() + reload."""
+    """A1: _total_chains / _total_commits survive save_all() + reload."""
     from titan_hcl.logic.reasoning import ReasoningEngine
     with tempfile.TemporaryDirectory() as tmp:
         e1 = ReasoningEngine(config={"save_dir": tmp})
         e1._total_chains = 250
-        e1._total_conclusions = 48
+        e1._total_commits = 48
         e1._total_reasoning_steps = 912
         e1.save_all()
         e2 = ReasoningEngine(config={"save_dir": tmp})
         assert e2._total_chains == 250
-        assert e2._total_conclusions == 48
+        assert e2._total_commits == 48
         assert e2._total_reasoning_steps == 912
 
 
@@ -1548,11 +1548,13 @@ def test_reasoning_totals_file_schema(tmp_path):
     from titan_hcl.logic.reasoning import ReasoningEngine
     e = ReasoningEngine(config={"save_dir": str(tmp_path)})
     e._total_chains = 5
-    e._total_conclusions = 1
+    e._total_commits = 1
     e.save_all()
     data = json.load(open(tmp_path / "reasoning_totals.json"))
     assert data["version"] == 1
     assert data["total_chains"] == 5
+    assert data["total_commits"] == 1
+    # back-compat alias kept so a rollback to pre-rename code still restores it
     assert data["total_conclusions"] == 1
     assert "saved_ts" in data
 
@@ -1562,7 +1564,44 @@ def test_reasoning_totals_missing_file_safe_on_first_boot(tmp_path):
     from titan_hcl.logic.reasoning import ReasoningEngine
     e = ReasoningEngine(config={"save_dir": str(tmp_path)})
     assert e._total_chains == 0
-    assert e._total_conclusions == 0
+    assert e._total_commits == 0
+
+
+def test_reasoning_totals_backcompat_reads_legacy_conclusions_key(tmp_path):
+    """A1 back-compat: a pre-rename reasoning_totals.json (only the old
+    `total_conclusions` key) still restores the lifetime commit count into
+    _total_commits — the fleet's commit history must survive the rename."""
+    from titan_hcl.logic.reasoning import ReasoningEngine
+    legacy = {"version": 1, "saved_ts": 1.0, "total_chains": 300,
+              "total_conclusions": 261, "total_reasoning_steps": 1000}
+    (tmp_path / "reasoning_totals.json").write_text(json.dumps(legacy))
+    e = ReasoningEngine(config={"save_dir": str(tmp_path)})
+    assert e._total_commits == 261   # read from the legacy total_conclusions key
+    assert e._total_chains == 300
+
+
+def test_reasoning_get_stats_emits_real_commit_rate(tmp_path):
+    """Regression for the commit_rate=0 false alarm: get_stats() must emit REAL
+    total_commits + commit_rate. The reasoning_state publisher reads
+    stats['total_commits']/['commit_rate']; get_stats once emitted NEITHER key,
+    so they defaulted to 0 forever — 'commit_rate=0 fleet-wide' while the engine
+    actually commits ~86%."""
+    from titan_hcl.logic.reasoning import ReasoningEngine
+    e = ReasoningEngine(config={"save_dir": str(tmp_path)})
+    e._total_chains = 100
+    e._total_commits = 86
+    e._action_counts = {"COMMIT": 86, "HOLD": 4, "ABANDON": 10}
+    e._concluded_total = 100
+    e._chain_len_sum = 312
+    e._last_action = "COMMIT"
+    stats = e.get_stats()
+    assert stats["total_commits"] == 86
+    assert stats["commit_rate"] == 0.86                 # was hardcoded 0.0
+    assert stats["action_distribution"] == {"COMMIT": 86, "HOLD": 4, "ABANDON": 10}
+    assert stats["avg_chain_length"] == 3.12
+    assert stats["last_action"] == "COMMIT"
+    assert stats["current_active"] == e.is_active
+    assert stats["total_conclusions"] == 86             # deprecated alias kept
 
 
 class TestStripLlmMetadataStateBlock:

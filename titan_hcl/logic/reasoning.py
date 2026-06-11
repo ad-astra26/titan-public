@@ -1275,8 +1275,21 @@ class ReasoningEngine:
         self._last_result: Optional[dict] = None
         self._loop_count: int = 0
         self._total_chains: int = 0
-        self._total_conclusions: int = 0
+        # Lifetime COMMIT count. Renamed from `_total_conclusions` (2026-06-11):
+        # it only ever incremented in the COMMIT branch, but the misleading
+        # name + a readout that never emitted total_commits/commit_rate trapped
+        # readers into "commit_rate=0 fleet-wide" when the engine commits ~86%.
+        self._total_commits: int = 0
         self._total_reasoning_steps: int = 0
+        # Session-since-boot reasoning telemetry — feeds the readout fields the
+        # reasoning_state publisher + SHM-slot schema declare but get_stats()
+        # never produced (action_distribution / avg_chain_length / last_action /
+        # last_outcome / current_active), so they were hardcoded to defaults.
+        self._action_counts: dict[str, int] = {"COMMIT": 0, "HOLD": 0, "ABANDON": 0}
+        self._concluded_total: int = 0
+        self._chain_len_sum: int = 0
+        self._last_action: str = ""
+        self._last_outcome: str = ""
         self._chain_start_time: float = 0.0
         self._strategy_bias: Optional[np.ndarray] = None  # 8D, set by meta-reasoning DELEGATE
         self._intuition_bias: Optional[np.ndarray] = None  # 8D, set by vertical convergence (M12)
@@ -1711,7 +1724,7 @@ class ReasoningEngine:
         # Determine action
         if self.confidence >= self.confidence_threshold and body_ready:
             action = "COMMIT"
-            self._total_conclusions += 1
+            self._total_commits += 1
         elif not body_ready:
             action = "HOLD"
         else:
@@ -1841,6 +1854,14 @@ class ReasoningEngine:
         self._strategy_bias = None   # Clear meta-reasoning bias on chain end
         self._intuition_bias = None  # Clear vertical convergence bias on chain end
         self._rr_step_snapshots = []  # rFP α — clear per-chain snapshots
+
+        # Session-since-boot telemetry for the reasoning readout
+        # (action_distribution / avg_chain_length / last_action / last_outcome).
+        self._action_counts[action] = self._action_counts.get(action, 0) + 1
+        self._concluded_total += 1
+        self._chain_len_sum += int(conclusion["chain_length"])
+        self._last_action = action
+        self._last_outcome = f"reward={reward:+.3f}"
 
         logger.info("[Reasoning] %s — conf=%.3f gut=%.3f chain=%d dur=%.1fs reward=%.3f "
                     "cum_bonus=%.3f mech_a_updates=%d mech_b_train=%d seq_size=%d",
@@ -2239,16 +2260,19 @@ class ReasoningEngine:
                 logger.warning("[Reasoning/StepPersist] trim failed: %s", e)
 
     def _save_totals(self) -> None:
-        """Persist _total_chains / _total_conclusions / _total_reasoning_steps
-        to reasoning_totals.json. Small file (3 ints + timestamp), atomic
-        replace. Called from save_all() on every persist cycle."""
+        """Persist _total_chains / _total_commits / _total_reasoning_steps to
+        reasoning_totals.json (atomic replace). Called from save_all() on every
+        persist cycle."""
         try:
             path = os.path.join(self.save_dir, "reasoning_totals.json")
             data = {
                 "version": 1,
                 "saved_ts": time.time(),
                 "total_chains": int(self._total_chains),
-                "total_conclusions": int(self._total_conclusions),
+                "total_commits": int(self._total_commits),
+                # Back-compat alias (same value) so a rollback to pre-rename
+                # code still restores the lifetime commit count from this key.
+                "total_conclusions": int(self._total_commits),
                 "total_reasoning_steps": int(self._total_reasoning_steps),
                 # v4 persistence gap fixes (2026-04-17)
                 "strategy_bias": self._strategy_bias.tolist() if getattr(self, '_strategy_bias', None) is not None else None,
@@ -2284,7 +2308,10 @@ class ReasoningEngine:
                     "ignoring", data.get("version"))
                 return
             self._total_chains = int(data.get("total_chains", 0))
-            self._total_conclusions = int(data.get("total_conclusions", 0))
+            # Read the new key; fall back to the pre-rename "total_conclusions"
+            # so existing persisted files keep their lifetime commit count.
+            self._total_commits = int(
+                data.get("total_commits", data.get("total_conclusions", 0)))
             self._total_reasoning_steps = int(
                 data.get("total_reasoning_steps", 0))
             # v4 persistence gap fixes (2026-04-17)
@@ -2296,10 +2323,10 @@ class ReasoningEngine:
                 self._intuition_bias = np.array(data["intuition_bias"], dtype=np.float32)
             logger.info(
                 "[Reasoning] Restored lifetime totals: chains=%d "
-                "conclusions=%d steps=%d (rate=%.1f%%)",
-                self._total_chains, self._total_conclusions,
+                "commits=%d steps=%d (commit_rate=%.1f%%)",
+                self._total_chains, self._total_commits,
                 self._total_reasoning_steps,
-                100.0 * self._total_conclusions
+                100.0 * self._total_commits
                 / max(1, self._total_chains))
         except Exception as e:
             logger.warning("[Reasoning] _load_totals failed: %s", e)
@@ -2447,10 +2474,26 @@ class ReasoningEngine:
         """Stats for API/monitoring."""
         return {
             "total_chains": self._total_chains,
-            "total_conclusions": self._total_conclusions,
+            # Canonical commit metrics the reasoning_state publisher + SHM-slot
+            # schema declare. get_stats historically emitted NEITHER, so the
+            # publisher's stats.get("total_commits"/"commit_rate", 0) defaulted
+            # to 0 forever — the "commit_rate=0 fleet-wide" false alarm. Real
+            # now: lifetime commit_rate (engine commits ~86%).
+            "total_commits": self._total_commits,
+            "commit_rate": round(
+                self._total_commits / max(1, self._total_chains), 4),
+            # Deprecated alias (== total_commits) — kept so existing readers of
+            # the misnamed "total_conclusions" readout field don't break.
+            "total_conclusions": self._total_commits,
             "total_reasoning_steps": self._total_reasoning_steps,
             "is_active": self.is_active,
+            "current_active": self.is_active,
             "chain_length": len(self.chain),
+            "avg_chain_length": round(
+                self._chain_len_sum / max(1, self._concluded_total), 2),
+            "last_action": self._last_action,
+            "last_outcome": self._last_outcome,
+            "action_distribution": dict(self._action_counts),
             "confidence": round(self.confidence, 4),
             "gut_agreement": round(self.gut_agreement, 4),
             "spirit_nudge": round(self.spirit_nudge, 4),
@@ -2468,7 +2511,7 @@ class ReasoningEngine:
             "perception": self.perception.get_state(),
             "observer": self.observer.get_state(),
             "total_chains": self._total_chains,
-            "total_conclusions": self._total_conclusions,
+            "total_commits": self._total_commits,
             "total_reasoning_steps": self._total_reasoning_steps,
             "is_active": self.is_active,
             "chain": list(self.chain),
@@ -2485,13 +2528,13 @@ class ReasoningEngine:
         # genuine state loss couldn't be distinguished).
         prev_chains = self._total_chains
         new_chains = state.get("total_chains", 0)
-        prev_conclusions = self._total_conclusions
-        new_conclusions = state.get("total_conclusions", 0)
+        prev_commits = self._total_commits
+        new_commits = state.get("total_commits", state.get("total_conclusions", 0))
 
         self.perception.restore_state(state.get("perception", {}))
         self.observer.restore_state(state.get("observer", {}))
         self._total_chains = new_chains
-        self._total_conclusions = new_conclusions
+        self._total_commits = new_commits
         self._total_reasoning_steps = state.get("total_reasoning_steps", 0)
         # Don't restore mid-chain state — start fresh after reload
         self.is_active = False
@@ -2501,13 +2544,13 @@ class ReasoningEngine:
         if prev_chains > 0 and new_chains < prev_chains:
             logger.warning(
                 "[Reasoning] STATE REGRESSION on restore_state: "
-                "chains %d → %d, conclusions %d → %d. "
+                "chains %d → %d, commits %d → %d. "
                 "Likely missing keys in state dict (defaulted to 0). "
                 "Investigate caller — this is the I-007 pattern.",
-                prev_chains, new_chains, prev_conclusions, new_conclusions,
+                prev_chains, new_chains, prev_commits, new_commits,
             )
         elif prev_chains > 0 or new_chains > 0:
             logger.info(
-                "[Reasoning] State restored: chains=%d→%d conclusions=%d→%d",
-                prev_chains, new_chains, prev_conclusions, new_conclusions,
+                "[Reasoning] State restored: chains=%d→%d commits=%d→%d",
+                prev_chains, new_chains, prev_commits, new_commits,
             )
