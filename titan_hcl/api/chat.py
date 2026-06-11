@@ -239,6 +239,15 @@ async def chat_stream(req: ChatRequest, request: Request,
                 if err:
                     yield f"event: error\ndata: {_json.dumps({'error': err, 'detail': payload.get('detail', '')})}\n\n"
                     break
+                # §7.B (B.4) — live progress phase (our-logic metadata, not content):
+                # "thinking" / "reasoning" / "researching" / "running-tool" /
+                # "using-skill" / "writing-reply". The client renders it + a live
+                # timer + an op icon. Carries no chunk → forward + move on.
+                phase = payload.get("phase")
+                if phase:
+                    yield (f"event: progress\ndata: "
+                           f"{_json.dumps({'phase': phase, 'detail': payload.get('detail', '')})}\n\n")
+                    continue
                 chunk_text = payload.get("chunk", "")
                 if chunk_text:
                     yield f"data: {_json.dumps({'chunk': chunk_text})}\n\n"

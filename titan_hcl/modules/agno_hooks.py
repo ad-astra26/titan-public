@@ -230,6 +230,47 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text):
 # unchanged (Phase 1 trains it directly at the oracle verdict).
 _NONVERIFIABLE_ACTIONS = frozenset({"direct", "research", "IDK"})
 
+# RFP §7.B (B.4) — OUR-logic progress phases (safe string metadata; NOT OVG- or
+# PreHook-gated — they are our own codebase strings). Agno streams them live as the
+# turn progresses; the source/timing is OURS (the decided action), not agno's
+# native run-events. mode (a MODE_* string) → the phase the user sees.
+_MODE_TO_PHASE = {
+    "MODE_RESEARCH": "researching",
+    "MODE_TOOL_ORACLE": "running-tool",
+    "MODE_SKILL_DELEGATE": "using-skill",
+    "MODE_SOVEREIGN": "reasoning",   # direct — answering from himself
+    "MODE_SHADOW": "reasoning",      # IDK
+}
+
+
+def _phase_for_mode(mode) -> str:
+    return _MODE_TO_PHASE.get(str(mode or ""), "reasoning")
+
+
+def _emit_stream_progress(plugin, phase: str, detail: str = "") -> None:
+    """§7.B (B.4) — stream ONE our-logic progress phase live over the chat stream,
+    IF this is a streaming turn (the agno worker set `_stream_progress_ctx` with the
+    send_queue + request_id). Safe metadata (no chunk, done=False); the SSE relay
+    forwards it as `event: progress`. No-op on a non-streaming turn / any error —
+    must never break chat (INV-OML-7)."""
+    ctx = getattr(plugin, "_stream_progress_ctx", None)
+    if not ctx:
+        return
+    try:
+        import time as _t
+        from titan_hcl.bus import CHAT_STREAM_CHUNK, make_msg
+        sq = ctx.get("send_queue")
+        if sq is None:
+            return
+        sq.put_nowait(make_msg(
+            CHAT_STREAM_CHUNK, ctx.get("name", "agno"), ctx.get("src", ""), {
+                "request_id": ctx.get("request_id", ""),
+                "phase": str(phase), "detail": str(detail or "")[:120],
+                "chunk": "", "done": False, "ts": _t.time(),
+            }, rid=ctx.get("rid")))
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def _emit_nonverifiable_decision(plugin, features, action, prompt_text, user_id):
     """Stash a non-verifiable decision for async reward. Returns the reasoning_id
@@ -1243,6 +1284,9 @@ def create_pre_hook(plugin):
             except Exception as _oml_err:
                 logger.debug("[PreHook] outer-policy decide skipped: %s", _oml_err)
         plugin._last_execution_mode = mode
+        # RFP §7.B (B.4) — stream the decided phase live (researching / running-tool
+        # / using-skill / reasoning) on a streaming turn. Our logic is the source.
+        _emit_stream_progress(plugin, _phase_for_mode(mode))
 
         # ── EEL Pillar A / A2 — learn-on-confirm (RFP §7.A2; INV-EEL-2/6) ─────
         # If this user has a researched node still awaiting confirmation, classify
