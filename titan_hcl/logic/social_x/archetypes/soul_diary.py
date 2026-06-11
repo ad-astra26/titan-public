@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import os
 import time
 
 from .base import ArchetypeBase, ArchetypeCandidate
@@ -97,8 +98,8 @@ class SoulDiaryArchetype(ArchetypeBase):
             "that captures the most interesting, SPECIFIC thing about today from "
             "that entry — name a real topic you explored or a concrete detail, in "
             "your own voice. Stay true to the entry; invent no new facts or "
-            "numbers. End with your archive link: {archive_url} — the full entry "
-            "and the felt-art you rendered for today live there."
+            "numbers. End with your archive link: {archive_url}. The attached image "
+            "is the felt-art you rendered for today."
         )
         prompt_values = {"entry": source_entry, "archive_url": archive_url}
 
@@ -106,7 +107,7 @@ class SoulDiaryArchetype(ArchetypeBase):
             archetype=self.name,
             pool="",
             source_id=f"{titan_id}:soul_diary:{date}",
-            layers=["identity"],   # art is web-archive-only (P11); X post is text-only
+            layers=["identity", "generated_art"],
             layer_values={},
             prompt_template=prompt_template,
             prompt_values=prompt_values,
@@ -124,21 +125,23 @@ class SoulDiaryArchetype(ArchetypeBase):
             bypass_rate_limit=True,
         )
 
-    # ── Media — X posts are TEXT-ONLY (P11): felt-art is web-archive-only ──
+    # ── Media — attach the ALREADY-rendered felt-art (P7), do NOT re-render ──
     def prepare_media(self, candidate: ArchetypeCandidate, *, neuromods,
                       titan_id: str = "T1") -> str:
-        """Soul-diary X posts carry NO image — the felt-art lives only on the
-        web archive page ({archive_url}). Always returns "" so the dispatcher
-        posts text-only. (The art_path still rides in metadata, harmlessly, for
-        the archive page; we simply never attach it to the tweet.)
-
-        WHY text-only: the live worker was observed rendering a STALE art
-        algorithm on the tweet image despite the repo carrying the corrected
-        deterministic renderer (see BUGS: worker-loads-stale-titan_hcl). Rather
-        than ship visibly-wrong art on the public timeline, the X post is
-        text-only and the (correct) art is shown on the archive page, which is
-        rendered from current code by the frontend/API path. (2026-06-11)"""
-        return ""
+        """Upload the day's procedural felt-art (rendered in P7, path on the
+        ledger row) and return its media_id. Empty string → caller posts
+        text-only (soft-fail)."""
+        art_path = candidate.metadata.get("art_path", "")
+        if not art_path or not os.path.exists(art_path):
+            logger.info("[soul_diary] no art to attach (%s) — posting text-only",
+                        art_path or "none")
+            return ""
+        try:
+            from titan_hcl.logic.social_x.image_pipeline import upload_media_via_gateway
+            return upload_media_via_gateway(self.gateway, art_path) or ""
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[soul_diary] media prepare failed: %s", e)
+            return ""
 
 
 __all__ = ("SoulDiaryArchetype", "SOUL_DIARY_POST_TYPE")
