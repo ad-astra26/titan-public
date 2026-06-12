@@ -71,6 +71,12 @@ _DEFAULTS = {
     "explore_replay_batch": 16,        # experience-replay batch size
     "explore_request_enabled": False,  # active idle problem-gen (Phase 2 consumer)
     "macro_min_wins": 5,               # verified wins of one (goal_class,action) → distil
+    # ── Anti-runaway regularization (2026-06-11). The unregularized REINFORCE
+    #    let the off-policy `tool` attribution explode the policy weights
+    #    (scores ~1100 → always-tool collapse). weight_decay = decoupled L2
+    #    pull/step; max_weight_norm = hard per-matrix Frobenius cap.
+    "weight_decay": 0.001,
+    "max_weight_norm": 6.0,
     # ── Phase B (§7.B) — non-verifiable reward source weights (the "bigger delta
     #    for Maker" mechanic). reward × weight → bigger advantage → bigger nudge.
     "judge_reward_weight": 1.0,        # LLM turn-judge (metered tier)
@@ -356,16 +362,31 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
         return
 
     # Policy — restore from our own store, else fresh (cold-start).
-    policy = OuterMetaPolicy(lr=float(cfg["policy_lr"]))
+    _wd = float(cfg["weight_decay"])
+    _mwn = float(cfg["max_weight_norm"])
+    policy = OuterMetaPolicy(lr=float(cfg["policy_lr"]), weight_decay=_wd, max_weight_norm=_mwn)
     loaded = store.load_policy_flat()
     if loaded is not None:
         try:
             import numpy as _np
             restored = OuterMetaPolicy.from_flat(_np.asarray(loaded[0], dtype=_np.float32))
-            policy = restored
-            policy.lr = float(cfg["policy_lr"])
-            logger.info("[self_learning] policy restored (updates=%d, baseline=%.3f)",
-                        policy.total_updates, policy.reward_baseline)
+            restored.lr = float(cfg["policy_lr"])
+            restored.weight_decay = _wd
+            restored.max_weight_norm = _mwn
+            # Self-heal a persisted RUNAWAY policy (the pre-2026-06-11 unregularized
+            # collapse: `tool` weights exploded → always-tool). A pathological
+            # restore is discarded for a fresh cold-start — the regularized
+            # train_step then re-learns without re-exploding.
+            if restored.is_pathological():
+                logger.warning("[self_learning] RESTORED POLICY IS PATHOLOGICAL "
+                               "(runaway weights, updates=%d) — re-initializing "
+                               "(regularized cold-start)", restored.total_updates)
+                policy = OuterMetaPolicy(lr=float(cfg["policy_lr"]),
+                                         weight_decay=_wd, max_weight_norm=_mwn)
+            else:
+                policy = restored
+                logger.info("[self_learning] policy restored (updates=%d, baseline=%.3f)",
+                            policy.total_updates, policy.reward_baseline)
         except Exception as e:  # noqa: BLE001
             logger.warning("[self_learning] policy restore failed (cold-start): %s", e)
 

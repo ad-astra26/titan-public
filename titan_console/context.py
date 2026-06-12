@@ -58,8 +58,6 @@ class Context:
     dist_dir: Optional[Path] = None        # built SPA bundle
     secrets_path: Optional[Path] = None    # ~/.titan/secrets.toml override (tests)
     dev_enabled: bool = False              # gate for dev-only endpoints (--dev)
-    tls_pin: Optional[str] = None          # sha256(DER) of the self-signed TLS cert → rides the QR (AG-TLS)
-    console_port: int = 7799              # the agent's listening port (for local-mode QR endpoint)
     run: Runner = default_runner
     http: HttpFn = default_http
 

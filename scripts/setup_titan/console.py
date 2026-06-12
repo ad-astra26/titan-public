@@ -55,29 +55,6 @@ def ensure_token() -> Result:
     return Result("console", "ok", f"console token generated → {TOKEN_PATH}")
 
 
-def ensure_tls_cert() -> Result:
-    """Mint the self-signed TLS cert the agent serves + the app pins (AG-TLS/AD-9):
-    ~/.titan/console_tls_{cert,key}.pem via openssl, one-time, off the agent hot path.
-    Reuses titan_console.tls so the installer + agent never drift on the openssl call."""
-    import sys
-    repo_root = str(Path(__file__).resolve().parents[2])
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-    try:
-        from titan_console import tls
-    except ImportError as e:
-        return Result("console", "warn", f"TLS module import failed: {e}",
-                      "Agent runs on plain HTTP; phones can't pin until the cert exists.")
-    titan_dir = Path(os.path.expanduser("~/.titan"))
-    try:
-        cert, _ = tls.ensure_console_tls(titan_dir)
-        return Result("console", "ok",
-                      f"self-signed TLS cert ready → {cert} (pin {tls.cert_pin(cert)[:16]}…)")
-    except (OSError, subprocess.CalledProcessError) as e:
-        return Result("console", "warn", f"could not mint TLS cert: {e}",
-                      "Install openssl; until then the agent serves plain HTTP (no pinning).")
-
-
 def ensure_bundle(install_root: Path) -> Result:
     """Prefer the committed prebuilt dist; on-box build only as a fallback."""
     dist = dist_dir(install_root)
@@ -116,22 +93,11 @@ def _sudo(cmd: list[str], *, explain: str) -> int:
 
 
 def _health_ok(port: int) -> bool:
-    # The agent serves HTTPS (self-signed) by default; accept it on loopback. Fall back
-    # to http for --no-tls deployments.
-    import ssl as _ssl
-    noverify = _ssl.create_default_context()
-    noverify.check_hostname = False
-    noverify.verify_mode = _ssl.CERT_NONE
-    for url in (f"https://127.0.0.1:{port}/console/health",
-                f"http://127.0.0.1:{port}/console/health"):
-        try:
-            kw = {"context": noverify} if url.startswith("https") else {}
-            with urllib.request.urlopen(url, timeout=5, **kw) as r:
-                if r.status == 200:
-                    return True
-        except (urllib.error.URLError, OSError):
-            continue
-    return False
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/console/health", timeout=5) as r:
+            return r.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 def run_console_phase(state: dict, install_root: Path, *, user: str,
@@ -142,7 +108,7 @@ def run_console_phase(state: dict, install_root: Path, *, user: str,
     Decoupling: runs on the SYSTEM python (stdlib-only) so a broken Titan venv
     can't take the console down with it.
     """
-    results: list[Result] = [ensure_token(), ensure_tls_cert(), ensure_bundle(install_root)]
+    results: list[Result] = [ensure_token(), ensure_bundle(install_root)]
 
     sys_python = shutil.which("python3") or "/usr/bin/python3"
     unit = render_unit(install_root=install_root, user=user, venv_python=sys_python,
@@ -166,8 +132,8 @@ def run_console_phase(state: dict, install_root: Path, *, user: str,
 
     if _health_ok(port):
         results.append(Result("console", "ok",
-                              f"Console Agent live at https://{bind_host}:{port} "
-                              f"(pinned TLS; stays up even if the Titan is down)"))
+                              f"Console Agent live at http://{bind_host}:{port} "
+                              f"(stays up even if the Titan is down)"))
     else:
         results.append(Result("console", "warn",
                               f"unit started but :{port}/console/health not 200 yet",
@@ -187,8 +153,7 @@ def run_console_phase(state: dict, install_root: Path, *, user: str,
     # Final guidance — where the user goes next to meet their Titan.
     cprint("", role="text")
     cprint("  ✔ Your Titan's Console (TC²) is ready.", role="success", bold=True)
-    cprint(f"     Open it →  https://{bind_host}:{port}  (self-signed — your browser will ask once)",
-           role="text_strong")
+    cprint(f"     Open it →  http://{bind_host}:{port}", role="text_strong")
     cprint("     Chat with your Titan there, and watch its identity, memory, and",
            role="text_muted")
     cprint("     growth. That console is your window into your sovereign Titan.",

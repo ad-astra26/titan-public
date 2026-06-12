@@ -98,50 +98,10 @@ def load_or_create_server_key(ctx: Context) -> tuple[bytes, bytes]:
 
 
 # ── pairing lifecycle ────────────────────────────────────────────────────────
-_VALID_MODES = {"local", "remote", "install"}
-
-
-def _detect_lan_ip() -> str | None:
-    """Default-route interface IP via a connect-less UDP socket (no packets sent).
-    Defensive: returns None on any failure so the caller can omit the endpoint."""
-    import socket
-    s = None
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("203.0.113.10", 80))  # picks the iface for the default route; sends nothing
-        return s.getsockname()[0]
-    except OSError:
-        return None
-    finally:
-        if s is not None:
-            s.close()
-
-
-def _https_endpoint(host: str, port: int) -> str:
-    """Normalize an operator-supplied/detected host into an https endpoint (AG-TLS:
-    every mode is pinned-TLS, so the endpoint is always https)."""
-    host = host.strip()
-    for scheme in ("https://", "http://"):
-        if host.startswith(scheme):
-            host = host[len(scheme):]
-            break
-    host = host.rstrip("/")
-    return f"https://{host}" if (":" in host) else f"https://{host}:{port}"
-
-
-def mint_pairing(ctx: Context, *, ttl: int = _TTL_DEFAULT, public_url: str | None = None,
-                 mode: str | None = None, now: float | None = None) -> tuple[int, dict]:
-    """Operator-triggered: mint a single-use QR pairing token. (token-gated route)
-
-    `mode` ∈ {local, remote, install} resolves the endpoint (AG-MODE/AD-8):
-      local  → https://<LAN-ip>:<console_port>   (auto-detected)
-      remote → public_url (Maker-typed, normalized to https)
-      install→ no endpoint (the CLI drives both ends on the box)
-    The QR additionally carries the TLS pin (AG-TLS) when the agent serves TLS.
-    """
+def mint_pairing(ctx: Context, *, ttl: int = _TTL_DEFAULT,
+                 public_url: str | None = None, now: float | None = None) -> tuple[int, dict]:
+    """Operator-triggered: mint a single-use QR pairing token. (token-gated route)"""
     now = now if now is not None else time.time()
-    if mode is not None and mode not in _VALID_MODES:
-        return 400, {"error": f"invalid mode {mode!r}; one of {sorted(_VALID_MODES)}"}
     token_raw = os.urandom(32)
     token_b64 = _b64(token_raw)
     _, server_pub = load_or_create_server_key(ctx)
@@ -154,18 +114,8 @@ def mint_pairing(ctx: Context, *, ttl: int = _TTL_DEFAULT, public_url: str | Non
         "titan_id": ctx.titan_id,
         "ttl": ttl,
     }
-    if mode:
-        payload["mode"] = mode
-    # endpoint resolution: explicit public_url wins; else local-mode auto-detects the LAN IP.
-    endpoint = public_url
-    if not endpoint and mode == "local":
-        ip = _detect_lan_ip()
-        if ip:
-            endpoint = f"{ip}:{ctx.console_port}"
-    if endpoint:
-        payload["endpoint_url"] = _https_endpoint(endpoint, ctx.console_port)
-    if ctx.tls_pin:
-        payload["server_tls_pin"] = ctx.tls_pin
+    if public_url:
+        payload["endpoint_url"] = public_url
     return 200, payload
 
 
@@ -221,42 +171,12 @@ def pair_status(ctx: Context, pairing_token: str, *, now: float | None = None) -
     if pend.get("state") in ("submitted", "confirmed"):
         out["code6"] = pend.get("code6")
         out["label"] = pend.get("label")
-        # The device pubkey (public, not secret) so the Maker panel can wallet-sign it
-        # for the additive on-chain Maker-binding (AG-MAKER-BIND).
-        out["device_pubkey"] = pend.get("device_pubkey")
     return 200, out
 
 
-def _maker_binding(device_pubkey_b64: str, maker_pubkey: str | None,
-                   maker_sig: str | None) -> dict:
-    """Additive Maker-binding (AG-MAKER-BIND/AD-10). If the Observatory path supplied a
-    wallet signature over the device pubkey, verify it (vendored Ed25519, AG2) and record
-    {method:'wallet', maker_pubkey}; otherwise the operator-token gate that admitted this
-    confirm IS the Maker proof → {method:'operator_token'}. A SUPPLIED-but-INVALID
-    signature is a hard error (caller maps to 403) — we never downgrade silently."""
-    if not (maker_pubkey and maker_sig):
-        return {"method": "operator_token"}
-    try:
-        pub_raw = _unb64(maker_pubkey)   # base64 of the raw 32-byte Solana pubkey
-        sig_raw = _unb64(maker_sig)      # base64 of the raw 64-byte Ed25519 signature
-    except (ValueError, base64.binascii.Error):
-        raise ValueError("maker_pubkey/maker_sig not valid base64")
-    if len(pub_raw) != 32 or len(sig_raw) != 64:
-        raise ValueError("maker_pubkey must be 32 bytes, maker_sig 64 bytes")
-    if not _ed25519.verify(sig_raw, device_pubkey_b64.encode(), pub_raw):
-        raise ValueError("maker wallet signature does not verify over the device pubkey")
-    return {"method": "wallet", "maker_pubkey": maker_pubkey}
-
-
 def confirm_device(ctx: Context, pairing_token: str, code: str,
-                   *, maker_pubkey: str | None = None, maker_sig: str | None = None,
-                   now: float | None = None) -> tuple[int, dict]:
-    """Operator-confirmed mutual code match → register the device. Token-gated.
-
-    Optionally carries an additive Maker wallet-binding (AG-MAKER-BIND): the Maker's
-    Solana/Privy wallet signs the device pubkey on the Observatory path; console/CLI
-    paths omit it and bind by operator-token possession.
-    """
+                   *, now: float | None = None) -> tuple[int, dict]:
+    """Operator-confirmed mutual code match → register the device. Token-gated."""
     now = now if now is not None else time.time()
     pend = _load_valid_pending(ctx, pairing_token, now)
     if not pend:
@@ -265,16 +185,12 @@ def confirm_device(ctx: Context, pairing_token: str, code: str,
         return 409, {"error": f"cannot confirm in state '{pend.get('state')}'"}
     if str(code).strip() != str(pend.get("code6")):
         return 403, {"error": "code mismatch"}
-    try:
-        authorized_by = _maker_binding(pend["device_pubkey"], maker_pubkey, maker_sig)
-    except ValueError as e:
-        return 403, {"error": str(e)}
     devices = _read_json(_devices_path(ctx), [])
     devices = [d for d in devices if d.get("device_id") != pend["device_id"]]  # re-pair replaces
     devices.append({
         "device_id": pend["device_id"], "pubkey": pend["device_pubkey"],
         "label": pend.get("label", "phone"), "fingerprint": pend.get("fingerprint", ""),
-        "paired_at": now, "authorized_by": authorized_by,
+        "paired_at": now,
     })
     _write_json(_devices_path(ctx), devices)
     # clear the pending session (single-use)
