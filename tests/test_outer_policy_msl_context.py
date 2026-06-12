@@ -70,3 +70,34 @@ def test_decide_returns_none_without_published_policy():
     p = _Plugin()
     p._outer_policy_reader = _Reader(None)
     assert agno_hooks._outer_policy_decide(p, _Readout(), True, "x") is None
+
+
+def test_retrieval_prior_flows_into_decision_vector(tmp_path, monkeypatch):
+    # Piece 7b end-to-end: a wired composite reader + a matching prompt_vec →
+    # composite_match_score/action_norm populate the last 2 feature dims.
+    faiss = pytest.importorskip("faiss")
+    import json
+    from titan_hcl.synthesis.outer_meta_policy import (
+        OUTER_ACTIONS, OuterCompositeReader)
+
+    dim = 384
+    rng = np.random.RandomState(1)
+    pv = rng.randn(dim).astype(np.float32)
+    pv = (pv / (np.linalg.norm(pv) + 1e-8)).astype(np.float32)
+    idx = faiss.IndexFlatL2(dim)
+    idx.add(pv.reshape(1, -1))
+    fpath = str(tmp_path / "reasoning_vectors.faiss")
+    faiss.write_index(idx, fpath)
+    spath = str(tmp_path / "reasoning_snapshot.json")
+    with open(spath, "w") as f:
+        json.dump({"macros": [{"embedding_id": 0, "action": "skill_delegate",
+                               "goal_class": "g"}]}, f)
+    monkeypatch.setattr(omp, "read_msl_context", lambda *a, **k: None)  # isolate retrieval dims
+
+    p = _plugin_with_policy()
+    p._outer_composite_reader = OuterCompositeReader(fpath, spath)
+    out = agno_hooks._outer_policy_decide(p, _Readout(), True, "solve it", pv)
+    assert out is not None
+    _mode, vec, _action = out
+    assert vec[-2] > 0.99   # composite_match_score (identical vec → cos≈1)
+    assert abs(vec[-1] - OUTER_ACTIONS.index("skill_delegate") / 4.0) < 1e-6

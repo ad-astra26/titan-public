@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -167,6 +168,80 @@ def read_msl_context(shm_root=None) -> Optional[np.ndarray]:
         return np.asarray(arr, dtype=np.float32).ravel()
     except Exception:
         return None
+
+
+class OuterCompositeReader:
+    """Phase-C piece 7b — the parametric retrieval prior (D4), lock-free.
+
+    SC-searches the live prompt against the MACRO reasoning-composites and returns
+    `(composite_match_score, composite_match_action_norm)` for the agno decide.
+
+    Cross-process design (SPEC-canonical, ARCHITECTURE_synthesis_engine §0.11.0 FU-1
+    / lesson 10): DuckDB 1.5+ holds the exclusive lock even for `read_only` opens, so
+    the agno process CANNOT open `reasoning.duckdb`. The faiss FILE is read-only-safe;
+    the `embedding_id→action` map rides the lock-free `reasoning_snapshot.json` (the
+    `snapshot_export` "readable past the writer-lock" surface). Both cached + mtime/
+    interval-refreshed; faiss is tiny (few macros). Reuses the PreHook's already-
+    computed normalized `_prompt_vec` (no extra embed). Any miss → (0.0, 0.0)."""
+
+    def __init__(self, faiss_path: str, snapshot_path: str, refresh_s: float = 60.0):
+        self._faiss_path = str(faiss_path)
+        self._snapshot_path = str(snapshot_path)
+        self._refresh_s = float(refresh_s)
+        self._index = None
+        self._macros: dict = {}        # embedding_id -> action_idx
+        self._next_refresh = 0.0
+
+    def _refresh(self, now: float) -> None:
+        if self._index is not None and now < self._next_refresh:
+            return
+        self._next_refresh = now + self._refresh_s
+        try:
+            import faiss  # local — keep faiss out of agno's import-time RSS
+            if os.path.exists(self._faiss_path):
+                self._index = faiss.read_index(self._faiss_path)
+        except Exception:
+            self._index = None
+        macros: dict = {}
+        try:
+            if os.path.exists(self._snapshot_path):
+                with open(self._snapshot_path) as f:
+                    snap = json.load(f)
+                for m in (snap.get("macros") or []):
+                    eid = int(m.get("embedding_id", -1))
+                    act = str(m.get("action", "") or "")
+                    if eid >= 0 and act in OUTER_ACTIONS:
+                        macros[eid] = OUTER_ACTIONS.index(act)
+        except Exception:
+            macros = {}
+        self._macros = macros
+
+    def prior(self, prompt_vec, now: Optional[float] = None) -> tuple:
+        """Return `(score, action_norm)` ∈ [0,1]² for the top matched macro
+        composite, or `(0.0, 0.0)` on any miss (cold-start / no macros / unreadable)."""
+        if now is None:
+            now = time.time()
+        self._refresh(now)
+        if (self._index is None or not self._macros
+                or getattr(self._index, "ntotal", 0) == 0 or prompt_vec is None):
+            return (0.0, 0.0)
+        try:
+            v = np.asarray(prompt_vec, dtype=np.float32).reshape(1, -1)
+            if v.shape[1] != self._index.d:
+                return (0.0, 0.0)
+            k = min(10, int(self._index.ntotal))
+            dists, ids = self._index.search(v, k)
+            for i in range(k):
+                eid = int(ids[0][i])
+                if eid in self._macros:
+                    # IndexFlatL2 returns squared-L2; for a normalized embedder
+                    # cos = 1 − L2²/2 (get_text_embedder normalizes — agno embed-once).
+                    score = 1.0 - float(dists[0][i]) / 2.0
+                    a_norm = self._macros[eid] / max(1, NUM_OUTER_ACTIONS - 1)
+                    return (_clip01(score), _clip01(a_norm))
+        except Exception:
+            return (0.0, 0.0)
+        return (0.0, 0.0)
 
 
 def _clip01(v: float) -> float:
@@ -481,6 +556,6 @@ __all__ = (
     "OUTER_MSL_CONTEXT_STATE_SLOT", "OUTER_MSL_CONTEXT_STATE_SPEC",
     "OUTER_MSL_CONTEXT_STATE_SCHEMA_VERSION",
     "msl_context_to_fixed", "read_msl_context",
-    "OuterFeatures", "OuterMetaPolicy",
+    "OuterFeatures", "OuterMetaPolicy", "OuterCompositeReader",
     "action_index_to_mode", "action_index_to_name",
 )

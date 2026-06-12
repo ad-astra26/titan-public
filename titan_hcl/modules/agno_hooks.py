@@ -177,21 +177,23 @@ def _self_learning_enabled(plugin) -> bool:
         return False
 
 
-def _outer_policy_decide(plugin, readout, requires_tool, prompt_text):
-    """Read the SHM-published `OuterMetaPolicy`, build the Phase-1 feature vector
-    from locally-available signals, and EXPLOIT (argmax) → `(MODE, features_list,
+def _outer_policy_decide(plugin, readout, requires_tool, prompt_text, prompt_vec=None):
+    """Read the SHM-published `OuterMetaPolicy`, build the feature vector from
+    locally-available signals, and EXPLOIT (argmax) → `(MODE, features_list,
     action_idx)`. Returns None on any miss → caller keeps `grounded_route`.
 
-    No sync RPC: the weights come from SHM (INV-OML-7). Phase-C piece 7a (Q4): the
-    full 20-D MSL `distilled_context` is read O(1) from its dedicated SHM slot
-    (`read_msl_context()`, published by cognitive_worker — piece 2) AT decision time,
-    closing the old "`_v5` fetched after the decision" gap. `skill_utility` /
-    `engram_ground` ride the GroundedReadout (live or reserved per the §1.2 D5 note).
-    The 2 retrieval-prior dims stay 0.0 until piece 7b (composite SC-search) lands."""
+    No sync RPC (INV-OML-7). Phase-C piece 7a (Q4): the full 20-D MSL
+    `distilled_context` is read O(1) from its dedicated SHM slot
+    (`read_msl_context()`, cognitive_worker — piece 2) AT decision time, closing the
+    "`_v5`-after-the-decision" gap. Piece 7b (D4): the 2 retrieval-prior dims =
+    `OuterCompositeReader.prior(prompt_vec)` — a lock-free SC-search of the prompt
+    against macro composites (faiss FILE + the `reasoning_snapshot.json` macro map;
+    the SPEC-canonical cross-process pattern). `skill_utility`/`engram_ground` ride
+    the GroundedReadout (live or reserved per the §1.2 D5 note)."""
     try:
         from titan_hcl.synthesis.outer_meta_policy import (
-            OUTER_META_POLICY_STATE_SPEC, OuterFeatures, OuterMetaPolicy,
-            action_index_to_mode, read_msl_context)
+            OUTER_META_POLICY_STATE_SPEC, OuterCompositeReader, OuterFeatures,
+            OuterMetaPolicy, action_index_to_mode, read_msl_context)
         from titan_hcl.core.state_registry import StateRegistryReader, resolve_shm_root
         from titan_hcl.synthesis.tool_intent import detect_tool_intent
     except Exception:
@@ -221,6 +223,23 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text):
         _msl_ctx = tuple(float(x) for x in _msl) if _msl is not None else ()
     except Exception:
         _msl_ctx = ()
+    # Piece 7b (D4) — parametric retrieval prior: lock-free SC-search of the prompt
+    # against macro composites. Reuses the PreHook's already-computed normalized
+    # `_prompt_vec` (no extra embed). Cached reader on the plugin; miss → (0.0, 0.0).
+    _cm_score, _cm_action = 0.0, 0.0
+    if prompt_vec is not None:
+        try:
+            import os as _os
+            creader = getattr(plugin, "_outer_composite_reader", None)
+            if creader is None:
+                _ddir = _os.environ.get("TITAN_DATA_DIR", "data")
+                creader = OuterCompositeReader(
+                    _os.path.join(_ddir, "reasoning_vectors.faiss"),
+                    _os.path.join(_ddir, "reasoning_snapshot.json"))
+                plugin._outer_composite_reader = creader
+            _cm_score, _cm_action = creader.prior(prompt_vec)
+        except Exception:
+            _cm_score, _cm_action = 0.0, 0.0
     feats = OuterFeatures(
         recall_top_cosine=float(getattr(readout, "recall_score", 0.0) or 0.0),
         skill_utility=float(getattr(readout, "skill_utility", 0.0) or 0.0),
@@ -228,6 +247,8 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text):
         requires_tool=bool(requires_tool),
         has_code_signal=_has_code,
         msl_context=_msl_ctx,
+        composite_match_score=float(_cm_score),
+        composite_match_action_norm=float(_cm_action),
     )
     vec = feats.to_vector()
     action = policy.exploit_action(vec)
@@ -1280,7 +1301,8 @@ def create_pre_hook(plugin):
                 _req_tool = bool(locals().get("_requires_tool", False))
                 if _readout_for_policy is not None:
                     _outer = _outer_policy_decide(
-                        plugin, _readout_for_policy, _req_tool, prompt_text)
+                        plugin, _readout_for_policy, _req_tool, prompt_text,
+                        locals().get("_prompt_vec"))
                     if _outer is not None:
                         _mode_override, _features, _action = _outer
                         mode = _mode_override
