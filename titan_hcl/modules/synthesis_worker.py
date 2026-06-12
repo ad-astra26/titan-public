@@ -3104,34 +3104,43 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         from titan_hcl.synthesis.outer_meta_policy import OUTER_ACTIONS
                         _gc = _goal_class_fn(str(payload.get("parent_goal", "") or ""))
                         _reward = 1.0 if str(payload.get("verdict", "")) == "true" else -1.0
-                        # OFF-POLICY attribution: a coding_sandbox verdict evaluates the
-                        # TOOL action — so we train `tool` (not whatever the policy
-                        # happened to pick) with the decision FEATURES as context. This
-                        # is how the RFP's "learned from prior verifiable wins"
-                        # bootstraps: every oracle-verified tool-use (regex- OR
-                        # policy-fired) teaches the policy that tool succeeds in this
-                        # context, breaking the cold-start deadlock where a cold policy
-                        # never tries the tool on a live (exploit-only) turn.
+                        # ON-POLICY credit (§24.7, 2026-06-12): credit `tool` ONLY
+                        # when the POLICY actually chose tool. Previously off-policy —
+                        # every coding_sandbox verdict (incl. an OVG VERIFICATION fired
+                        # on a turn the policy routed to direct/research/IDK) trained
+                        # `tool`, hijacking the policy's choice and relentlessly
+                        # re-collapsing it to always-tool (live-verified 2026-06-12:
+                        # only `tool`'s baseline ever moved). When the policy chose a
+                        # non-tool action, the sandbox ran purely as correctness
+                        # VERIFICATION → it does NOT train `tool`; the policy's actual
+                        # action is credited via the turn path (TURN_REASONING_RECORD →
+                        # turn-judge). The §24.7 structural-oracle idle exploration now
+                        # provides the cold-start bootstrap the off-policy attribution
+                        # used to.
                         _tool_action = OUTER_ACTIONS.index("tool")
-                        _send(send_queue, SELF_LEARN_REWARD, name, "self_learning", {
-                            "features": list(_decision_feats),
-                            "action": _tool_action,
-                            "reward": _reward,
-                            "goal_class": _gc,
-                            "oracle_id": str(payload.get("oracle_id", "") or ""),
-                            "policy_action": payload.get("action"),  # what the policy chose (telemetry)
-                            "parent_tool_call_tx": _ptx,
-                        })
-                        # C1 (INV-OML-11): graph the per-use Reasoning record under
-                        # SELF → LEARNING → REASONING (DuckDB + FAISS + Kuzu), keyed
-                        # by the tool_call_tx (the SC-search DEREF pointer). Soft.
-                        if reasoning_store is not None:
-                            reasoning_store.record_tool_use(
-                                reasoning_id=str(_ptx), goal_class=_gc, action="tool",
-                                oracle_id=str(payload.get("oracle_id", "") or ""),
-                                verdict=str(payload.get("verdict", "") or ""),
-                                reward=_reward, features=list(_decision_feats),
-                                signature_text=str(payload.get("parent_goal", "") or ""))
+                        _policy_action = payload.get("action")
+                        _on_policy_tool = (_policy_action is not None
+                                           and int(_policy_action) == _tool_action)
+                        if _on_policy_tool:
+                            _send(send_queue, SELF_LEARN_REWARD, name, "self_learning", {
+                                "features": list(_decision_feats),
+                                "action": _tool_action,
+                                "reward": _reward,
+                                "goal_class": _gc,
+                                "oracle_id": str(payload.get("oracle_id", "") or ""),
+                                "policy_action": _policy_action,  # telemetry
+                                "parent_tool_call_tx": _ptx,
+                            })
+                            # C1 (INV-OML-11): graph the per-use Reasoning record under
+                            # SELF → LEARNING → REASONING (DuckDB + FAISS + Kuzu), keyed
+                            # by the tool_call_tx (the SC-search DEREF pointer). Soft.
+                            if reasoning_store is not None:
+                                reasoning_store.record_tool_use(
+                                    reasoning_id=str(_ptx), goal_class=_gc, action="tool",
+                                    oracle_id=str(payload.get("oracle_id", "") or ""),
+                                    verdict=str(payload.get("verdict", "") or ""),
+                                    reward=_reward, features=list(_decision_feats),
+                                    signature_text=str(payload.get("parent_goal", "") or ""))
                     except Exception as _sl_err:
                         logger.debug(
                             "[synthesis_worker] self-learn reward/record emit failed: %s",

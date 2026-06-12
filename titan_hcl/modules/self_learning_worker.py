@@ -256,6 +256,19 @@ class _SelfLearningStore:
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] record_reward_tuple soft-fail: %s", e)
 
+    def clear_reward_tuples(self) -> int:
+        """Wipe the experience-replay history (§24.7). Called on a THERAPEUTIC
+        cold-start (pathological self-heal or a schema-version discard): the old
+        tuples encode the collapsed/old-schema behavior, and replaying them would
+        re-collapse the fresh policy. Returns the count cleared. Soft-fail."""
+        try:
+            n = self._conn.execute("SELECT COUNT(*) FROM reward_tuples").fetchone()
+            self._conn.execute("DELETE FROM reward_tuples")
+            return int(n[0]) if n and n[0] else 0
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] clear_reward_tuples soft-fail: %s", e)
+            return 0
+
     def recent_reward_tuples(self, n: int):
         try:
             rows = self._conn.execute(
@@ -449,12 +462,29 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
                                "(regularized cold-start)", restored.total_updates)
                 policy = OuterMetaPolicy(lr=float(cfg["policy_lr"]),
                                          weight_decay=_wd, max_weight_norm=_mwn)
+                # Therapeutic cold-start ⇒ the reward-tuple history encodes the
+                # COLLAPSED behavior (the always-tool era) — replaying it would
+                # re-collapse the fresh policy (live-verified 2026-06-12). Clear it
+                # so the cold-start is a truly clean baseline (§24.7).
+                _n = store.clear_reward_tuples()
+                logger.warning("[self_learning] cleared %d collapsed-era reward tuples "
+                               "(clean cold-start baseline)", _n)
             else:
                 policy = restored
                 logger.info("[self_learning] policy restored (updates=%d, baseline=%.3f)",
                             policy.total_updates, policy.reward_baseline)
         except Exception as e:  # noqa: BLE001
+            # Restore failed (e.g. a schema-version flat-dim change discarded the
+            # persisted policy) ⇒ cold-start. The reward-tuple history belongs to the
+            # OLD policy/schema (and likely the collapsed era) — clear it for a clean
+            # baseline (§24.7); the regularized + structurally-explored policy re-learns.
             logger.warning("[self_learning] policy restore failed (cold-start): %s", e)
+            try:
+                _n = store.clear_reward_tuples()
+                logger.warning("[self_learning] cleared %d stale reward tuples "
+                               "(clean cold-start baseline)", _n)
+            except Exception:  # noqa: BLE001
+                pass
 
     # SHM weight publisher (single writer — INV-OML-8 / G21).
     _shm_writer = None

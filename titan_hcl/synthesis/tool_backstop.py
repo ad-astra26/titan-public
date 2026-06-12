@@ -153,21 +153,33 @@ async def run_tool_backstop(
     if not cfg.get("enabled", True):
         return BackstopResult(reason="disabled")
 
-    # 1) cheap regex gate — exits on ~95% of (pure-conversation) turns. BUT the
-    #    learned OuterMetaPolicy may have chosen `tool` even ABSENT the regex
-    #    trigger (RFP_synthesis_self_learning_meta_reasoning v1.1, §1.3: the policy
-    #    learned that computational-shaped prompts reward the tool) → honor that
-    #    decision and proceed to the router, which synthesizes the code.
+    # 1) Gate. When the OuterMetaPolicy is enabled it is the ROUTER — the PRE
+    #    backstop must honor its choice (autonomy/emergence, §24.7): fire tool on
+    #    a pre-LLM turn ONLY if the policy chose tool. The regex `requires_tool`
+    #    no longer FORCES tool over the policy's non-tool choice — that hijacked
+    #    routing + credit (every regex-matched conversational turn became a
+    #    tool-use crediting `tool`) and re-collapsed the policy to always-tool
+    #    (live-verified 2026-06-12). The POST phase is VERIFICATION (OVG salvage
+    #    of numeric claims in the response — correctness), so it still fires on a
+    #    regex/router signal regardless of the policy; the on-policy credit in
+    #    synthesis_worker ensures such a verification does NOT credit `tool` when
+    #    the policy chose a non-tool action. When OML is OFF (no decision), the
+    #    legacy regex gate stands (back-compat).
     intent = detect_tool_intent(prompt, response)
+    _dec = getattr(plugin, "_last_outer_decision", None)
+    _oml_enabled = _dec is not None and len(_dec) == 2
     _policy_wants_tool = False
-    try:
-        _dec = getattr(plugin, "_last_outer_decision", None)
-        if _dec is not None and len(_dec) == 2:
+    if _oml_enabled:
+        try:
             from titan_hcl.synthesis.outer_meta_policy import OUTER_ACTIONS
             _policy_wants_tool = (int(_dec[1]) == OUTER_ACTIONS.index("tool"))
-    except Exception:  # noqa: BLE001
-        _policy_wants_tool = False
-    if not intent.requires_tool and not _policy_wants_tool:
+        except Exception:  # noqa: BLE001
+            _policy_wants_tool = False
+    if phase == "pre" and _oml_enabled:
+        # policy is the router on a live pre-LLM turn — fire iff it chose tool
+        if not _policy_wants_tool:
+            return BackstopResult(fired=False, reason="policy_non_tool")
+    elif not intent.requires_tool and not _policy_wants_tool:
         return BackstopResult(fired=False, reason="no_intent")
 
     # 2) fast-model router — reliable code on gated turns. The router also

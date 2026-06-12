@@ -58,6 +58,23 @@ def test_balanced_replay_empty_store_is_safe(tmp_path):
         store.close()
 
 
+def test_clear_reward_tuples_wipes_collapsed_history(tmp_path):
+    """Therapeutic cold-start cleaning (§24.7): clear_reward_tuples wipes the
+    replay history so a cold-start is a clean baseline (no collapsed-era replay)."""
+    store = _SelfLearningStore(path=str(tmp_path / "clear.duckdb"))
+    try:
+        for _ in range(30):
+            store.record_reward_tuple(features=_feats(), action=TOOL, reward=1.0, goal_class="c")
+        assert len(store.recent_reward_tuples(50)) == 30
+        n = store.clear_reward_tuples()
+        assert n == 30
+        assert store.recent_reward_tuples(50) == []
+        assert store.balanced_reward_tuples(16) == []
+        assert store.clear_reward_tuples() == 0   # safe on an empty store
+    finally:
+        store.close()
+
+
 def test_distinct_recent_contexts_spans_goal_classes(tmp_path):
     store = _SelfLearningStore(path=str(tmp_path / "ctx.duckdb"))
     try:
