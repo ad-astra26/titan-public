@@ -182,13 +182,16 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text):
     from locally-available signals, and EXPLOIT (argmax) → `(MODE, features_list,
     action_idx)`. Returns None on any miss → caller keeps `grounded_route`.
 
-    No sync RPC: the weights come from SHM (INV-OML-7). The 3 MSL slots are RESERVED
-    0.0 (Phase 3 / Q4 — `_v5` is not available at this decision point); `skill_utility`
-    / `engram_ground` ride the GroundedReadout (live or reserved per the §1.2 D5 note)."""
+    No sync RPC: the weights come from SHM (INV-OML-7). Phase-C piece 7a (Q4): the
+    full 20-D MSL `distilled_context` is read O(1) from its dedicated SHM slot
+    (`read_msl_context()`, published by cognitive_worker — piece 2) AT decision time,
+    closing the old "`_v5` fetched after the decision" gap. `skill_utility` /
+    `engram_ground` ride the GroundedReadout (live or reserved per the §1.2 D5 note).
+    The 2 retrieval-prior dims stay 0.0 until piece 7b (composite SC-search) lands."""
     try:
         from titan_hcl.synthesis.outer_meta_policy import (
             OUTER_META_POLICY_STATE_SPEC, OuterFeatures, OuterMetaPolicy,
-            action_index_to_mode)
+            action_index_to_mode, read_msl_context)
         from titan_hcl.core.state_registry import StateRegistryReader, resolve_shm_root
         from titan_hcl.synthesis.tool_intent import detect_tool_intent
     except Exception:
@@ -211,12 +214,20 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text):
         _has_code = bool(getattr(detect_tool_intent(prompt_text or ""), "code", "") or "")
     except Exception:
         _has_code = False
+    # Piece 7a (Q4 full MSL) — read the live 20-D distilled_context O(1) from SHM.
+    # Miss (slot not yet published / cold-start) → () → to_vector pads zeros.
+    try:
+        _msl = read_msl_context()
+        _msl_ctx = tuple(float(x) for x in _msl) if _msl is not None else ()
+    except Exception:
+        _msl_ctx = ()
     feats = OuterFeatures(
         recall_top_cosine=float(getattr(readout, "recall_score", 0.0) or 0.0),
         skill_utility=float(getattr(readout, "skill_utility", 0.0) or 0.0),
         engram_ground=float(getattr(readout, "engram_ground", 0.0) or 0.0),
         requires_tool=bool(requires_tool),
         has_code_signal=_has_code,
+        msl_context=_msl_ctx,
     )
     vec = feats.to_vector()
     action = policy.exploit_action(vec)
