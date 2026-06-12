@@ -187,14 +187,18 @@ def _oml_decide_debug_capture(policy, vec, action, prompt_text, cm_score, cm_act
     "the policy is only as good as the live feature vector — INSTRUMENT FIRST").
 
     Gated by a FILE flag so capture can be armed/disarmed on a LIVE box with NO
-    restart: `touch <flag>` to arm, `rm` to disarm (default flag
-    `/tmp/oml_decide_debug.on` → capture appends to `/tmp/oml_decide_debug.jsonl`).
+    restart: `touch <flag>` to arm, `rm` to disarm. Both the flag and the capture
+    live in the PERSISTENT in-repo `<TITAN_DATA_DIR>/logs/` (default `data/logs/`,
+    alongside `sage_research.log`) — NOT `/tmp` (which is wiped on reboot + prone
+    to cross-owner permission surprises). Override paths via the two env vars.
     Read-only telemetry, fully wrapped — must NEVER break a chat turn (INV-OML-7).
     A single `os.path.exists` stat per user turn when disarmed (turns are
     user-paced, not a hot loop) → negligible."""
     try:
         import os as _os
-        flag = _os.environ.get("TITAN_OML_DECIDE_DEBUG_FLAG", "/tmp/oml_decide_debug.on")
+        _logdir = _os.path.join(_os.environ.get("TITAN_DATA_DIR", "data"), "logs")
+        flag = _os.environ.get("TITAN_OML_DECIDE_DEBUG_FLAG",
+                               _os.path.join(_logdir, "oml_decide_debug.on"))
         if not _os.path.exists(flag):
             return
         import json as _json
@@ -218,8 +222,9 @@ def _oml_decide_debug_capture(policy, vec, action, prompt_text, cm_score, cm_act
                               "action_norm": round(float(cm_action), 4)},
             "total_updates": int(getattr(policy, "total_updates", 0)),
         }
-        path = _os.environ.get(
-            "TITAN_OML_DECIDE_DEBUG_PATH", "/tmp/oml_decide_debug.jsonl")
+        path = _os.environ.get("TITAN_OML_DECIDE_DEBUG_PATH",
+                               _os.path.join(_logdir, "oml_decide_debug.jsonl"))
+        _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "a") as _f:
             _f.write(_json.dumps(rec) + "\n")
     except Exception:
