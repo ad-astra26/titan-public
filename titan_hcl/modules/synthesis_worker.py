@@ -571,6 +571,28 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
             "[synthesis_worker] _send %s → %s failed: %s", msg_type, dst, e)
 
 
+def _correctness_aware_reward_msgs(*, decision_feats, policy_action, tool_action,
+                                   goal_class, oracle_id, parent_tool_call_tx) -> list:
+    """Fix 1 (§24.10) — the two SELF_LEARN_REWARD payloads emitted when the policy
+    chose a NON-tool action whose numeric claim the OVG POST-backstop had to
+    SALVAGE (verdict "false" → the chosen action's answer was WRONG; coding_sandbox
+    computed the right value). Reward by the verification OUTCOME, not the turn-
+    judge's QUALITY score: credit `tool` (+1, it produced the right value) AND
+    penalize the chosen action (−1, it failed). Both `source="oracle"` (objective
+    correctness, the top authority rank). Pure → unit-testable; the caller _sends
+    each + graphs the C1 salvage record."""
+    return [
+        {"features": list(decision_feats), "action": int(tool_action),
+         "reward": 1.0, "goal_class": goal_class, "oracle_id": oracle_id,
+         "policy_action": policy_action, "parent_tool_call_tx": parent_tool_call_tx,
+         "source": "oracle"},
+        {"features": list(decision_feats), "action": int(policy_action),
+         "reward": -1.0, "goal_class": goal_class,
+         "policy_action": policy_action, "parent_tool_call_tx": parent_tool_call_tx,
+         "source": "oracle"},
+    ]
+
+
 def _heartbeat_loop(send_queue, name: str,
                     stop_event: threading.Event,
                     state_writer: Optional[Any] = None,
@@ -3140,6 +3162,41 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                     oracle_id=str(payload.get("oracle_id", "") or ""),
                                     verdict=str(payload.get("verdict", "") or ""),
                                     reward=_reward, features=list(_decision_feats),
+                                    signature_text=str(payload.get("parent_goal", "") or ""))
+                        elif (_policy_action is not None
+                              and str(payload.get("verdict", "")) == "false"):
+                            # ── Fix 1 (§24.10) — CORRECTNESS-aware credit ──────────
+                            # The policy chose a NON-tool action AND the OVG POST-
+                            # backstop had to SALVAGE its numeric claim: verdict=="false"
+                            # ⇒ the chosen action's answer was WRONG and `coding_sandbox`
+                            # computed the right value. So `tool` was the right action by
+                            # OUTCOME (not the turn-judge's QUALITY score). Reward by the
+                            # verification outcome, not plausibility: credit `tool` (+1,
+                            # it worked) AND penalize the chosen action (−1, it failed).
+                            # This kills the "wrong direct/research answer to a computable
+                            # prompt earns +reward → collapse" the live T3 soak proved
+                            # (2026-06-12). Scoped to wrong NUMERIC answers only — a
+                            # conversational `direct` turn has no numeric claim, so the
+                            # post-backstop never runs ⇒ verdict=="" ⇒ this never fires.
+                            # (verdict=="true" → the chosen action's answer was fine →
+                            # keep §24.8: the sandbox ran as pure VERIFICATION, train
+                            # nothing here; the turn-judge credits the chosen action.)
+                            for _m in _correctness_aware_reward_msgs(
+                                    decision_feats=_decision_feats,
+                                    policy_action=_policy_action,
+                                    tool_action=_tool_action, goal_class=_gc,
+                                    oracle_id=str(payload.get("oracle_id", "") or ""),
+                                    parent_tool_call_tx=_ptx):
+                                _send(send_queue, SELF_LEARN_REWARD, name,
+                                      "self_learning", _m)
+                            # C1: graph the salvage as a verified tool-use (the value the
+                            # sandbox computed IS correct — verdict "true" for tool).
+                            if reasoning_store is not None:
+                                reasoning_store.record_tool_use(
+                                    reasoning_id=str(_ptx), goal_class=_gc, action="tool",
+                                    oracle_id=str(payload.get("oracle_id", "") or ""),
+                                    verdict="true", reward=1.0,
+                                    features=list(_decision_feats),
                                     signature_text=str(payload.get("parent_goal", "") or ""))
                     except Exception as _sl_err:
                         logger.debug(

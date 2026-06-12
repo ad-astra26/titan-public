@@ -99,7 +99,12 @@ _DEFAULTS = {
     # HURT and entropy-reg was neutral, so only this knob moved. (2026-06-12.)
     "explore_structural_batch": 64,    # recalled contexts taught per idle tick (Lever 1: was 24)
     "explore_structural_advantage": 3.0,  # cross-entropy push magnitude toward the verified target (Lever 1: was 1.0)
-    "explore_know_threshold": 0.5,     # recall_top_cosine ≥ this ⇒ "he knows" (→ direct)
+    "explore_know_threshold": 0.65,    # recall_top_cosine ≥ this ⇒ "he knows" (→ direct).
+    #   Calibrated 0.5→0.65 (§24.9) to MATCH the grounded router's recall_known_floor
+    #   (grounded_router.py default 0.65). The live T3 soak showed the 0.5 boundary made
+    #   moderate-recall informational prompts (recall ~0.5–0.65 — a false-positive "knows"
+    #   signal) route `direct` where grounded sends them `research`. Same boundary ⇒ the
+    #   seed + idle pass agree with the symbolic router on "does he actually know?".
     "explore_skill_floor": 0.3,        # skill_utility ≥ this + matched ⇒ reuse (→ skill_delegate)
     "explore_research_chi_floor": 0.4, # chi ≥ this ⇒ research affordable; else honest IDK
     "explore_request_enabled": False,  # active idle problem-gen (LLM-judge layer; Phase 2 consumer)
@@ -139,7 +144,12 @@ _DEFAULTS = {
 }
 # Reward-source authority rank (Phase B corrective-delta): a higher-rank source
 # may correct a lower-rank applied reward; same-or-lower is ignored (no double-train).
-_REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2}
+# `oracle` (§24.10, Fix 1) = the OVG numeric-VERIFICATION outcome — objective
+# correctness for a verifiable claim, so it out-ranks ALL subjective sources
+# (the quality turn-judge, a user/Maker rating): a numerically-wrong answer is
+# wrong regardless of how it reads. (Emitted at verdict-time on the direct path
+# today; the rank governs any future join-path correction of the turn-judge.)
+_REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3}
 _SURVIVAL_STATES = frozenset({"SURVIVAL", "STARVATION"})
 
 

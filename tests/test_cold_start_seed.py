@@ -32,7 +32,7 @@ _LANE_ACTION = {
 _CFG = {
     "cold_start_seed_epochs": 300,
     "cold_start_seed_advantage": 3.0,
-    "explore_know_threshold": 0.5,
+    "explore_know_threshold": 0.65,   # calibrated to grounded recall_known_floor (§24.9)
     "explore_skill_floor": 0.3,
 }
 
