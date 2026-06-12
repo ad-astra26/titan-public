@@ -109,6 +109,7 @@ _DEFAULTS = {
     "explore_research_chi_floor": 0.4, # chi ≥ this ⇒ research affordable; else honest IDK
     "explore_request_enabled": False,  # active idle problem-gen (LLM-judge layer; Phase 2 consumer)
     "macro_min_wins": 5,               # verified wins of one (goal_class,action) → distil
+    "macro_refine_min_growth": 5,      # §7.D D.4c — +N verified wins since last emit → a successor composite
     # Fix 2 (§24.9 — cold-start feature-discriminating seed). A FRESH policy's
     # argmax is ~uniform; the first dense live reward stream (the turn-judge,
     # which rewards a single action regardless of features) collapses it to that
@@ -194,7 +195,18 @@ class _SelfLearningStore:
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS macro_emitted ("
             " goal_class VARCHAR, action INTEGER, ts DOUBLE,"
+            " version INTEGER DEFAULT 1, wins_at_emit INTEGER DEFAULT 0,"
             " PRIMARY KEY (goal_class, action))")
+        # §7.D D.4c — additive columns on a pre-D.4c macro_emitted table (refinement
+        # versioning / mutate-not-update). Idempotent (DuckDB IF NOT EXISTS).
+        for _col, _ddl in (("version", "INTEGER DEFAULT 1"),
+                           ("wins_at_emit", "INTEGER DEFAULT 0")):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE macro_emitted ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+            except Exception as _e:  # noqa: BLE001
+                logger.debug("[self_learning] macro_emitted ALTER %s soft-fail: %s",
+                             _col, _e)
 
     # -- policy weights -------------------------------------------------
     def load_policy_flat(self):
@@ -386,14 +398,59 @@ class _SelfLearningStore:
             logger.debug("[self_learning] macro_already_emitted soft-fail: %s", e)
             return False
 
-    def mark_macro_emitted(self, goal_class: str, action: int) -> None:
+    def mark_macro_emitted(self, goal_class: str, action: int,
+                           version: int = 1, wins_at_emit: int = 0) -> None:
+        """§7.D D.4c — record the emit + its version + the win_count at emit-time
+        (the refinement baseline). On a successor (version>1) UPDATE in place; the
+        prior macro RECORD is never overwritten (it lives under its own ::v{n} id —
+        mutate-not-update, INV-OML-5)."""
         try:
             self._conn.execute(
-                "INSERT INTO macro_emitted (goal_class, action, ts) VALUES (?,?,?) "
-                "ON CONFLICT (goal_class, action) DO NOTHING",
-                [str(goal_class or ""), int(action), time.time()])
+                "INSERT INTO macro_emitted (goal_class, action, ts, version, "
+                "wins_at_emit) VALUES (?,?,?,?,?) "
+                "ON CONFLICT (goal_class, action) DO UPDATE SET "
+                "ts=excluded.ts, version=excluded.version, "
+                "wins_at_emit=excluded.wins_at_emit",
+                [str(goal_class or ""), int(action), time.time(),
+                 int(version), int(wins_at_emit)])
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] mark_macro_emitted soft-fail: %s", e)
+
+    def macro_version(self, goal_class: str, action: int) -> tuple:
+        """Return (version, wins_at_emit) for an emitted (goal_class, action), or
+        (0, 0) if never emitted."""
+        try:
+            row = self._conn.execute(
+                "SELECT version, wins_at_emit FROM macro_emitted "
+                "WHERE goal_class=? AND action=?",
+                [str(goal_class or ""), int(action)]).fetchone()
+            if not row:
+                return (0, 0)
+            return (int(row[0] or 1), int(row[1] or 0))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] macro_version soft-fail: %s", e)
+            return (0, 0)
+
+    def refinement_candidates(self, min_growth: int, limit: int = 4):
+        """§7.D D.4c — already-emitted (goal_class, action) whose verified wins have
+        GROWN by ≥ `min_growth` since the last emit → a successor composite is worth
+        distilling (the strategy got more evidence). Most-grown first."""
+        try:
+            rows = self._conn.execute(
+                "SELECT goal_class, action, version, wins_at_emit, wins FROM ("
+                "  SELECT me.goal_class AS goal_class, me.action AS action, "
+                "    me.version AS version, me.wins_at_emit AS wins_at_emit, "
+                "    (SELECT COUNT(*) FROM reward_tuples rt "
+                "     WHERE rt.goal_class=me.goal_class AND rt.action=me.action "
+                "     AND rt.reward>0) AS wins "
+                "  FROM macro_emitted me"
+                ") WHERE wins - wins_at_emit >= ? "
+                "ORDER BY wins - wins_at_emit DESC LIMIT ?",
+                [int(min_growth), int(limit)]).fetchall()
+            return [(str(r[0]), int(r[1]), int(r[2] or 1), int(r[3] or 0)) for r in rows]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] refinement_candidates soft-fail: %s", e)
+            return []
 
     def candidate_macro_classes(self, min_wins: int, limit: int = 8):
         """Phase-C piece 6 — (goal_class, action) classes with ≥ `min_wins`
@@ -799,37 +856,51 @@ def _handle_reward(payload, store, policy, shm_writer, cfg, send_queue, name) ->
 
 
 def _emit_macro(goal_class, action, store, send_queue, name,
-                composed_from=None) -> None:
+                composed_from=None, version=1) -> None:
     """Emit the `SELF_LEARN_MACRO_READY` S2 contract + mark emitted. Shared by the
-    Phase-1 reactive path (`_maybe_distill_macro`) and the Phase-C deliberative
-    explore-tick path (`_outer_deliberate`). `composed_from` (leaf reasoning_ids)
-    is forwarded when available; the worker has no leaf-id join today so it stays
-    None (the leaf-edge enrichment is a synthesis-side fast-follow — RFP §7.C)."""
+    Phase-1 reactive path (`_maybe_distill_macro`), the Phase-C deliberative
+    explore-tick path (`_outer_deliberate`), and the §7.D D.4c refinement path.
+
+    `version` (D.4c, mutate-not-update / INV-OML-5): v1 keeps the canonical label
+    `macro::{gc}::{action}` (back-compat); a successor (v>1) is a NEW record
+    `macro::{gc}::{action}::v{n}` whose `composed_from` carries the parent label as
+    lineage — the prior macro is never overwritten. `composed_from` extra entries
+    (D.4b child composites) are merged in. The synthesis-side handler joins the
+    verified tool_use leaves when composed_from is empty (D.1)."""
+    win_count = store.win_count(goal_class, action)
     signature = store.mean_features(goal_class, action)
     if signature is None:
         return
+    action_name = action_index_to_name(action)
+    base_label = f"macro::{goal_class}::{action_name}"
+    label = base_label if int(version) <= 1 else f"{base_label}::v{int(version)}"
+    lineage = list(composed_from or [])
+    if int(version) > 1 and base_label not in lineage:
+        lineage.append(base_label)        # successor cites its predecessor (lineage)
     payload = {
         "goal_class": goal_class,
         "action": int(action),
-        "action_name": action_index_to_name(action),
+        "action_name": action_name,
         "signature": signature,
         "b_i": 1.0, "c": 1.0,
         "time_cost": 1.0,                 # oracle-verified → proficient (B1)
-        "use_count": store.win_count(goal_class, action),
+        "use_count": win_count,
         "verified": True,                  # only verified classes reach here
-        "label": f"macro::{goal_class}::{action_index_to_name(action)}",
+        "label": label,
+        "version": int(version),
     }
-    if composed_from:
-        payload["composed_from"] = list(composed_from)
+    if lineage:
+        payload["composed_from"] = lineage
     try:
         send_queue.put({
             "type": SELF_LEARN_MACRO_READY, "src": name, "dst": "synthesis",
             "ts": time.time(), "payload": payload})
-        store.mark_macro_emitted(goal_class, action)
-        store.log_explore("macro_emitted", goal_class, action_index_to_name(action))
-        logger.info("[self_learning] macro-strategy distilled: %s → %s (wins=%d)",
-                    goal_class, action_index_to_name(action),
-                    store.win_count(goal_class, action))
+        store.mark_macro_emitted(goal_class, action, version=int(version),
+                                 wins_at_emit=win_count)
+        store.log_explore("macro_emitted", goal_class,
+                          f"{action_name} v{int(version)} wins={win_count}")
+        logger.info("[self_learning] macro-strategy distilled: %s → %s v%d (wins=%d)",
+                    goal_class, action_name, int(version), win_count)
     except Exception as e:  # noqa: BLE001
         logger.debug("[self_learning] macro emit soft-fail: %s", e)
 
@@ -984,10 +1055,20 @@ def _outer_deliberate(cfg, store, send_queue, name, outer_reason, outer_meta) ->
     EVALUATEs via the in-worker win-oracle) → trains the outer policies. On a
     VERIFIED composite, emits the macro via the shared S2 contract. This is the
     continuous idle-time deliberative learner ("otherwise dead code → useful")."""
+    # §7.D D.4c — prefer a FRESH class (v1); else refine an already-emitted class
+    # whose verified wins GREW ≥ macro_refine_min_growth since last emit → a
+    # successor composite v{n+1} (mutate-not-update; the prior macro is untouched).
     candidates = store.candidate_macro_classes(int(cfg["macro_min_wins"]), limit=4)
-    if not candidates:
-        return
-    goal_class, action = candidates[0]
+    version = 1
+    if candidates:
+        goal_class, action = candidates[0]
+    else:
+        refine = store.refinement_candidates(
+            int(cfg["macro_refine_min_growth"]), limit=4)
+        if not refine:
+            return
+        goal_class, action, _prev_version, _wins_at_emit = refine[0]
+        version = int(_prev_version) + 1
     signature = store.mean_features(goal_class, action)
     if signature is None or len(signature) != OUTER_POLICY_INPUT_DIM:
         return
@@ -1003,10 +1084,10 @@ def _outer_deliberate(cfg, store, send_queue, name, outer_reason, outer_meta) ->
         pass
     store.log_explore(
         "outer_deliberate", goal_class,
-        f"verified={composite.get('verified')} reward={composite.get('reward')} "
-        f"chain={composite.get('chain_length')}")
+        f"v{version} verified={composite.get('verified')} "
+        f"reward={composite.get('reward')} chain={composite.get('chain_length')}")
     if composite.get("verified"):
-        _emit_macro(goal_class, action, store, send_queue, name)
+        _emit_macro(goal_class, action, store, send_queue, name, version=version)
 
 
 def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
