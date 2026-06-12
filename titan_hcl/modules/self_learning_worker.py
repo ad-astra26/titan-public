@@ -110,6 +110,15 @@ _DEFAULTS = {
     "explore_request_enabled": False,  # active idle problem-gen (LLM-judge layer; Phase 2 consumer)
     "macro_min_wins": 5,               # verified wins of one (goal_class,action) → distil
     "macro_refine_min_growth": 5,      # §7.D D.4c — +N verified wins since last emit → a successor composite
+    # §7.D D.4b — macro-of-macros: when the deliberation for goal_class G builds on
+    # ≥ macro_compose_min_children ALREADY-emitted macros whose 30-D mean-feature
+    # signature is cosine ≥ macro_compose_floor to G's (the D7-honest reuse signal —
+    # numpy over the worker's OWN verified macros, no 384-D embedder), the new macro
+    # is emitted `composed_from` those child macro labels → REASONING_COMPOSED_FROM
+    # edges (parent-of-children provenance, not the D.1 leaf-join). Conservative
+    # floor so only genuinely feature-near verified macros compose.
+    "macro_compose_floor": 0.85,       # §7.D D.4b — cosine over 30-D signatures
+    "macro_compose_min_children": 2,   # §7.D D.4b — ≥2 children → a macro-of-macros
     # Fix 2 (§24.9 — cold-start feature-discriminating seed). A FRESH policy's
     # argmax is ~uniform; the first dense live reward stream (the turn-judge,
     # which rewards a single action regardless of features) collapses it to that
@@ -471,6 +480,46 @@ class _SelfLearningStore:
             return [(str(r[0]), int(r[1])) for r in rows]
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] candidate_macro_classes soft-fail: %s", e)
+            return []
+
+    def related_emitted_macros(self, signature, *, exclude_goal_class,
+                               exclude_action, floor, limit=4):
+        """§7.D D.4b — ALREADY-emitted macros whose 30-D mean-feature signature is
+        cosine ≥ `floor` to `signature` (excluding the target class). This is the
+        D7-honest macro-of-macros reuse signal: the worker is numpy-only with no
+        384-D embedder (so it cannot faiss-search the composite library), but it
+        DOES own every emitted macro's 30-D signature (`mean_features`), so a
+        cosine over THAT space is a real "operates in the same problem-region"
+        signal — the parent composite genuinely builds on these verified macros.
+        numpy dot/norm RELEASE the GIL (no heartbeat starvation; the macro count is
+        small). Returns [(goal_class, action, cosine), ...] most-similar first.
+        Soft → []."""
+        try:
+            sig = np.asarray(signature, dtype=np.float32)
+            n_sig = float(np.linalg.norm(sig))
+            if n_sig <= 0.0:
+                return []
+            rows = self._conn.execute(
+                "SELECT goal_class, action FROM macro_emitted").fetchall()
+            scored = []
+            for r in rows:
+                gc, act = str(r[0]), int(r[1])
+                if gc == str(exclude_goal_class) and act == int(exclude_action):
+                    continue
+                v = self.mean_features(gc, act)
+                if v is None:
+                    continue
+                vv = np.asarray(v, dtype=np.float32)
+                nv = float(np.linalg.norm(vv))
+                if nv <= 0.0:
+                    continue
+                cos = float(np.dot(sig, vv) / (n_sig * nv))
+                if cos >= float(floor):
+                    scored.append((gc, act, cos))
+            scored.sort(key=lambda t: -t[2])
+            return scored[:int(limit)]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] related_emitted_macros soft-fail: %s", e)
             return []
 
     def mean_features(self, goal_class: str, action: int):
@@ -1087,7 +1136,30 @@ def _outer_deliberate(cfg, store, send_queue, name, outer_reason, outer_meta) ->
         f"v{version} verified={composite.get('verified')} "
         f"reward={composite.get('reward')} chain={composite.get('chain_length')}")
     if composite.get("verified"):
-        _emit_macro(goal_class, action, store, send_queue, name, version=version)
+        # §7.D D.4b — macro-of-macros: if this verified deliberation builds on
+        # ≥ macro_compose_min_children already-emitted macros feature-near G's
+        # signature, emit `composed_from` those child macro labels (REASONING_
+        # COMPOSED_FROM edges) instead of the D.1 leaf-join. The children's
+        # canonical v1 labels (`macro::{gc}::{action_name}`) are the spine ids.
+        composed_children = None
+        try:
+            related = store.related_emitted_macros(
+                signature, exclude_goal_class=goal_class,
+                exclude_action=int(action),
+                floor=float(cfg["macro_compose_floor"]), limit=4)
+            if len(related) >= int(cfg["macro_compose_min_children"]):
+                composed_children = [
+                    f"macro::{gc}::{action_index_to_name(a)}"
+                    for gc, a, _cos in related]
+                store.log_explore(
+                    "macro_of_macros", goal_class,
+                    f"children={len(composed_children)} "
+                    f"floor={cfg['macro_compose_floor']}")
+        except Exception as _d4b_err:  # noqa: BLE001
+            logger.debug("[self_learning] D.4b compose detect soft-fail: %s",
+                         _d4b_err)
+        _emit_macro(goal_class, action, store, send_queue, name,
+                    composed_from=composed_children, version=version)
 
 
 def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
