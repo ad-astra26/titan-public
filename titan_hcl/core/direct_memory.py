@@ -874,18 +874,21 @@ class TitanKnowledgeGraph:
     def spine_create_reasoning_node(
         self, reasoning_id: str, kind: str, goal_class: str, action: str,
         oracle_id: str, verdict: str, anchor_tx: str, created_at: float,
+        idea_type: str = "",
     ) -> bool:
         """INSERT one Reasoning node (kind='tool_use' leaf | 'macro_strategy').
-        Idempotent — returns False if the row already exists (safe on replay)."""
+        `idea_type` (§7.D D.3 / FC-8) = 'procedural' on a macro_strategy composite,
+        '' on a tool_use/turn episode. Idempotent — returns False if the row
+        already exists (safe on replay)."""
         try:
             self._conn.execute(
                 "CREATE (r:Reasoning {reasoning_id: $rid, kind: $kind, "
                 "goal_class: $gc, action: $act, oracle_id: $oid, verdict: $v, "
-                "anchor_tx: $atx, created_at: $ts})",
+                "anchor_tx: $atx, created_at: $ts, idea_type: $it})",
                 {"rid": reasoning_id, "kind": str(kind), "gc": str(goal_class or ""),
                  "act": str(action or ""), "oid": str(oracle_id or ""),
                  "v": str(verdict or ""), "atx": str(anchor_tx or ""),
-                 "ts": float(created_at)},
+                 "ts": float(created_at), "it": str(idea_type or "")},
             )
             return True
         except Exception as e:  # noqa: BLE001

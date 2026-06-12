@@ -523,6 +523,53 @@ class OuterMemoryWriter:
         self.emit(event)
         return anchor_tx
 
+    def write_reasoning_composite(
+        self,
+        *,
+        reasoning_id: str,
+        goal_class: str,
+        action: str,
+        use_count: int = 1,
+        composed_from: Optional[list] = None,
+        significance: float = 0.6,
+        novelty: float = 0.4,
+        coherence: float = 0.85,
+    ) -> str:
+        """§7.D D.2 (FC-3 / INV-OML-6) — anchor a VERIFIED Reasoning composite
+        (`Reasoning(kind='macro_strategy')`) as a procedural-fork TX at the Idea
+        tier. Only verified macro-strategies are individually anchored; per-use
+        `tool_use` leaves stay Merkle-snapshot-covered. Returns the SHA-256
+        content-hash (= the `anchor_tx` pointer stored on the Reasoning record)."""
+        content = {
+            "reasoning_id": reasoning_id,
+            "goal_class": goal_class,
+            "action": action,
+            "use_count": int(use_count),
+            "idea_type": "procedural",         # FC-8 §6.2.8 — composite IS procedural Idea
+            "composed_from": list(composed_from or []),
+            "ts": time.time(),
+        }
+        anchor_tx = _canonical_concept_content_hash(content)
+        tags = [
+            "reasoning_composite",
+            "macro_strategy",
+            f"goal_class:{goal_class}",
+            f"action:{action}",
+            "idea_type:procedural",
+        ]
+        event = OuterMemoryEvent(
+            fork="procedural",
+            thought_type="reasoning_composite",
+            source=self._src,
+            content=content,
+            tags=tags,
+            significance=significance,
+            novelty=novelty,
+            coherence=coherence,
+        )
+        self.emit(event)
+        return anchor_tx
+
     # ── Phase 8 writers (D-SPEC-PHASE8) ─────────────────────────────
 
     def write_llm_judge_batch(

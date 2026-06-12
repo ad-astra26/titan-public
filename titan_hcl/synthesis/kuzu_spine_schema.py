@@ -116,6 +116,12 @@ _NODE_TABLES: tuple[tuple[str, str], ...] = (
         "Reasoning",
         "reasoning_id STRING, kind STRING, goal_class STRING, action STRING, "
         "oracle_id STRING, verdict STRING, anchor_tx STRING, created_at DOUBLE, "
+        # §7.D (D.3 / FC-8 §6.2.8) — the BRAIN Idea-unification property. A
+        # Reasoning composite is procedural knowledge (declarative ← Engram). Set
+        # 'procedural' on a macro_strategy; '' on tool_use/turn episodes. Advisory
+        # synthesis hint mirroring the Engram.memory_type column; lets BRAIN ingest
+        # Reasoning composites + Engrams under one Idea primitive.
+        "idea_type STRING, "
         "PRIMARY KEY(reasoning_id)",
     ),
     (
@@ -188,6 +194,36 @@ def _table_exists(conn, table_name: str) -> bool:
     return False
 
 
+def _column_exists(conn, table_name: str, column: str) -> bool:
+    """Return True if `column` is present on an existing Kuzu node table.
+    Uses CALL TABLE_INFO; the column name is the second field per row (shape
+    varies by version → also scans the first)."""
+    try:
+        qr = conn.execute(f"CALL TABLE_INFO('{table_name}') RETURN *")
+        while qr.has_next():
+            row = qr.get_next()
+            if not row:
+                continue
+            if (len(row) >= 2 and row[1] == column) or (
+                len(row) >= 1 and row[0] == column
+            ):
+                return True
+    except Exception as e:
+        logger.debug("[kuzu_spine_schema] TABLE_INFO(%s) probe failed: %s",
+                     table_name, e)
+    return False
+
+
+# Additive node-column migrations (table, column, kuzu_type) applied to an
+# EXISTING table whose CREATE already ran in a prior version — bootstrap_spine
+# only CREATEs missing tables, so a new column on a shipped table (e.g. the
+# §7.D D.3 Reasoning.idea_type) needs an ALTER. Each is idempotent (probe
+# first) + best-effort. APPEND-ONLY (never drop/rename here).
+_NODE_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("Reasoning", "idea_type", "STRING"),  # §7.D D.3 / FC-8
+)
+
+
 # ── Bootstrap entry-point ───────────────────────────────────────────
 
 def bootstrap_spine_schema(graph: Any) -> dict:
@@ -227,6 +263,27 @@ def bootstrap_spine_schema(graph: Any) -> dict:
                 table_name, e,
             )
             out["errors"].append(f"node:{table_name}:{e}")
+
+    # Additive column migrations on already-existing node tables (§7.D D.3:
+    # Reasoning.idea_type). Fresh graphs got the column from the CREATE above
+    # (probe short-circuits); deployed graphs get an ALTER TABLE ... ADD.
+    for table_name, column, col_type in _NODE_COLUMN_MIGRATIONS:
+        if not _table_exists(conn, table_name):
+            continue  # the CREATE above already includes the column
+        if _column_exists(conn, table_name, column):
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table_name} ADD {column} {col_type}")
+            out.setdefault("migrated_columns", []).append(f"{table_name}.{column}")
+            logger.info("[kuzu_spine_schema] added column %s.%s", table_name, column)
+        except Exception as e:
+            msg = str(e).lower()
+            if "already exists" in msg or "binder exception" in msg:
+                continue
+            logger.warning(
+                "[kuzu_spine_schema] ALTER TABLE %s ADD %s failed: %s",
+                table_name, column, e)
+            out["errors"].append(f"col:{table_name}.{column}:{e}")
 
     for rel_name, src, dst in _REL_TABLES:
         if _table_exists(conn, rel_name):

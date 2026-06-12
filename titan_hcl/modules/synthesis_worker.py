@@ -3266,19 +3266,43 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 if reasoning_store is None:
                     continue
                 try:
+                    _gc = str(payload.get("goal_class", "") or "")
+                    _action = str(payload.get("action_name", "tool") or "tool")
+                    _rid = str(payload.get("label") or f"macro::{_gc}")
+                    _ucount = int(payload.get("use_count", 1))
+                    # §7.D D.1 — provenance: the macro's verified tool_use leaves
+                    # (the worker has no leaf ids; they live in this store). The
+                    # payload may carry explicit child composite ids (D.4b
+                    # macro-of-macros); else join the leaves by (goal_class, action).
+                    composed_from = list(payload.get("composed_from") or [])
+                    if not composed_from:
+                        composed_from = reasoning_store.leaf_reasoning_ids(_gc, _action)
+                    # §7.D D.2 — verified-only Idea-tier anchor (FC-3 / INV-OML-6).
+                    # Only the composite is individually anchored; leaves stay
+                    # Merkle-snapshot-covered. Soft-fail → empty anchor (still stored).
+                    _anchor_tx = ""
+                    try:
+                        _anchor_tx = writer.write_reasoning_composite(
+                            reasoning_id=_rid, goal_class=_gc, action=_action,
+                            use_count=_ucount, composed_from=composed_from)
+                    except Exception as _anchor_err:  # noqa: BLE001
+                        logger.debug("[synthesis_worker] composite anchor soft-fail: %s",
+                                     _anchor_err)
                     reasoning_store.write_macro(
-                        reasoning_id=str(payload.get("label")
-                                         or f"macro::{payload.get('goal_class','')}"),
-                        goal_class=str(payload.get("goal_class", "") or ""),
-                        action=str(payload.get("action_name", "tool") or "tool"),
+                        reasoning_id=_rid,
+                        goal_class=_gc,
+                        action=_action,
                         signature=list(payload.get("signature") or []),
                         b_i=float(payload.get("b_i", 1.0)),
                         c=float(payload.get("c", 1.0)),
                         time_cost=float(payload.get("time_cost", 1.0)),
-                        use_count=int(payload.get("use_count", 1)),
+                        use_count=_ucount,
+                        anchor_tx=_anchor_tx,
+                        composed_from=composed_from,
                     )
-                    logger.info("[synthesis_worker] v1.1 macro-strategy stored under Self: %s",
-                                payload.get("label"))
+                    logger.info("[synthesis_worker] v1.1 macro-strategy stored under Self: "
+                                "%s (anchored=%s, composed_from=%d)",
+                                _rid, bool(_anchor_tx), len(composed_from))
                 except Exception as _macro_err:  # noqa: BLE001
                     logger.debug("[synthesis_worker] macro store failed: %s", _macro_err)
                 continue

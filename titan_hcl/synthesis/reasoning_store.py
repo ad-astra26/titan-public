@@ -224,7 +224,8 @@ class ReasoningStore:
             action=action, oracle_id="", verdict="true", reward=1.0,
             features=list(signature or []), signature_text=str(goal_class or ""),
             b_i=b_i, c=c, time_cost=time_cost, use_count=int(use_count),
-            anchor_tx=anchor_tx, composed_from=composed_from)
+            anchor_tx=anchor_tx, composed_from=composed_from,
+            idea_type="procedural")   # §7.D D.3 / FC-8 — a composite IS procedural Idea
         if ok:
             self.macros_written += 1
         return ok
@@ -232,7 +233,7 @@ class ReasoningStore:
     def _write_record(
         self, *, reasoning_id, kind, goal_class, action, oracle_id, verdict,
         reward, features, signature_text, b_i, c, time_cost, use_count=1,
-        anchor_tx="", composed_from=None,
+        anchor_tx="", composed_from=None, idea_type="",
     ) -> bool:
         if not reasoning_id:
             return False
@@ -275,7 +276,8 @@ class ReasoningStore:
                         reasoning_id=str(reasoning_id), kind=str(kind),
                         goal_class=str(goal_class or ""), action=str(action or ""),
                         oracle_id=str(oracle_id or ""), verdict=str(verdict or ""),
-                        anchor_tx=str(anchor_tx or ""), created_at=float(self._clock()))
+                        anchor_tx=str(anchor_tx or ""), created_at=float(self._clock()),
+                        idea_type=str(idea_type or ""))
                     self._graph.spine_link_learning_reasoning(str(reasoning_id))
                     for leaf in (composed_from or []):
                         self._graph.spine_link_reasoning_composed_from(
@@ -294,6 +296,31 @@ class ReasoningStore:
         except Exception as e:  # noqa: BLE001
             logger.warning("[ReasoningStore] record write failed: %s", e)
             return False
+
+    # ── §7.D D.1 — the macro→leaf provenance join (synthesis-side; the worker
+    # has no leaf reasoning_ids — they live HERE). Verified tool_use leaves of a
+    # (goal_class, action) become the macro's REASONING_COMPOSED_FROM evidence.
+    def leaf_reasoning_ids(
+        self, goal_class: str, action: Optional[str] = None, limit: int = 16,
+    ) -> list[str]:
+        """Return the reasoning_ids of VERIFIED (reward>0) `tool_use` leaves for a
+        (goal_class[, action]), most-recent first — the composite's evidence."""
+        if not goal_class:
+            return []
+        try:
+            params: list = [str(goal_class)]
+            sql = ("SELECT reasoning_id FROM reasoning_records "
+                   "WHERE kind='tool_use' AND goal_class=? AND reward>0")
+            if action:
+                sql += " AND action=?"
+                params.append(str(action))
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(int(limit))
+            rows = self._db.execute(sql, params).fetchall()
+            return [str(r[0]) for r in rows if r and r[0]]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[ReasoningStore] leaf_reasoning_ids failed: %s", e)
+            return []
 
     # ── READ / SC-search (DEREF) ─────────────────────────────────────────
     def faiss_search(self, query_vec: Any, top_k: int = 10) -> list[tuple[int, float]]:
@@ -400,8 +427,12 @@ class ReasoningStore:
             # FILE (read-only-safe) to SC-search the prompt against macro composites.
             # embedding_id = the faiss position (set at write time); action = the
             # routed action; only macro_strategy rows with a real embedding.
+            # §7.D D.4a — `reasoning_id` added so the worker's OuterCompositeReader
+            # can NAME a matched composite (macro-of-macros provenance + reuse) and
+            # the agno reader can deref it; `use_count` ranks library entries.
             macros = self._db.execute(
-                "SELECT embedding_id, action, goal_class FROM reasoning_records "
+                "SELECT embedding_id, action, goal_class, reasoning_id, use_count "
+                "FROM reasoning_records "
                 "WHERE kind='macro_strategy' AND embedding_id >= 0").fetchall()
             # §24.12 Track 2 — the EMERGENT retrieval prior. The composite reader
             # should match a prompt not only against the rare hand-distilled
@@ -432,7 +463,8 @@ class ReasoningStore:
                     for r in recent],
                 "macros": [
                     {"embedding_id": int(m[0]), "action": str(m[1] or ""),
-                     "goal_class": str(m[2] or "")}
+                     "goal_class": str(m[2] or ""), "reasoning_id": str(m[3] or ""),
+                     "use_count": int(m[4] or 1)}
                     for m in macros],
                 "verified_priors": [
                     {"embedding_id": int(v[0]), "action": str(v[1] or ""),
