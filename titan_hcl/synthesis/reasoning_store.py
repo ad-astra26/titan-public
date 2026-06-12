@@ -403,6 +403,19 @@ class ReasoningStore:
             macros = self._db.execute(
                 "SELECT embedding_id, action, goal_class FROM reasoning_records "
                 "WHERE kind='macro_strategy' AND embedding_id >= 0").fetchall()
+            # §24.12 Track 2 — the EMERGENT retrieval prior. The composite reader
+            # should match a prompt not only against the rare hand-distilled
+            # macro_strategy composites, but against Titan's OWN oracle-VERIFIED
+            # tool_use experience (kind='tool_use', reward>0 = a verified win) —
+            # the self-learning, oracle-scored tool-intent the Maker envisioned,
+            # built from data that already accumulates at verdict-time. Bounded +
+            # fresh (recent wins) so the matchable set stays small as records grow;
+            # the reader reward-weights the match. macro_strategy still takes
+            # precedence (it is the refined distillate).
+            verified = self._db.execute(
+                "SELECT embedding_id, action, goal_class, reward FROM reasoning_records "
+                "WHERE kind='tool_use' AND embedding_id >= 0 AND reward > 0 "
+                "ORDER BY created_at DESC LIMIT 256").fetchall()
             return {
                 "version": 1, "ts": float(self._clock()), "count": int(total),
                 "records_written": int(self.records_written),
@@ -421,6 +434,11 @@ class ReasoningStore:
                     {"embedding_id": int(m[0]), "action": str(m[1] or ""),
                      "goal_class": str(m[2] or "")}
                     for m in macros],
+                "verified_priors": [
+                    {"embedding_id": int(v[0]), "action": str(v[1] or ""),
+                     "goal_class": str(v[2] or ""),
+                     "reward": float(v[3]) if v[3] is not None else 0.0}
+                    for v in verified],
             }
         except Exception as e:  # noqa: BLE001
             logger.debug("[ReasoningStore] snapshot payload failed: %s", e)

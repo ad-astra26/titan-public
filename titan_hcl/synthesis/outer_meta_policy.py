@@ -244,6 +244,7 @@ class OuterCompositeReader:
         self._refresh_s = float(refresh_s)
         self._index = None
         self._macros: dict = {}        # embedding_id -> action_idx
+        self._weights: dict = {}       # embedding_id -> match weight ∈ [0,1] (§24.12 Track 2)
         self._next_refresh = 0.0
 
     def _refresh(self, now: float) -> None:
@@ -257,18 +258,33 @@ class OuterCompositeReader:
         except Exception:
             self._index = None
         macros: dict = {}
+        weights: dict = {}
         try:
             if os.path.exists(self._snapshot_path):
                 with open(self._snapshot_path) as f:
                     snap = json.load(f)
+                # §24.12 Track 2 — the EMERGENT prior: Titan's own oracle-VERIFIED
+                # tool_use experience (reward>0 wins), reward-weighted. Loaded FIRST
+                # so the rare hand-distilled `macro_strategy` composites (loaded
+                # next, weight 1.0) OVERLAY them — the refined distillate wins on a
+                # shared embedding_id, the verified experience fills the rest.
+                for v in (snap.get("verified_priors") or []):
+                    eid = int(v.get("embedding_id", -1))
+                    act = str(v.get("action", "") or "")
+                    if eid >= 0 and act in OUTER_ACTIONS:
+                        macros[eid] = OUTER_ACTIONS.index(act)
+                        weights[eid] = _clip01(float(v.get("reward", 0.0) or 0.0))
                 for m in (snap.get("macros") or []):
                     eid = int(m.get("embedding_id", -1))
                     act = str(m.get("action", "") or "")
                     if eid >= 0 and act in OUTER_ACTIONS:
                         macros[eid] = OUTER_ACTIONS.index(act)
+                        weights[eid] = 1.0
         except Exception:
             macros = {}
+            weights = {}
         self._macros = macros
+        self._weights = weights
 
     def prior(self, prompt_vec, now: Optional[float] = None) -> tuple:
         """Return `(score, action_norm)` ∈ [0,1]² for the top matched macro
@@ -285,14 +301,23 @@ class OuterCompositeReader:
                 return (0.0, 0.0)
             k = min(10, int(self._index.ntotal))
             dists, ids = self._index.search(v, k)
+            # §24.12 Track 2 — among ALL matched neighbors in the top-k, pick the
+            # one maximizing cos × weight (reward-weighted). For macro_strategy
+            # (weight 1.0) this reduces to the nearest match = the prior behaviour
+            # (faiss returns nearest-first), so macro-only snapshots are unchanged.
+            best_score, best_action = -1.0, None
             for i in range(k):
                 eid = int(ids[0][i])
                 if eid in self._macros:
                     # IndexFlatL2 returns squared-L2; for a normalized embedder
                     # cos = 1 − L2²/2 (get_text_embedder normalizes — agno embed-once).
-                    score = 1.0 - float(dists[0][i]) / 2.0
-                    a_norm = self._macros[eid] / max(1, NUM_OUTER_ACTIONS - 1)
-                    return (_clip01(score), _clip01(a_norm))
+                    cos = 1.0 - float(dists[0][i]) / 2.0
+                    score = _clip01(cos) * _clip01(self._weights.get(eid, 1.0))
+                    if score > best_score:
+                        best_score, best_action = score, self._macros[eid]
+            if best_action is not None:
+                a_norm = best_action / max(1, NUM_OUTER_ACTIONS - 1)
+                return (_clip01(best_score), _clip01(a_norm))
         except Exception:
             return (0.0, 0.0)
         return (0.0, 0.0)
