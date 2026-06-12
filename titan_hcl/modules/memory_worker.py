@@ -688,6 +688,54 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             # spirit_worker P8 D8.4).
             continue
 
+        # ── DK.1 (§7.D-knowledge) — sovereign LLM-Wiki research→concept seed ──
+        # A user just CONFIRMED a researched answer (agno EEL-A confirm branch).
+        # Promote+ANCHOR that finding NOW — continuous, not the 6h meditation
+        # epoch (INV-OML-12) — via the SAME per-node anchor mechanic meditation
+        # uses (`_anchor_promoted_node` → local-timechain tx_hash + sidecar
+        # content), then ask synthesis (sole spine writer, INV-Syn-7) to seed the
+        # declarative concept citing that tx (RESEARCH_CONCEPT_SEED). Soft — a
+        # librarian failure must NEVER break the chat turn that triggered it.
+        if msg_type == bus.RESEARCH_CONFIRMED:
+            _rp = msg.get("payload", {}) or {}
+            try:
+                _felt = _rp.get("felt") if isinstance(_rp.get("felt"), dict) else {}
+                _node = {
+                    "id": _rp.get("node_id"),
+                    "user_prompt": str(_rp.get("user_prompt", "") or ""),
+                    "agent_response": str(_rp.get("agent_response", "") or ""),
+                    "tags": ["acquired:research"],
+                    "acquired_source": _rp.get("acquired_source"),
+                    "source_id": _rp.get("acquired_source") or "research",
+                    "neuromod_context": _felt,
+                }
+                _content = (_node["user_prompt"] + "\n"
+                            + _node["agent_response"]).strip()
+                if not _content:
+                    continue
+                _sidecar = _get_thought_sidecar(
+                    os.environ.get("TITAN_DATA_DIR", "data"))
+                with ctx.write_lock:
+                    _seed_tx = _anchor_promoted_node(
+                        _node, now=time.time(), sidecar=_sidecar, ctx=ctx)
+                if _seed_tx:
+                    _synth_bus_emit(bus.RESEARCH_CONCEPT_SEED, {
+                        "tx_hash": _seed_tx,
+                        "content": _content,
+                        "domain_hint": "",
+                        "felt_coverage": 0.0,
+                        "ts": time.time(),
+                    })
+                    logger.info(
+                        "[MemoryWorker] DK.1 research finding anchored + "
+                        "RESEARCH_CONCEPT_SEED emitted (tx=%s)",
+                        str(_seed_tx)[:12])
+            except Exception as _rc_err:  # noqa: BLE001
+                logger.warning(
+                    "[MemoryWorker] RESEARCH_CONFIRMED handler failed: %s",
+                    _rc_err)
+            continue
+
         # ── Everything else goes through the dispatcher ───────────────
         # router.dispatch classifies bus.QUERY by action (read/write/
         # meditation) and routes bus.MEMORY_ADD / bus.MEMORY_MEMPOOL_ADD

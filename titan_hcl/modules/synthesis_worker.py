@@ -78,6 +78,7 @@ from titan_hcl.bus import (
     MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
     RETRIEVAL_SAMPLE,
+    RESEARCH_CONCEPT_SEED,
     SELF_LEARN_MACRO_READY,
     SELF_LEARN_REWARD,
     SYNTHESIS_FORK_COMMAND,
@@ -788,6 +789,51 @@ def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
                             "(queue=%d)", scored, len(turn_queue))
         except Exception as e:  # noqa: BLE001
             logger.debug("[synthesis_worker] turn-judge pass failed: %s", e)
+        stop_event.wait(interval_s)
+
+
+def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
+                        stop_event: threading.Event, interval_s: float,
+                        per_pass_cap: int = 8) -> None:
+    """DK.1 (§7.D-knowledge) — the sovereign LLM-Wiki seed daemon. Drains the
+    bounded queue of confirmed+anchored research findings (held by the
+    RESEARCH_CONCEPT_SEED handler) and seeds/refines a declarative `Engram`
+    concept for each via `seed_research_concept`. OFF the recv loop AND off the
+    writer thread: the LLM librarian name-call is network I/O (releases the GIL),
+    and the EngramStore writes auto-route to the writer thread (@on_writer) — so
+    a slow provider never starves the recv-loop heartbeat (the synthesis
+    crash-loop guard). Continuous, NOT dream-gated (INV-OML-12). Soft — a seed
+    failure is logged, never raised, never blocks the next."""
+    from titan_hcl.synthesis.research_wiki import seed_research_concept
+    stop_event.wait(min(interval_s, 20.0))   # settle; offset from other passes
+    while not stop_event.is_set():
+        seeded = 0
+        try:
+            for _ in range(int(per_pass_cap)):
+                if stop_event.is_set():
+                    break
+                try:
+                    item = wiki_queue.popleft()
+                except IndexError:
+                    break
+                try:
+                    cv = seed_research_concept(
+                        engram_store=engram_store, cgn_bridge=cgn_bridge,
+                        tx_hash=str(item.get("tx_hash", "") or ""),
+                        content=str(item.get("content", "") or ""),
+                        name_fn=name_fn,
+                        domain_hint=str(item.get("domain_hint", "") or ""),
+                        felt_coverage=float(item.get("felt_coverage", 0.0) or 0.0))
+                    if cv is not None:
+                        seeded += 1
+                except Exception:  # noqa: BLE001
+                    continue   # one bad seed never stalls the queue
+            if seeded:
+                logger.info("[synthesis_worker] DK.1 research-wiki seeded %d "
+                            "declarative concept(s) (queue=%d)",
+                            seeded, len(wiki_queue))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[synthesis_worker] research-wiki pass failed: %s", e)
         stop_event.wait(interval_s)
 
 
@@ -2338,6 +2384,25 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             daemon=True, name=f"synthesis-turn-judge-{name}").start()
         logger.info("[synthesis_worker] §7.B TurnJudge daemon started (B.2)")
 
+    # DK.1 (§7.D-knowledge) — the sovereign LLM-Wiki research→declarative-concept
+    # seed daemon. Drains RESEARCH_CONCEPT_SEED items (confirmed+anchored research
+    # findings) → declarative `Engram` concept via the single writer path, LLM as
+    # librarian-never-author. Bounded queue (drops oldest if flooded — research
+    # confirms are rare). Off the recv-loop (the name-call is network I/O). The
+    # name_fn reuses the consolidation proposer (propose_fn); deterministic
+    # fallback when the proposer is unconfigured/declines.
+    research_wiki_queue = _collections.deque(maxlen=256)
+    if engram_store is not None and cgn_bridge is not None:
+        from titan_hcl.synthesis.research_wiki import make_research_name_fn
+        _wiki_name_fn = make_research_name_fn(propose_fn)
+        threading.Thread(
+            target=_research_wiki_loop,
+            args=(research_wiki_queue, engram_store, cgn_bridge, _wiki_name_fn,
+                  stop_event, interval_s),
+            daemon=True, name=f"synthesis-research-wiki-{name}").start()
+        logger.info("[synthesis_worker] DK.1 research-wiki seed daemon started "
+                    "(§7.D-knowledge; continuous, not dream-gated)")
+
     # EEL B1 (D-SPEC-153 / INV-Syn-29) — wire the OracleRouter's skill-score
     # capture to the store. At each companion-batch flush, every canonical
     # verdict naming its (goal, tool) is forwarded here → derive (outcome,
@@ -3305,6 +3370,25 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                 _rid, bool(_anchor_tx), len(composed_from))
                 except Exception as _macro_err:  # noqa: BLE001
                     logger.debug("[synthesis_worker] macro store failed: %s", _macro_err)
+                continue
+
+            if msg_type == RESEARCH_CONCEPT_SEED:
+                # DK.1 (§7.D-knowledge): memory_worker anchored a confirmed
+                # research finding → enqueue it for the research-wiki daemon to
+                # seed/refine a declarative `Engram` concept (the LLM name-call +
+                # writer ops run off this recv-loop thread). Bounded deque (drops
+                # oldest if flooded). No-op if the daemon never started (no
+                # engram_store / cgn_bridge on this box) — the seed just isn't made.
+                try:
+                    research_wiki_queue.append({
+                        "tx_hash": str(payload.get("tx_hash", "") or ""),
+                        "content": str(payload.get("content", "") or ""),
+                        "domain_hint": str(payload.get("domain_hint", "") or ""),
+                        "felt_coverage": float(payload.get("felt_coverage", 0.0) or 0.0),
+                    })
+                except Exception as _seed_err:  # noqa: BLE001
+                    logger.debug("[synthesis_worker] research concept seed "
+                                 "enqueue failed: %s", _seed_err)
                 continue
 
             if msg_type == USER_FEEDBACK_SIGNAL:

@@ -393,6 +393,34 @@ def _emit_nonverifiable_decision(plugin, features, action, prompt_text, user_id)
         return None
 
 
+def _emit_research_confirmed(plugin, node) -> None:
+    """DK.1 (§7.D-knowledge) — a researched finding the user just CONFIRMED → tell
+    memory_worker to promote+anchor it NOW + seed the declarative concept
+    (continuous, not the 6h epoch; INV-OML-12). Fire-and-forget, OFF the hot path;
+    never raises (must not break chat — INV-OML-7). The fact is already verified by
+    the EEL-A confirm — memory_worker anchors it, synthesis (sole spine writer)
+    seeds the concept with the LLM as librarian-never-author (GD10)."""
+    try:
+        import time as _t
+        from titan_hcl import bus as _bus_mod
+        from titan_hcl.bus import make_msg as _mk
+        _bus = getattr(plugin, "bus", None)
+        if _bus is None:
+            return
+        _felt = node.get("neuromod_context")
+        _bus.publish(_mk(
+            _bus_mod.RESEARCH_CONFIRMED, "pre_hook", "memory", {
+                "node_id": node.get("id"),
+                "user_prompt": str(node.get("user_prompt", "") or ""),
+                "agent_response": str(node.get("agent_response", "") or ""),
+                "acquired_source": node.get("acquired_source"),
+                "felt": _felt if isinstance(_felt, dict) else {},
+                "ts": _t.time(),
+            }))
+    except Exception as e:  # noqa: BLE001 — never break chat
+        logger.debug("[PreHook][A2] research-confirmed emit skipped: %s", e)
+
+
 def _p2_router_thresholds(plugin):
     """RouterThresholds with the recall floors SELF-CALIBRATED to the embedder's
     gibberish noise floor (P2). The engram/skill floors keep their static config
@@ -1397,6 +1425,10 @@ def create_pre_hook(plugin):
                     plugin.memory.reinforce_mempool_node(_a2_top["id"], _a2_delta)
                     logger.info("[PreHook][A2] confirm → node %s (+%.2f)",
                                 _a2_top["id"], _a2_delta)
+                    # DK.1 (§7.D-knowledge): the finding is now verified → seed the
+                    # sovereign wiki concept continuously (memory_worker anchors,
+                    # synthesis creates the declarative Engram). Off the hot path.
+                    _emit_research_confirmed(plugin, _a2_top)
                 elif _a2_intent == "dispute":
                     plugin.memory.reinforce_mempool_node(_a2_top["id"], _a2_dispute)
                     plugin._force_research_topic = _a2_top.get("user_prompt") or prompt_text

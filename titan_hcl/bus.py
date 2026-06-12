@@ -288,6 +288,23 @@ SELF_LEARN_MACRO_READY = "SELF_LEARN_MACRO_READY"
 # so its reward flows back through the normal join (exploration never on a live
 # user turn — INV-OML-9). Payload: {goal_class, prompt_hint, ts}.
 SELF_LEARN_EXPLORE_REQUEST = "SELF_LEARN_EXPLORE_REQUEST"
+# ── Phase D / §7.D-knowledge (DK.1) — the sovereign LLM-Wiki research→declarative-
+# concept COMPOUNDING loop, continuous-at-confirm (INV-OML-12). Two hops, each
+# worker does what it owns:
+# RESEARCH_CONFIRMED: agno PreHook (EEL-A `detect_confirmation=="confirm"` branch)
+#   → memory_worker (promotion/DB owner). The user just confirmed a researched
+#   answer; promote+anchor THAT single `acquired:research` mempool node NOW (reuse
+#   `migrate_to_persistent` + `_anchor_promoted_node` → local-timechain tx_hash +
+#   sidecar) instead of waiting for the 6h meditation epoch. Payload:
+#   {node_id, user_prompt, agent_response, acquired_source, user_id, felt, ts}.
+RESEARCH_CONFIRMED = "RESEARCH_CONFIRMED"
+# RESEARCH_CONCEPT_SEED: memory_worker (after the per-node anchor) → synthesis_worker
+#   (sole spine writer, INV-Syn-7). Seed/refine the declarative `Engram` concept for
+#   the now-anchored finding via the single SynthesisWriter path (LLM-librarian names
+#   it over the VERIFIED content — never authors the fact; GD10). Payload:
+#   {tx_hash (the finding's anchor — deref target, INV-OML-10), content, domain_hint,
+#   felt_coverage, ts}.
+RESEARCH_CONCEPT_SEED = "RESEARCH_CONCEPT_SEED"
 # ── Phase B (§7.B, C1′) — the NON-verifiable lane. agno PostHook → synthesis_worker
 # AFTER the response is generated (a direct/research/IDK turn has no oracle). The
 # synthesis single-writer graphs a `Reasoning(kind='turn')` record under SELF →

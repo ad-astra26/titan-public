@@ -957,6 +957,18 @@ class EngramStore:
         return len(concepts)
 
     @on_writer
+    @on_writer
+    def latest_concept(self, concept_id: str) -> Optional[dict]:
+        """The latest-version row for ``concept_id`` (``{concept_id, version,
+        name, memory_type, groundedness, anchor_tx, created_at, ...}``) or
+        ``None`` if the concept does not exist yet. Thin public wrapper over
+        ``spine_get_latest_concept`` — the create-vs-bump dedup probe for the
+        DK.1 research-concept seed (RFP §7.D-knowledge): a confirmed research
+        finding whose proposed ``concept_id`` already exists is a
+        ``bump_version`` refinement (INV-OML-5 mutate-not-update), else a fresh
+        ``create_concept``. Kuzu is writer-owned (@on_writer)."""
+        return self._graph.spine_get_latest_concept(concept_id)
+
     def read_spine_strands(self, concept_id: str, version: int) -> Optional[dict]:
         """Four spine strands for a (concept_id, version) as Timechain-anchor
         (tx_hash) lists — the read surface CGNMeaningOracle.meaning_of consumes

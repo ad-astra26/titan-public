@@ -1264,6 +1264,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # RFP_synthesis_self_learning_meta_reasoning v1.1 (S2) — the self_learning
             # worker's distilled macro-strategy → write the Reasoning node under Self.
             _bus_constants.SELF_LEARN_MACRO_READY,
+            # §7.D-knowledge (DK.1) — memory_worker anchored a confirmed research
+            # finding → seed the declarative `Engram` concept (sole spine writer).
+            _bus_constants.RESEARCH_CONCEPT_SEED,
             # §7.B (C1′) — agno PostHook's non-verifiable turn (direct/research/IDK)
             # → graph a Reasoning(kind='turn') record (reward=NULL, judged later).
             _bus_constants.TURN_REASONING_RECORD,
