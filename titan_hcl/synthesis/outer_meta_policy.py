@@ -103,16 +103,28 @@ OUTER_POLICY_INPUT_DIM = len(OUTER_FEATURE_NAMES)  # 30 (8 base + 20 MSL + 2 ret
 _H1 = 16
 _H2 = 8
 
-# Flat SHM layout: all weights/biases (row-major) then 2 metadata scalars
-# (total_updates, reward_baseline). Reconstructed by from_flat() using the
-# constant dims below — fixed size, so a fixed float32 RegistrySpec fits.
+# Flat SHM layout: all weights/biases (row-major) then the metadata tail
+# (total_updates, reward_baseline, *reward_baseline_per_action). Reconstructed by
+# from_flat() using the constant dims below — fixed size, so a fixed float32
+# RegistrySpec fits. The PER-ACTION baseline tail (v3) is what dissolves the
+# always-tool routing deadlock: with one GLOBAL baseline the dense off-policy
+# `tool` +1 stream saturated the baseline to ~1.0, so a POSITIVE direct/research
+# reward (e.g. +0.5) became a NEGATIVE advantage (0.5−1.0) and the policy
+# actively suppressed non-tool actions (verified live T1: direct/research scores
+# ~−0.15, baseline=1.0). A baseline PER ACTION measures each action's advantage
+# against its OWN running mean → tool's +1 stream raises only tool's baseline
+# (its advantage → 0, no monopoly) while direct's +0.5 stays a positive advantage
+# vs direct's own (lower) baseline. (§24.3 residual fix; RFP §7.C tuning step 1.)
 _W1_N = OUTER_POLICY_INPUT_DIM * _H1
 _W2_N = _H1 * _H2
 _W3_N = _H2 * NUM_OUTER_ACTIONS
-OUTER_POLICY_FLAT_DIM = (_W1_N + _H1 + _W2_N + _H2 + _W3_N + NUM_OUTER_ACTIONS) + 2
+# metadata tail = total_updates + reward_baseline (global EMA, telemetry/back-compat)
+# + NUM_OUTER_ACTIONS per-action baselines.
+_META_TAIL_N = 2 + NUM_OUTER_ACTIONS
+OUTER_POLICY_FLAT_DIM = (_W1_N + _H1 + _W2_N + _H2 + _W3_N + NUM_OUTER_ACTIONS) + _META_TAIL_N
 
 OUTER_META_POLICY_STATE_SLOT = "outer_meta_policy_state"
-OUTER_META_POLICY_STATE_SCHEMA_VERSION = 2  # v2 (Phase C): 11→30 (full MSL context[20] + retrieval prior)
+OUTER_META_POLICY_STATE_SCHEMA_VERSION = 3  # v3: per-action REINFORCE baseline (deadlock fix); v2 was 30-D MSL/retrieval
 OUTER_META_POLICY_STATE_SPEC = RegistrySpec(
     name=OUTER_META_POLICY_STATE_SLOT,
     dtype=np.dtype("float32"),
@@ -266,7 +278,14 @@ class OuterMetaPolicy:
         self.w3 = np.random.randn(_H2, NUM_OUTER_ACTIONS).astype(np.float32) * s3
         self.b3 = np.zeros(NUM_OUTER_ACTIONS, dtype=np.float32)
         self.total_updates = 0
-        self.reward_baseline = 0.0  # EMA over observed rewards (REINFORCE baseline)
+        # PER-ACTION REINFORCE baseline (v3, the deadlock fix). Each action's
+        # advantage is measured against ITS OWN running mean — so the dense
+        # off-policy `tool` +1 stream can no longer drive a positive non-tool
+        # reward into negative advantage (the always-tool collapse, §24.3).
+        self.reward_baseline_per_action = np.zeros(NUM_OUTER_ACTIONS, dtype=np.float32)
+        # Global EMA over ALL rewards — retained for telemetry / back-compat
+        # (the worker log line, the GB3 "baseline moves" gate, the diagnostic).
+        self.reward_baseline = 0.0
         self._cache: dict = {}
 
     # -- inference ---------------------------------------------------
@@ -381,11 +400,24 @@ class OuterMetaPolicy:
             return False
 
     def learn(self, x, action: int, reward: float, baseline_alpha: float = 0.05) -> float:
-        """One REINFORCE-with-baseline update: advantage uses the CURRENT EMA
-        baseline, then the baseline moves toward the observed reward."""
-        advantage = float(reward) - self.reward_baseline
-        loss = self.train_step(x, action, advantage)
-        self.reward_baseline += baseline_alpha * (float(reward) - self.reward_baseline)
+        """One REINFORCE-with-baseline update. The advantage uses the CURRENT
+        baseline OF THIS ACTION (v3 — not the global one), then that action's
+        baseline moves toward the observed reward. This is what breaks the
+        always-tool deadlock: a positive direct/research reward stays a positive
+        advantage even while `tool` is being flooded with +1 (its own baseline
+        absorbs that, leaving direct's advantage untouched). The global EMA is
+        still tracked for telemetry / the GB3 gate."""
+        r = float(reward)
+        a = int(action)
+        if 0 <= a < NUM_OUTER_ACTIONS:
+            advantage = r - float(self.reward_baseline_per_action[a])
+        else:  # defensive — out-of-range action falls back to the global baseline
+            advantage = r - self.reward_baseline
+        loss = self.train_step(x, a, advantage)
+        if 0 <= a < NUM_OUTER_ACTIONS:
+            self.reward_baseline_per_action[a] += baseline_alpha * (
+                r - float(self.reward_baseline_per_action[a]))
+        self.reward_baseline += baseline_alpha * (r - self.reward_baseline)
         return loss
 
     def seed_prior(self, action: int, strength: float = 1.0) -> None:
@@ -403,6 +435,7 @@ class OuterMetaPolicy:
             "w3": self.w3.tolist(), "b3": self.b3.tolist(),
             "total_updates": self.total_updates,
             "reward_baseline": self.reward_baseline,
+            "reward_baseline_per_action": self.reward_baseline_per_action.tolist(),
             "input_dim": self.input_dim,
             "num_actions": NUM_OUTER_ACTIONS,
         }
@@ -429,6 +462,12 @@ class OuterMetaPolicy:
             self.b3 = np.array(d["b3"], dtype=np.float32)
             self.total_updates = int(d.get("total_updates", 0))
             self.reward_baseline = float(d.get("reward_baseline", 0.0))
+            _bpa = d.get("reward_baseline_per_action")
+            if _bpa is not None and len(_bpa) == NUM_OUTER_ACTIONS:
+                self.reward_baseline_per_action = np.array(_bpa, dtype=np.float32)
+            else:  # pre-v3 artifact — seed all per-action baselines from the global
+                self.reward_baseline_per_action = np.full(
+                    NUM_OUTER_ACTIONS, self.reward_baseline, dtype=np.float32)
             return True
         except Exception:
             return False
@@ -444,6 +483,7 @@ class OuterMetaPolicy:
             self.w3.ravel(), self.b3.ravel(),
             np.array([float(self.total_updates), float(self.reward_baseline)],
                      dtype=np.float32),
+            np.asarray(self.reward_baseline_per_action, dtype=np.float32).ravel(),
         ]).astype(np.float32)
         if flat.shape[0] != OUTER_POLICY_FLAT_DIM:  # invariant guard
             raise ValueError(
@@ -470,6 +510,7 @@ class OuterMetaPolicy:
         p.b3 = take(NUM_OUTER_ACTIONS).astype(np.float32)
         p.total_updates = int(round(float(take(1)[0])))
         p.reward_baseline = float(take(1)[0])
+        p.reward_baseline_per_action = take(NUM_OUTER_ACTIONS).astype(np.float32).copy()
         return p
 
 

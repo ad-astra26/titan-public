@@ -182,8 +182,10 @@ def test_schema_is_30_full_msl():
     assert OUTER_FEATURE_NAMES[8:28] == tuple(f"msl_ctx_{i}" for i in range(20))
     assert OUTER_FEATURE_NAMES[28:] == (
         "composite_match_score", "composite_match_action_norm")
-    # schema bumped so the live 11-D policy / SHM slot is detected as stale
-    assert OUTER_META_POLICY_STATE_SCHEMA_VERSION == 2
+    # schema bumped to v3 (per-action REINFORCE baseline — the always-tool
+    # routing-deadlock fix); the live v2 30-D slot is detected as stale → clean
+    # cold-start. (v2 was the 11→30 MSL/retrieval schema.)
+    assert OUTER_META_POLICY_STATE_SCHEMA_VERSION == 3
 
 
 def test_msl_context_flows_into_slots_clamped():
