@@ -733,924 +733,6 @@ class MultiChainScheduler:
         self.total_steps_used = 0
 
 
-# ── Primitive Handlers Mixin (OML Phase C — shared inner/outer) ───────
-class PrimitiveHandlersMixin:
-    """Meta-reasoning PRIMITIVE HANDLERS — the plane-agnostic execution layer.
-
-    Relocated here (OML Phase C piece 4, RFP §7.C) so BOTH the inner
-    ``MetaReasoningEngine`` (which inherits this mixin — byte-identical, additive)
-    and the outer ``OuterMetaReasoningEngine`` (piece 5) reuse the SAME handler
-    code with NO duplication and NO cherry-pick.
-
-    Behavior-preserving relocation: ``self`` resolves identically via inheritance.
-    These methods read ONLY ``self.state`` (a ``MetaChainState``) + deps injected
-    as args (``reasoning_engine`` / ``meta_wisdom`` / ``autoencoder`` / ``sv`` /
-    ``nm`` / ``chain_archive`` / ``exp_orchestrator``) + a few instance attrs the
-    host sets in __init__ (``_delegate_max_bias`` / ``_baseline_confidence`` /
-    ``_ema_state`` / ``_outer_reader`` / ``_spirit_self_cooldown_max`` / …).
-    ZERO ``self._meta_cgn`` ([V] census 2026-06-11) — the inner CGN/meta-CGN/
-    neuromod coupling lives in the TICK orchestration + conclude, which stay in
-    ``MetaReasoningEngine`` and are UNTOUCHED. ``_check_delegate`` /
-    ``_save_checkpoint`` are the delegate/checkpoint helpers physically co-located
-    in this execution block (verified ``self``-only; the host's orchestration
-    calls them via ``self``).
-    """
-
-    def _prim_formulate(self, sub, sv, nm, meta_wisdom, autoencoder):
-        """Define or refine the problem being investigated."""
-        sv_arr = np.array(sv[:132], dtype=np.float32)
-
-        if sub == "define":
-            # Find top anomalous dimensions (deviation from EMA)
-            deviation = np.abs(sv_arr - self._ema_state)
-            top_dims = np.argsort(deviation)[-5:][::-1].tolist()
-            # Classify domain from anomalous dimension ranges
-            domain = "general"
-            avg_dim = np.mean(top_dims)
-            if avg_dim < 20:
-                domain = "body_mind"
-            elif avg_dim < 65:
-                domain = "inner_spirit"
-            elif avg_dim < 85:
-                domain = "outer_perception"
-            else:
-                domain = "outer_spirit"
-
-            difficulty = float(np.mean(deviation[top_dims]))
-            template = f"{domain} anomaly: dims {top_dims}, deviation={difficulty:.3f}"
-
-            self.state.formulate_output = {
-                "problem_template": template,
-                "domain": domain,
-                "anomalous_dims": top_dims,
-                "difficulty": difficulty,
-                "trigger": self.state.trigger_reason,
-            }
-            return {"primitive": "FORMULATE", "sub_mode": "define",
-                    "domain": domain, "difficulty": round(difficulty, 4),
-                    "anomalous_dims": top_dims, "confidence": 0.5}
-
-        elif sub == "refine":
-            # Narrow problem based on recall data
-            if self.state.recalled_data:
-                best = self.state.recalled_data.get("best_match")
-                if best:
-                    self.state.formulate_output["prior_strategy"] = best
-                    self.state.formulate_output["refined"] = True
-            return {"primitive": "FORMULATE", "sub_mode": "refine",
-                    "refined": bool(self.state.recalled_data),
-                    "confidence": min(0.6, self.state.confidence + 0.05)}
-
-        elif sub == "load_wisdom":
-            wisdom_found = False
-            if meta_wisdom and self.state.formulate_output:
-                template = self.state.formulate_output.get("problem_template", "")
-                results = meta_wisdom.query_by_pattern(template, min_confidence=0.4)
-                if not results and autoencoder and autoencoder.is_trained:
-                    emb = autoencoder.encode(sv[:132])
-                    results = meta_wisdom.query_by_embedding(emb, min_confidence=0.4)
-                if results:
-                    self.state.formulate_output["prior_strategy"] = results[0]
-                    wisdom_found = True
-            return {"primitive": "FORMULATE", "sub_mode": "load_wisdom",
-                    "wisdom_found": wisdom_found, "confidence": 0.6 if wisdom_found else 0.4}
-
-        # ── F-phase compositional sub-modes (rFP §6) ────────────────────
-        # Session 1: each new sub-mode extends `define` (anomaly-based problem
-        # formulation) with a compositional operator tag. Session 2 dispatches
-        # these through the Recruitment Layer to reasoning primitives
-        # (DECOMPOSE / CONTRAST / GENERALIZE) + pattern_primitives.merge/abstract.
-        elif sub in ("compose_intersection", "compose_union",
-                     "compose_difference", "narrow_to_subset",
-                     "generalize_from_instance"):
-            deviation = np.abs(sv_arr - self._ema_state)
-            top_k = 3 if sub == "narrow_to_subset" else 5
-            top_dims = np.argsort(deviation)[-top_k:][::-1].tolist()
-            avg_dim = np.mean(top_dims)
-            if avg_dim < 20:
-                domain = "body_mind"
-            elif avg_dim < 65:
-                domain = "inner_spirit"
-            elif avg_dim < 85:
-                domain = "outer_perception"
-            else:
-                domain = "outer_spirit"
-            difficulty = float(np.mean(deviation[top_dims]))
-            compose_op = {
-                "compose_intersection": "intersection",
-                "compose_union": "union",
-                "compose_difference": "difference",
-                "narrow_to_subset": "narrow",
-                "generalize_from_instance": "generalize",
-            }[sub]
-            template = (f"{domain} anomaly [{compose_op}]: dims {top_dims}, "
-                        f"deviation={difficulty:.3f}")
-            self.state.formulate_output = {
-                "problem_template": template,
-                "domain": domain,
-                "anomalous_dims": top_dims,
-                "difficulty": difficulty,
-                "compose_op": compose_op,
-                "trigger": self.state.trigger_reason,
-            }
-            return {"primitive": "FORMULATE", "sub_mode": sub,
-                    "domain": domain, "difficulty": round(difficulty, 4),
-                    "anomalous_dims": top_dims, "compose_op": compose_op,
-                    "confidence": 0.5, "session_1_stub": True,
-                    "recruitment_resolved": False}
-
-    def _prim_recall(self, sub, chain_archive, meta_wisdom, exp_orchestrator):
-        """Query memory sources."""
-        results = []
-        best_match = None
-
-        if sub == "chain_archive" and chain_archive:
-            domain = self.state.formulate_output.get("domain", "general")
-            results = chain_archive.query_by_domain(domain, min_outcome=0.3, limit=10)
-            if not results:
-                results = chain_archive.query_high_scoring(min_outcome=0.5, limit=10)
-            if results:
-                best_match = results[0]
-
-        elif sub == "experience" and exp_orchestrator:
-            try:
-                domain = self.state.formulate_output.get("domain", "general")
-                results = exp_orchestrator.recall_similar(domain, top_k=5)
-                if results:
-                    best_match = results[0] if isinstance(results[0], dict) else {"score": results[0]}
-            except Exception as _swallow_exc:
-                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
-                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3589', throttle=100)
-
-        elif sub == "wisdom" and meta_wisdom:
-            template = self.state.formulate_output.get("problem_template", "")
-            results = meta_wisdom.query_by_pattern(template, min_confidence=0.3)
-            if results:
-                best_match = results[0]
-
-        elif sub == "entity":
-            # rFP_titan_meta_outer_layer Bridge 1+2 — composed RECALL across
-            # heterogeneous stores keyed by entity_refs["primary_person"].
-            # Blocks up to 200ms on the async composed-recall future that
-            # FORMULATE dispatched. Falls back to inner-only gracefully if
-            # outer_reader not wired or is_active() is False.
-            outer = self._await_outer_context(timeout_s=0.2)
-            if outer:
-                person = (outer.get("person") or {})
-                felt = outer.get("felt_history") or []
-                events = outer.get("recent_events") or []
-                if person or felt or events:
-                    results = []
-                    if person:
-                        results.append({"kind": "person", "data": person})
-                    for f in felt[:5]:
-                        results.append({"kind": "felt", "data": f})
-                    for e in events[:3]:
-                        results.append({"kind": "event", "data": e})
-                    if results:
-                        best_match = results[0]
-                        self.state.outer_context_used = True
-
-        elif sub == "topic":
-            # rFP_titan_meta_outer_layer Bridge 1 — topic-scoped composed recall.
-            # Pulls concept (via knowledge_worker bus-RPC) + felt_experiences
-            # mentioning the topic + inner narrative snippets.
-            outer = self._await_outer_context(timeout_s=0.2)
-            if outer:
-                concept = outer.get("topic")
-                felt = outer.get("felt_history") or []
-                inner = outer.get("inner_narrative") or []
-                if concept or felt or inner:
-                    results = []
-                    if concept:
-                        results.append({"kind": "concept", "data": concept})
-                    for f in felt[:5]:
-                        results.append({"kind": "felt", "data": f})
-                    for n in inner[:5]:
-                        results.append({"kind": "inner", "data": n})
-                    if results:
-                        best_match = results[0]
-                        self.state.outer_context_used = True
-
-        # ── F-phase compositional sub-modes (rFP §6) ────────────────────
-        # Session 1: each new sub-mode falls back to the closest existing
-        # retrieval path. Session 2 dispatches through Recruitment Layer
-        # to episodic_memory / semantic_graph / chain_archive / timechain.
-        elif sub == "episodic_specific" and exp_orchestrator:
-            try:
-                domain = self.state.formulate_output.get("domain", "general")
-                results = exp_orchestrator.recall_similar(domain, top_k=5)
-                if results:
-                    best_match = (results[0] if isinstance(results[0], dict)
-                                  else {"score": results[0]})
-            except Exception as _swallow_exc:
-                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
-                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3653', throttle=100)
-
-        elif sub == "semantic_neighbors":
-            pass  # Session 2: semantic_graph.neighbors resolver
-
-        elif sub == "procedural_matching" and chain_archive:
-            domain = self.state.formulate_output.get("domain", "general")
-            results = chain_archive.query_by_domain(domain, min_outcome=0.3,
-                                                     limit=10)
-            if results:
-                best_match = results[0]
-
-        elif sub == "autobiographical_relevant" and exp_orchestrator:
-            try:
-                domain = self.state.formulate_output.get("domain", "general")
-                results = exp_orchestrator.recall_similar(domain, top_k=10)
-                if results:
-                    best_match = (results[0] if isinstance(results[0], dict)
-                                  else {"score": results[0]})
-            except Exception as _swallow_exc:
-                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
-                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3673', throttle=100)
-
-        is_new_mode = sub in ("episodic_specific", "semantic_neighbors",
-                               "procedural_matching",
-                               "autobiographical_relevant")
-        self.state.recalled_data = {
-            "source": sub, "results": results,
-            "count": len(results), "best_match": best_match,
-        }
-        out = {"primitive": "RECALL", "sub_mode": sub,
-               "count": len(results), "best_match": best_match is not None,
-               "confidence": min(0.7, 0.4 + len(results) * 0.03)}
-        if is_new_mode:
-            out["session_1_stub"] = True
-            out["recruitment_resolved"] = False
-        return out
-
-    def _prim_hypothesize(self, sub, nm):
-        """Generate or refine strategy hypotheses."""
-        if sub == "generate":
-            # Build hypothesis from formulation + recall
-            strategy = []
-            # Default strategy template based on domain
-            domain = self.state.formulate_output.get("domain", "general")
-            if domain in ("body_mind", "outer_perception"):
-                strategy = ["DECOMPOSE", "COMPARE", "IF_THEN"]
-            elif domain in ("inner_spirit", "outer_spirit"):
-                strategy = ["ASSOCIATE", "SEQUENCE", "COMPARE"]
-            else:
-                strategy = ["COMPARE", "DECOMPOSE", "IF_THEN"]
-
-            # Enhance from recalled best match
-            if self.state.recalled_data.get("best_match"):
-                recalled = self.state.recalled_data["best_match"]
-                if isinstance(recalled, dict) and recalled.get("chain_sequence"):
-                    strategy = recalled["chain_sequence"][:5]
-
-            predicted = 0.5 + random.random() * 0.3
-            hypothesis = {
-                "strategy": strategy,
-                "predicted_confidence": predicted,
-                "domain": domain,
-                "reasoning": f"Based on {self.state.recalled_data.get('count', 0)} recalled chains",
-            }
-            self.state.hypotheses.append(hypothesis)
-            return {"primitive": "HYPOTHESIZE", "sub_mode": "generate",
-                    "hypothesis": hypothesis, "confidence": predicted}
-
-        elif sub == "refine":
-            if self.state.hypotheses and self.state.delegate_results:
-                last_result = self.state.delegate_results[-1]
-                best_hyp = self.state.hypotheses[-1]
-                actual = last_result.get("confidence", 0.5)
-                if actual < best_hyp["predicted_confidence"] * 0.7:
-                    # Strategy underperformed — try different primitives
-                    alt_prims = ["ASSOCIATE", "NEGATE", "LOOP", "SEQUENCE"]
-                    best_hyp["strategy"] = random.sample(alt_prims, min(3, len(alt_prims)))
-                    best_hyp["predicted_confidence"] *= 0.8
-                    best_hyp["refined"] = True
-            return {"primitive": "HYPOTHESIZE", "sub_mode": "refine",
-                    "refined": bool(self.state.delegate_results),
-                    "confidence": self.state.confidence}
-
-        elif sub == "compare":
-            if len(self.state.hypotheses) >= 2:
-                ranked = sorted(self.state.hypotheses,
-                                key=lambda h: h.get("predicted_confidence", 0), reverse=True)
-                spread = ranked[0]["predicted_confidence"] - ranked[-1]["predicted_confidence"]
-                return {"primitive": "HYPOTHESIZE", "sub_mode": "compare",
-                        "best": ranked[0], "spread": round(spread, 3),
-                        "count": len(ranked), "confidence": ranked[0]["predicted_confidence"]}
-            return {"primitive": "HYPOTHESIZE", "sub_mode": "compare",
-                    "count": len(self.state.hypotheses), "confidence": self.state.confidence}
-
-        # ── F-phase compositional sub-modes (rFP §6) ────────────────────
-        # Session 1: fall back to closest existing mode + tag the hypothesis
-        # with the compositional operator. Session 2 routes via Recruitment
-        # Layer to reasoning.ANALOGIZE / CONTRAST / IF_THEN + CREATIVITY
-        # for richer downstream strategies.
-        elif sub in ("analogize_from", "contrast_with",
-                     "propose_by_inversion", "extend_pattern"):
-            domain = self.state.formulate_output.get("domain", "general")
-            # Strategy template biased by compositional intent
-            if sub == "analogize_from":
-                strategy = ["ASSOCIATE", "COMPARE", "SEQUENCE"]
-            elif sub == "contrast_with":
-                strategy = ["COMPARE", "NEGATE", "IF_THEN"]
-            elif sub == "propose_by_inversion":
-                strategy = ["NEGATE", "IF_THEN", "COMPARE"]
-            else:  # extend_pattern
-                strategy = ["SEQUENCE", "ASSOCIATE", "IF_THEN"]
-            if self.state.recalled_data.get("best_match"):
-                recalled = self.state.recalled_data["best_match"]
-                if isinstance(recalled, dict) and recalled.get("chain_sequence"):
-                    strategy = recalled["chain_sequence"][:5]
-            predicted = 0.5 + random.random() * 0.3
-            hypothesis = {
-                "strategy": strategy,
-                "predicted_confidence": predicted,
-                "domain": domain,
-                "compose_op": sub,
-                "reasoning": (f"[{sub}] "
-                              f"Based on {self.state.recalled_data.get('count', 0)} "
-                              f"recalled chains"),
-            }
-            self.state.hypotheses.append(hypothesis)
-            return {"primitive": "HYPOTHESIZE", "sub_mode": sub,
-                    "hypothesis": hypothesis, "confidence": predicted,
-                    "session_1_stub": True, "recruitment_resolved": False}
-
-    def _prim_delegate(self, sub, reasoning_engine):
-        """Inject strategy bias into main reasoning."""
-        # rFP_titan_meta_outer_layer Bridge 3 — active search / gap-fill.
-        # When chain hit impasse OR composed recall returned thin, DELEGATE
-        # can invoke external fetchers: knowledge_search, X timeline,
-        # events_window_poll. Result flows into outer_context.gap_fill.
-        if sub == "gap_fill":
-            return self._prim_delegate_gap_fill()
-
-        if not reasoning_engine or not self.state.hypotheses:
-            return {"primitive": "DELEGATE", "sub_mode": sub,
-                    "delegated": False, "reason": "no_hypothesis"}
-
-        best_hyp = max(self.state.hypotheses,
-                       key=lambda h: h.get("predicted_confidence", 0))
-        strategy = best_hyp.get("strategy", [])
-
-        # Build 8D bias vector for main reasoning primitives
-        MAIN_PRIMITIVES = ["COMPARE", "IF_THEN", "SEQUENCE", "ASSOCIATE",
-                           "DECOMPOSE", "LOOP", "NEGATE", "CONCLUDE"]
-        bias = np.zeros(8, dtype=np.float32)
-        for prim in strategy:
-            if prim in MAIN_PRIMITIVES:
-                idx = MAIN_PRIMITIVES.index(prim)
-                bias[idx] += self._delegate_bias_strength
-        bias = np.clip(bias, -self._delegate_max_bias, self._delegate_max_bias)
-
-        # Set bias on reasoning engine
-        if hasattr(reasoning_engine, 'set_strategy_bias'):
-            reasoning_engine.set_strategy_bias(bias)
-
-        # Track delegation
-        self.state.awaiting_delegate = True
-        self.state.delegate_start_chains = reasoning_engine._total_chains
-        self.state.delegate_wait_ticks = 0
-
-        return {"primitive": "DELEGATE", "sub_mode": sub,
-                "delegated": True, "bias": bias.tolist(),
-                "strategy": strategy, "confidence": self.state.confidence}
-
-    def _prim_delegate_gap_fill(self):
-        """DELEGATE.gap_fill — pull fresh external data when chain is thin.
-
-        Invokes knowledge_search, X timeline search, or events window poll
-        based on what the chain seems to need. Config-gated per source:
-          - active_search_knowledge (default True)
-          - active_search_x (default False)
-          - active_search_events (default False)
-
-        Result stored in outer_context["gap_fill"] for subsequent primitives.
-        """
-        if not self._outer_enabled():
-            return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
-                    "gap_filled": False, "reason": "outer_inactive"}
-        reader = self._outer_reader
-        topic = self.state.entity_refs.get("current_topic") or ""
-        person = self.state.entity_refs.get("primary_person") or ""
-        if not topic and not person and not self.state.impasse_topic:
-            return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
-                    "gap_filled": False, "reason": "no_handle"}
-        gap: dict = {"sources": []}
-        try:
-            if topic or self.state.impasse_topic:
-                t = topic or self.state.impasse_topic
-                kn = reader.knowledge_search(t, max_results=5)
-                if kn:
-                    gap["knowledge"] = kn
-                    gap["sources"].append("knowledge")
-                if reader.config.active_search_x:
-                    x_q = (f"@{person[1:]} {t}".strip()
-                           if person.startswith("@") else t)
-                    x_hits = reader.x_timeline_search(x_q, count=10)
-                    if x_hits:
-                        gap["x_timeline"] = x_hits
-                        gap["sources"].append("x_timeline")
-            if reader.config.active_search_events:
-                ev = reader.events_window_poll()
-                if ev:
-                    gap["events_window"] = ev
-                    gap["sources"].append("events_window")
-        except Exception as e:
-            swallow_warn('[MetaOuter] gap_fill err', e,
-                         key="logic.meta_reasoning.gap_fill_err", throttle=100)
-        if not gap["sources"]:
-            return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
-                    "gap_filled": False, "reason": "all_sources_empty"}
-        # Stash onto outer_context so downstream primitives can read
-        self.state.outer_context.setdefault("gap_fill", {})
-        self.state.outer_context["gap_fill"] = gap
-        self.state.outer_context_used = True
-        return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
-                "gap_filled": True, "sources": gap["sources"],
-                "confidence": self.state.confidence}
-
-    def _check_delegate(self, reasoning_engine):
-        """Check if delegated main reasoning has completed."""
-        if not reasoning_engine:
-            self.state.awaiting_delegate = False
-            return {"action": "CONTINUE", "primitive": "DELEGATE", "waiting": False}
-
-        chains_since = reasoning_engine._total_chains - self.state.delegate_start_chains
-        if chains_since < 1:
-            # DIAGNOSTIC (2026-06-10): an unbounded DELEGATE wait wedges the whole
-            # meta-chain (tick early-returns here every epoch → no step → frozen).
-            # Latent for ages; only surfaced once meta-reasoning ran long enough to
-            # hit a DELEGATE. Log WHY it never resolves (throttled): if chains_since
-            # is stuck/negative, delegate_start_chains is stale vs the live reasoning
-            # _total_chains (e.g. reasoning's lifetime counter was restored LOWER
-            # than the baseline captured at delegate time → never reaches +1).
-            self.state.delegate_wait_ticks += 1
-            if (self.state.delegate_wait_ticks == 1
-                    or self.state.delegate_wait_ticks % 20 == 0):
-                logger.warning(
-                    "[META] DELEGATE waiting %d ticks: chains_since=%d "
-                    "(reasoning._total_chains=%d - delegate_start_chains=%d) "
-                    "chain_len=%d",
-                    self.state.delegate_wait_ticks, chains_since,
-                    int(getattr(reasoning_engine, "_total_chains", -1)),
-                    int(self.state.delegate_start_chains),
-                    len(self.state.chain))
-            # FIX (2026-06-10): bound the wait so a stale baseline or a stuck/slow
-            # reasoning engine can NEVER wedge the whole meta-chain again (the
-            # weeks-long freeze). Abandon the delegate gracefully and CONTINUE on:
-            #   - chains_since < 0 : the reasoning lifetime counter was restored/reset
-            #     BELOW delegate_start_chains → the +1 condition is UNREACHABLE
-            #     (the exact stuck-chain wedge confirmed on T2); OR
-            #   - delegate_wait_ticks >= max : a chronically-slow/stuck reasoning
-            #     engine (a normal delegate resolves in ~1 tick).
-            if (chains_since < 0
-                    or self.state.delegate_wait_ticks
-                    >= self._delegate_max_wait_ticks):
-                logger.warning(
-                    "[META] DELEGATE wait ABANDONED (ticks=%d chains_since=%d) — "
-                    "stale baseline or stuck reasoning; continuing chain with empty "
-                    "delegate result", self.state.delegate_wait_ticks, chains_since)
-                self.state.delegate_results.append({
-                    "confidence": 0.0, "gut_agreement": 0.0,
-                    "chains_completed": 0, "abandoned": True})
-                self.state.awaiting_delegate = False
-                self.state.delegate_wait_ticks = 0
-                return {"action": "CONTINUE", "primitive": "DELEGATE",
-                        "delegate_done": True, "abandoned": True,
-                        "result_confidence": 0.0,
-                        "confidence": self.state.confidence}
-            return {"action": "WAITING", "primitive": "DELEGATE",
-                    "chains_since": chains_since}
-
-        # Collect result
-        conf = reasoning_engine.confidence
-        gut = reasoning_engine.gut_agreement
-        self.state.delegate_results.append({
-            "confidence": conf, "gut_agreement": gut,
-            "chains_completed": chains_since,
-        })
-        self.state.awaiting_delegate = False
-
-        # Clear bias
-        if hasattr(reasoning_engine, 'clear_strategy_bias'):
-            reasoning_engine.clear_strategy_bias()
-
-        # Update meta confidence
-        self.state.confidence = 0.4 * self.state.confidence + 0.6 * conf
-
-        return {"action": "CONTINUE", "primitive": "DELEGATE",
-                "delegate_done": True, "result_confidence": conf,
-                "confidence": self.state.confidence}
-
-    def _prim_synthesize(self, sub, meta_wisdom, autoencoder, sv):
-        """Integrate insights from the meta-chain."""
-        if sub == "combine":
-            combined = {
-                "formulation": self.state.formulate_output.get("problem_template", ""),
-                "recalled_count": self.state.recalled_data.get("count", 0),
-                "hypotheses_count": len(self.state.hypotheses),
-                "delegate_count": len(self.state.delegate_results),
-            }
-            if self.state.delegate_results:
-                avg_conf = np.mean([r["confidence"] for r in self.state.delegate_results])
-                combined["avg_delegate_confidence"] = round(float(avg_conf), 4)
-            self.state.synthesized = combined
-            return {"primitive": "SYNTHESIZE", "sub_mode": "combine",
-                    "combined": combined, "confidence": self.state.confidence}
-
-        elif sub == "abstract":
-            insight = f"Domain {self.state.formulate_output.get('domain', '?')}: "
-            if self.state.delegate_results:
-                best_del = max(self.state.delegate_results, key=lambda r: r["confidence"])
-                insight += f"best strategy achieved {best_del['confidence']:.2f} confidence"
-            else:
-                insight += "no delegation results to abstract from"
-            self.state.synthesized["insight"] = insight
-            return {"primitive": "SYNTHESIZE", "sub_mode": "abstract",
-                    "insight": insight, "confidence": self.state.confidence}
-
-        elif sub == "rank":
-            if self.state.hypotheses:
-                ranked = sorted(self.state.hypotheses,
-                                key=lambda h: h.get("predicted_confidence", 0), reverse=True)
-                self.state.synthesized["ranked_strategies"] = [
-                    {"strategy": h["strategy"], "predicted": h["predicted_confidence"]}
-                    for h in ranked[:3]
-                ]
-            return {"primitive": "SYNTHESIZE", "sub_mode": "rank",
-                    "count": len(self.state.hypotheses), "confidence": self.state.confidence}
-
-        elif sub == "distill_save":
-            saved = False
-            if meta_wisdom and self.state.confidence > 0.4 and self.state.formulate_output:
-                prob_emb = None
-                if autoencoder and autoencoder.is_trained:
-                    prob_emb = autoencoder.encode(sv[:132])
-                meta_wisdom.store_wisdom(
-                    problem_pattern=self.state.formulate_output.get("problem_template",
-                                                                    self.state.trigger_reason),
-                    strategy_sequence=self.state.chain,
-                    outcome_score=self.state.confidence,
-                    problem_embedding=prob_emb,
-                )
-                saved = True
-                self._total_wisdom_saved += 1
-            return {"primitive": "SYNTHESIZE", "sub_mode": "distill_save",
-                    "saved": saved, "confidence": self.state.confidence}
-
-    def _prim_evaluate(self, sub, nm):
-        """Assess meta-chain quality."""
-        n = len(self.state.chain)
-
-        if sub == "check_progress":
-            conf_trend = 0.0
-            if len(self.state.chain_results) >= 3:
-                recent = [r.get("confidence", 0.5) for r in self.state.chain_results[-5:]]
-                conf_trend = (recent[-1] - recent[0]) / max(len(recent), 1)
-
-            should_continue = n < self.state.max_steps and (conf_trend >= -0.1 or n < 5)
-            rec = "continue" if should_continue else "conclude"
-
-            return {"primitive": "EVALUATE", "sub_mode": "check_progress",
-                    "should_continue": should_continue,
-                    "confidence_trend": round(conf_trend, 4),
-                    "steps_remaining": self.state.max_steps - n,
-                    "recommendation": rec,
-                    "confidence": self.state.confidence}
-
-        elif sub == "check_strategy":
-            improvement = 0.0
-            if self.state.delegate_results:
-                avg = np.mean([r["confidence"] for r in self.state.delegate_results])
-                improvement = float(avg - self._baseline_confidence)
-            return {"primitive": "EVALUATE", "sub_mode": "check_strategy",
-                    "improvement": round(improvement, 4),
-                    "baseline": round(self._baseline_confidence, 4),
-                    "confidence": self.state.confidence}
-
-        elif sub == "check_resources":
-            fatigue_signal = nm.get("GABA", 0.5)
-            has_energy = fatigue_signal < 0.7
-            return {"primitive": "EVALUATE", "sub_mode": "check_resources",
-                    "has_energy": has_energy, "gaba": round(fatigue_signal, 3),
-                    "recommendation": "continue" if has_energy else "conclude",
-                    "confidence": self.state.confidence}
-
-        elif sub == "peer_cgn":
-            # rFP_titan_meta_outer_layer Bridge 4 — weight meta confidence
-            # by peer CGN consumers' β-posterior on current topic. When
-            # peers are well-grounded on the topic, meta should be more
-            # confident; when peers are uncertain, meta tempers down.
-            if not self._outer_enabled():
-                return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
-                        "grounded": False, "reason": "outer_inactive",
-                        "confidence": self.state.confidence}
-            reader = self._outer_reader
-            topic = (self.state.entity_refs.get("current_topic")
-                     or self.state.impasse_topic or "")
-            if not topic:
-                return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
-                        "grounded": False, "reason": "no_topic",
-                        "confidence": self.state.confidence}
-            betas = []
-            for consumer in ("knowledge", "language", "social", "reasoning"):
-                b = reader.peer_cgn_beta(consumer, topic)
-                if b is not None:
-                    betas.append((consumer, b))
-            if not betas:
-                return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
-                        "grounded": False, "reason": "no_peer_data",
-                        "peers_queried": ["knowledge", "language", "social",
-                                           "reasoning"],
-                        "confidence": self.state.confidence}
-            avg_beta = sum(b for _, b in betas) / len(betas)
-            # Soft-modulate confidence (±10% max) — peer β is informative
-            # but cannot override meta's own estimate.
-            weight_nudge = (avg_beta - 0.5) * 0.2
-            new_conf = float(np.clip(self.state.confidence + weight_nudge,
-                                      0.0, 1.0))
-            self.state.confidence = new_conf
-            self.state.outer_context_used = True
-            return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
-                    "grounded": True, "peers": dict(betas),
-                    "avg_beta": round(avg_beta, 4),
-                    "confidence_nudge": round(weight_nudge, 4),
-                    "confidence": round(new_conf, 4)}
-
-    # ── M7: BREAK Primitive ────────────────────────────────────────
-
-    def _save_checkpoint(self):
-        """Auto-save checkpoint at FORMULATE/SYNTHESIZE steps."""
-        import copy
-        self.state.checkpoints.append({
-            "step_index": len(self.state.chain),
-            "chain_snapshot": list(self.state.chain),
-            "results_snapshot": list(self.state.chain_results),
-            "confidence": self.state.confidence,
-            "formulate_output": copy.deepcopy(self.state.formulate_output),
-            "recalled_data": copy.deepcopy(self.state.recalled_data),
-            "hypotheses": copy.deepcopy(self.state.hypotheses),
-            "delegate_results": copy.deepcopy(self.state.delegate_results),
-        })
-
-    def _prim_break(self, sub, sv, reasoning_engine):
-        """Backtrack the meta-chain."""
-        self.state.break_count += 1
-
-        if sub == "rewind_last":
-            if self.state.chain:
-                removed = self.state.chain.pop()
-                if self.state.chain_results:
-                    self.state.chain_results.pop()
-                # Recalculate confidence from remaining results
-                if self.state.chain_results:
-                    self.state.confidence = self.state.chain_results[-1].get(
-                        "confidence", self.state.confidence)
-                else:
-                    self.state.confidence = 0.5
-                # Clear bias if we had DELEGATE
-                if reasoning_engine and hasattr(reasoning_engine, 'clear_strategy_bias'):
-                    reasoning_engine.clear_strategy_bias()
-                return {"primitive": "BREAK", "sub_mode": "rewind_last",
-                        "removed": removed, "confidence": self.state.confidence}
-            return {"primitive": "BREAK", "sub_mode": "rewind_last",
-                    "removed": None, "confidence": self.state.confidence}
-
-        elif sub == "rewind_to_checkpoint":
-            if self.state.checkpoints:
-                cp = self.state.checkpoints.pop()
-                self.state.chain = cp["chain_snapshot"]
-                self.state.chain_results = cp["results_snapshot"]
-                self.state.confidence = cp["confidence"]
-                self.state.formulate_output = cp["formulate_output"]
-                self.state.recalled_data = cp["recalled_data"]
-                self.state.hypotheses = cp["hypotheses"]
-                self.state.delegate_results = cp["delegate_results"]
-                if reasoning_engine and hasattr(reasoning_engine, 'clear_strategy_bias'):
-                    reasoning_engine.clear_strategy_bias()
-                logger.info("[META] BREAK rewind to checkpoint (step %d)", cp["step_index"])
-                return {"primitive": "BREAK", "sub_mode": "rewind_to_checkpoint",
-                        "rewound_to": cp["step_index"], "confidence": cp["confidence"]}
-            return {"primitive": "BREAK", "sub_mode": "rewind_to_checkpoint",
-                    "rewound_to": None, "confidence": self.state.confidence}
-
-        elif sub == "restart_fresh":
-            # Remember what failed for negative bias
-            failed_strategy = list(self.state.chain[-5:]) if self.state.chain else []
-            self.state.chain.clear()
-            self.state.chain_results.clear()
-            self.state.checkpoints.clear()
-            self.state.hypotheses.clear()
-            self.state.delegate_results.clear()
-            self.state.synthesized.clear()
-            self.state.confidence = 0.5
-            self.state.awaiting_delegate = False
-            if reasoning_engine and hasattr(reasoning_engine, 'clear_strategy_bias'):
-                reasoning_engine.clear_strategy_bias()
-            logger.info("[META] BREAK restart_fresh (failed: %s)", failed_strategy[:3])
-            return {"primitive": "BREAK", "sub_mode": "restart_fresh",
-                    "failed_strategy": failed_strategy, "confidence": 0.5}
-
-        return {"primitive": "BREAK", "sub_mode": sub, "confidence": self.state.confidence}
-
-    # ── M8: SPIRIT_SELF Primitive ────────────────────────────────
-
-    def _prim_spirit_self(self, sub, nm):
-        """Nudge own neuromodulators to shift emotional context."""
-        nudges = SPIRIT_SELF_NUDGE_MAP.get(sub, {})
-        self.state.pre_nudge_confidence = self.state.confidence
-        self.state.last_spirit_self_step = len(self.state.chain)
-        self.state.spirit_self_cooldown = self._spirit_self_cooldown_max
-        logger.info("[META] SPIRIT_SELF.%s — nudges=%s", sub, nudges)
-        return {"primitive": "SPIRIT_SELF", "sub_mode": sub,
-                "nudge_request": {"sub_mode": sub, "nudges": nudges},
-                "confidence": self.state.confidence}
-
-    # ── INTROSPECT Primitive ───────────────────────────────────
-
-    def _prim_introspect(self, sub, sv, nm):
-        """Self-reasoning: observe and model own cognitive state.
-
-        Delegates to SelfReasoningEngine for actual introspection.
-        If no engine attached, returns a minimal self-observation from
-        the 132D state vector and neuromod levels.
-        """
-        self.state.introspect_used = True  # Max 1 per chain
-
-        # Tier 3: maker_alignment queries the Maker-Titan bond state
-        if sub == "maker_alignment":
-            try:
-                from titan_hcl.maker import get_titan_maker
-                _tm = get_titan_maker()
-                if _tm:
-                    alignment = _tm.get_maker_alignment_score()
-                    bond_health = _tm.get_bond_health()
-                    dialogue_summary = _tm.get_dialogue_for_introspect(n=5)
-                    result = {
-                        "primitive": "INTROSPECT", "sub_mode": "maker_alignment",
-                        "alignment_score": round(alignment, 4),
-                        "bond_health": bond_health,
-                        "dialogue_summary": dialogue_summary,
-                        "confidence": min(0.9, 0.3 + alignment * 0.6),
-                        "note": "Maker-Titan bond state via TitanMaker Tier 3",
-                    }
-                    logger.info(
-                        "[META] INTROSPECT.maker_alignment — score=%.3f "
-                        "interactions=%d trajectory=%.3f",
-                        alignment, bond_health.get("interaction_count", 0),
-                        bond_health.get("agreement_trajectory", 0))
-                    return result
-            except Exception as _ma_err:
-                swallow_warn('[META] maker_alignment error', _ma_err,
-                             key="logic.meta_reasoning.maker_alignment_error", throttle=100)
-            return {
-                "primitive": "INTROSPECT", "sub_mode": "maker_alignment",
-                "alignment_score": 0.5, "confidence": 0.2,
-                "note": "TitanMaker not available",
-            }
-
-        # ── D-SPEC-70 v1.15.0 (2026-05-17) SHM-bridge pattern ──
-        # Pre-Phase-C: in-process `sr = self._self_reasoning` → sr.introspect.
-        # Post-D8-3 spirit_worker retirement: SelfReasoningEngine lives in
-        # self_reflection_worker (separate process). _prim_introspect:
-        #   1. Reads pre-warmed inner_self_insight.bin SHM slot for the
-        #      latest insight (cognitive_worker's last-tick request).
-        #   2. Fires a fire-and-forget META_INTROSPECT_REQUEST bus event
-        #      for next tick's result (send_queue.put_nowait per §8.0.ter
-        #      D-SPEC-48; no awaiting Future — preserves G20 hot-path).
-        #   3. Populates META-CGN Producer #13/#14 queues from the cached
-        #      insight (deduped per epoch to avoid drain-side double-emit).
-        #   4. Returns the cached result (or synthetic placeholder on
-        #      cold-start — matches the legacy "fallback" shape; zero
-        #      regression vs broken state).
-        # Closes F-8 fleet-wide.
-
-        ctx = getattr(self, '_introspect_context', {})
-        epoch = int(ctx.get("epoch", 0))
-
-        # Step 1: SHM read (pre-warmed cache).
-        cached = None
-        reader_bank = getattr(self, '_inner_self_insight_reader', None)
-        if reader_bank is not None:
-            try:
-                cached = reader_bank.read_inner_self_insight()
-            except Exception as _read_err:
-                logger.debug(
-                    "[META] inner_self_insight SHM read failed: %s "
-                    "(falling back to cold-start placeholder)", _read_err)
-
-        # Step 2: fire-and-forget next-tick request.
-        # The handler in self_reflection_worker calls sr.introspect with
-        # this payload + writes the result to SHM for cognitive_worker's
-        # next tick. No correlation_id, no Future — pure fire-and-forget
-        # per Maker Q1 greenlight (NEW META_INTROSPECT_REQUEST event).
-        if self._send_queue is not None:
-            try:
-                # Local import to avoid module-import cycle at MetaReasoning
-                # boot (bus.py is heavy; this lazy-load matches the
-                # _send_queue.put pattern at L2567 / L3104).
-                from titan_hcl import bus as _bus
-                _req_payload = {
-                    "sub_mode": sub,
-                    "epoch": epoch,
-                    "neuromods": dict(nm) if nm else {},
-                    "msl_data": ctx.get("msl_data"),
-                    "reasoning_stats": ctx.get("reasoning_stats"),
-                    "language_stats": ctx.get("language_stats"),
-                    "coordinator_data": ctx.get("coordinator_data"),
-                    "state_132d": list(sv[:132]) if sv else [],
-                    "ts": time.time(),
-                }
-                self._send_queue.put_nowait({
-                    "type": _bus.META_INTROSPECT_REQUEST,
-                    "src": "cognitive_worker",
-                    "dst": "self_reflection_worker",
-                    "payload": _req_payload,
-                    "ts": time.time(),
-                })
-            except Exception as _pub_err:
-                # Send queue saturated or worker shutting down — skip
-                # this tick; next tick will retry. Bounded log per
-                # directive_error_visibility.
-                _err_count = getattr(self, '_meta_introspect_pub_err_count', 0) + 1
-                self._meta_introspect_pub_err_count = _err_count
-                if _err_count <= 3 or _err_count % 100 == 0:
-                    logger.warning(
-                        "[META] META_INTROSPECT_REQUEST publish failed "
-                        "(#%d): %s", _err_count, _pub_err)
-
-        # Step 3: handle cold-start (SHM empty) — return synthetic placeholder
-        # matching the legacy fallback shape. The placeholder's confidence=0.3
-        # is preserved to maintain numerical compatibility with downstream
-        # consumers that previously saw the same value when sr was None.
-        if not isinstance(cached, dict) or not cached:
-            sv_arr = np.array(sv[:132], dtype=np.float32) if sv else np.zeros(132, dtype=np.float32)
-            inner_avg = float(np.mean(sv_arr[:65]))
-            outer_avg = float(np.mean(sv_arr[65:])) if len(sv_arr) > 65 else 0.5
-            placeholder = {
-                "primitive": "INTROSPECT", "sub_mode": sub,
-                "inner_avg": round(inner_avg, 4),
-                "outer_avg": round(outer_avg, 4),
-                "neuromods": {k: round(v, 3) for k, v in nm.items()},
-                "confidence": 0.3,
-                "note": "cold_start — awaiting first inner_self_insight write",
-                "cold_start": True,
-            }
-            logger.info(
-                "[META] INTROSPECT.%s (cold_start) — inner=%.3f outer=%.3f "
-                "(awaiting self_reflection_worker SHM publish)",
-                sub, inner_avg, outer_avg)
-            return placeholder
-
-        # Step 4: cache hit — return result + populate META-CGN queues.
-        cached_epoch = int(cached.get("epoch", -1))
-        effective_sub = str(cached.get("effective_sub_mode") or
-                              cached.get("sub_mode") or sub)
-        logger.info(
-            "[META] INTROSPECT.%s (cached effective=%s epoch=%d) — "
-            "conf=%.3f trigger=%s",
-            sub, effective_sub, cached_epoch,
-            float(cached.get("confidence", 0.0)),
-            str(cached.get("mode_trigger", "default")))
-
-        # Producer #13/#14 dedup: enqueue only when SHM epoch advances
-        # past the last consumed epoch. Without this, every _prim_introspect
-        # call between SR worker publishes would re-enqueue the same result
-        # → drainage emits duplicate META-CGN signals → EdgeDetector still
-        # dedupes downstream but the queue churn is wasted.
-        if cached_epoch > self._last_shm_insight_epoch:
-            self._last_shm_insight_epoch = cached_epoch
-            # META-CGN Producer #13: self_reasoning.reflection_depth
-            try:
-                _rd_conf = cached.get("confidence")
-                if _rd_conf is not None:
-                    self._pending_cgn_reflection_events.append({
-                        "sub_mode": effective_sub,
-                        "confidence": float(_rd_conf),
-                    })
-            except Exception as _rd_q_err:
-                logger.warning(
-                    "[META-CGN] Failed to queue reflection_depth event "
-                    "for producer #13 drain: %s (sub_mode=%s) — emission missed",
-                    _rd_q_err, effective_sub)
-            # META-CGN Producer #14: self_reasoning.coherence_gain
-            # Fires only on coherence_check sub-mode (matches pre-fix behavior).
-            try:
-                if effective_sub == "coherence_check":
-                    _cg_chi = cached.get("chi_coh")
-                    if _cg_chi is not None:
-                        self._pending_cgn_coherence_events.append({
-                            "chi_coh": float(_cg_chi),
-                        })
-            except Exception as _cg_q_err:
-                logger.warning(
-                    "[META-CGN] Failed to queue coherence_gain event "
-                    "for producer #14 drain: %s — emission missed", _cg_q_err)
-
-        return cached
-
-
 # ── Meta-Reasoning Engine ─────────────────────────────────────────
 
 # PERSISTENCE_BY_DESIGN: MetaReasoningEngine._chain_iql + _meta_cgn are
@@ -1658,7 +740,7 @@ class PrimitiveHandlersMixin:
 # (chain_iql state + primitive_grounding.json). _subsystem_cache_pending is
 # a transient async-fetch flag. None are state the MetaReasoningEngine
 # should restore itself.
-class MetaReasoningEngine(PrimitiveHandlersMixin):
+class MetaReasoningEngine:
     """Meta-reasoning: thinking about thinking.
 
     Runs at epoch rate. Resource-aware chain budget (20-100 steps).
@@ -5032,6 +4114,900 @@ class MetaReasoningEngine(PrimitiveHandlersMixin):
         elif prim == "INTROSPECT":
             return self._prim_introspect(sub, sv, nm)
         return {"primitive": prim, "error": "unknown"}
+
+    def _prim_formulate(self, sub, sv, nm, meta_wisdom, autoencoder):
+        """Define or refine the problem being investigated."""
+        sv_arr = np.array(sv[:132], dtype=np.float32)
+
+        if sub == "define":
+            # Find top anomalous dimensions (deviation from EMA)
+            deviation = np.abs(sv_arr - self._ema_state)
+            top_dims = np.argsort(deviation)[-5:][::-1].tolist()
+            # Classify domain from anomalous dimension ranges
+            domain = "general"
+            avg_dim = np.mean(top_dims)
+            if avg_dim < 20:
+                domain = "body_mind"
+            elif avg_dim < 65:
+                domain = "inner_spirit"
+            elif avg_dim < 85:
+                domain = "outer_perception"
+            else:
+                domain = "outer_spirit"
+
+            difficulty = float(np.mean(deviation[top_dims]))
+            template = f"{domain} anomaly: dims {top_dims}, deviation={difficulty:.3f}"
+
+            self.state.formulate_output = {
+                "problem_template": template,
+                "domain": domain,
+                "anomalous_dims": top_dims,
+                "difficulty": difficulty,
+                "trigger": self.state.trigger_reason,
+            }
+            return {"primitive": "FORMULATE", "sub_mode": "define",
+                    "domain": domain, "difficulty": round(difficulty, 4),
+                    "anomalous_dims": top_dims, "confidence": 0.5}
+
+        elif sub == "refine":
+            # Narrow problem based on recall data
+            if self.state.recalled_data:
+                best = self.state.recalled_data.get("best_match")
+                if best:
+                    self.state.formulate_output["prior_strategy"] = best
+                    self.state.formulate_output["refined"] = True
+            return {"primitive": "FORMULATE", "sub_mode": "refine",
+                    "refined": bool(self.state.recalled_data),
+                    "confidence": min(0.6, self.state.confidence + 0.05)}
+
+        elif sub == "load_wisdom":
+            wisdom_found = False
+            if meta_wisdom and self.state.formulate_output:
+                template = self.state.formulate_output.get("problem_template", "")
+                results = meta_wisdom.query_by_pattern(template, min_confidence=0.4)
+                if not results and autoencoder and autoencoder.is_trained:
+                    emb = autoencoder.encode(sv[:132])
+                    results = meta_wisdom.query_by_embedding(emb, min_confidence=0.4)
+                if results:
+                    self.state.formulate_output["prior_strategy"] = results[0]
+                    wisdom_found = True
+            return {"primitive": "FORMULATE", "sub_mode": "load_wisdom",
+                    "wisdom_found": wisdom_found, "confidence": 0.6 if wisdom_found else 0.4}
+
+        # ── F-phase compositional sub-modes (rFP §6) ────────────────────
+        # Session 1: each new sub-mode extends `define` (anomaly-based problem
+        # formulation) with a compositional operator tag. Session 2 dispatches
+        # these through the Recruitment Layer to reasoning primitives
+        # (DECOMPOSE / CONTRAST / GENERALIZE) + pattern_primitives.merge/abstract.
+        elif sub in ("compose_intersection", "compose_union",
+                     "compose_difference", "narrow_to_subset",
+                     "generalize_from_instance"):
+            deviation = np.abs(sv_arr - self._ema_state)
+            top_k = 3 if sub == "narrow_to_subset" else 5
+            top_dims = np.argsort(deviation)[-top_k:][::-1].tolist()
+            avg_dim = np.mean(top_dims)
+            if avg_dim < 20:
+                domain = "body_mind"
+            elif avg_dim < 65:
+                domain = "inner_spirit"
+            elif avg_dim < 85:
+                domain = "outer_perception"
+            else:
+                domain = "outer_spirit"
+            difficulty = float(np.mean(deviation[top_dims]))
+            compose_op = {
+                "compose_intersection": "intersection",
+                "compose_union": "union",
+                "compose_difference": "difference",
+                "narrow_to_subset": "narrow",
+                "generalize_from_instance": "generalize",
+            }[sub]
+            template = (f"{domain} anomaly [{compose_op}]: dims {top_dims}, "
+                        f"deviation={difficulty:.3f}")
+            self.state.formulate_output = {
+                "problem_template": template,
+                "domain": domain,
+                "anomalous_dims": top_dims,
+                "difficulty": difficulty,
+                "compose_op": compose_op,
+                "trigger": self.state.trigger_reason,
+            }
+            return {"primitive": "FORMULATE", "sub_mode": sub,
+                    "domain": domain, "difficulty": round(difficulty, 4),
+                    "anomalous_dims": top_dims, "compose_op": compose_op,
+                    "confidence": 0.5, "session_1_stub": True,
+                    "recruitment_resolved": False}
+
+    def _prim_recall(self, sub, chain_archive, meta_wisdom, exp_orchestrator):
+        """Query memory sources."""
+        results = []
+        best_match = None
+
+        if sub == "chain_archive" and chain_archive:
+            domain = self.state.formulate_output.get("domain", "general")
+            results = chain_archive.query_by_domain(domain, min_outcome=0.3, limit=10)
+            if not results:
+                results = chain_archive.query_high_scoring(min_outcome=0.5, limit=10)
+            if results:
+                best_match = results[0]
+
+        elif sub == "experience" and exp_orchestrator:
+            try:
+                domain = self.state.formulate_output.get("domain", "general")
+                results = exp_orchestrator.recall_similar(domain, top_k=5)
+                if results:
+                    best_match = results[0] if isinstance(results[0], dict) else {"score": results[0]}
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3589', throttle=100)
+
+        elif sub == "wisdom" and meta_wisdom:
+            template = self.state.formulate_output.get("problem_template", "")
+            results = meta_wisdom.query_by_pattern(template, min_confidence=0.3)
+            if results:
+                best_match = results[0]
+
+        elif sub == "entity":
+            # rFP_titan_meta_outer_layer Bridge 1+2 — composed RECALL across
+            # heterogeneous stores keyed by entity_refs["primary_person"].
+            # Blocks up to 200ms on the async composed-recall future that
+            # FORMULATE dispatched. Falls back to inner-only gracefully if
+            # outer_reader not wired or is_active() is False.
+            outer = self._await_outer_context(timeout_s=0.2)
+            if outer:
+                person = (outer.get("person") or {})
+                felt = outer.get("felt_history") or []
+                events = outer.get("recent_events") or []
+                if person or felt or events:
+                    results = []
+                    if person:
+                        results.append({"kind": "person", "data": person})
+                    for f in felt[:5]:
+                        results.append({"kind": "felt", "data": f})
+                    for e in events[:3]:
+                        results.append({"kind": "event", "data": e})
+                    if results:
+                        best_match = results[0]
+                        self.state.outer_context_used = True
+
+        elif sub == "topic":
+            # rFP_titan_meta_outer_layer Bridge 1 — topic-scoped composed recall.
+            # Pulls concept (via knowledge_worker bus-RPC) + felt_experiences
+            # mentioning the topic + inner narrative snippets.
+            outer = self._await_outer_context(timeout_s=0.2)
+            if outer:
+                concept = outer.get("topic")
+                felt = outer.get("felt_history") or []
+                inner = outer.get("inner_narrative") or []
+                if concept or felt or inner:
+                    results = []
+                    if concept:
+                        results.append({"kind": "concept", "data": concept})
+                    for f in felt[:5]:
+                        results.append({"kind": "felt", "data": f})
+                    for n in inner[:5]:
+                        results.append({"kind": "inner", "data": n})
+                    if results:
+                        best_match = results[0]
+                        self.state.outer_context_used = True
+
+        # ── F-phase compositional sub-modes (rFP §6) ────────────────────
+        # Session 1: each new sub-mode falls back to the closest existing
+        # retrieval path. Session 2 dispatches through Recruitment Layer
+        # to episodic_memory / semantic_graph / chain_archive / timechain.
+        elif sub == "episodic_specific" and exp_orchestrator:
+            try:
+                domain = self.state.formulate_output.get("domain", "general")
+                results = exp_orchestrator.recall_similar(domain, top_k=5)
+                if results:
+                    best_match = (results[0] if isinstance(results[0], dict)
+                                  else {"score": results[0]})
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3653', throttle=100)
+
+        elif sub == "semantic_neighbors":
+            pass  # Session 2: semantic_graph.neighbors resolver
+
+        elif sub == "procedural_matching" and chain_archive:
+            domain = self.state.formulate_output.get("domain", "general")
+            results = chain_archive.query_by_domain(domain, min_outcome=0.3,
+                                                     limit=10)
+            if results:
+                best_match = results[0]
+
+        elif sub == "autobiographical_relevant" and exp_orchestrator:
+            try:
+                domain = self.state.formulate_output.get("domain", "general")
+                results = exp_orchestrator.recall_similar(domain, top_k=10)
+                if results:
+                    best_match = (results[0] if isinstance(results[0], dict)
+                                  else {"score": results[0]})
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3673', throttle=100)
+
+        is_new_mode = sub in ("episodic_specific", "semantic_neighbors",
+                               "procedural_matching",
+                               "autobiographical_relevant")
+        self.state.recalled_data = {
+            "source": sub, "results": results,
+            "count": len(results), "best_match": best_match,
+        }
+        out = {"primitive": "RECALL", "sub_mode": sub,
+               "count": len(results), "best_match": best_match is not None,
+               "confidence": min(0.7, 0.4 + len(results) * 0.03)}
+        if is_new_mode:
+            out["session_1_stub"] = True
+            out["recruitment_resolved"] = False
+        return out
+
+    def _prim_hypothesize(self, sub, nm):
+        """Generate or refine strategy hypotheses."""
+        if sub == "generate":
+            # Build hypothesis from formulation + recall
+            strategy = []
+            # Default strategy template based on domain
+            domain = self.state.formulate_output.get("domain", "general")
+            if domain in ("body_mind", "outer_perception"):
+                strategy = ["DECOMPOSE", "COMPARE", "IF_THEN"]
+            elif domain in ("inner_spirit", "outer_spirit"):
+                strategy = ["ASSOCIATE", "SEQUENCE", "COMPARE"]
+            else:
+                strategy = ["COMPARE", "DECOMPOSE", "IF_THEN"]
+
+            # Enhance from recalled best match
+            if self.state.recalled_data.get("best_match"):
+                recalled = self.state.recalled_data["best_match"]
+                if isinstance(recalled, dict) and recalled.get("chain_sequence"):
+                    strategy = recalled["chain_sequence"][:5]
+
+            predicted = 0.5 + random.random() * 0.3
+            hypothesis = {
+                "strategy": strategy,
+                "predicted_confidence": predicted,
+                "domain": domain,
+                "reasoning": f"Based on {self.state.recalled_data.get('count', 0)} recalled chains",
+            }
+            self.state.hypotheses.append(hypothesis)
+            return {"primitive": "HYPOTHESIZE", "sub_mode": "generate",
+                    "hypothesis": hypothesis, "confidence": predicted}
+
+        elif sub == "refine":
+            if self.state.hypotheses and self.state.delegate_results:
+                last_result = self.state.delegate_results[-1]
+                best_hyp = self.state.hypotheses[-1]
+                actual = last_result.get("confidence", 0.5)
+                if actual < best_hyp["predicted_confidence"] * 0.7:
+                    # Strategy underperformed — try different primitives
+                    alt_prims = ["ASSOCIATE", "NEGATE", "LOOP", "SEQUENCE"]
+                    best_hyp["strategy"] = random.sample(alt_prims, min(3, len(alt_prims)))
+                    best_hyp["predicted_confidence"] *= 0.8
+                    best_hyp["refined"] = True
+            return {"primitive": "HYPOTHESIZE", "sub_mode": "refine",
+                    "refined": bool(self.state.delegate_results),
+                    "confidence": self.state.confidence}
+
+        elif sub == "compare":
+            if len(self.state.hypotheses) >= 2:
+                ranked = sorted(self.state.hypotheses,
+                                key=lambda h: h.get("predicted_confidence", 0), reverse=True)
+                spread = ranked[0]["predicted_confidence"] - ranked[-1]["predicted_confidence"]
+                return {"primitive": "HYPOTHESIZE", "sub_mode": "compare",
+                        "best": ranked[0], "spread": round(spread, 3),
+                        "count": len(ranked), "confidence": ranked[0]["predicted_confidence"]}
+            return {"primitive": "HYPOTHESIZE", "sub_mode": "compare",
+                    "count": len(self.state.hypotheses), "confidence": self.state.confidence}
+
+        # ── F-phase compositional sub-modes (rFP §6) ────────────────────
+        # Session 1: fall back to closest existing mode + tag the hypothesis
+        # with the compositional operator. Session 2 routes via Recruitment
+        # Layer to reasoning.ANALOGIZE / CONTRAST / IF_THEN + CREATIVITY
+        # for richer downstream strategies.
+        elif sub in ("analogize_from", "contrast_with",
+                     "propose_by_inversion", "extend_pattern"):
+            domain = self.state.formulate_output.get("domain", "general")
+            # Strategy template biased by compositional intent
+            if sub == "analogize_from":
+                strategy = ["ASSOCIATE", "COMPARE", "SEQUENCE"]
+            elif sub == "contrast_with":
+                strategy = ["COMPARE", "NEGATE", "IF_THEN"]
+            elif sub == "propose_by_inversion":
+                strategy = ["NEGATE", "IF_THEN", "COMPARE"]
+            else:  # extend_pattern
+                strategy = ["SEQUENCE", "ASSOCIATE", "IF_THEN"]
+            if self.state.recalled_data.get("best_match"):
+                recalled = self.state.recalled_data["best_match"]
+                if isinstance(recalled, dict) and recalled.get("chain_sequence"):
+                    strategy = recalled["chain_sequence"][:5]
+            predicted = 0.5 + random.random() * 0.3
+            hypothesis = {
+                "strategy": strategy,
+                "predicted_confidence": predicted,
+                "domain": domain,
+                "compose_op": sub,
+                "reasoning": (f"[{sub}] "
+                              f"Based on {self.state.recalled_data.get('count', 0)} "
+                              f"recalled chains"),
+            }
+            self.state.hypotheses.append(hypothesis)
+            return {"primitive": "HYPOTHESIZE", "sub_mode": sub,
+                    "hypothesis": hypothesis, "confidence": predicted,
+                    "session_1_stub": True, "recruitment_resolved": False}
+
+    def _prim_delegate(self, sub, reasoning_engine):
+        """Inject strategy bias into main reasoning."""
+        # rFP_titan_meta_outer_layer Bridge 3 — active search / gap-fill.
+        # When chain hit impasse OR composed recall returned thin, DELEGATE
+        # can invoke external fetchers: knowledge_search, X timeline,
+        # events_window_poll. Result flows into outer_context.gap_fill.
+        if sub == "gap_fill":
+            return self._prim_delegate_gap_fill()
+
+        if not reasoning_engine or not self.state.hypotheses:
+            return {"primitive": "DELEGATE", "sub_mode": sub,
+                    "delegated": False, "reason": "no_hypothesis"}
+
+        best_hyp = max(self.state.hypotheses,
+                       key=lambda h: h.get("predicted_confidence", 0))
+        strategy = best_hyp.get("strategy", [])
+
+        # Build 8D bias vector for main reasoning primitives
+        MAIN_PRIMITIVES = ["COMPARE", "IF_THEN", "SEQUENCE", "ASSOCIATE",
+                           "DECOMPOSE", "LOOP", "NEGATE", "CONCLUDE"]
+        bias = np.zeros(8, dtype=np.float32)
+        for prim in strategy:
+            if prim in MAIN_PRIMITIVES:
+                idx = MAIN_PRIMITIVES.index(prim)
+                bias[idx] += self._delegate_bias_strength
+        bias = np.clip(bias, -self._delegate_max_bias, self._delegate_max_bias)
+
+        # Set bias on reasoning engine
+        if hasattr(reasoning_engine, 'set_strategy_bias'):
+            reasoning_engine.set_strategy_bias(bias)
+
+        # Track delegation
+        self.state.awaiting_delegate = True
+        self.state.delegate_start_chains = reasoning_engine._total_chains
+        self.state.delegate_wait_ticks = 0
+
+        return {"primitive": "DELEGATE", "sub_mode": sub,
+                "delegated": True, "bias": bias.tolist(),
+                "strategy": strategy, "confidence": self.state.confidence}
+
+    def _prim_delegate_gap_fill(self):
+        """DELEGATE.gap_fill — pull fresh external data when chain is thin.
+
+        Invokes knowledge_search, X timeline search, or events window poll
+        based on what the chain seems to need. Config-gated per source:
+          - active_search_knowledge (default True)
+          - active_search_x (default False)
+          - active_search_events (default False)
+
+        Result stored in outer_context["gap_fill"] for subsequent primitives.
+        """
+        if not self._outer_enabled():
+            return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
+                    "gap_filled": False, "reason": "outer_inactive"}
+        reader = self._outer_reader
+        topic = self.state.entity_refs.get("current_topic") or ""
+        person = self.state.entity_refs.get("primary_person") or ""
+        if not topic and not person and not self.state.impasse_topic:
+            return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
+                    "gap_filled": False, "reason": "no_handle"}
+        gap: dict = {"sources": []}
+        try:
+            if topic or self.state.impasse_topic:
+                t = topic or self.state.impasse_topic
+                kn = reader.knowledge_search(t, max_results=5)
+                if kn:
+                    gap["knowledge"] = kn
+                    gap["sources"].append("knowledge")
+                if reader.config.active_search_x:
+                    x_q = (f"@{person[1:]} {t}".strip()
+                           if person.startswith("@") else t)
+                    x_hits = reader.x_timeline_search(x_q, count=10)
+                    if x_hits:
+                        gap["x_timeline"] = x_hits
+                        gap["sources"].append("x_timeline")
+            if reader.config.active_search_events:
+                ev = reader.events_window_poll()
+                if ev:
+                    gap["events_window"] = ev
+                    gap["sources"].append("events_window")
+        except Exception as e:
+            swallow_warn('[MetaOuter] gap_fill err', e,
+                         key="logic.meta_reasoning.gap_fill_err", throttle=100)
+        if not gap["sources"]:
+            return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
+                    "gap_filled": False, "reason": "all_sources_empty"}
+        # Stash onto outer_context so downstream primitives can read
+        self.state.outer_context.setdefault("gap_fill", {})
+        self.state.outer_context["gap_fill"] = gap
+        self.state.outer_context_used = True
+        return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
+                "gap_filled": True, "sources": gap["sources"],
+                "confidence": self.state.confidence}
+
+    def _check_delegate(self, reasoning_engine):
+        """Check if delegated main reasoning has completed."""
+        if not reasoning_engine:
+            self.state.awaiting_delegate = False
+            return {"action": "CONTINUE", "primitive": "DELEGATE", "waiting": False}
+
+        chains_since = reasoning_engine._total_chains - self.state.delegate_start_chains
+        if chains_since < 1:
+            # DIAGNOSTIC (2026-06-10): an unbounded DELEGATE wait wedges the whole
+            # meta-chain (tick early-returns here every epoch → no step → frozen).
+            # Latent for ages; only surfaced once meta-reasoning ran long enough to
+            # hit a DELEGATE. Log WHY it never resolves (throttled): if chains_since
+            # is stuck/negative, delegate_start_chains is stale vs the live reasoning
+            # _total_chains (e.g. reasoning's lifetime counter was restored LOWER
+            # than the baseline captured at delegate time → never reaches +1).
+            self.state.delegate_wait_ticks += 1
+            if (self.state.delegate_wait_ticks == 1
+                    or self.state.delegate_wait_ticks % 20 == 0):
+                logger.warning(
+                    "[META] DELEGATE waiting %d ticks: chains_since=%d "
+                    "(reasoning._total_chains=%d - delegate_start_chains=%d) "
+                    "chain_len=%d",
+                    self.state.delegate_wait_ticks, chains_since,
+                    int(getattr(reasoning_engine, "_total_chains", -1)),
+                    int(self.state.delegate_start_chains),
+                    len(self.state.chain))
+            # FIX (2026-06-10): bound the wait so a stale baseline or a stuck/slow
+            # reasoning engine can NEVER wedge the whole meta-chain again (the
+            # weeks-long freeze). Abandon the delegate gracefully and CONTINUE on:
+            #   - chains_since < 0 : the reasoning lifetime counter was restored/reset
+            #     BELOW delegate_start_chains → the +1 condition is UNREACHABLE
+            #     (the exact stuck-chain wedge confirmed on T2); OR
+            #   - delegate_wait_ticks >= max : a chronically-slow/stuck reasoning
+            #     engine (a normal delegate resolves in ~1 tick).
+            if (chains_since < 0
+                    or self.state.delegate_wait_ticks
+                    >= self._delegate_max_wait_ticks):
+                logger.warning(
+                    "[META] DELEGATE wait ABANDONED (ticks=%d chains_since=%d) — "
+                    "stale baseline or stuck reasoning; continuing chain with empty "
+                    "delegate result", self.state.delegate_wait_ticks, chains_since)
+                self.state.delegate_results.append({
+                    "confidence": 0.0, "gut_agreement": 0.0,
+                    "chains_completed": 0, "abandoned": True})
+                self.state.awaiting_delegate = False
+                self.state.delegate_wait_ticks = 0
+                return {"action": "CONTINUE", "primitive": "DELEGATE",
+                        "delegate_done": True, "abandoned": True,
+                        "result_confidence": 0.0,
+                        "confidence": self.state.confidence}
+            return {"action": "WAITING", "primitive": "DELEGATE",
+                    "chains_since": chains_since}
+
+        # Collect result
+        conf = reasoning_engine.confidence
+        gut = reasoning_engine.gut_agreement
+        self.state.delegate_results.append({
+            "confidence": conf, "gut_agreement": gut,
+            "chains_completed": chains_since,
+        })
+        self.state.awaiting_delegate = False
+
+        # Clear bias
+        if hasattr(reasoning_engine, 'clear_strategy_bias'):
+            reasoning_engine.clear_strategy_bias()
+
+        # Update meta confidence
+        self.state.confidence = 0.4 * self.state.confidence + 0.6 * conf
+
+        return {"action": "CONTINUE", "primitive": "DELEGATE",
+                "delegate_done": True, "result_confidence": conf,
+                "confidence": self.state.confidence}
+
+    def _prim_synthesize(self, sub, meta_wisdom, autoencoder, sv):
+        """Integrate insights from the meta-chain."""
+        if sub == "combine":
+            combined = {
+                "formulation": self.state.formulate_output.get("problem_template", ""),
+                "recalled_count": self.state.recalled_data.get("count", 0),
+                "hypotheses_count": len(self.state.hypotheses),
+                "delegate_count": len(self.state.delegate_results),
+            }
+            if self.state.delegate_results:
+                avg_conf = np.mean([r["confidence"] for r in self.state.delegate_results])
+                combined["avg_delegate_confidence"] = round(float(avg_conf), 4)
+            self.state.synthesized = combined
+            return {"primitive": "SYNTHESIZE", "sub_mode": "combine",
+                    "combined": combined, "confidence": self.state.confidence}
+
+        elif sub == "abstract":
+            insight = f"Domain {self.state.formulate_output.get('domain', '?')}: "
+            if self.state.delegate_results:
+                best_del = max(self.state.delegate_results, key=lambda r: r["confidence"])
+                insight += f"best strategy achieved {best_del['confidence']:.2f} confidence"
+            else:
+                insight += "no delegation results to abstract from"
+            self.state.synthesized["insight"] = insight
+            return {"primitive": "SYNTHESIZE", "sub_mode": "abstract",
+                    "insight": insight, "confidence": self.state.confidence}
+
+        elif sub == "rank":
+            if self.state.hypotheses:
+                ranked = sorted(self.state.hypotheses,
+                                key=lambda h: h.get("predicted_confidence", 0), reverse=True)
+                self.state.synthesized["ranked_strategies"] = [
+                    {"strategy": h["strategy"], "predicted": h["predicted_confidence"]}
+                    for h in ranked[:3]
+                ]
+            return {"primitive": "SYNTHESIZE", "sub_mode": "rank",
+                    "count": len(self.state.hypotheses), "confidence": self.state.confidence}
+
+        elif sub == "distill_save":
+            saved = False
+            if meta_wisdom and self.state.confidence > 0.4 and self.state.formulate_output:
+                prob_emb = None
+                if autoencoder and autoencoder.is_trained:
+                    prob_emb = autoencoder.encode(sv[:132])
+                meta_wisdom.store_wisdom(
+                    problem_pattern=self.state.formulate_output.get("problem_template",
+                                                                    self.state.trigger_reason),
+                    strategy_sequence=self.state.chain,
+                    outcome_score=self.state.confidence,
+                    problem_embedding=prob_emb,
+                )
+                saved = True
+                self._total_wisdom_saved += 1
+            return {"primitive": "SYNTHESIZE", "sub_mode": "distill_save",
+                    "saved": saved, "confidence": self.state.confidence}
+
+    def _prim_evaluate(self, sub, nm):
+        """Assess meta-chain quality."""
+        n = len(self.state.chain)
+
+        if sub == "check_progress":
+            conf_trend = 0.0
+            if len(self.state.chain_results) >= 3:
+                recent = [r.get("confidence", 0.5) for r in self.state.chain_results[-5:]]
+                conf_trend = (recent[-1] - recent[0]) / max(len(recent), 1)
+
+            should_continue = n < self.state.max_steps and (conf_trend >= -0.1 or n < 5)
+            rec = "continue" if should_continue else "conclude"
+
+            return {"primitive": "EVALUATE", "sub_mode": "check_progress",
+                    "should_continue": should_continue,
+                    "confidence_trend": round(conf_trend, 4),
+                    "steps_remaining": self.state.max_steps - n,
+                    "recommendation": rec,
+                    "confidence": self.state.confidence}
+
+        elif sub == "check_strategy":
+            improvement = 0.0
+            if self.state.delegate_results:
+                avg = np.mean([r["confidence"] for r in self.state.delegate_results])
+                improvement = float(avg - self._baseline_confidence)
+            return {"primitive": "EVALUATE", "sub_mode": "check_strategy",
+                    "improvement": round(improvement, 4),
+                    "baseline": round(self._baseline_confidence, 4),
+                    "confidence": self.state.confidence}
+
+        elif sub == "check_resources":
+            fatigue_signal = nm.get("GABA", 0.5)
+            has_energy = fatigue_signal < 0.7
+            return {"primitive": "EVALUATE", "sub_mode": "check_resources",
+                    "has_energy": has_energy, "gaba": round(fatigue_signal, 3),
+                    "recommendation": "continue" if has_energy else "conclude",
+                    "confidence": self.state.confidence}
+
+        elif sub == "peer_cgn":
+            # rFP_titan_meta_outer_layer Bridge 4 — weight meta confidence
+            # by peer CGN consumers' β-posterior on current topic. When
+            # peers are well-grounded on the topic, meta should be more
+            # confident; when peers are uncertain, meta tempers down.
+            if not self._outer_enabled():
+                return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
+                        "grounded": False, "reason": "outer_inactive",
+                        "confidence": self.state.confidence}
+            reader = self._outer_reader
+            topic = (self.state.entity_refs.get("current_topic")
+                     or self.state.impasse_topic or "")
+            if not topic:
+                return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
+                        "grounded": False, "reason": "no_topic",
+                        "confidence": self.state.confidence}
+            betas = []
+            for consumer in ("knowledge", "language", "social", "reasoning"):
+                b = reader.peer_cgn_beta(consumer, topic)
+                if b is not None:
+                    betas.append((consumer, b))
+            if not betas:
+                return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
+                        "grounded": False, "reason": "no_peer_data",
+                        "peers_queried": ["knowledge", "language", "social",
+                                           "reasoning"],
+                        "confidence": self.state.confidence}
+            avg_beta = sum(b for _, b in betas) / len(betas)
+            # Soft-modulate confidence (±10% max) — peer β is informative
+            # but cannot override meta's own estimate.
+            weight_nudge = (avg_beta - 0.5) * 0.2
+            new_conf = float(np.clip(self.state.confidence + weight_nudge,
+                                      0.0, 1.0))
+            self.state.confidence = new_conf
+            self.state.outer_context_used = True
+            return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
+                    "grounded": True, "peers": dict(betas),
+                    "avg_beta": round(avg_beta, 4),
+                    "confidence_nudge": round(weight_nudge, 4),
+                    "confidence": round(new_conf, 4)}
+
+    # ── M7: BREAK Primitive ────────────────────────────────────────
+
+    def _save_checkpoint(self):
+        """Auto-save checkpoint at FORMULATE/SYNTHESIZE steps."""
+        import copy
+        self.state.checkpoints.append({
+            "step_index": len(self.state.chain),
+            "chain_snapshot": list(self.state.chain),
+            "results_snapshot": list(self.state.chain_results),
+            "confidence": self.state.confidence,
+            "formulate_output": copy.deepcopy(self.state.formulate_output),
+            "recalled_data": copy.deepcopy(self.state.recalled_data),
+            "hypotheses": copy.deepcopy(self.state.hypotheses),
+            "delegate_results": copy.deepcopy(self.state.delegate_results),
+        })
+
+    def _prim_break(self, sub, sv, reasoning_engine):
+        """Backtrack the meta-chain."""
+        self.state.break_count += 1
+
+        if sub == "rewind_last":
+            if self.state.chain:
+                removed = self.state.chain.pop()
+                if self.state.chain_results:
+                    self.state.chain_results.pop()
+                # Recalculate confidence from remaining results
+                if self.state.chain_results:
+                    self.state.confidence = self.state.chain_results[-1].get(
+                        "confidence", self.state.confidence)
+                else:
+                    self.state.confidence = 0.5
+                # Clear bias if we had DELEGATE
+                if reasoning_engine and hasattr(reasoning_engine, 'clear_strategy_bias'):
+                    reasoning_engine.clear_strategy_bias()
+                return {"primitive": "BREAK", "sub_mode": "rewind_last",
+                        "removed": removed, "confidence": self.state.confidence}
+            return {"primitive": "BREAK", "sub_mode": "rewind_last",
+                    "removed": None, "confidence": self.state.confidence}
+
+        elif sub == "rewind_to_checkpoint":
+            if self.state.checkpoints:
+                cp = self.state.checkpoints.pop()
+                self.state.chain = cp["chain_snapshot"]
+                self.state.chain_results = cp["results_snapshot"]
+                self.state.confidence = cp["confidence"]
+                self.state.formulate_output = cp["formulate_output"]
+                self.state.recalled_data = cp["recalled_data"]
+                self.state.hypotheses = cp["hypotheses"]
+                self.state.delegate_results = cp["delegate_results"]
+                if reasoning_engine and hasattr(reasoning_engine, 'clear_strategy_bias'):
+                    reasoning_engine.clear_strategy_bias()
+                logger.info("[META] BREAK rewind to checkpoint (step %d)", cp["step_index"])
+                return {"primitive": "BREAK", "sub_mode": "rewind_to_checkpoint",
+                        "rewound_to": cp["step_index"], "confidence": cp["confidence"]}
+            return {"primitive": "BREAK", "sub_mode": "rewind_to_checkpoint",
+                    "rewound_to": None, "confidence": self.state.confidence}
+
+        elif sub == "restart_fresh":
+            # Remember what failed for negative bias
+            failed_strategy = list(self.state.chain[-5:]) if self.state.chain else []
+            self.state.chain.clear()
+            self.state.chain_results.clear()
+            self.state.checkpoints.clear()
+            self.state.hypotheses.clear()
+            self.state.delegate_results.clear()
+            self.state.synthesized.clear()
+            self.state.confidence = 0.5
+            self.state.awaiting_delegate = False
+            if reasoning_engine and hasattr(reasoning_engine, 'clear_strategy_bias'):
+                reasoning_engine.clear_strategy_bias()
+            logger.info("[META] BREAK restart_fresh (failed: %s)", failed_strategy[:3])
+            return {"primitive": "BREAK", "sub_mode": "restart_fresh",
+                    "failed_strategy": failed_strategy, "confidence": 0.5}
+
+        return {"primitive": "BREAK", "sub_mode": sub, "confidence": self.state.confidence}
+
+    # ── M8: SPIRIT_SELF Primitive ────────────────────────────────
+
+    def _prim_spirit_self(self, sub, nm):
+        """Nudge own neuromodulators to shift emotional context."""
+        nudges = SPIRIT_SELF_NUDGE_MAP.get(sub, {})
+        self.state.pre_nudge_confidence = self.state.confidence
+        self.state.last_spirit_self_step = len(self.state.chain)
+        self.state.spirit_self_cooldown = self._spirit_self_cooldown_max
+        logger.info("[META] SPIRIT_SELF.%s — nudges=%s", sub, nudges)
+        return {"primitive": "SPIRIT_SELF", "sub_mode": sub,
+                "nudge_request": {"sub_mode": sub, "nudges": nudges},
+                "confidence": self.state.confidence}
+
+    # ── INTROSPECT Primitive ───────────────────────────────────
+
+    def _prim_introspect(self, sub, sv, nm):
+        """Self-reasoning: observe and model own cognitive state.
+
+        Delegates to SelfReasoningEngine for actual introspection.
+        If no engine attached, returns a minimal self-observation from
+        the 132D state vector and neuromod levels.
+        """
+        self.state.introspect_used = True  # Max 1 per chain
+
+        # Tier 3: maker_alignment queries the Maker-Titan bond state
+        if sub == "maker_alignment":
+            try:
+                from titan_hcl.maker import get_titan_maker
+                _tm = get_titan_maker()
+                if _tm:
+                    alignment = _tm.get_maker_alignment_score()
+                    bond_health = _tm.get_bond_health()
+                    dialogue_summary = _tm.get_dialogue_for_introspect(n=5)
+                    result = {
+                        "primitive": "INTROSPECT", "sub_mode": "maker_alignment",
+                        "alignment_score": round(alignment, 4),
+                        "bond_health": bond_health,
+                        "dialogue_summary": dialogue_summary,
+                        "confidence": min(0.9, 0.3 + alignment * 0.6),
+                        "note": "Maker-Titan bond state via TitanMaker Tier 3",
+                    }
+                    logger.info(
+                        "[META] INTROSPECT.maker_alignment — score=%.3f "
+                        "interactions=%d trajectory=%.3f",
+                        alignment, bond_health.get("interaction_count", 0),
+                        bond_health.get("agreement_trajectory", 0))
+                    return result
+            except Exception as _ma_err:
+                swallow_warn('[META] maker_alignment error', _ma_err,
+                             key="logic.meta_reasoning.maker_alignment_error", throttle=100)
+            return {
+                "primitive": "INTROSPECT", "sub_mode": "maker_alignment",
+                "alignment_score": 0.5, "confidence": 0.2,
+                "note": "TitanMaker not available",
+            }
+
+        # ── D-SPEC-70 v1.15.0 (2026-05-17) SHM-bridge pattern ──
+        # Pre-Phase-C: in-process `sr = self._self_reasoning` → sr.introspect.
+        # Post-D8-3 spirit_worker retirement: SelfReasoningEngine lives in
+        # self_reflection_worker (separate process). _prim_introspect:
+        #   1. Reads pre-warmed inner_self_insight.bin SHM slot for the
+        #      latest insight (cognitive_worker's last-tick request).
+        #   2. Fires a fire-and-forget META_INTROSPECT_REQUEST bus event
+        #      for next tick's result (send_queue.put_nowait per §8.0.ter
+        #      D-SPEC-48; no awaiting Future — preserves G20 hot-path).
+        #   3. Populates META-CGN Producer #13/#14 queues from the cached
+        #      insight (deduped per epoch to avoid drain-side double-emit).
+        #   4. Returns the cached result (or synthetic placeholder on
+        #      cold-start — matches the legacy "fallback" shape; zero
+        #      regression vs broken state).
+        # Closes F-8 fleet-wide.
+
+        ctx = getattr(self, '_introspect_context', {})
+        epoch = int(ctx.get("epoch", 0))
+
+        # Step 1: SHM read (pre-warmed cache).
+        cached = None
+        reader_bank = getattr(self, '_inner_self_insight_reader', None)
+        if reader_bank is not None:
+            try:
+                cached = reader_bank.read_inner_self_insight()
+            except Exception as _read_err:
+                logger.debug(
+                    "[META] inner_self_insight SHM read failed: %s "
+                    "(falling back to cold-start placeholder)", _read_err)
+
+        # Step 2: fire-and-forget next-tick request.
+        # The handler in self_reflection_worker calls sr.introspect with
+        # this payload + writes the result to SHM for cognitive_worker's
+        # next tick. No correlation_id, no Future — pure fire-and-forget
+        # per Maker Q1 greenlight (NEW META_INTROSPECT_REQUEST event).
+        if self._send_queue is not None:
+            try:
+                # Local import to avoid module-import cycle at MetaReasoning
+                # boot (bus.py is heavy; this lazy-load matches the
+                # _send_queue.put pattern at L2567 / L3104).
+                from titan_hcl import bus as _bus
+                _req_payload = {
+                    "sub_mode": sub,
+                    "epoch": epoch,
+                    "neuromods": dict(nm) if nm else {},
+                    "msl_data": ctx.get("msl_data"),
+                    "reasoning_stats": ctx.get("reasoning_stats"),
+                    "language_stats": ctx.get("language_stats"),
+                    "coordinator_data": ctx.get("coordinator_data"),
+                    "state_132d": list(sv[:132]) if sv else [],
+                    "ts": time.time(),
+                }
+                self._send_queue.put_nowait({
+                    "type": _bus.META_INTROSPECT_REQUEST,
+                    "src": "cognitive_worker",
+                    "dst": "self_reflection_worker",
+                    "payload": _req_payload,
+                    "ts": time.time(),
+                })
+            except Exception as _pub_err:
+                # Send queue saturated or worker shutting down — skip
+                # this tick; next tick will retry. Bounded log per
+                # directive_error_visibility.
+                _err_count = getattr(self, '_meta_introspect_pub_err_count', 0) + 1
+                self._meta_introspect_pub_err_count = _err_count
+                if _err_count <= 3 or _err_count % 100 == 0:
+                    logger.warning(
+                        "[META] META_INTROSPECT_REQUEST publish failed "
+                        "(#%d): %s", _err_count, _pub_err)
+
+        # Step 3: handle cold-start (SHM empty) — return synthetic placeholder
+        # matching the legacy fallback shape. The placeholder's confidence=0.3
+        # is preserved to maintain numerical compatibility with downstream
+        # consumers that previously saw the same value when sr was None.
+        if not isinstance(cached, dict) or not cached:
+            sv_arr = np.array(sv[:132], dtype=np.float32) if sv else np.zeros(132, dtype=np.float32)
+            inner_avg = float(np.mean(sv_arr[:65]))
+            outer_avg = float(np.mean(sv_arr[65:])) if len(sv_arr) > 65 else 0.5
+            placeholder = {
+                "primitive": "INTROSPECT", "sub_mode": sub,
+                "inner_avg": round(inner_avg, 4),
+                "outer_avg": round(outer_avg, 4),
+                "neuromods": {k: round(v, 3) for k, v in nm.items()},
+                "confidence": 0.3,
+                "note": "cold_start — awaiting first inner_self_insight write",
+                "cold_start": True,
+            }
+            logger.info(
+                "[META] INTROSPECT.%s (cold_start) — inner=%.3f outer=%.3f "
+                "(awaiting self_reflection_worker SHM publish)",
+                sub, inner_avg, outer_avg)
+            return placeholder
+
+        # Step 4: cache hit — return result + populate META-CGN queues.
+        cached_epoch = int(cached.get("epoch", -1))
+        effective_sub = str(cached.get("effective_sub_mode") or
+                              cached.get("sub_mode") or sub)
+        logger.info(
+            "[META] INTROSPECT.%s (cached effective=%s epoch=%d) — "
+            "conf=%.3f trigger=%s",
+            sub, effective_sub, cached_epoch,
+            float(cached.get("confidence", 0.0)),
+            str(cached.get("mode_trigger", "default")))
+
+        # Producer #13/#14 dedup: enqueue only when SHM epoch advances
+        # past the last consumed epoch. Without this, every _prim_introspect
+        # call between SR worker publishes would re-enqueue the same result
+        # → drainage emits duplicate META-CGN signals → EdgeDetector still
+        # dedupes downstream but the queue churn is wasted.
+        if cached_epoch > self._last_shm_insight_epoch:
+            self._last_shm_insight_epoch = cached_epoch
+            # META-CGN Producer #13: self_reasoning.reflection_depth
+            try:
+                _rd_conf = cached.get("confidence")
+                if _rd_conf is not None:
+                    self._pending_cgn_reflection_events.append({
+                        "sub_mode": effective_sub,
+                        "confidence": float(_rd_conf),
+                    })
+            except Exception as _rd_q_err:
+                logger.warning(
+                    "[META-CGN] Failed to queue reflection_depth event "
+                    "for producer #13 drain: %s (sub_mode=%s) — emission missed",
+                    _rd_q_err, effective_sub)
+            # META-CGN Producer #14: self_reasoning.coherence_gain
+            # Fires only on coherence_check sub-mode (matches pre-fix behavior).
+            try:
+                if effective_sub == "coherence_check":
+                    _cg_chi = cached.get("chi_coh")
+                    if _cg_chi is not None:
+                        self._pending_cgn_coherence_events.append({
+                            "chi_coh": float(_cg_chi),
+                        })
+            except Exception as _cg_q_err:
+                logger.warning(
+                    "[META-CGN] Failed to queue coherence_gain event "
+                    "for producer #14 drain: %s — emission missed", _cg_q_err)
+
+        return cached
 
     # ── M9: EUREKA Detection ────────────────────────────────────
 
