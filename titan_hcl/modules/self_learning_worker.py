@@ -49,10 +49,12 @@ from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
 from titan_hcl.synthesis.outer_meta_policy import (
+    MSL_CONTEXT_DIM,
     NUM_OUTER_ACTIONS,
     OUTER_META_POLICY_STATE_SPEC,
     OUTER_POLICY_INPUT_DIM,
     OuterMetaPolicy,
+    _BASE_FEATURE_NAMES,
     action_index_to_name,
     structural_target_action,
 )
@@ -88,13 +90,33 @@ _DEFAULTS = {
     #    outcomes); idle consolidates toward the verifiable oracle, live verdicts
     #    refine BEYOND it. This is what actually closes G5/GB8.
     "explore_structural": True,        # run the structural-verifier bootstrap pass
-    "explore_structural_batch": 24,    # recalled contexts taught per idle tick
-    "explore_structural_advantage": 1.0,  # cross-entropy push magnitude toward the verified target
+    # Lever 1 (§24.9 — THE routing-collapse fix). The structural cross-entropy
+    # pass is the ONLY feature-CONDITIONAL signal (the live judge rewards a single
+    # action regardless of features → collapse). Offline lever experiments
+    # (`/tmp/lever_lab.py`, 5 seeds) reproduced the collapse at routing-acc 0.33
+    # and showed cranking THIS pass (freq 24→64 contexts/tick + advantage 1→3)
+    # restores feature-conditional routing → 1.00; tightening max_weight_norm
+    # HURT and entropy-reg was neutral, so only this knob moved. (2026-06-12.)
+    "explore_structural_batch": 64,    # recalled contexts taught per idle tick (Lever 1: was 24)
+    "explore_structural_advantage": 3.0,  # cross-entropy push magnitude toward the verified target (Lever 1: was 1.0)
     "explore_know_threshold": 0.5,     # recall_top_cosine ≥ this ⇒ "he knows" (→ direct)
     "explore_skill_floor": 0.3,        # skill_utility ≥ this + matched ⇒ reuse (→ skill_delegate)
     "explore_research_chi_floor": 0.4, # chi ≥ this ⇒ research affordable; else honest IDK
     "explore_request_enabled": False,  # active idle problem-gen (LLM-judge layer; Phase 2 consumer)
     "macro_min_wins": 5,               # verified wins of one (goal_class,action) → distil
+    # Fix 2 (§24.9 — cold-start feature-discriminating seed). A FRESH policy's
+    # argmax is ~uniform; the first dense live reward stream (the turn-judge,
+    # which rewards a single action regardless of features) collapses it to that
+    # action BEFORE it learns to discriminate on features. We warm-start a
+    # cold-started policy from the SAME verifiable structural oracle the idle pass
+    # teaches (`structural_target_action`) on a synthetic balanced feature set, so
+    # it routes computable→tool / known→direct / unknowable→research /
+    # skill→skill_delegate from boot. Cold-start ONLY (a restored policy already
+    # carries learned routing); live verdicts + Lever-1's boosted idle pass refine
+    # beyond it. Deterministic (fixed rng) → identical warm-start every cold boot.
+    "cold_start_seed_enabled": True,   # warm-start a cold policy toward feature-conditional routing
+    "cold_start_seed_epochs": 300,     # passes over the synthetic balanced lane set
+    "cold_start_seed_advantage": 3.0,  # cross-entropy push magnitude for the seed
     # ── Phase C (§7.C piece 6) — the OUTER two-level reasoner as the continuous
     #    idle-time deliberative learner. When enabled, the explore tick runs the
     #    OuterMetaReasoningEngine over OuterReasoningEngine on a verified-win
@@ -475,6 +497,7 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
     _wd = float(cfg["weight_decay"])
     _mwn = float(cfg["max_weight_norm"])
     policy = OuterMetaPolicy(lr=float(cfg["policy_lr"]), weight_decay=_wd, max_weight_norm=_mwn)
+    _cold_start = True   # True unless a healthy persisted policy is restored below (Fix 2 §24.9)
     loaded = store.load_policy_flat()
     if loaded is not None:
         try:
@@ -502,6 +525,7 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
                                "(clean cold-start baseline)", _n)
             else:
                 policy = restored
+                _cold_start = False   # healthy restore — keep learned routing, do NOT re-seed
                 logger.info("[self_learning] policy restored (updates=%d, baseline=%.3f)",
                             policy.total_updates, policy.reward_baseline)
         except Exception as e:  # noqa: BLE001
@@ -516,6 +540,22 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
                                "(clean cold-start baseline)", _n)
             except Exception:  # noqa: BLE001
                 pass
+
+    # Fix 2 (§24.9) — cold-start feature-discriminating seed. ONLY on a genuine
+    # cold-start (fresh / pathological re-init / restore-fail), BEFORE the SHM
+    # publish so the seeded weights are what the agno DECIDE path reads from boot.
+    # A restored policy already carries learned routing → never re-seed it.
+    if _cold_start and bool(cfg.get("cold_start_seed_enabled", True)):
+        try:
+            _seeded = _seed_cold_start(policy, cfg)
+            if _seeded:
+                logger.info("[self_learning] cold-start seed: %d structural steps "
+                            "→ feature-conditional warm-start (§24.9)", _seeded)
+                store.save_policy_flat(policy.to_flat().tolist(),
+                                       policy.total_updates, policy.reward_baseline)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[self_learning] cold-start seed failed (continuing "
+                           "unseeded): %s", e)
 
     # SHM weight publisher (single writer — INV-OML-8 / G21).
     _shm_writer = None
@@ -794,6 +834,82 @@ def _research_affordable(life, cfg) -> bool:
         return float(life.get_chi_total()) >= float(cfg["explore_research_chi_floor"])
     except Exception:  # noqa: BLE001
         return True
+
+
+# ── Fix 2 (§24.9) — cold-start feature-discriminating seed ──────────────────
+# The lane archetypes: only the DISCRIMINATING base features (the ones
+# `structural_target_action` reads — recall@1, skill_util@3, skill_matched@4,
+# requires_tool@6, has_code@7) are pinned; everything else is jittered per
+# sample so the net keys on the base features, not a memorized vector. We seed
+# the 4 feature-DISCRIMINABLE lanes; IDK is NOT seeded — it differs from research
+# only by metabolic affordability (NOT a feature), so seeding both on the same
+# low-recall vec would teach two actions for one feature-region. IDK stays a
+# downstream metabolic conversion (MODE_SHADOW) + the idle pass under genuine
+# starvation (structural_target → IDK when not affordable).
+#   (lane label, {base_feature_index: pinned_value}, affordable)
+_COLD_START_LANES: tuple = (
+    ("tool",           {6: 1.0, 7: 1.0}, True),   # computational shape → verify deterministically
+    ("direct",         {1: 0.85},        True),   # dereferenceable knowledge present → he KNOWS
+    ("research",       {1: 0.05},        True),   # does not know, affordable → find out
+    ("skill_delegate", {4: 1.0, 3: 0.8}, True),   # proficient learned skill matches → reuse
+)
+
+
+def _synth_feature_vec(rng, overrides: dict) -> np.ndarray:
+    """A jittered synthetic 30-D OuterFeatures vector for cold-start seeding.
+
+    The non-discriminating features are randomized so the net learns to KEY ON
+    the pinned base features rather than memorizing one vector: the base block is
+    low noise [0,0.2] (kept below every structural threshold so an un-pinned base
+    feature never spuriously trips the ladder), the MSL block is full-range
+    [-1,1] noise (decorrelating it — w1's HE-random MSL rows otherwise inject
+    live noise into the score), the retrieval prior is [0,0.3] noise. `bias`=1.0;
+    the `overrides` then pin this vector squarely into one structural lane."""
+    n_base = len(_BASE_FEATURE_NAMES)
+    vec = np.empty(OUTER_POLICY_INPUT_DIM, dtype=np.float32)
+    vec[:n_base] = rng.uniform(0.0, 0.2, size=n_base).astype(np.float32)
+    vec[0] = 1.0  # bias
+    vec[n_base:n_base + MSL_CONTEXT_DIM] = rng.uniform(
+        -1.0, 1.0, size=MSL_CONTEXT_DIM).astype(np.float32)
+    vec[n_base + MSL_CONTEXT_DIM:] = rng.uniform(
+        0.0, 0.3, size=OUTER_POLICY_INPUT_DIM - n_base - MSL_CONTEXT_DIM).astype(np.float32)
+    for idx, val in overrides.items():
+        vec[idx] = float(val)
+    return vec
+
+
+def _seed_cold_start(policy, cfg) -> int:
+    """Fix 2 (§24.9) — warm-start a cold policy toward feature-conditional routing
+    BEFORE the first live turn, from the verifiable structural oracle.
+
+    A fresh policy's argmax is ~uniform; the first dense live reward stream (the
+    turn-judge, which rewards response QUALITY of a single action regardless of
+    features) collapses it to that action before it learns to DISCRIMINATE on
+    features (the routing-collapse failure mode, quantified live across T1/T2/T3
+    2026-06-12). We teach the SAME verifiable structural target the idle pass
+    teaches (`structural_target_action`) on a synthetic balanced lane set via the
+    cross-entropy `train_step` (the proven robust rule, 8/8 seeds — NOT
+    Boltzmann, which decays to a degenerate single action). Deterministic (fixed
+    rng) → identical warm-start every cold boot; bounded by the §24.2 weight
+    regularization. Live verdicts + Lever-1's boosted idle pass refine beyond it
+    (a prior, not a freeze). Returns the number of cross-entropy steps taken."""
+    epochs = int(cfg.get("cold_start_seed_epochs", 300))
+    adv = float(cfg.get("cold_start_seed_advantage", 3.0))
+    if epochs <= 0 or adv <= 0:
+        return 0
+    know_thr = float(cfg["explore_know_threshold"])
+    skill_floor = float(cfg["explore_skill_floor"])
+    rng = np.random.default_rng(0)   # deterministic warm-start
+    n = 0
+    for _ in range(epochs):
+        for _label, overrides, affordable in _COLD_START_LANES:
+            vec = _synth_feature_vec(rng, overrides)
+            target = structural_target_action(
+                vec, affordable=affordable,
+                know_threshold=know_thr, skill_floor=skill_floor)
+            policy.train_step(vec, target, advantage=adv)
+            n += 1
+    return n
 
 
 def _structural_explore(cfg, store, policy, shm_writer, life, name) -> None:
