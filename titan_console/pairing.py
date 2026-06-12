@@ -293,6 +293,12 @@ def _find_device(ctx: Context, device_id: str):
     return None
 
 
+def registered_device_ids(ctx: Context) -> list[str]:
+    """All paired device ids (for fan-out — e.g. HealthMonitor enqueues to every phone)."""
+    return [d["device_id"] for d in _read_json(_devices_path(ctx), [])
+            if d.get("device_id")]
+
+
 def device_record(ctx: Context, device_id: str) -> dict | None:
     """Public registration view for the signed /console/device/me self-check.
 

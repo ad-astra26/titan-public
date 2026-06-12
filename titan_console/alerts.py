@@ -148,6 +148,19 @@ class HealthMonitor:
         if prev is None or prev == up:
             return {"transition": None, "up": up}
 
+        # App event channel: enqueue a health event to every paired phone (AG-EVT-3).
+        # Independent of Telegram + best-effort — the monitor must never crash the agent.
+        try:
+            from . import events, pairing
+            for did in pairing.registered_device_ids(self.ctx):
+                events.enqueue(
+                    self.ctx, did, type="health",
+                    payload={"up": up, "why": status.get("why_down"),
+                             "text": format_alert(self.ctx, status)},
+                    urgency=("high" if not up else "normal"))
+        except Exception:
+            pass
+
         token, chat_id = resolve_telegram_creds(self.ctx)
         sent = False
         if token and chat_id:

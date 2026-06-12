@@ -26,19 +26,21 @@ Routes (all under /console; live cognition is proxied under /console/api):
 """
 from __future__ import annotations
 
+import hmac
 import json
 import posixpath
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from . import __version__, backup_config, config_api, dev_endpoints, ops, pairing, proxy
+from . import (__version__, alerts, backup_config, config_api, dev_endpoints, events,
+               ops, pairing, presence, proxy)
 from .context import Context
 from .host import read_host_resources
 from .titan_status import titan_status
 
 _MUTATIONS = {"/console/restart", "/console/clean-hdd", "/console/config/set",
-              "/console/chat", "/console/backup/config"}
+              "/console/chat", "/console/backup/config", "/console/app/heartbeat"}
 # Pairing CONTROL routes are operator-only (mint/confirm/inspect device pairings).
 # /console/pair/submit is deliberately NOT here — it's the unauthenticated bootstrap,
 # gated by the single-use pairing token inside pairing.submit_device.
@@ -241,6 +243,23 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
                 return 401, {"error": "valid device signature required"}
             rec = pairing.device_record(ctx, headers.get("x-device-id", ""))
             return (200, rec) if rec else (404, {"error": "device not registered"})
+        if path == "/console/events":
+            # Device drains its outbound queue (RFP event-channel AG-EVT-6). The non-local
+            # gate already enforces a device signature remotely; require it on localhost too
+            # (mirrors /console/device/me) so the route is never anonymous.
+            if not device_authed:
+                return 401, {"error": "valid device signature required"}
+            try:
+                wait_s = int((query.get("wait", ["0"])[0] or "0"))
+                since = int((query.get("since", ["0"])[0] or "0"))
+            except (TypeError, ValueError):
+                return 400, {"error": "wait/since must be integers"}
+            try:
+                evs, cursor = events.drain(ctx, headers.get("x-device-id", ""),
+                                           since, max(0, wait_s))
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            return 200, {"events": evs, "cursor": cursor}
         if path.startswith("/console/api/"):
             v6 = path[len("/console/api"):]  # → "/v6/..."
             if query:
@@ -281,6 +300,41 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             return pairing.confirm_device(ctx, data.get("pairing_token", ""), data.get("code", ""),
                                           maker_pubkey=data.get("maker_pubkey"),
                                           maker_sig=data.get("maker_sig"))
+        if path == "/console/events/enqueue":
+            # Titan's cognition / HealthMonitor push an event to a paired phone. This is an
+            # INTERNAL, co-located call (kernel + console share the box): local-only + the
+            # internal key (RFP decision #1). No remote party — not even the app — enqueues.
+            if not is_local:
+                return 403, {"error": "enqueue is local-only"}
+            expected = alerts.resolve_internal_key(ctx)
+            provided = headers.get("x-titan-internal-key", "")
+            if not expected or not hmac.compare_digest(provided, expected):
+                return 401, {"error": "internal key required"}
+            device_id = data.get("device_id", "")
+            if not pairing._find_device(ctx, device_id):
+                return 404, {"error": "unknown device"}
+            try:
+                evt = events.enqueue(ctx, device_id,
+                                     type=str(data.get("type", "message")),
+                                     payload=data.get("payload"),
+                                     urgency=str(data.get("urgency", "normal")),
+                                     dedupe_key=data.get("dedupe_key"))
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            return 200, {"ok": True, "seq": evt["seq"]}
+        if path == "/console/app/heartbeat":
+            # Phone reports presence (+ acks delivered events). Device-authed (in _MUTATIONS).
+            if not device_authed:
+                return 401, {"error": "valid device signature required"}
+            device_id = headers.get("x-device-id", "")
+            try:
+                presence.put(ctx, device_id, data)
+                ack_cursor = data.get("ack_cursor")
+                if isinstance(ack_cursor, int) and not isinstance(ack_cursor, bool):
+                    events.ack(ctx, device_id, ack_cursor)
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            return 200, {"ok": True}
         if ctx.dev_enabled and path == "/console/dev/log":
             return dev_endpoints.ingest_log(ctx, body)
         return 404, {"error": f"no such console route: {path}"}
