@@ -394,6 +394,15 @@ class ReasoningStore:
                 "SELECT reasoning_id, kind, goal_class, action, oracle_id, verdict, "
                 "reward, created_at FROM reasoning_records ORDER BY created_at DESC "
                 "LIMIT 50").fetchall()
+            # Phase-C piece 7b — the macro retrieval-prior map. The agno hot-path
+            # decide reads this lock-free snapshot (DuckDB holds the exclusive lock
+            # even read_only — the SPEC-canonical cross-process pattern) + the faiss
+            # FILE (read-only-safe) to SC-search the prompt against macro composites.
+            # embedding_id = the faiss position (set at write time); action = the
+            # routed action; only macro_strategy rows with a real embedding.
+            macros = self._db.execute(
+                "SELECT embedding_id, action, goal_class FROM reasoning_records "
+                "WHERE kind='macro_strategy' AND embedding_id >= 0").fetchall()
             return {
                 "version": 1, "ts": float(self._clock()), "count": int(total),
                 "records_written": int(self.records_written),
@@ -408,6 +417,10 @@ class ReasoningStore:
                      "reward": float(r[6]) if r[6] is not None else 0.0,
                      "created_at": r[7]}
                     for r in recent],
+                "macros": [
+                    {"embedding_id": int(m[0]), "action": str(m[1] or ""),
+                     "goal_class": str(m[2] or "")}
+                    for m in macros],
             }
         except Exception as e:  # noqa: BLE001
             logger.debug("[ReasoningStore] snapshot payload failed: %s", e)
