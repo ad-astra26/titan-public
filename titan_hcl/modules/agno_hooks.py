@@ -421,6 +421,47 @@ def _emit_research_confirmed(plugin, node) -> None:
         logger.debug("[PreHook][A2] research-confirmed emit skipped: %s", e)
 
 
+_DK4_STOPWORDS = frozenset((
+    "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
+    "was", "were", "what", "which", "who", "does", "do", "did", "how", "why",
+    "with", "that", "this", "it", "its", "as", "by", "at", "be", "can", "you",
+))
+
+
+def _dk4_concept_ground(plugin, prompt_text, query_vec):
+    """DK.4 (§7.D-knowledge) — read-whole concept-granularity recall. If a curated
+    declarative `Engram` concept covers the ask, return (groundedness, name) so the
+    router + outer policy see a STRONG sovereign-substrate signal (`engram_ground`)
+    → answer `direct` from his own anchored concept instead of re-researching
+    (research COMPOUNDS, the DK.1 write half pays off here). Relevance-gated by a
+    query-token name match (the same cheap signal `_concept_granularity_recall`
+    ranks on) so a high-groundedness-but-UNRELATED concept never spuriously routes
+    direct. Returns (0.0, "") on miss / no kuzu_reader / error — never raises (hot
+    path; INV-OML-7). One bounded Kuzu spine read, no LLM, no embed."""
+    try:
+        import re as _re
+        rc = getattr(plugin, "engine_recall", None)
+        if rc is None or not prompt_text:
+            return (0.0, "")
+        results = rc.recall(prompt_text, granularity="concept", k=3,
+                            query_vec=query_vec)
+        if not results:
+            return (0.0, "")
+        toks = {t for t in _re.findall(r"[a-z0-9]+", prompt_text.lower())
+                if len(t) >= 3 and t not in _DK4_STOPWORDS}
+        if not toks:
+            return (0.0, "")
+        for r in results:  # ranked groundedness×name-match desc; first relevant wins
+            name = (getattr(r, "summary", "") or "").lower()
+            if any(t in name for t in toks):
+                return (float(getattr(r, "importance", 0.0) or 0.0),
+                        getattr(r, "summary", "") or "")
+        return (0.0, "")
+    except Exception as e:  # noqa: BLE001 — never break chat
+        logger.debug("[PreHook] DK.4 concept-ground skipped: %s", e)
+        return (0.0, "")
+
+
 def _p2_router_thresholds(plugin):
     """RouterThresholds with the recall floors SELF-CALIBRATED to the embedder's
     gibberish noise floor (P2). The engram/skill floors keep their static config
@@ -1346,9 +1387,20 @@ def create_pre_hook(plugin):
                     _requires_tool = bool(detect_tool_intent(prompt_text).requires_tool)
                 except Exception:
                     _requires_tool = False
+                # DK.4 (§7.D-knowledge): a curated declarative concept covering the
+                # ask lifts `engram_ground` (was hardcoded 0) → grounded_route +
+                # outer policy treat the sovereign wiki page as strong substrate →
+                # `direct` (MODE_SOVEREIGN), no SOL research turn. Relevance-gated.
+                _dk4_ground, _dk4_name = _dk4_concept_ground(
+                    plugin, prompt_text, _prompt_vec)
+                if _dk4_ground > 0.0:
+                    plugin._dk4_concept_name = _dk4_name   # read-whole context hint
+                    logger.info("[PreHook] DK.4 concept covers ask: '%s' "
+                                "(ground=%.2f) → strong substrate signal",
+                                _dk4_name[:48], _dk4_ground)
                 _readout = GroundedReadout(
                     recall_score=_recall_input,
-                    engram_ground=0.0,         # fast-follow (recall-only for now)
+                    engram_ground=_dk4_ground,  # DK.4 — curated concept substrate
                     skill_utility=None,        # B1 (skill-lane dormant until then)
                     requires_tool=_requires_tool,
                     is_informational=is_informational_query(prompt_text),
