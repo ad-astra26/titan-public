@@ -154,13 +154,8 @@ def _backup_options(ctx: Context) -> dict:
 
 
 def dispatch(ctx: Context, method: str, path: str, query: dict,
-             body: bytes, headers: dict, is_local: bool = True) -> tuple:
-    """Pure router. Returns (status_int, payload) where payload is dict|bytes.
-
-    `is_local` is True when the TCP peer is loopback (computed in `_handle` from
-    `client_address`). It drives AD-5: beyond localhost EVERY route is auth-gated.
-    Default True so localhost behavior + the 6-arg test convention are unchanged.
-    """
+             body: bytes, headers: dict) -> tuple:
+    """Pure router. Returns (status_int, payload) where payload is dict|bytes."""
     # ── auth gate (AG4): operator token OR a paired device's signature ────
     # A signed request from a registered device is authorized like the operator.
     device_authed = bool(headers.get("x-device-id")) and pairing.verify_request_signature(
@@ -173,19 +168,6 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
         if not ctx.token:
             return True  # no token configured = open (localhost dev)
         return (headers.get("x-console-token") or headers.get("X-Console-Token")) == ctx.token
-
-    def _operator_token_valid() -> bool:
-        # STRICT: a token must be configured AND match. The "open when no token"
-        # escape (above) is a localhost-only convenience — it MUST NOT apply remotely.
-        return bool(ctx.token) and (
-            (headers.get("x-console-token") or headers.get("X-Console-Token")) == ctx.token)
-
-    # ── AD-5 (AG4/AG-TLS): beyond localhost, EVERY route requires a verified device
-    # signature OR a strictly-valid operator token (reads too). The only exemption is
-    # the unauthenticated bootstrap /console/pair/submit (single-use-token-gated in-body).
-    if not is_local and path != "/console/pair/submit":
-        if not (device_authed or _operator_token_valid()):
-            return 401, {"error": "device signature or operator token required (AD-5)"}
 
     if path in _PAIR_OPERATOR:
         if not _operator_ok():
@@ -273,14 +255,11 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             res = backup_config.set_backup_config(ctx, data)
             return (200 if res.get("ok") else 400), res
         if path == "/console/pair/start":
-            return pairing.mint_pairing(ctx, public_url=data.get("public_url"),
-                                        mode=data.get("mode"))
+            return pairing.mint_pairing(ctx, public_url=data.get("public_url"))
         if path == "/console/pair/submit":
             return pairing.submit_device(ctx, data)
         if path == "/console/pair/confirm":
-            return pairing.confirm_device(ctx, data.get("pairing_token", ""), data.get("code", ""),
-                                          maker_pubkey=data.get("maker_pubkey"),
-                                          maker_sig=data.get("maker_sig"))
+            return pairing.confirm_device(ctx, data.get("pairing_token", ""), data.get("code", ""))
         if ctx.dev_enabled and path == "/console/dev/log":
             return dev_endpoints.ingest_log(ctx, body)
         return 404, {"error": f"no such console route: {path}"}
@@ -328,11 +307,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b""
         headers = {k.lower(): v for k, v in self.headers.items()}
-        peer = self.client_address[0] if self.client_address else ""
-        is_local = _is_loopback(peer)
         try:
             status, payload = dispatch(self.server.ctx, method, parts.path,
-                                       query, body, headers, is_local)
+                                       query, body, headers)
         except Exception as e:  # the agent must never 500-crash silently
             status, payload = 500, {"error": f"agent exception: {e}"}
 
@@ -360,21 +337,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         pass  # quiet by default; journald captures stderr if needed
 
 
-def _is_loopback(host: str) -> bool:
-    """True for the loopback peer (127.0.0.0/8, ::1, IPv4-mapped loopback). Drives AD-5."""
-    return host in ("::1", "localhost") or host.startswith("127.") or host.startswith("::ffff:127.")
-
-
-def make_server(ctx: Context, host: str = "127.0.0.1", port: int = 7799,
-                tls: tuple | None = None) -> ThreadingHTTPServer:
-    """Build the agent server. `tls=(cert_path, key_path)` wraps the listening socket
-    in a TLS-server context (AG-TLS/AD-9) so phones reach a confidential, forward-secret,
-    pinned channel on a bare IP. None ⇒ plain HTTP (localhost dev / tests)."""
+def make_server(ctx: Context, host: str = "127.0.0.1", port: int = 7799) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((host, port), ConsoleHandler)
     httpd.ctx = ctx
-    if tls is not None:
-        from . import tls as _tls
-        cert, key = tls
-        httpd.socket = _tls.server_ssl_context(cert, key).wrap_socket(
-            httpd.socket, server_side=True)
     return httpd

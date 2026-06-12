@@ -34,7 +34,6 @@ import time
 from queue import Empty
 
 import duckdb
-import numpy as np
 
 from titan_hcl import bus
 from titan_hcl.bus import (
@@ -49,13 +48,13 @@ from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
 from titan_hcl.synthesis.outer_meta_policy import (
-    NUM_OUTER_ACTIONS,
     OUTER_META_POLICY_STATE_SPEC,
     OUTER_POLICY_INPUT_DIM,
     OuterMetaPolicy,
     action_index_to_name,
-    structural_target_action,
 )
+from titan_hcl.synthesis.outer_meta_reasoning import OuterMetaReasoningEngine
+from titan_hcl.synthesis.outer_reasoning import OuterReasoningEngine
 
 logger = logging.getLogger("self_learning")
 
@@ -72,27 +71,16 @@ _DEFAULTS = {
     "explore_interval_s": 120.0,       # idle EXPLORE tick cadence
     "explore_chi_floor": 0.30,         # metabolic floor for exploration (INV-OML-9)
     "explore_replay_batch": 16,        # experience-replay batch size
-    "explore_balanced": True,          # replay BALANCED across actions (deadlock fix, step 1)
-    # ── Active idle action-space exploration (deadlock fix step 2, §7.C/§24.6).
-    #    On recalled contexts, teach the policy the VERIFIABLE structural target
-    #    (structural_target_action) directly via cross-entropy — so the under-used
-    #    actions (esp. IDK, which has NO live reward stream) get learned on the
-    #    contexts where they are structurally correct, off the live path
-    #    (INV-OML-9). The target is VERIFIABLE (the memory-search "does he know?"
-    #    signal + tool-intent + skill-match + metabolic affordability), so we
-    #    teach it directly rather than Boltzmann-sample-and-reward (which decays
-    #    to a degenerate single-action policy — REINFORCE's advantage → 0 at
-    #    convergence). Stochastic discovery belongs to LIVE turns (unknown
-    #    outcomes); idle consolidates toward the verifiable oracle, live verdicts
-    #    refine BEYOND it. This is what actually closes G5/GB8.
-    "explore_structural": True,        # run the structural-verifier bootstrap pass
-    "explore_structural_batch": 24,    # recalled contexts taught per idle tick
-    "explore_structural_advantage": 1.0,  # cross-entropy push magnitude toward the verified target
-    "explore_know_threshold": 0.5,     # recall_top_cosine ≥ this ⇒ "he knows" (→ direct)
-    "explore_skill_floor": 0.3,        # skill_utility ≥ this + matched ⇒ reuse (→ skill_delegate)
-    "explore_research_chi_floor": 0.4, # chi ≥ this ⇒ research affordable; else honest IDK
-    "explore_request_enabled": False,  # active idle problem-gen (LLM-judge layer; Phase 2 consumer)
+    "explore_request_enabled": False,  # active idle problem-gen (Phase 2 consumer)
     "macro_min_wins": 5,               # verified wins of one (goal_class,action) → distil
+    # ── Phase C (§7.C piece 6) — the OUTER two-level reasoner as the continuous
+    #    idle-time deliberative learner. When enabled, the explore tick runs the
+    #    OuterMetaReasoningEngine over OuterReasoningEngine on a verified-win
+    #    goal_class → trains the outer policies + emits the (verified) macro;
+    #    the reactive Phase-1 `_maybe_distill_macro` is SUPERSEDED (fallback when
+    #    disabled). Numpy-only, INV-OML-8 isolation preserved.
+    "outer_meta_enabled": True,        # explore-tick deliberative macro path (supersede)
+    "outer_meta_max_steps": 16,        # max meta-chain length per deliberation
     # ── Anti-runaway regularization (2026-06-11). The unregularized REINFORCE
     #    let the off-policy `tool` attribution explode the policy weights
     #    (scores ~1100 → always-tool collapse). weight_decay = decoupled L2
@@ -266,50 +254,6 @@ class _SelfLearningStore:
             logger.debug("[self_learning] recent_reward_tuples soft-fail: %s", e)
             return []
 
-    def balanced_reward_tuples(self, n: int):
-        """Replay batch BALANCED across actions (deadlock fix, tuning step 1).
-
-        `recent_reward_tuples` is strict time-order → dominated by the dense
-        `tool` stream, so replay just re-reinforces the always-tool collapse. This
-        draws the most-recent tuples PER ACTION (round-robin), so the minority
-        direct/research/IDK samples train at parity with `tool`. Combined with the
-        per-action baseline, that lets a positive non-tool reward actually move
-        its action. Falls back to the most-recent within each action's slice."""
-        try:
-            per_action = max(1, int(n) // max(1, NUM_OUTER_ACTIONS) + 1)
-            rows = self._conn.execute(
-                "SELECT features_json, action, reward FROM ("
-                "  SELECT features_json, action, reward, id,"
-                "    ROW_NUMBER() OVER (PARTITION BY action ORDER BY id DESC) AS rn"
-                "  FROM reward_tuples"
-                ") WHERE rn <= ? ORDER BY rn ASC, id DESC LIMIT ?",
-                [int(per_action), int(n)]).fetchall()
-            return [(json.loads(r[0]), int(r[1]), float(r[2])) for r in rows]
-        except Exception as e:  # noqa: BLE001
-            logger.debug("[self_learning] balanced_reward_tuples soft-fail: %s", e)
-            return []
-
-    def distinct_recent_contexts(self, n: int):
-        """Diverse recalled CONTEXTS (feature vec + goal_class) for active idle
-        exploration (step 2) — the most-recent few per goal_class, round-robin,
-        so exploration probes the whole context space (conversational/unknowable
-        included) rather than just the dense `tool` region. Returns the FEATURE
-        vector only (the action taken / its reward are irrelevant — exploration
-        chooses a fresh action and scores it structurally)."""
-        try:
-            per_class = max(1, int(n) // 4 + 1)
-            rows = self._conn.execute(
-                "SELECT features_json, goal_class FROM ("
-                "  SELECT features_json, goal_class, id,"
-                "    ROW_NUMBER() OVER (PARTITION BY goal_class ORDER BY id DESC) AS rn"
-                "  FROM reward_tuples"
-                ") WHERE rn <= ? ORDER BY rn ASC, id DESC LIMIT ?",
-                [int(per_class), int(n)]).fetchall()
-            return [(json.loads(r[0]), str(r[1] or "")) for r in rows]
-        except Exception as e:  # noqa: BLE001
-            logger.debug("[self_learning] distinct_recent_contexts soft-fail: %s", e)
-            return []
-
     def win_count(self, goal_class: str, action: int) -> int:
         """Verified wins (reward>0) of a (goal_class, action) — the macro trigger."""
         try:
@@ -339,6 +283,27 @@ class _SelfLearningStore:
                 [str(goal_class or ""), int(action), time.time()])
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] mark_macro_emitted soft-fail: %s", e)
+
+    def candidate_macro_classes(self, min_wins: int, limit: int = 8):
+        """Phase-C piece 6 — (goal_class, action) classes with ≥ `min_wins`
+        verified wins (reward>0) that have NOT yet been macro-emitted, most-won
+        first. The explore-tick deliberative path draws from here."""
+        try:
+            rows = self._conn.execute(
+                "SELECT rt.goal_class, rt.action, COUNT(*) AS wins "
+                "FROM reward_tuples rt "
+                "WHERE rt.reward > 0 AND rt.goal_class <> '' "
+                "GROUP BY rt.goal_class, rt.action "
+                "HAVING COUNT(*) >= ? "
+                "AND NOT EXISTS (SELECT 1 FROM macro_emitted me "
+                "                WHERE me.goal_class = rt.goal_class "
+                "                AND me.action = rt.action) "
+                "ORDER BY wins DESC LIMIT ?",
+                [int(min_wins), int(limit)]).fetchall()
+            return [(str(r[0]), int(r[1])) for r in rows]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] candidate_macro_classes soft-fail: %s", e)
+            return []
 
     def mean_features(self, goal_class: str, action: int):
         """Mean winning feature vector for a (goal_class, action) — the macro signature."""
@@ -472,6 +437,36 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
     except Exception:  # noqa: BLE001
         _life = None
 
+    # ── Phase C piece 6 — the OUTER two-level reasoner (numpy-only; INV-OML-8) ──
+    # OuterMetaReasoningEngine (reuses the meta handlers via PrimitiveHandlersMixin)
+    # over OuterReasoningEngine (reuses reasoning.py's primitive funcs). The
+    # explore tick runs them on verified-win classes. EVALUATE ← an in-worker
+    # win-verification oracle (reads only this worker's own duckdb — no
+    # coding_sandbox import, isolation preserved).
+    _outer_reason = None
+    _outer_meta = None
+    if cfg["enabled"] and cfg["outer_meta_enabled"]:
+        try:
+            _outer_dir = os.path.join("data", "self_learning_outer")
+            _outer_reason = OuterReasoningEngine(save_dir=_outer_dir)
+            _outer_meta = OuterMetaReasoningEngine(
+                config={"max_steps": int(cfg["outer_meta_max_steps"])},
+                save_dir=_outer_dir)
+
+            def _win_oracle(problem, _delegate_results, _store=store):
+                gc = str(problem.get("goal_class", "") or "")
+                act = int(problem.get("action", 0))
+                return 1.0 if _store.win_count(gc, act) > 0 else -1.0
+
+            _outer_meta.set_oracle(_win_oracle)
+            logger.info("[self_learning] OuterMetaReasoningEngine wired "
+                        "(deliberative macro path; in-worker win-oracle)")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[self_learning] outer reasoner init failed "
+                           "(deliberative path disabled): %s", e)
+            _outer_reason = None
+            _outer_meta = None
+
     _WORKER_READY = True
     if _state_writer is not None:
         try:
@@ -511,7 +506,8 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
         # Idle EXPLORE tick — metabolically gated (INV-OML-9), top of loop.
         if now - last_explore >= float(cfg["explore_interval_s"]):
             try:
-                _explore_tick(cfg, store, policy, _shm_writer, _life, send_queue, name)
+                _explore_tick(cfg, store, policy, _shm_writer, _life, send_queue, name,
+                              _outer_reason, _outer_meta)
             except Exception as e:  # noqa: BLE001
                 logger.debug("[self_learning] explore tick soft-fail: %s", e)
             last_explore = now
@@ -647,34 +643,42 @@ def _handle_reward(payload, store, policy, shm_writer, cfg, send_queue, name) ->
                 train_reward, source or "direct", goal_class or "-",
                 policy.total_updates, policy.reward_baseline)
     # Macro distillation (S1) — a (goal_class, action) with enough verified wins.
-    if macro_reward > 0 and goal_class:
+    # Phase-C piece 6: when the deliberative explore-tick path is enabled it is
+    # the SOLE macro source (it would otherwise be pre-empted by this reactive
+    # path firing the instant the threshold is crossed); the reactive path is
+    # the FALLBACK when `outer_meta_enabled=False`.
+    if macro_reward > 0 and goal_class and not cfg["outer_meta_enabled"]:
         _maybe_distill_macro(goal_class, action, store, cfg, send_queue, name)
     return True
 
 
-def _maybe_distill_macro(goal_class, action, store, cfg, send_queue, name) -> None:
-    if store.macro_already_emitted(goal_class, action):
-        return
-    if store.win_count(goal_class, action) < int(cfg["macro_min_wins"]):
-        return
+def _emit_macro(goal_class, action, store, send_queue, name,
+                composed_from=None) -> None:
+    """Emit the `SELF_LEARN_MACRO_READY` S2 contract + mark emitted. Shared by the
+    Phase-1 reactive path (`_maybe_distill_macro`) and the Phase-C deliberative
+    explore-tick path (`_outer_deliberate`). `composed_from` (leaf reasoning_ids)
+    is forwarded when available; the worker has no leaf-id join today so it stays
+    None (the leaf-edge enrichment is a synthesis-side fast-follow — RFP §7.C)."""
     signature = store.mean_features(goal_class, action)
     if signature is None:
         return
+    payload = {
+        "goal_class": goal_class,
+        "action": int(action),
+        "action_name": action_index_to_name(action),
+        "signature": signature,
+        "b_i": 1.0, "c": 1.0,
+        "time_cost": 1.0,                 # oracle-verified → proficient (B1)
+        "use_count": store.win_count(goal_class, action),
+        "verified": True,                  # only verified classes reach here
+        "label": f"macro::{goal_class}::{action_index_to_name(action)}",
+    }
+    if composed_from:
+        payload["composed_from"] = list(composed_from)
     try:
         send_queue.put({
             "type": SELF_LEARN_MACRO_READY, "src": name, "dst": "synthesis",
-            "ts": time.time(),
-            "payload": {
-                "goal_class": goal_class,
-                "action": int(action),
-                "action_name": action_index_to_name(action),
-                "signature": signature,
-                "b_i": 1.0, "c": 1.0,
-                "time_cost": 1.0,                 # oracle-verified → proficient (B1)
-                "use_count": store.win_count(goal_class, action),
-                "verified": True,                  # only verified wins reach here
-                "label": f"macro::{goal_class}::{action_index_to_name(action)}",
-            }})
+            "ts": time.time(), "payload": payload})
         store.mark_macro_emitted(goal_class, action)
         store.log_explore("macro_emitted", goal_class, action_index_to_name(action))
         logger.info("[self_learning] macro-strategy distilled: %s → %s (wins=%d)",
@@ -684,70 +688,55 @@ def _maybe_distill_macro(goal_class, action, store, cfg, send_queue, name) -> No
         logger.debug("[self_learning] macro emit soft-fail: %s", e)
 
 
-def _research_affordable(life, cfg) -> bool:
-    """Can Titan afford a research request right now? (research costs an oracle/web
-    request — FC-6). Below the chi floor the honest action is IDK, not research.
-    No metabolic reader → assume affordable (cold default permits)."""
-    if life is None:
-        return True
-    try:
-        return float(life.get_chi_total()) >= float(cfg["explore_research_chi_floor"])
-    except Exception:  # noqa: BLE001
-        return True
-
-
-def _structural_explore(cfg, store, policy, shm_writer, life, name) -> None:
-    """Active idle action-space exploration (deadlock fix step 2, §7.C/§24.6).
-
-    For each recalled context, teach the policy the VERIFIABLE structural target
-    (`structural_target_action`) directly via cross-entropy (`train_step` toward
-    the known-correct action) — so the under-used actions get learned on the
-    contexts where they are structurally correct, off the live path (INV-OML-9).
-    Esp. `IDK`: it has NO live reward stream, so this idle bootstrap is the only
-    place it can be learned. The oracle's know/don't-know axis is the
-    memory-search signal (recall_top_cosine captured per turn — "does a
-    dereferenceable thought exist?"); research-vs-IDK is metabolic affordability.
-
-    We teach the verifiable target DIRECTLY rather than Boltzmann-sample-and-
-    reward: the target is known, and sampling + REINFORCE's decaying advantage
-    provably collapses to a degenerate single-action policy in this net (verified
-    across seeds). `train_step(target, advantage>0)` is a cross-entropy step
-    (gradient = probs − onehot_target) → it robustly learns the feature-
-    conditional routing (8/8 seeds with the live multi-feature recall signal),
-    bounded by the existing weight regularization. Stochastic discovery stays on
-    LIVE turns (unknown outcomes, per-action-baseline `learn`); idle consolidates
-    toward the verifiable oracle, live verdicts refine BEYOND it. This is what
-    closes G5/GB8."""
-    contexts = store.distinct_recent_contexts(int(cfg["explore_structural_batch"]))
-    if not contexts:
+def _maybe_distill_macro(goal_class, action, store, cfg, send_queue, name) -> None:
+    if store.macro_already_emitted(goal_class, action):
         return
-    affordable = _research_affordable(life, cfg)
-    adv = float(cfg["explore_structural_advantage"])
-    know_thr = float(cfg["explore_know_threshold"])
-    skill_floor = float(cfg["explore_skill_floor"])
-    taught = 0
-    for features, _goal_class in contexts:
-        if len(features) != OUTER_POLICY_INPUT_DIM:
-            continue
-        vec = np.asarray(features, dtype=np.float32)
-        target = structural_target_action(
-            vec, affordable=affordable, know_threshold=know_thr, skill_floor=skill_floor)
-        policy.train_step(vec, target, advantage=adv)   # cross-entropy → verifiable target
-        taught += 1
-    if taught:
-        store.save_policy_flat(policy.to_flat().tolist(),
-                               policy.total_updates, policy.reward_baseline)
-        _publish_weights(shm_writer, policy)
-        store.log_explore("structural", "", f"n={taught} affordable={affordable}")
+    if store.win_count(goal_class, action) < int(cfg["macro_min_wins"]):
+        return
+    _emit_macro(goal_class, action, store, send_queue, name)
 
 
-def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name) -> None:
-    """Idle EXPLORE (L3) — metabolically gated (INV-OML-9). Two passes:
-    (1) balanced experience-replay (step 1 — sharpens between sparse live
-    rewards, minority actions at parity); (2) active structural exploration
-    (step 2 — Boltzmann + verifiable structural oracle, the G5/GB8 closer). The
-    LLM-judge counterfactual layer rides the existing `explore_request` hook
-    (Phase 2 consumer)."""
+def _outer_deliberate(cfg, store, send_queue, name, outer_reason, outer_meta) -> None:
+    """Phase-C piece 6 — ONE outer meta-reasoning deliberation per explore tick.
+
+    Draws a verified-win `goal_class` not yet macro-emitted → seeds the lower
+    `OuterReasoningEngine` with its 30-D mean-feature signature → runs the
+    `OuterMetaReasoningEngine` meta-chain (which DELEGATEs to the lower engine +
+    EVALUATEs via the in-worker win-oracle) → trains the outer policies. On a
+    VERIFIED composite, emits the macro via the shared S2 contract. This is the
+    continuous idle-time deliberative learner ("otherwise dead code → useful")."""
+    candidates = store.candidate_macro_classes(int(cfg["macro_min_wins"]), limit=4)
+    if not candidates:
+        return
+    goal_class, action = candidates[0]
+    signature = store.mean_features(goal_class, action)
+    if signature is None or len(signature) != OUTER_POLICY_INPUT_DIM:
+        return
+    outer_reason.set_problem(signature)
+    problem = {"topic": goal_class, "goal_class": goal_class, "action": int(action),
+               "entry_primitive": "RECALL", "reason": "outer_deliberate"}
+    composite = outer_meta.run_chain(problem=problem, reasoning_engine=outer_reason)
+    outer_meta.train_terminal(float(composite.get("reward", 0.0)))
+    try:
+        outer_reason.save_all()
+        outer_meta.save_all()
+    except Exception:  # noqa: BLE001
+        pass
+    store.log_explore(
+        "outer_deliberate", goal_class,
+        f"verified={composite.get('verified')} reward={composite.get('reward')} "
+        f"chain={composite.get('chain_length')}")
+    if composite.get("verified"):
+        _emit_macro(goal_class, action, store, send_queue, name)
+
+
+def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
+                  outer_reason=None, outer_meta=None) -> None:
+    """Idle EXPLORE (L3) — metabolically gated (INV-OML-9). Phase-1 action =
+    experience-replay on accumulated reward tuples (self-contained; sharpens the
+    policy between sparse live rewards). Phase-C piece 6: also runs ONE outer
+    meta-reasoning deliberation (the continuous deliberative learner). The active
+    idle problem-generation request is emitted only when its consumer is wired."""
     # Metabolic floor: never explore in survival/starvation or while dreaming.
     if life is not None:
         try:
@@ -759,12 +748,9 @@ def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name) -> Non
                 return
         except Exception:  # noqa: BLE001
             return  # can't confirm metabolic headroom → conservatively skip
-    # (1) balanced experience-replay.
-    _batch_n = int(cfg["explore_replay_batch"])
-    if cfg.get("explore_balanced", True):
-        batch = store.balanced_reward_tuples(_batch_n)
-    else:
-        batch = store.recent_reward_tuples(_batch_n)
+    batch = store.recent_reward_tuples(int(cfg["explore_replay_batch"]))
+    if not batch:
+        return
     replayed = 0
     for features, action, reward in batch:
         if len(features) != OUTER_POLICY_INPUT_DIM:
@@ -775,11 +761,15 @@ def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name) -> Non
         store.save_policy_flat(policy.to_flat().tolist(),
                                policy.total_updates, policy.reward_baseline)
         _publish_weights(shm_writer, policy)
-        store.log_explore("replay", "", f"batch={replayed}balanced={cfg.get('explore_balanced', True)}")
-    # (2) active structural exploration — the G5/GB8 closer.
-    if cfg.get("explore_structural", True):
-        _structural_explore(cfg, store, policy, shm_writer, life, name)
-    # (3) LLM-judge counterfactual layer (Phase 2 consumer; off by default).
+        store.log_explore("replay", "", f"batch={replayed}")
+    # ── Phase C piece 6 — ONE outer meta-reasoning deliberation per tick ──
+    if (outer_meta is not None and outer_reason is not None
+            and cfg["outer_meta_enabled"]):
+        try:
+            _outer_deliberate(cfg, store, send_queue, name, outer_reason, outer_meta)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] outer deliberation soft-fail: %s", e)
+    # Active idle problem-generation (Phase 2 consumer; off by default).
     if cfg.get("explore_request_enabled"):
         try:
             send_queue.put({
