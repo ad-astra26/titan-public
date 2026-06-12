@@ -48,7 +48,6 @@ from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
 from titan_hcl.synthesis.outer_meta_policy import (
-    NUM_OUTER_ACTIONS,
     OUTER_META_POLICY_STATE_SPEC,
     OUTER_POLICY_INPUT_DIM,
     OuterMetaPolicy,
@@ -70,7 +69,6 @@ _DEFAULTS = {
     "explore_interval_s": 120.0,       # idle EXPLORE tick cadence
     "explore_chi_floor": 0.30,         # metabolic floor for exploration (INV-OML-9)
     "explore_replay_batch": 16,        # experience-replay batch size
-    "explore_balanced": True,          # replay BALANCED across actions (deadlock fix, step 1)
     "explore_request_enabled": False,  # active idle problem-gen (Phase 2 consumer)
     "macro_min_wins": 5,               # verified wins of one (goal_class,action) → distil
     # ── Anti-runaway regularization (2026-06-11). The unregularized REINFORCE
@@ -244,29 +242,6 @@ class _SelfLearningStore:
             return [(json.loads(r[0]), int(r[1]), float(r[2])) for r in rows]
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] recent_reward_tuples soft-fail: %s", e)
-            return []
-
-    def balanced_reward_tuples(self, n: int):
-        """Replay batch BALANCED across actions (deadlock fix, tuning step 1).
-
-        `recent_reward_tuples` is strict time-order → dominated by the dense
-        `tool` stream, so replay just re-reinforces the always-tool collapse. This
-        draws the most-recent tuples PER ACTION (round-robin), so the minority
-        direct/research/IDK samples train at parity with `tool`. Combined with the
-        per-action baseline, that lets a positive non-tool reward actually move
-        its action. Falls back to the most-recent within each action's slice."""
-        try:
-            per_action = max(1, int(n) // max(1, NUM_OUTER_ACTIONS) + 1)
-            rows = self._conn.execute(
-                "SELECT features_json, action, reward FROM ("
-                "  SELECT features_json, action, reward, id,"
-                "    ROW_NUMBER() OVER (PARTITION BY action ORDER BY id DESC) AS rn"
-                "  FROM reward_tuples"
-                ") WHERE rn <= ? ORDER BY rn ASC, id DESC LIMIT ?",
-                [int(per_action), int(n)]).fetchall()
-            return [(json.loads(r[0]), int(r[1]), float(r[2])) for r in rows]
-        except Exception as e:  # noqa: BLE001
-            logger.debug("[self_learning] balanced_reward_tuples soft-fail: %s", e)
             return []
 
     def win_count(self, goal_class: str, action: int) -> int:
@@ -659,11 +634,7 @@ def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name) -> Non
                 return
         except Exception:  # noqa: BLE001
             return  # can't confirm metabolic headroom → conservatively skip
-    _batch_n = int(cfg["explore_replay_batch"])
-    if cfg.get("explore_balanced", True):
-        batch = store.balanced_reward_tuples(_batch_n)
-    else:
-        batch = store.recent_reward_tuples(_batch_n)
+    batch = store.recent_reward_tuples(int(cfg["explore_replay_batch"]))
     if not batch:
         return
     replayed = 0
@@ -676,7 +647,7 @@ def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name) -> Non
         store.save_policy_flat(policy.to_flat().tolist(),
                                policy.total_updates, policy.reward_baseline)
         _publish_weights(shm_writer, policy)
-        store.log_explore("replay", "", f"batch={replayed}balanced={cfg.get('explore_balanced', True)}")
+        store.log_explore("replay", "", f"batch={replayed}")
     # Active idle problem-generation (Phase 2 consumer; off by default).
     if cfg.get("explore_request_enabled"):
         try:
