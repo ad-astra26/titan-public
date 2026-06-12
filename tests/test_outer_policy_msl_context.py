@@ -72,6 +72,19 @@ def test_decide_returns_none_without_published_policy():
     assert agno_hooks._outer_policy_decide(p, _Readout(), True, "x") is None
 
 
+def test_flag_off_parity_gating():
+    # Piece 8 / G8 — flag-off parity: the LEARNED outer decide is entirely behind
+    # `_self_learning_enabled`. Default config → OFF → _outer_policy_decide is never
+    # invoked at the call site → grounded_route stands byte-identical.
+    p = _Plugin()
+    p._full_config = {}
+    assert agno_hooks._self_learning_enabled(p) is False
+    p._full_config = {"synthesis": {"self_learning": {"enabled": False}}}
+    assert agno_hooks._self_learning_enabled(p) is False
+    p._full_config = {"synthesis": {"self_learning": {"enabled": True}}}
+    assert agno_hooks._self_learning_enabled(p) is True
+
+
 def test_retrieval_prior_flows_into_decision_vector(tmp_path, monkeypatch):
     # Piece 7b end-to-end: a wired composite reader + a matching prompt_vec →
     # composite_match_score/action_norm populate the last 2 feature dims.
