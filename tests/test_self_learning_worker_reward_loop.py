@@ -88,11 +88,8 @@ def test_direct_reward_trains_without_stash(tmp_path):
 
 def test_direct_reward_distills_macro(tmp_path):
     # enough direct verified wins of one (goal_class, action) → macro emitted.
-    # Phase-C piece 6: the reactive `_maybe_distill_macro` is now the FALLBACK,
-    # superseded by the explore-tick deliberative path when `outer_meta_enabled`
-    # (the default). This test covers the reactive fallback → flag it off.
     store = _store(tmp_path)
-    cfg = _cfg({"synthesis": {"self_learning": {"outer_meta_enabled": False}}})
+    cfg = _cfg({})
     q = _Q()
     policy = OuterMetaPolicy(lr=0.05)
     tool = OUTER_ACTIONS.index("tool")
