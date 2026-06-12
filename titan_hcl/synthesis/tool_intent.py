@@ -36,7 +36,22 @@ _INTENT_PATTERNS: tuple[re.Pattern, ...] = tuple(
         r"\bis\s+\d+\s+prime\b",
         r"\bfactorial of\b",
         r"\bfibonacci\s*\(",
-        r"\bsum of the first\b",
+        r"\bsum of\b",
+        # ── Natural-language + symbolic arithmetic (§24.12 Track 1 bootstrap).
+        # COLD-START crutch only: number-adjacent operators + math-function words
+        # so common compute phrasings ("17 times 23", "2^10", "144 divided by 12")
+        # route to the deterministic oracle instead of an LLM guess. The LONG-TERM,
+        # self-emergent path is the learned composite-prior (oracle-verified
+        # `compute→tool` macros matched by embedding similarity, §24.12 Track 2) —
+        # this regex is the bootstrap for when that library is still cold/sparse.
+        # Patterns are number-adjacent or specific math words to keep the
+        # false-positive rate low (a false flag costs only a no-op: intent without
+        # extractable code → no exec → normal fallback, per the module note above).
+        r"\b\d+\s*(?:\*|×|\^|\*\*)\s*\d+",          # 17*23, 17×23, 2^10, 2**10
+        r"\b\d+\s+(?:times|multiplied by|divided by|plus|minus|mod(?:ulo)?)\s+\d+",
+        r"\bto the power of\b",
+        r"\b(?:square root|cube root|sqrt|gcd|lcm|modulo)\b",
+        r"\b\d+\s+(?:squared|cubed)\b",
         r"\bcheck (?:that |whether |if )?(?:this )?(?:python|code|snippet)\b",
         r"\bcheck (?:that |whether |if )\b.{0,80}\bequals?\b",
         r"\bdoes\b.{0,40}\bequal\b",

@@ -177,6 +177,55 @@ def _self_learning_enabled(plugin) -> bool:
         return False
 
 
+def _oml_decide_debug_capture(policy, vec, action, prompt_text, cm_score, cm_action):
+    """§24.12 LIVE-OVERRIDE-GAP diagnostic — capture the LIVE 30-D OuterFeatures
+    vector + the per-action `policy.forward(vec)` scores on a real user turn, so
+    it can be diffed against the SYNTHETIC SHM probe
+    (`scripts/titan-docs/oml_recall_probe.py`, which hardcodes
+    composite/skill/engram=0 + has_code=False). The feature whose LIVE value
+    differs from the probe AND flips the argmax is the override cause (§5.B:
+    "the policy is only as good as the live feature vector — INSTRUMENT FIRST").
+
+    Gated by a FILE flag so capture can be armed/disarmed on a LIVE box with NO
+    restart: `touch <flag>` to arm, `rm` to disarm (default flag
+    `/tmp/oml_decide_debug.on` → capture appends to `/tmp/oml_decide_debug.jsonl`).
+    Read-only telemetry, fully wrapped — must NEVER break a chat turn (INV-OML-7).
+    A single `os.path.exists` stat per user turn when disarmed (turns are
+    user-paced, not a hot loop) → negligible."""
+    try:
+        import os as _os
+        flag = _os.environ.get("TITAN_OML_DECIDE_DEBUG_FLAG", "/tmp/oml_decide_debug.on")
+        if not _os.path.exists(flag):
+            return
+        import json as _json
+        import numpy as _np
+        from titan_hcl.synthesis.outer_meta_policy import (
+            OUTER_ACTIONS, OUTER_FEATURE_NAMES, action_index_to_mode,
+            action_index_to_name)
+        scores = policy.forward(_np.asarray(vec, dtype=_np.float32))
+        vlist = [float(x) for x in _np.asarray(vec).ravel().tolist()]
+        rec = {
+            "ts": round(time.time(), 3),
+            "prompt": (prompt_text or "")[:160],
+            "action": int(action),
+            "action_name": action_index_to_name(int(action)),
+            "mode": action_index_to_mode(int(action)),
+            "scores": {OUTER_ACTIONS[i]: round(float(scores[i]), 4)
+                       for i in range(len(OUTER_ACTIONS))},
+            "features": {OUTER_FEATURE_NAMES[i]: round(vlist[i], 4)
+                         for i in range(min(len(OUTER_FEATURE_NAMES), len(vlist)))},
+            "composite_raw": {"score": round(float(cm_score), 4),
+                              "action_norm": round(float(cm_action), 4)},
+            "total_updates": int(getattr(policy, "total_updates", 0)),
+        }
+        path = _os.environ.get(
+            "TITAN_OML_DECIDE_DEBUG_PATH", "/tmp/oml_decide_debug.jsonl")
+        with open(path, "a") as _f:
+            _f.write(_json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 def _outer_policy_decide(plugin, readout, requires_tool, prompt_text, prompt_vec=None):
     """Read the SHM-published `OuterMetaPolicy`, build the feature vector from
     locally-available signals, and EXPLOIT (argmax) → `(MODE, features_list,
@@ -252,6 +301,7 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text, prompt_vec
     )
     vec = feats.to_vector()
     action = policy.exploit_action(vec)
+    _oml_decide_debug_capture(policy, vec, action, prompt_text, _cm_score, _cm_action)
     return (action_index_to_mode(action), vec.tolist(), action)
 
 
