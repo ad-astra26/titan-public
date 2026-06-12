@@ -957,7 +957,6 @@ class EngramStore:
         return len(concepts)
 
     @on_writer
-    @on_writer
     def latest_concept(self, concept_id: str) -> Optional[dict]:
         """The latest-version row for ``concept_id`` (``{concept_id, version,
         name, memory_type, groundedness, anchor_tx, created_at, ...}``) or
@@ -968,6 +967,20 @@ class EngramStore:
         ``bump_version`` refinement (INV-OML-5 mutate-not-update), else a fresh
         ``create_concept``. Kuzu is writer-owned (@on_writer)."""
         return self._graph.spine_get_latest_concept(concept_id)
+
+    @on_writer
+    def list_declarative_concepts(self, limit: int = 200) -> list[dict]:
+        """Latest-version declarative `Engram` concepts (each `{concept_id,
+        version, name, groundedness, anchor_tx, domain_hint}`), groundedness DESC.
+        The DK.2 concept-of-concepts survey reads this to group base concepts by
+        `domain_hint` and compose a summary (§7.D-knowledge). Kuzu is
+        writer-owned (@on_writer)."""
+        try:
+            return self._graph.spine_list_concepts(
+                limit=int(limit), memory_type="declarative")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[EngramStore] list_declarative_concepts failed: %s", e)
+            return []
 
     def read_spine_strands(self, concept_id: str, version: int) -> Optional[dict]:
         """Four spine strands for a (concept_id, version) as Timechain-anchor

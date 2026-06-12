@@ -804,8 +804,14 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
     a slow provider never starves the recv-loop heartbeat (the synthesis
     crash-loop guard). Continuous, NOT dream-gated (INV-OML-12). Soft — a seed
     failure is logged, never raised, never blocks the next."""
-    from titan_hcl.synthesis.research_wiki import seed_research_concept
+    from titan_hcl.synthesis.research_wiki import (
+        seed_research_concept, compose_concept_summaries)
     stop_event.wait(min(interval_s, 20.0))   # settle; offset from other passes
+    # DK.2 concept-of-concepts rides a throttle (a population survey, not every
+    # tick): run it once per _DK2_EVERY drained passes, and only when the seed
+    # queue is idle so curation never delays primary fact capture.
+    _DK2_EVERY = 20
+    _pass = 0
     while not stop_event.is_set():
         seeded = 0
         try:
@@ -832,6 +838,19 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                 logger.info("[synthesis_worker] DK.1 research-wiki seeded %d "
                             "declarative concept(s) (queue=%d)",
                             seeded, len(wiki_queue))
+            # DK.2 — concept-of-concepts survey (throttled, queue-idle only).
+            _pass += 1
+            if _pass % _DK2_EVERY == 0 and not wiki_queue:
+                try:
+                    n = compose_concept_summaries(
+                        engram_store=engram_store, cgn_bridge=cgn_bridge,
+                        name_fn=name_fn)
+                    if n:
+                        logger.info("[synthesis_worker] DK.2 concept-of-concepts "
+                                    "composed %d summary concept(s)", n)
+                except Exception as _dk2e:  # noqa: BLE001
+                    logger.debug("[synthesis_worker] DK.2 survey soft-fail: %s",
+                                 _dk2e)
         except Exception as e:  # noqa: BLE001
             logger.debug("[synthesis_worker] research-wiki pass failed: %s", e)
         stop_event.wait(interval_s)

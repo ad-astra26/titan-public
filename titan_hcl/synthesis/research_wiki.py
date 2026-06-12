@@ -212,8 +212,98 @@ def seed_research_concept(
     return cv
 
 
+_SUMMARY_PREFIX = "summary::"
+
+
+def compose_concept_summaries(
+    *,
+    engram_store: Any,
+    cgn_bridge: Any,
+    min_children: int = 2,
+    max_summaries_per_pass: int = 3,
+    name_fn: Optional[Callable[[str], tuple[str, str, str]]] = None,
+) -> int:
+    """DK.2 (§7.D-knowledge) — concept-of-concepts (the "wiki index"). Survey BASE
+    declarative `Engram` concepts, group by `domain_hint`, and compose a SUMMARY
+    `Engram` whose `composed_from` = the domain's child concepts — a higher-order
+    page that cites pages. Idempotent via the `summary::{domain}` concept_id
+    convention: an existing summary is **bumped** (refreshed with the current
+    children, INV-OML-5 mutate-not-update), else **created**. Summary concepts are
+    themselves declarative but are EXCLUDED from the base set (the `summary::`
+    prefix), so there is no infinite re-summarization. The LLM is librarian — it
+    may NAME the summary over the *already-verified* child concepts; it never
+    authors a fact (GD10). Returns # summaries created/bumped. Soft — never raises.
+
+    Rides a periodic survey (the research-wiki daemon throttle): curation over the
+    existing population, not primary fact capture, so a population-scan cadence
+    (not every tick) is correct."""
+    made = 0
+    try:
+        concepts = engram_store.list_declarative_concepts(limit=400)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[research_wiki] DK.2 list failed: %s", e)
+        return 0
+
+    by_domain: dict[str, list] = {}
+    for c in concepts or []:
+        cid = str(c.get("concept_id") or "")
+        if not cid or cid.startswith(_SUMMARY_PREFIX):
+            continue  # skip existing summaries → no infinite re-summarization
+        dom = (c.get("domain_hint") or "").strip().lower()
+        if not dom:
+            continue
+        by_domain.setdefault(dom, []).append(c)
+
+    for dom, children in sorted(by_domain.items(), key=lambda kv: -len(kv[1])):
+        if made >= int(max_summaries_per_pass):
+            break
+        if len(children) < int(min_children):
+            continue
+        summary_id = _SUMMARY_PREFIX + re.sub(r"[^a-z0-9_]+", "_", dom)[:48]
+        child_refs = [(str(c["concept_id"]), int(c["version"])) for c in children]
+        evidence = [str(c.get("anchor_tx") or "")
+                    for c in children if c.get("anchor_tx")]
+        name = f"{dom.replace('_', ' ').title()} — Overview"
+        if name_fn is not None:
+            try:
+                _cid, _nm, _dh = name_fn(
+                    "Overview of: " + "; ".join(
+                        str(c.get("name") or "") for c in children[:8]))
+                if _nm:
+                    name = _nm
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            cgn_bridge.register_spine_concept(
+                summary_id, name, seed_consumer="research_wiki_index")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            existing = engram_store.latest_concept(summary_id)
+            if existing is None:
+                engram_store.create_concept(
+                    concept_id=summary_id, name=name, memory_type="declarative",
+                    composed_from=child_refs, derivation_evidence=evidence,
+                    domain_hint=dom)
+            else:
+                engram_store.bump_version(
+                    concept_id=summary_id, composed_from=child_refs,
+                    derivation_evidence=evidence, domain_hint=dom)
+            made += 1
+            logger.info(
+                "[research_wiki] DK.2 concept-of-concepts %s %s "
+                "composed_from=%d (domain=%s)",
+                "created" if existing is None else "bumped",
+                summary_id, len(child_refs), dom)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[research_wiki] DK.2 compose %s soft-fail: %s",
+                         summary_id, e)
+    return made
+
+
 __all__ = (
     "seed_research_concept",
     "make_research_name_fn",
     "fallback_concept_name",
+    "compose_concept_summaries",
 )

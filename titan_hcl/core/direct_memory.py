@@ -1270,14 +1270,14 @@ class TitanKnowledgeGraph:
                 qr = self._conn.execute(
                     "MATCH (c:Engram) WHERE c.memory_type = $mt "
                     "RETURN c.concept_id, c.version, c.name, c.memory_type, "
-                    "c.groundedness, c.anchor_tx, c.created_at",
+                    "c.groundedness, c.anchor_tx, c.created_at, c.domain_hint",
                     {"mt": memory_type},
                 )
             else:
                 qr = self._conn.execute(
                     "MATCH (c:Engram) "
                     "RETURN c.concept_id, c.version, c.name, c.memory_type, "
-                    "c.groundedness, c.anchor_tx, c.created_at"
+                    "c.groundedness, c.anchor_tx, c.created_at, c.domain_hint"
                 )
             while qr.has_next():
                 row = qr.get_next()
@@ -1286,6 +1286,9 @@ class TitanKnowledgeGraph:
                     "name": row[2], "memory_type": row[3],
                     "groundedness": float(row[4]),
                     "anchor_tx": row[5], "created_at": float(row[6]),
+                    # DK.2 (§7.D-knowledge) — domain_hint groups concepts for the
+                    # concept-of-concepts summary; additive (API back-compat).
+                    "domain_hint": (row[7] or "") if len(row) > 7 else "",
                 })
         except Exception as e:
             logger.debug("[KnowledgeGraph] spine_list_concepts failed: %s", e)
