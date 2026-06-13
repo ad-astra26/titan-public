@@ -300,29 +300,28 @@ def build_features(nudge: "Nudge",
     return feat
 
 
-def signed_delta_target(pre_v8: Optional[np.ndarray],
-                        post_v8: Optional[np.ndarray]) -> Optional[float]:
-    """The Hybrid attribution target (RFP §7.B, Maker-approved): the SIGNED
-    magnitude of the emot drift across the wake cycle, measured on the 8-D
-    grounding valence vector (`ShmEmotReader.read_grounding` → per-primitive V).
+def signed_delta_target(pre_v: Optional[float],
+                        post_v: Optional[float]) -> Optional[float]:
+    """The Hybrid attribution target (RFP §7.B): the SIGNED emot-valence drift
+    across the wake cycle, measured on the dominant **blended valence**
+    `V_blended` (`ShmEmotReader.read_state` → 'V_blended').
 
-      target = sign(mean(post) − mean(pre)) · ‖post − pre‖₂
+      target = post_V_blended − pre_V_blended
 
-    The L2 norm captures how much the whole felt-space moved; the sign records
-    whether the dominant valence rose or fell. The net learns to PREDICT this
-    magnitude per signal → habituation emerges as the observed drift flattens.
+    LIVE-VERIFIED CHOICE (2026-06-13): the original design used the 8-D
+    `read_grounding` per-primitive vector, but an online proof on T2 found the
+    grounding SHM slot is NEVER written fleet-wide (`write_grounding` is defined
+    but never called → header n=0 → `read_grounding()` returns None always). So
+    the 8-D target would skip EVERY nudge → the net would never train. `V_blended`
+    (the dominant blended valence) IS live-versioned in `emot_state.bin` and is the
+    headline 'did the felt-state's valence move' signal — the faithful, available
+    attribution scalar. Sign is intrinsic (rose → +, fell → −); the net learns to
+    predict its magnitude per signal → habituation emerges as the drift flattens.
     Returns None when either snapshot is unavailable (skip — never train on a
     fabricated delta, INV-AFF-HONEST)."""
-    if pre_v8 is None or post_v8 is None:
+    if pre_v is None or post_v is None:
         return None
-    if pre_v8.shape != post_v8.shape or pre_v8.size == 0:
-        return None
-    diff = post_v8 - pre_v8
-    mag = float(np.linalg.norm(diff))
-    if mag == 0.0:
-        return 0.0
-    sign = 1.0 if float(post_v8.mean() - pre_v8.mean()) >= 0.0 else -1.0
-    return sign * mag
+    return float(post_v) - float(pre_v)
 
 
 class AffectiveNudgeNet:
@@ -438,9 +437,10 @@ class AffectiveNudgeNet:
 
 @dataclass
 class _PendingNudge:
-    """A fired nudge awaiting its dream-boundary emot-delta attribution."""
+    """A fired nudge awaiting its dream-boundary emot-delta attribution.
+    `pre_v` = the dominant blended valence (`V_blended`) snapshotted at emit."""
     features: np.ndarray
-    pre_v8: Optional[np.ndarray]
+    pre_v: Optional[float]
     ts: float
 
 
@@ -452,9 +452,13 @@ class AffectiveNudgeRuntime:
     net weights (forward/train never run concurrently in practice — drain is light,
     dream is the ordered sequence — but the lock keeps it correct).
 
-    `emot_state_reader` / `emot_grounding_reader` are zero-arg callables returning
-    the emot SHM `read_state()` dict and `read_grounding()` list (injected so the
-    runtime stays decoupled from emot_shm_protocol — and unit-testable)."""
+    `emot_state_reader` is a zero-arg callable returning the emot SHM
+    `read_state()` dict — the source of BOTH the felt-context features
+    (`V_blended`, `dominant_idx`) AND the attribution valence (`V_blended`). It is
+    injected so the runtime stays decoupled from emot_shm_protocol (+ unit-testable).
+    `emot_grounding_reader` is accepted for backward-compat but UNUSED — the 8-D
+    grounding SHM slot is never written fleet-wide (`write_grounding` uncalled), so
+    attribution rides the live `V_blended` from `read_state` (see signed_delta_target)."""
 
     def __init__(self, cfg: AffectiveConfig, state_path: str, net_path: str,
                  *, emot_state_reader=None, emot_grounding_reader=None,
@@ -463,25 +467,13 @@ class AffectiveNudgeRuntime:
         self.state_path = state_path
         self.net_path = net_path
         self._emot_state_reader = emot_state_reader
-        self._emot_grounding_reader = emot_grounding_reader
+        self._emot_grounding_reader = emot_grounding_reader  # unused (see docstring)
         self._max_pending = int(max_pending)
         self._lock = threading.Lock()
         self._pending: List[_PendingNudge] = []
         self.net = AffectiveNudgeNet.load_npz(net_path, hidden=cfg.net_hidden)
 
     # ── helpers ──────────────────────────────────────────────────────────────
-    @staticmethod
-    def _grounding_to_v8(grounding) -> Optional[np.ndarray]:
-        """ShmEmotReader.read_grounding() → 8-vector of per-primitive V, or None."""
-        if not grounding:
-            return None
-        try:
-            v = np.array([float(e.get("V", 0.0)) for e in grounding],
-                         dtype=np.float64)
-            return v if v.size == 8 else None
-        except Exception:
-            return None
-
     def _read_emot_state(self) -> Optional[dict]:
         if self._emot_state_reader is None:
             return None
@@ -490,11 +482,15 @@ class AffectiveNudgeRuntime:
         except Exception:
             return None
 
-    def _read_v8(self) -> Optional[np.ndarray]:
-        if self._emot_grounding_reader is None:
+    def _read_valence(self) -> Optional[float]:
+        """The live attribution scalar = dominant blended valence (`V_blended`)
+        from emot `read_state` (the grounding 8-vector is never written — see
+        signed_delta_target). None if emot SHM is unavailable."""
+        st = self._read_emot_state()
+        if not st or "V_blended" not in st:
             return None
         try:
-            return self._grounding_to_v8(self._emot_grounding_reader())
+            return float(st["V_blended"])
         except Exception:
             return None
 
@@ -535,9 +531,9 @@ class AffectiveNudgeRuntime:
                     rate=base_nudge.rate, mu_before=base_nudge.mu_before,
                     n=base_nudge.n)
 
-        pre_v8 = self._read_v8()
+        pre_v = self._read_valence()
         with self._lock:
-            self._pending.append(_PendingNudge(features=features, pre_v8=pre_v8,
+            self._pending.append(_PendingNudge(features=features, pre_v=pre_v,
                                                ts=float(ts)))
             if len(self._pending) > self._max_pending:
                 self._pending = self._pending[-self._max_pending:]
@@ -555,12 +551,12 @@ class AffectiveNudgeRuntime:
         if not pending:
             return {"trained": 0, "skipped": 0}
 
-        post_v8 = self._read_v8()
+        post_v = self._read_valence()
         X_rows: List[np.ndarray] = []
         y_rows: List[float] = []
         skipped = 0
         for p in pending:
-            target = signed_delta_target(p.pre_v8, post_v8)
+            target = signed_delta_target(p.pre_v, post_v)
             if target is None:
                 skipped += 1
                 continue

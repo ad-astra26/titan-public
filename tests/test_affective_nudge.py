@@ -230,12 +230,20 @@ CFGB = AffectiveConfig(enabled=True, k_surprise=0.04, max_mag=0.06,
                        net_enabled=True, net_lr=0.05, net_l2=1e-4, net_hidden=16)
 
 
+class _Emot:
+    """Mutable fake emot read_state — set .v / .idx to simulate live emot drift
+    (attribution rides V_blended; see signed_delta_target). Callable like the
+    injected emot_state_reader."""
+    def __init__(self, v_blended=0.3, dominant_idx=0):
+        self.v = v_blended
+        self.idx = dominant_idx
+
+    def __call__(self):
+        return {"V_blended": self.v, "dominant_idx": self.idx}
+
+
 def _emot(v_blended=0.3, dominant_idx=0):
-    return lambda: {"V_blended": v_blended, "dominant_idx": dominant_idx}
-
-
-def _grounding(vals):
-    return lambda: [{"V": float(x)} for x in vals]
+    return _Emot(v_blended, dominant_idx)
 
 
 # ── the net: forward / numpy-SGD backprop / persistence ──────────────────────
@@ -329,29 +337,23 @@ def test_build_features_missing_emot_safe():
 
 
 def test_signed_delta_target_sign_and_magnitude():
-    pre = np.array([0.1] * 8)
-    up = np.array([0.3] * 8)
-    down = np.array([0.0] * 8)
-    t_up = signed_delta_target(pre, up)
-    t_down = signed_delta_target(pre, down)
-    assert t_up > 0 and t_down < 0                          # honest direction
-    assert abs(t_up) == pytest.approx(np.linalg.norm(up - pre))
-    assert signed_delta_target(pre, None) is None           # missing → skip
-    assert signed_delta_target(None, up) is None
-    assert signed_delta_target(pre, pre) == 0.0             # no movement
+    # Attribution = signed delta of the dominant blended valence (V_blended scalar).
+    assert signed_delta_target(0.1, 0.3) == pytest.approx(0.2)   # rose → +
+    assert signed_delta_target(0.3, 0.1) == pytest.approx(-0.2)  # fell → −
+    assert signed_delta_target(0.2, None) is None                # missing → skip
+    assert signed_delta_target(None, 0.3) is None
+    assert signed_delta_target(0.2, 0.2) == 0.0                  # no movement
 
 
 # ── the runtime: cold-start fallback → net takeover, pending attribution ──────
 
-def _runtime(tmp_path, name="r", emot_v=0.3, grounding=None):
+def _runtime(tmp_path, name="r", emot_v=0.3):
     d = tmp_path / name
-    gr = grounding if grounding is not None else _grounding([0.1] * 8)
     return AffectiveNudgeRuntime(
         CFGB,
         str(d / "state.json"),
         str(d / "net.npz"),
         emot_state_reader=_emot(emot_v),
-        emot_grounding_reader=gr,
     )
 
 
@@ -372,13 +374,14 @@ def test_runtime_cold_start_uses_formula_magnitude(tmp_path):
 
 
 def test_runtime_records_pending_and_trains_on_dream(tmp_path):
-    rt = _runtime(tmp_path, "rt2", grounding=_grounding([0.1] * 8))
+    emot = _emot(0.1)
+    rt = AffectiveNudgeRuntime(CFGB, str(tmp_path / "s.json"),
+                               str(tmp_path / "n.npz"), emot_state_reader=emot)
     for _ in range(2):
         rt.observe_drain(1, 1, ts=0.0)                       # warm baseline
     rt.observe_drain(10, 0, ts=1.0)                          # a real nudge fires
     assert len(rt._pending) >= 1
-    # move emot for the post-snapshot so there is an attributable drift
-    rt._emot_grounding_reader = _grounding([0.4] * 8)
+    emot.v = 0.4                                             # emot valence drifted post-cycle
     summary = rt.train_on_dream()
     assert summary["trained"] >= 1
     assert rt.net.is_trained is True
@@ -386,11 +389,13 @@ def test_runtime_records_pending_and_trains_on_dream(tmp_path):
 
 
 def test_runtime_net_takes_over_after_training(tmp_path):
-    rt = _runtime(tmp_path, "rt3", grounding=_grounding([0.1] * 8))
+    emot = _emot(0.1)
+    rt = AffectiveNudgeRuntime(CFGB, str(tmp_path / "s.json"),
+                               str(tmp_path / "n.npz"), emot_state_reader=emot)
     for _ in range(2):
         rt.observe_drain(1, 1, ts=0.0)
     rt.observe_drain(9, 1, ts=1.0)
-    rt._emot_grounding_reader = _grounding([0.35] * 8)
+    emot.v = 0.35                                            # post-cycle drift
     rt.train_on_dream()
     assert rt.net.is_trained
     # next nudge magnitude now comes from the net (still clamped gentle)
@@ -407,11 +412,11 @@ def test_runtime_train_no_pending_is_noop(tmp_path):
 
 
 def test_runtime_train_skips_when_no_emot(tmp_path):
-    # No grounding reader → no pre/post snapshot → cannot attribute → skip (never
-    # fabricate a delta, INV-AFF-HONEST).
+    # emot SHM unavailable → no pre/post valence snapshot → cannot attribute →
+    # skip (never fabricate a delta, INV-AFF-HONEST).
     rt = AffectiveNudgeRuntime(
         CFGB, str(tmp_path / "s.json"), str(tmp_path / "n.npz"),
-        emot_state_reader=_emot(0.3), emot_grounding_reader=lambda: None)
+        emot_state_reader=lambda: None)
     for _ in range(2):
         rt.observe_drain(1, 1, ts=0.0)
     rt.observe_drain(10, 0, ts=1.0)
@@ -424,16 +429,19 @@ def test_runtime_train_skips_when_no_emot(tmp_path):
 def test_runtime_per_titan_net_divergence(tmp_path):
     # Same nudge stimulus, DIFFERENT emot trajectories → divergent net weights
     # (INV-AFF-SELF-SOVEREIGN; no shared weights).
-    a = _runtime(tmp_path, "A", grounding=_grounding([0.1] * 8))
-    b = _runtime(tmp_path, "B", grounding=_grounding([0.1] * 8))
-    for rt, post in ((a, [0.5] * 8), (b, [0.12] * 8)):       # A's world moves a lot; B's barely
+    ea, eb = _emot(0.1), _emot(0.1)
+    a = AffectiveNudgeRuntime(CFGB, str(tmp_path / "A.json"),
+                              str(tmp_path / "A.npz"), emot_state_reader=ea)
+    b = AffectiveNudgeRuntime(CFGB, str(tmp_path / "B.json"),
+                              str(tmp_path / "B.npz"), emot_state_reader=eb)
+    for rt, emot, post in ((a, ea, 0.5), (b, eb, 0.12)):     # A's valence moves a lot; B's barely
         for _ in range(2):
             rt.observe_drain(1, 1, ts=0.0)
         for k in range(5):
+            emot.v = 0.1
             rt.observe_drain(9, 1, ts=float(k + 1))
-            rt._emot_grounding_reader = _grounding(post)
+            emot.v = post                                    # post-cycle drift differs per Titan
             rt.train_on_dream()
-            rt._emot_grounding_reader = _grounding([0.1] * 8)
     probe = build_features(
         Nudge(0.05, 1.0, 5.0, 1, 0.9, 0.5, 6), {"V_blended": 0.3, "dominant_idx": 0})
     assert a.net.forward(probe) != b.net.forward(probe)     # diverged
