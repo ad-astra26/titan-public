@@ -1015,8 +1015,15 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                         max_contradiction_pairs=int(
                             _caps.get("max_contradiction_pairs", 8)),
                         max_orphans=int(_caps.get("max_orphans", 16)))
-                    if _ls.get("stale") or _ls.get("contradiction") or _ls.get("orphan"):
-                        logger.info("[synthesis_worker] DK.3 wiki-lint: %s", _ls)
+                    # Always log the pass at INFO (once per cadence ≈30min in prod —
+                    # not spammy; the librarian-rhythm heartbeat + GD8 observable).
+                    logger.info(
+                        "[synthesis_worker] DK.3 wiki-lint pass: scanned=%d stale=%d "
+                        "contradiction=%d/%d orphan=%d (now_epochs=%d)",
+                        _ls.get("scanned", 0), _ls.get("stale", 0),
+                        _ls.get("contradiction", 0),
+                        _ls.get("contradiction_pairs_judged", 0),
+                        _ls.get("orphan", 0), int(_ne))
                 except Exception as _dk3e:  # noqa: BLE001
                     logger.debug("[synthesis_worker] DK.3 wiki-lint soft-fail: %s",
                                  _dk3e)
