@@ -3719,3 +3719,21 @@ dispute_delta        = -1.0   # explicit dispute ("no/wrong/search more") → co
 # their `~/.titan/microkernel_<id>.toml` override (the same deep-merge as
 # l0_rust_enabled). No mint path bypasses this flag.
 mint_enabled = false
+
+[affective]
+# RFP_affective_grounding_loop §7.A — the Affective Grounding Loop (real events →
+# emergent emotional nudges → emot-cgn). Phase A: synthesis skill-score outcomes →
+# surprise-scaled, honest-valence DA nudge → neuromod substrate → 210-D felt vec →
+# RegionClusterer. Default OFF (safe) until the §0 experiment is proven to MOVE.
+# These are GAINS (emergence-over-determinism: they tune, they do NOT predetermine
+# the felt outcome); there are NO per-tier/per-event magnitudes. Each Titan's EMA
+# baseline (data/affective/affective_nudge_state.json) habituates independently →
+# divergent emotional personalities (INV-AFF-SELF-SOVEREIGN). Per-Titan overrides
+# go in ~/.titan/microkernel_<id>.toml (same deep-merge as l0_rust_enabled).
+enabled = true        # Phase A spine — LIVE-PROVEN on T2 2026-06-13 (armed + real-data-seeded μ=0.875 from 8 skill-scores); fleet-soak enabled. Reversible (one line). NOTE: a proper per-Titan microkernel override is a follow-up so the base default can return to false for fresh installs.
+k_surprise = 0.04     # gain: surprise (|rate-μ|/σ) → apply_external_nudge max_delta
+max_mag = 0.06        # ceiling on a single nudge's max_delta (keep it gentle)
+ema_alpha = 0.15      # EMA learning rate for the per-signal success-rate baseline
+sigma_init = 0.25     # initial σ before min_samples (wide → low early surprise)
+eps = 0.001           # σ floor in the surprise denominator
+min_samples = 2       # no nudge until the baseline has folded in this many ticks

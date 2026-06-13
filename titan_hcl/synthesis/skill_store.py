@@ -512,11 +512,17 @@ class ProceduralSkillStore:
                 [max(1, int(limit))],
             ).fetchall()
         if not rows:
-            return {"drained": 0, "cells_touched": 0, "promoted": 0}
+            return {"drained": 0, "cells_touched": 0, "promoted": 0,
+                    "successes": 0, "failures": 0}
 
         touched_cells: set[tuple] = set()
         outcomes_seen: set[str] = set()
         drained_ids: list[str] = []
+        # Affective Grounding Loop §7.A: tally this pass's outcomes (only the
+        # ones that applied cleanly) so the caller can derive a competence-delta
+        # affective nudge. Purely additive — no effect on cell/promotion logic.
+        successes = 0
+        failures = 0
         for (eid, oracle_id, goal_class, task_shape, success,
              parent_tx, ts) in rows:
             try:
@@ -529,6 +535,10 @@ class ProceduralSkillStore:
                 touched_cells.add((skill_id, task_shape))
                 outcomes_seen.add(skill_id)
                 drained_ids.append(eid)
+                if bool(success):
+                    successes += 1
+                else:
+                    failures += 1
             except Exception as e:
                 logger.warning(
                     "[ProceduralSkillStore] drain: event %s failed: %s", eid, e)
@@ -557,6 +567,8 @@ class ProceduralSkillStore:
             "drained": len(drained_ids),
             "cells_touched": len(touched_cells),
             "promoted": promoted,
+            "successes": successes,
+            "failures": failures,
         }
 
     def _apply_event_to_cell(
