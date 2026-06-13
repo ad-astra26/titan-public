@@ -2608,15 +2608,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         prompt_signature_store = None
         logger.warning("[synthesis_worker] PromptSignatureStore wiring failed "
                        "(E.2 cache off; routing unaffected): %s", _ps_err)
-        # §7.E live-diagnostic (2026-06-13): the fleet logs aren't readable, so
-        # persist the actual init traceback to a file to close the Finding-2 root
-        # cause. (Temporary — removed once diagnosed.)
-        try:
-            import traceback as _tb
-            with open(os.path.join(_data_dir, "e2_init_error.txt"), "w") as _ef:
-                _ef.write(_tb.format_exc())
-        except Exception:  # noqa: BLE001
-            pass
 
     # ── §7.B (B.2) — the turn-judge daemon: reward NON-verifiable turns. The
     # TURN_REASONING_RECORD handler pushes FRESH (reasoning_id, prompt, response,
@@ -3506,27 +3497,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     logger.debug(
                         "[synthesis_worker] tool-call verdict record failed: %s",
                         _tcv_err)
-                # §7.E live-diagnostic (2026-06-13, temporary): dump the verdict
-                # payload's E.2-relevant shape so we can see WHY E.2 skips on a
-                # verified tool turn (store-None / empty result_summary / parent_goal).
-                try:
-                    with open(os.path.join(_data_dir, "e2_payload_diag.txt"), "a") as _pf:
-                        _pf.write("store_not_none=%s verdict=%r keys=%s result_summary_len=%d parent_goal_len=%d features=%s oracle=%r\n" % (
-                            prompt_signature_store is not None,
-                            str(payload.get("verdict", "")),
-                            sorted(payload.keys()),
-                            len(str(payload.get("result_summary", "") or "")),
-                            len(str(payload.get("parent_goal", "") or "")),
-                            payload.get("features") is not None,
-                            str(payload.get("oracle_id", ""))))
-                except Exception:  # noqa: BLE001
-                    pass
                 # ── §7.E (E.2) — cache the verified (prompt → answer) as a
                 # PromptSignature so an identical DURABLE re-ask is served literally
                 # (zero LLM/oracle) by the agno reader. Fires on ANY true tool
-                # verdict carrying a result; durable/volatile via the DK.3-shared
-                # research_volatility seam (volatile values are stored but the reader
-                # never serves them literally). Off the hot path; soft.
+                # verdict carrying a result + the prompt; durable/volatile via the
+                # DK.3-shared research_volatility seam (volatile values are stored but
+                # the reader never serves them literally). Off the hot path; soft.
                 if (prompt_signature_store is not None
                         and str(payload.get("verdict", "")) == "true"):
                     try:
@@ -3535,24 +3511,19 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         _e2_ans = str(payload.get("result_summary", "") or "")
                         _e2_prompt = str(payload.get("parent_goal", "") or "")
                         if _e2_ans and _e2_prompt:
-                            _e2_ok = prompt_signature_store.write_signature(
+                            # created_epoch=0.0 is the grandfather/evergreen marker —
+                            # CORRECT for E.2: the reader never TTL-expires a DURABLE
+                            # literal (only volatile decays, and volatile is never
+                            # served literally → it re-fetches via E.3). The emergent-
+                            # epoch helper (`_now_epoch`) is a nested closure NOT in
+                            # this handler's scope (the live NameError that silently
+                            # killed EVERY E.2 write, root-caused 2026-06-13).
+                            prompt_signature_store.write_signature(
                                 prompt=_e2_prompt, literal_answer=_e2_ans,
                                 solved_by=str(_ptx),
                                 durability=classify_volatility(_e2_prompt),
-                                created_epoch=float(_now_epoch()))
-                            try:  # §7.E live-diagnostic (temporary)
-                                with open(os.path.join(_data_dir, "e2_write_diag.txt"), "a") as _wf:
-                                    _wf.write("write_signature -> %r ans=%r promptlen=%d\n" % (
-                                        _e2_ok, _e2_ans, len(_e2_prompt)))
-                            except Exception:  # noqa: BLE001
-                                pass
+                                created_epoch=0.0)
                     except Exception as _e2_err:  # noqa: BLE001
-                        try:  # §7.E live-diagnostic — dump the swallowed exception
-                            import traceback as _tb2
-                            with open(os.path.join(_data_dir, "e2_write_diag.txt"), "a") as _wf:
-                                _wf.write("EXC: " + _tb2.format_exc() + "\n")
-                        except Exception:  # noqa: BLE001
-                            pass
                         logger.debug(
                             "[synthesis_worker] E.2 prompt-signature write skipped: %s",
                             _e2_err)
