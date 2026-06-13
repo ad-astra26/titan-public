@@ -368,8 +368,13 @@ class EngramStore:
         derivation_merkle_root: Optional[str] = None,
         oracle_verdict: Optional[dict] = None,
         domain_hint: str = "",
+        created_epoch: float = 0.0,
     ) -> Engram:
         """Materialize a brand-new spine concept at v=1.
+
+        `created_epoch` (§7.D-knowledge DK.3 / M0) = the EMERGENT-epoch creation
+        stamp (consciousness_age.bin::age_epochs at create) so the wiki-lint TTL
+        can age this concept in epochs; 0.0 → grandfathered evergreen.
 
         Caller MUST have registered `concept_id` with CGN first (P4.C). This
         method does NOT touch CGN — that's the caller's job (separation of
@@ -448,7 +453,7 @@ class EngramStore:
             concept_id=concept_id, version=1, name=name,
             memory_type=memory_type, groundedness=initial_groundedness,
             anchor_tx=tx_hash, created_at=self._clock(),
-            domain_hint=domain_hint,
+            domain_hint=domain_hint, created_epoch=float(created_epoch or 0.0),
         )
         if not created:
             # Pre-existing row at v=1 — surfaces a logic error in the
@@ -648,6 +653,37 @@ class EngramStore:
         if not updated:
             return 0.0
         return new_value
+
+    @on_writer
+    def decay_groundedness(
+        self, concept_id: str, version: int, *, factor: float,
+    ) -> float:
+        """§7.D-knowledge DK.3 (M3 contradiction / M4 orphan) — DURABLY decay a
+        concept's groundedness by `factor` ∈ (0,1]. Reads the current scalar +
+        writes `current·factor` to BOTH `groundedness` AND `axis_used` (the rank
+        base the dream population-recompute re-blends from) so the demotion
+        SURVIVES the next dream boundary — a one-shot `groundedness` write alone
+        would be restored from the stale `axis_used`. This is the faithful
+        "recompute_groundedness↓" of the pinned mechanic for the proportional
+        decay cases (M2 volatile-stale uses `recompute_groundedness` with zero
+        inputs to drop below the floor outright). Returns the new value (0.0 if
+        the row is missing / on soft-fail). Writer-thread (Kuzu writer-owned)."""
+        f = max(0.0, min(1.0, float(factor)))
+        row = self._graph.spine_get_latest_concept(concept_id)
+        if not row or int(row.get("version") or 0) != int(version):
+            row = self._graph.spine_get_concept_version(concept_id, int(version))
+        if not row:
+            return 0.0
+        cur = float(row.get("groundedness") or 0.0)
+        new_value = cur * f
+        try:
+            updated = self._graph.spine_update_groundedness(
+                concept_id, int(version), new_value, axes={"used": new_value})
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[EngramStore] decay_groundedness(%s v%s) soft-fail: %s",
+                         concept_id, version, e)
+            return 0.0
+        return new_value if updated else 0.0
 
     @on_writer
     def recompute_population_groundedness(
@@ -981,6 +1017,18 @@ class EngramStore:
         except Exception as e:  # noqa: BLE001
             logger.debug("[EngramStore] list_declarative_concepts failed: %s", e)
             return []
+
+    @on_writer
+    def concept_has_consumers(self, concept_id: str) -> bool:
+        """§7.D-knowledge DK.3 (M4) — True if any Engram composes FROM this
+        concept (an incoming `COMPOSED_FROM` edge). The orphan pass keeps a
+        concept that something else cites. Kuzu writer-owned (@on_writer)."""
+        try:
+            return bool(self._graph.spine_concept_has_consumers(str(concept_id)))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[EngramStore] concept_has_consumers(%s) failed: %s",
+                         concept_id, e)
+            return True  # conservative — never orphan on a read error
 
     def read_spine_strands(self, concept_id: str, version: int) -> Optional[dict]:
         """Four spine strands for a (concept_id, version) as Timechain-anchor

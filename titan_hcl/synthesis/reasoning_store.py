@@ -80,6 +80,11 @@ class ReasoningStore:
                 "  use_count     INTEGER DEFAULT 1,"
                 "  embedding_id  INTEGER DEFAULT -1,"
                 "  anchor_tx     TEXT,"
+                # §7.D-knowledge DK.5 finisher (M6) — the matured research source
+                # on a crystallized `research::{gc}` macro ("research via <src>");
+                # '' on non-research reasoning. Additive (the anchor_tx/idea_type
+                # additive-column precedent).
+                "  source        TEXT    DEFAULT '',"
                 "  created_at    DOUBLE  NOT NULL"
                 ")")
             # §7.B (B.3) — the Maker↔Titan bond scalars (the MakerAssessment Kuzu
@@ -102,13 +107,32 @@ class ReasoningStore:
             # Titan's emergent epoch (not wall-clock). Synthesis-owned, no cross-DB.
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS research_recipes ("
-                "  goal_class      TEXT NOT NULL,"
-                "  source          TEXT NOT NULL,"
-                "  success_count   INTEGER DEFAULT 0,"
-                "  last_used_epoch DOUBLE  DEFAULT 0,"
-                "  created_at      DOUBLE  NOT NULL,"
+                "  goal_class           TEXT NOT NULL,"
+                "  source               TEXT NOT NULL,"
+                "  success_count        INTEGER DEFAULT 0,"
+                "  last_used_epoch      DOUBLE  DEFAULT 0,"
+                # §7.D-knowledge DK.5 finisher (M5) — the success_count at which
+                # this recipe last (re-)crystallized its (goal_class,'research')
+                # macro; the next re-version fires at crystallized_at_count +
+                # macro_compose_min (the recipe keeps GROWING past maturity).
+                "  crystallized_at_count INTEGER DEFAULT 0,"
+                "  created_at           DOUBLE  NOT NULL,"
                 "  PRIMARY KEY (goal_class, source)"
                 ")")
+            # Additive column migrations for already-existing tables (deployed
+            # synthesis.duckdb predates M5/M6). DuckDB ALTER ... ADD is idempotent
+            # via IF NOT EXISTS; tolerated best-effort.
+            for _table, _col, _decl in (
+                ("reasoning_records", "source", "TEXT DEFAULT ''"),
+                ("research_recipes", "crystallized_at_count", "INTEGER DEFAULT 0"),
+            ):
+                try:
+                    self._db.execute(
+                        f"ALTER TABLE {_table} ADD COLUMN IF NOT EXISTS "
+                        f"{_col} {_decl}")
+                except Exception as _alter_e:  # noqa: BLE001
+                    logger.debug("[ReasoningStore] ALTER %s.%s soft-fail: %s",
+                                 _table, _col, _alter_e)
         try:
             self._writer.submit_sync(_create)
         except Exception as e:  # noqa: BLE001
@@ -232,60 +256,126 @@ class ReasoningStore:
         self, *, reasoning_id: str, goal_class: str, action: str,
         signature: list, b_i: float, c: float, time_cost: float, use_count: int,
         anchor_tx: str = "", composed_from: Optional[list] = None,
+        source: str = "",
     ) -> bool:
         """Persist a distilled `Reasoning(kind='macro_strategy')` (S2). The signature
-        is the mean leaf feature vector; `composed_from` = the leaf reasoning_ids."""
+        is the mean leaf feature vector; `composed_from` = the leaf reasoning_ids.
+        `source` (§7.D-knowledge DK.5 / M6) = the matured research source on a
+        `research::{gc}` macro ("research via <src>"), '' on a strategy macro."""
         ok = self._write_record(
             reasoning_id=reasoning_id, kind="macro_strategy", goal_class=goal_class,
             action=action, oracle_id="", verdict="true", reward=1.0,
             features=list(signature or []), signature_text=str(goal_class or ""),
             b_i=b_i, c=c, time_cost=time_cost, use_count=int(use_count),
             anchor_tx=anchor_tx, composed_from=composed_from,
-            idea_type="procedural")   # §7.D D.3 / FC-8 — a composite IS procedural Idea
+            idea_type="procedural",   # §7.D D.3 / FC-8 — a composite IS procedural Idea
+            source=source)
         if ok:
             self.macros_written += 1
         return ok
 
     def record_research_recipe(
         self, *, goal_class: str, source: str, epoch: float, mature_at: int = 2,
-    ) -> tuple[int, bool]:
-        """§7.D-knowledge DK.5 (a) — reinforce the research recipe for a
-        successful (goal_class, source). Upsert: `success_count += 1`,
-        `last_used_epoch = epoch`. Returns `(success_count, just_matured)` where
-        `just_matured` is True exactly on the bump that REACHES `mature_at`
-        (so the caller crystallizes the (goal_class, 'research') macro once). The
-        recipe is the LIVING reinforced skill — it keeps growing past maturity,
-        surviving the volatile data's decay. Soft → (0, False)."""
+        macro_compose_min: int = 2,
+    ) -> tuple[int, str]:
+        """§7.D-knowledge DK.5 (a) + finisher (M5) — reinforce the research recipe
+        for a successful (goal_class, source). Upsert: `success_count += 1`,
+        `last_used_epoch = epoch`. The recipe is the LIVING reinforced skill — it
+        keeps growing past maturity, surviving the volatile data's decay.
+
+        Returns `(success_count, crystallize_signal)`:
+          • ``"initial"`` — exactly on the bump that first REACHES `mature_at`
+            (crystallized_at_count was 0) → the caller crystallizes the base
+            `research::{gc}` macro once. Sets `crystallized_at_count`.
+          • ``"reversion"`` (M5) — on a later bump where `success_count ≥
+            crystallized_at_count + macro_compose_min` → the caller mints the
+            SUCCESSOR `research::{gc}::v{n+1}` (mutate-not-update lineage). Re-bumps
+            `crystallized_at_count`.
+          • ``""`` — no crystallize event this bump.
+        Soft → (0, "")."""
         gc = str(goal_class or "").strip()
         src = str(source or "").strip()
         if not gc or not src:
-            return (0, False)
+            return (0, "")
 
-        def _do() -> tuple[int, bool]:
+        def _do() -> tuple[int, str]:
             self._db.execute(
                 "INSERT INTO research_recipes "
-                "(goal_class, source, success_count, last_used_epoch, created_at) "
-                "VALUES (?,?,1,?,?) "
+                "(goal_class, source, success_count, last_used_epoch, "
+                " crystallized_at_count, created_at) "
+                "VALUES (?,?,1,?,0,?) "
                 "ON CONFLICT (goal_class, source) DO UPDATE SET "
                 "  success_count = research_recipes.success_count + 1, "
                 "  last_used_epoch = excluded.last_used_epoch",
                 [gc, src, float(epoch), float(self._clock())])
             row = self._db.execute(
-                "SELECT success_count FROM research_recipes "
+                "SELECT success_count, crystallized_at_count FROM research_recipes "
                 "WHERE goal_class=? AND source=?", [gc, src]).fetchone()
             cnt = int(row[0]) if row else 0
-            return (cnt, cnt == int(mature_at))
+            crystallized_at = int(row[1]) if row and row[1] is not None else 0
+            signal = ""
+            if crystallized_at == 0 and cnt >= int(mature_at):
+                signal = "initial"
+            elif (crystallized_at > 0
+                  and cnt >= crystallized_at + int(macro_compose_min)):
+                signal = "reversion"
+            if signal:
+                self._db.execute(
+                    "UPDATE research_recipes SET crystallized_at_count = ? "
+                    "WHERE goal_class=? AND source=?", [cnt, gc, src])
+            return (cnt, signal)
 
         try:
             return self._writer.submit_sync(_do)
         except Exception as e:  # noqa: BLE001
             logger.debug("[ReasoningStore] record_research_recipe soft-fail: %s", e)
-            return (0, False)
+            return (0, "")
+
+    def research_macro_lineage(self, goal_class: str) -> tuple[str, int]:
+        """§7.D-knowledge DK.5 finisher (M5) — the research-macro version chain for
+        `goal_class`. Returns `(prior_label, next_version)`:
+          • no macro yet           → ``("", 1)``         (mint base `research::{gc}`)
+          • only base exists       → ``("research::{gc}", 2)``
+          • `…::v{k}` is the max    → ``("research::{gc}::v{k}", k+1)``
+        The successor's `composed_from=[prior_label]` is the D.4c mutate-not-update
+        lineage. Soft → ("", 1)."""
+        gc = str(goal_class or "").strip()
+        if not gc:
+            return ("", 1)
+        base = f"research::{gc}"
+
+        def _do() -> tuple[str, int]:
+            rows = self._db.execute(
+                "SELECT reasoning_id FROM reasoning_records "
+                "WHERE kind='macro_strategy' AND reasoning_id LIKE ?",
+                [base + "%"]).fetchall()
+            ids = {str(r[0]) for r in (rows or [])}
+            if base not in ids:
+                return ("", 1)
+            max_v = 1
+            prior = base
+            for rid in ids:
+                if rid == base:
+                    continue
+                suffix = rid[len(base):]
+                m = suffix.startswith("::v") and suffix[3:].isdigit()
+                if m:
+                    v = int(suffix[3:])
+                    if v > max_v:
+                        max_v = v
+                        prior = rid
+            return (prior, max_v + 1)
+
+        try:
+            return self._writer.submit_sync(_do)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[ReasoningStore] research_macro_lineage soft-fail: %s", e)
+            return ("", 1)
 
     def _write_record(
         self, *, reasoning_id, kind, goal_class, action, oracle_id, verdict,
         reward, features, signature_text, b_i, c, time_cost, use_count=1,
-        anchor_tx="", composed_from=None, idea_type="",
+        anchor_tx="", composed_from=None, idea_type="", source="",
     ) -> bool:
         if not reasoning_id:
             return False
@@ -309,15 +399,17 @@ class ReasoningStore:
                 self._db.execute(
                     "INSERT INTO reasoning_records (reasoning_id, kind, goal_class, "
                     "action, oracle_id, verdict, reward, features_json, b_i, c, "
-                    "time_cost, use_count, embedding_id, anchor_tx, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "time_cost, use_count, embedding_id, anchor_tx, source, "
+                    "created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT (reasoning_id) DO NOTHING",
                     [str(reasoning_id), str(kind), str(goal_class or ""),
                      str(action or ""), str(oracle_id or ""), str(verdict or ""),
                      (None if reward is None else float(reward)),  # §7.B turn = NULL (pending)
                      json.dumps(list(features or [])),
                      int(b_i), float(c), float(time_cost), int(use_count),
-                     int(emb_id), str(anchor_tx or ""), float(self._clock())])
+                     int(emb_id), str(anchor_tx or ""), str(source or ""),
+                     float(self._clock())])
             except Exception as e:  # noqa: BLE001
                 logger.warning("[ReasoningStore] duckdb insert failed: %s", e)
                 return False
@@ -329,7 +421,7 @@ class ReasoningStore:
                         goal_class=str(goal_class or ""), action=str(action or ""),
                         oracle_id=str(oracle_id or ""), verdict=str(verdict or ""),
                         anchor_tx=str(anchor_tx or ""), created_at=float(self._clock()),
-                        idea_type=str(idea_type or ""))
+                        idea_type=str(idea_type or ""), source=str(source or ""))
                     self._graph.spine_link_learning_reasoning(str(reasoning_id))
                     for leaf in (composed_from or []):
                         self._graph.spine_link_reasoning_composed_from(

@@ -239,6 +239,25 @@ class RecallAttribution:
             logger.debug("[RecallAttribution] fluent_map soft-fail: %s", e)
         return out
 
+    def recall_counts_map(self) -> dict[tuple[str, int], tuple[int, int, float]]:
+        """§7.D-knowledge DK.3 (M4) — {(engram_id, version): (surfaced_count,
+        cited_count, updated_ts)} for every Engram with recall history. The DK.3
+        orphan pass reads `cited_count` to find concepts NEVER cited over their
+        lifetime (an Engram absent from this map has zero recall → a candidate
+        orphan). Empty dict on failure (orphan pass then no-ops, never false-
+        decays). Reads on the writer thread (synthesis.duckdb is writer-owned)."""
+        out: dict[tuple[str, int], tuple[int, int, float]] = {}
+        try:
+            rows = self._writer.submit_sync(lambda: self._conn.execute(
+                "SELECT engram_id, version, surfaced_count, cited_count, "
+                "updated_ts FROM engram_recall_stats").fetchall())
+            for row in (rows or []):
+                out[(str(row[0]), int(row[1]))] = (
+                    int(row[2] or 0), int(row[3] or 0), float(row[4] or 0.0))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[RecallAttribution] recall_counts_map soft-fail: %s", e)
+        return out
+
     def read_training_events(
         self, limit: int = 50000,
     ) -> list[tuple[tuple[float, float, float, float], bool]]:

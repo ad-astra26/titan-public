@@ -91,4 +91,57 @@ def is_volatile(text: str, domain_hint: str = "") -> bool:
     return classify_volatility(text, domain_hint) == "volatile"
 
 
-__all__ = ("classify_volatility", "is_volatile")
+# Default volatile half-life in Titan emergent epochs (~417 ≈ 1 human-hour at the
+# ~10k-epochs/day cognitive tick). Config `[synthesis.research].volatile_lifetime
+# _epochs` overrides per-Titan; per-category overrides ride the classifier marker
+# class. RFP §7.D-knowledge M1 / the RESEARCH LIFECYCLE Axis-1 decay.
+DEFAULT_VOLATILE_LIFETIME_EPOCHS = 417
+
+
+def age_epochs(created_epoch: float, now_epochs: float) -> float:
+    """Age in Titan emergent epochs = ``now_epochs − created_epoch``. A finding/
+    concept with `created_epoch` ≤ 0 (legacy / unstamped) returns ``0.0`` — the
+    M0 grandfather signal (uncomputable age → treated as fresh, never TTL'd).
+    Clamped at 0 (a clock that went backwards never yields a negative age)."""
+    try:
+        ce = float(created_epoch or 0.0)
+        ne = float(now_epochs or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if ce <= 0.0 or ne <= 0.0:
+        return 0.0
+    return max(0.0, ne - ce)
+
+
+def is_stale(created_epoch: float, now_epochs: float,
+             lifetime_epochs: float = DEFAULT_VOLATILE_LIFETIME_EPOCHS) -> bool:
+    """A volatile finding/concept is STALE once its emergent age reaches its
+    `lifetime_epochs` half-life. Grandfathered rows (`created_epoch` ≤ 0) are
+    NEVER stale (age_epochs → 0). Shared by the DK.3 idle-pass TTL (M2) AND the
+    M1 mempool epoch-prune (and Phase E.2's hot-path cache when it lands)."""
+    lt = float(lifetime_epochs or DEFAULT_VOLATILE_LIFETIME_EPOCHS)
+    if lt <= 0.0:
+        return False
+    return age_epochs(created_epoch, now_epochs) >= lt
+
+
+def freshness_weight(created_epoch: float, now_epochs: float,
+                     lifetime_epochs: float = DEFAULT_VOLATILE_LIFETIME_EPOCHS
+                     ) -> float:
+    """Gradual decay multiplier ``max(0, 1 − age/lifetime)`` ∈ [0,1] for a
+    volatile node's recall weight (M1). 1.0 at birth → 0.0 at the half-life
+    (where the epoch-prune gate fires). Grandfathered rows → 1.0 (never decays)."""
+    lt = float(lifetime_epochs or DEFAULT_VOLATILE_LIFETIME_EPOCHS)
+    if lt <= 0.0:
+        return 1.0
+    a = age_epochs(created_epoch, now_epochs)
+    if a <= 0.0:
+        return 1.0
+    return max(0.0, 1.0 - a / lt)
+
+
+__all__ = (
+    "classify_volatility", "is_volatile",
+    "DEFAULT_VOLATILE_LIFETIME_EPOCHS",
+    "age_epochs", "is_stale", "freshness_weight",
+)

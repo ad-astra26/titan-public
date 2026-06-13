@@ -106,6 +106,24 @@ class TieredMemoryGraph:
         self._synth_w_r = None
         self._synth_w_p = None
 
+        # §7.D-knowledge DK.3 (M1) — volatile research-finding EMERGENT-epoch
+        # decay. A finding tagged `volatile` (the Axis-1 discern gate) decays +
+        # prunes in ~`volatile_lifetime_epochs` emergent epochs (~417 ≈ 1hr),
+        # independent of the 12h/24h wall-clock sigmoid (which stays for the
+        # cosmetic recall weight). The epoch reader is lazy + cold-boot tolerant
+        # (0 → grandfather, no prune): a process without the consciousness_age
+        # SHM slot simply falls back to the wall-clock TTL, never crashes.
+        self._epoch_reader = None          # ConsciousnessAgeReader, lazy
+        self._epoch_reader_init = False    # one-shot construct guard
+        _rcfg = (config.get("synthesis", {}) or {}).get("research", {}) or {}
+        try:
+            from titan_hcl.synthesis.research_volatility import (
+                DEFAULT_VOLATILE_LIFETIME_EPOCHS as _DEF_LT)
+            self._volatile_lifetime_epochs = float(
+                _rcfg.get("volatile_lifetime_epochs", _DEF_LT) or _DEF_LT)
+        except Exception:  # noqa: BLE001 — defensive (import/config shape)
+            self._volatile_lifetime_epochs = 417.0
+
         # Data directory. BUG-B1-SHARED-LOCKS: shadow kernels set
         # TITAN_DATA_DIR pointing at data_shadow_<port>/ so they don't
         # contend on the original kernel's DuckDB/FAISS exclusive locks.
@@ -323,6 +341,50 @@ class TieredMemoryGraph:
     # -------------------------------------------------------------------------
     # Mempool Sigmoid Decay
     # -------------------------------------------------------------------------
+    def _now_age_epochs(self) -> int:
+        """Titan emergent epoch count (consciousness_age.bin::age_epochs) via a
+        lazy, process-local SHM reader. 0 if the slot is unavailable (cold-boot /
+        no producer) — the M0 grandfather signal, which disables the volatile
+        epoch gate (falls back to the wall-clock TTL). Never raises."""
+        if not self._epoch_reader_init:
+            self._epoch_reader_init = True
+            try:
+                from titan_hcl.logic.consciousness_age_reader import (
+                    ConsciousnessAgeReader)
+                self._epoch_reader = ConsciousnessAgeReader()
+            except Exception as e:  # noqa: BLE001 — SHM unavailable in some procs/tests
+                logger.debug("[TieredMemoryGraph] epoch reader init failed "
+                             "(volatile epoch-decay disabled): %s", e)
+                self._epoch_reader = None
+        if self._epoch_reader is None:
+            return 0
+        try:
+            return int(self._epoch_reader.get_age_epochs())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def mark_node_volatile(self, node_id: int) -> bool:
+        """§7.D-knowledge DK.3 (M0/M1) — tag an existing mempool node `volatile`
+        and stamp its EMERGENT-epoch creation time, so the M1 epoch gate decays +
+        prunes it in ~`volatile_lifetime_epochs` (≈1hr) instead of the 24h
+        wall-clock TTL. Called by the memory_worker RESEARCH_CONFIRMED handler
+        when the Axis-1 classifier returns `volatile` (the value decays; the DK.5
+        research SKILL survives separately). Idempotent; soft → False if the node
+        is gone / not in the mempool."""
+        node = self._node_store.get(node_id)
+        if node is None or node.get("status") != "mempool":
+            return False
+        node["volatile"] = True
+        # Stamp once — re-confirm of the same node keeps the original birth epoch
+        # (a re-ask reinforces the DK.5 recipe, it does NOT refresh the stale data).
+        if not node.get("created_epoch"):
+            node["created_epoch"] = float(self._now_age_epochs())
+        try:
+            self._persist_node(node)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[TieredMemoryGraph] mark_node_volatile persist soft-fail: %s", e)
+        return True
+
     def _compute_mempool_weight(self, node: Dict) -> float:
         """
         Sigmoid decay for mempool nodes:
@@ -335,6 +397,14 @@ class TieredMemoryGraph:
         At t=24h: w ≈ 0.01 (hard TTL kicks in)
 
         Reinforcement shifts the reference time forward (resets decay clock).
+
+        §7.D-knowledge DK.3 (M1): a `volatile`-tagged research finding ALSO
+        decays in Titan EMERGENT epochs — its recall weight is scaled by
+        max(0, 1 − age_epochs/lifetime) and hits 0 (→ pruned by the existing
+        weight<threshold sweep) at `volatile_lifetime_epochs` (~417 ≈ 1hr). The
+        wall-clock sigmoid stays for the cosmetic non-volatile decay; the epoch
+        gate is the REAL volatile cutoff (the Maker-locked emergent-not-wall-clock
+        decision). Grandfathered (created_epoch≤0 / no epoch slot) → gate skipped.
         """
         now = time.time()
         # Use last_reinforced if available, otherwise created_at
@@ -352,7 +422,22 @@ class TieredMemoryGraph:
         # Reinforcement bonus: +10% per hit, max +50%
         reinforcement_bonus = min(0.50, node.get("mempool_reinforcements", 0) * 0.10)
 
-        return min(1.0, base_weight + reinforcement_bonus)
+        weight = min(1.0, base_weight + reinforcement_bonus)
+
+        # §7.D-knowledge DK.3 (M1) — volatile EMERGENT-epoch decay gate.
+        if node.get("volatile"):
+            created_epoch = float(node.get("created_epoch", 0.0) or 0.0)
+            if created_epoch > 0.0:  # 0 → grandfathered, gate skipped
+                lifetime = self._volatile_lifetime_epochs
+                now_epochs = self._now_age_epochs()
+                if now_epochs > 0:  # slot live (else fall back to wall-clock)
+                    from titan_hcl.synthesis.research_volatility import (
+                        freshness_weight, is_stale)
+                    if is_stale(created_epoch, now_epochs, lifetime):
+                        return 0.0   # past half-life → prune on next sweep
+                    weight *= freshness_weight(created_epoch, now_epochs, lifetime)
+
+        return weight
 
     def _apply_mempool_decay(self, node: Dict):
         """Update mempool_weight on a node using sigmoid decay."""

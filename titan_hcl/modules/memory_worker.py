@@ -725,7 +725,22 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     continue
                 _volatile = is_volatile(_content)
                 _seed_tx = ""
-                if not _volatile:
+                if _volatile:
+                    # Volatile (M0/M1) → tag the mempool node + stamp its emergent
+                    # birth-epoch so it decays + prunes in ~1hr Titan-time (the
+                    # value goes stale; the DK.5 research SKILL survives). NOT
+                    # anchored, NOT a concept (anchoring a transient violates
+                    # FC-3/INV-OML-6).
+                    _vid = _node.get("id")
+                    if _vid is not None:
+                        try:
+                            with ctx.write_lock:
+                                ctx.memory.mark_node_volatile(int(_vid))
+                        except Exception as _mv_err:  # noqa: BLE001
+                            logger.debug(
+                                "[MemoryWorker] mark_node_volatile soft-fail: %s",
+                                _mv_err)
+                else:
                     # Durable → anchor now (the deref target for the DK.1 concept).
                     _sidecar = _get_thought_sidecar(
                         os.environ.get("TITAN_DATA_DIR", "data"))

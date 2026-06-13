@@ -664,11 +664,13 @@ class TitanKnowledgeGraph:
     def spine_create_concept_node(
         self, concept_id: str, version: int, name: str, memory_type: str,
         groundedness: float, anchor_tx: str, created_at: float,
-        domain_hint: str = "",
+        domain_hint: str = "", created_epoch: float = 0.0,
     ) -> bool:
         """INSERT one Concept row keyed by synthetic pk = `<id>:v<ver>` so the
         same concept_id can carry multiple versions (§10 versioning invariant).
         `domain_hint` (§7.F) is an advisory free-text domain stored on the node.
+        `created_epoch` (§7.D-knowledge DK.3 / M0) is the EMERGENT-epoch creation
+        stamp (consciousness_age.bin::age_epochs); 0.0 → grandfathered evergreen.
 
         Returns True on insert, False if the row already exists (idempotent —
         safe to call on replay). Raises only on unexpected Cypher errors.
@@ -678,11 +680,13 @@ class TitanKnowledgeGraph:
             self._conn.execute(
                 "CREATE (c:Engram {pk: $pk, concept_id: $cid, version: $ver, "
                 "name: $name, memory_type: $mt, groundedness: $g, "
-                "anchor_tx: $atx, created_at: $ts, domain_hint: $dh})",
+                "anchor_tx: $atx, created_at: $ts, domain_hint: $dh, "
+                "created_epoch: $cep})",
                 {"pk": pk, "cid": concept_id, "ver": int(version),
                  "name": name, "mt": memory_type,
                  "g": float(groundedness), "atx": anchor_tx,
-                 "ts": float(created_at), "dh": str(domain_hint or "")},
+                 "ts": float(created_at), "dh": str(domain_hint or ""),
+                 "cep": float(created_epoch or 0.0)},
             )
             return True
         except Exception as e:
@@ -874,21 +878,24 @@ class TitanKnowledgeGraph:
     def spine_create_reasoning_node(
         self, reasoning_id: str, kind: str, goal_class: str, action: str,
         oracle_id: str, verdict: str, anchor_tx: str, created_at: float,
-        idea_type: str = "",
+        idea_type: str = "", source: str = "",
     ) -> bool:
         """INSERT one Reasoning node (kind='tool_use' leaf | 'macro_strategy').
         `idea_type` (§7.D D.3 / FC-8) = 'procedural' on a macro_strategy composite,
-        '' on a tool_use/turn episode. Idempotent — returns False if the row
-        already exists (safe on replay)."""
+        '' on a tool_use/turn episode. `source` (§7.D-knowledge DK.5 / M6) = the
+        matured research source on a `research::{gc}` macro ("research via <src>"),
+        '' otherwise. Idempotent — returns False if the row already exists (safe
+        on replay)."""
         try:
             self._conn.execute(
                 "CREATE (r:Reasoning {reasoning_id: $rid, kind: $kind, "
                 "goal_class: $gc, action: $act, oracle_id: $oid, verdict: $v, "
-                "anchor_tx: $atx, created_at: $ts, idea_type: $it})",
+                "anchor_tx: $atx, created_at: $ts, idea_type: $it, source: $src})",
                 {"rid": reasoning_id, "kind": str(kind), "gc": str(goal_class or ""),
                  "act": str(action or ""), "oid": str(oracle_id or ""),
                  "v": str(verdict or ""), "atx": str(anchor_tx or ""),
-                 "ts": float(created_at), "it": str(idea_type or "")},
+                 "ts": float(created_at), "it": str(idea_type or ""),
+                 "src": str(source or "")},
             )
             return True
         except Exception as e:  # noqa: BLE001
@@ -1270,14 +1277,16 @@ class TitanKnowledgeGraph:
                 qr = self._conn.execute(
                     "MATCH (c:Engram) WHERE c.memory_type = $mt "
                     "RETURN c.concept_id, c.version, c.name, c.memory_type, "
-                    "c.groundedness, c.anchor_tx, c.created_at, c.domain_hint",
+                    "c.groundedness, c.anchor_tx, c.created_at, c.domain_hint, "
+                    "c.created_epoch",
                     {"mt": memory_type},
                 )
             else:
                 qr = self._conn.execute(
                     "MATCH (c:Engram) "
                     "RETURN c.concept_id, c.version, c.name, c.memory_type, "
-                    "c.groundedness, c.anchor_tx, c.created_at, c.domain_hint"
+                    "c.groundedness, c.anchor_tx, c.created_at, c.domain_hint, "
+                    "c.created_epoch"
                 )
             while qr.has_next():
                 row = qr.get_next()
@@ -1289,6 +1298,11 @@ class TitanKnowledgeGraph:
                     # DK.2 (§7.D-knowledge) — domain_hint groups concepts for the
                     # concept-of-concepts summary; additive (API back-compat).
                     "domain_hint": (row[7] or "") if len(row) > 7 else "",
+                    # DK.3 (M0) — emergent-epoch creation stamp for the wiki-lint
+                    # TTL; 0.0 (legacy/NULL) → grandfathered evergreen.
+                    "created_epoch": (
+                        float(row[8] or 0.0) if len(row) > 8 and row[8] is not None
+                        else 0.0),
                 })
         except Exception as e:
             logger.debug("[KnowledgeGraph] spine_list_concepts failed: %s", e)
@@ -1307,6 +1321,27 @@ class TitanKnowledgeGraph:
             reverse=True,
         )
         return ordered[offset : offset + limit]
+
+    def spine_concept_has_consumers(self, concept_id: str) -> bool:
+        """§7.D-knowledge DK.3 (M4) — does ANY Engram compose FROM this concept?
+        (an incoming `COMPOSED_FROM` edge: `(y)-[:COMPOSED_FROM]->(this)`, e.g. a
+        DK.2 summary concept that cites it). True = the concept has a consumer →
+        NOT an orphan. Any-version match (a consumer of any version counts). Soft
+        → True on error (never falsely orphans a concept on a transient read)."""
+        try:
+            qr = self._conn.execute(
+                "MATCH (y:Engram)-[:COMPOSED_FROM]->(c:Engram {concept_id: $cid}) "
+                "RETURN COUNT(y)",
+                {"cid": str(concept_id)},
+            )
+            if qr.has_next():
+                return int(qr.get_next()[0] or 0) > 0
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "[KnowledgeGraph] spine_concept_has_consumers(%s) failed: %s",
+                concept_id, e)
+            return True  # conservative — don't orphan on a read error
 
     # ── Phase 5 — HypothesisFork node + EXPLORES edge helpers ─────────
     #

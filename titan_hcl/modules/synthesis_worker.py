@@ -842,36 +842,67 @@ def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
 def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                         stop_event: threading.Event, interval_s: float,
                         reasoning_store=None, life_reader=None,
-                        per_pass_cap: int = 8) -> None:
-    """DK.1/DK.5 (§7.D-knowledge) — the sovereign LLM-Wiki + research-skill seed
-    daemon. Drains the bounded queue of confirmed research findings (held by the
-    RESEARCH_CONCEPT_SEED handler) and per item:
+                        per_pass_cap: int = 8, judge_fn=None, attribution=None,
+                        lifetime_epochs: float = 417.0, recall_floor: float = 0.65,
+                        mature_at: int = 2, macro_compose_min: int = 2,
+                        lint_caps: dict | None = None) -> None:
+    """DK.1/DK.3/DK.5 (§7.D-knowledge) — the sovereign LLM-Wiki + research-skill +
+    librarian-lint daemon. Drains the bounded queue of confirmed research findings
+    (held by the RESEARCH_CONCEPT_SEED handler) and per item:
       • **DK.1** (durable only — `tx_hash` present, not volatile): seed/refine a
-        declarative `Engram` concept via `seed_research_concept`.
+        declarative `Engram` concept via `seed_research_concept` (stamping the M0
+        emergent `created_epoch` so DK.3 can age it).
       • **DK.5** (BOTH classes — the research SKILL survives the data decay):
         reinforce the `(goal_class, source)` recipe; a matured recipe crystallizes
-        the `(goal_class, 'research')` macro (a→b).
-    OFF the recv loop AND off the writer thread (the LLM name-call is network I/O;
-    EngramStore/ReasoningStore writes auto-route to the writer @on_writer) — so a
-    slow provider never starves the heartbeat (the synthesis crash-loop guard).
-    Continuous, NOT dream-gated (INV-OML-12). Soft — a failure never stalls the queue."""
+        the `research::{gc}` macro (a→b); further growth RE-VERSIONS it (M5) and
+        the macro carries its matured `source` (M6).
+    and periodically (queue-idle, throttled):
+      • **DK.2** concept-of-concepts survey.
+      • **DK.3** wiki-lint (M2 TTL / M3 contradiction / M4 orphan) — the librarian
+        rhythm (FC-6 metabolic-gated: throttled + capped + queue-idle).
+    OFF the recv loop AND off the writer thread (the LLM name/judge calls are
+    network I/O; EngramStore/ReasoningStore writes auto-route to the writer
+    @on_writer) — so a slow provider never starves the heartbeat (the synthesis
+    crash-loop guard). Continuous, NOT dream-gated (INV-OML-12). Soft — a failure
+    never stalls the queue."""
     from titan_hcl.synthesis.research_wiki import (
         seed_research_concept, compose_concept_summaries)
+    from titan_hcl.synthesis.wiki_lint import run_wiki_lint
     from titan_hcl.synthesis.goal_class import goal_class as _goal_class_fn
     stop_event.wait(min(interval_s, 20.0))   # settle; offset from other passes
 
-    def _now_epoch() -> float:
-        # Titan emergent epoch (not wall-clock). life_reader exposes the epoch
-        # counter; 0.0 if unavailable (the recipe still reinforces — only the
-        # last_used_epoch timestamp degrades).
+    # M0 — the EMERGENT-epoch reader (consciousness_age.bin::age_epochs, the FAST
+    # cognitive tick ~417/hr — NOT life_reader.get_epoch_count() which is the SLOW
+    # GreatEpoch, the wrong scale for a 1hr TTL). Process-local, lazy, cold-boot
+    # tolerant (0 → grandfather, gates inert). `life_reader` is accepted for
+    # back-compat but the epoch source is now the canonical SHM slot.
+    _epoch_reader_box: dict = {}
+
+    def _now_epoch() -> int:
+        r = _epoch_reader_box.get("r")
+        if r is None and "tried" not in _epoch_reader_box:
+            _epoch_reader_box["tried"] = True
+            try:
+                from titan_hcl.logic.consciousness_age_reader import (
+                    ConsciousnessAgeReader)
+                r = ConsciousnessAgeReader()
+                _epoch_reader_box["r"] = r
+            except Exception as _ee:  # noqa: BLE001
+                logger.debug("[synthesis_worker] epoch reader init failed "
+                             "(DK.3 TTL inert): %s", _ee)
+                r = None
+        if r is None:
+            return 0
         try:
-            return float(life_reader.get_epoch_count()) if life_reader else 0.0
+            return int(r.get_age_epochs())
         except Exception:  # noqa: BLE001
-            return 0.0
-    # DK.2 concept-of-concepts rides a throttle (a population survey, not every
-    # tick): run it once per _DK2_EVERY drained passes, and only when the seed
-    # queue is idle so curation never delays primary fact capture.
+            return 0
+    # DK.2/DK.3 ride a throttle (population surveys, not every tick): run once per
+    # _DK2_EVERY / _LINT_EVERY drained passes, and only when the seed queue is idle
+    # so curation never delays primary fact capture.
     _DK2_EVERY = 20
+    _LINT_EVERY = 30
+    _caps = dict(lint_caps or {})
     _pass = 0
     while not stop_event.is_set():
         seeded = 0
@@ -893,7 +924,8 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                             tx_hash=str(item.get("tx_hash", "") or ""),
                             content=_content, name_fn=name_fn,
                             domain_hint=str(item.get("domain_hint", "") or ""),
-                            felt_coverage=float(item.get("felt_coverage", 0.0) or 0.0))
+                            felt_coverage=float(item.get("felt_coverage", 0.0) or 0.0),
+                            created_epoch=float(_now_epoch()))  # M0 emergent stamp
                         if cv is not None:
                             seeded += 1
                 except Exception:  # noqa: BLE001
@@ -904,19 +936,38 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                     _src = str(item.get("source", "") or "")
                     if reasoning_store is not None and _src and _content:
                         _gc = _goal_class_fn(_content)
-                        _cnt, _matured = reasoning_store.record_research_recipe(
-                            goal_class=_gc, source=_src, epoch=_now_epoch())
-                        if _matured:
-                            # (a)→(b): crystallize the (goal_class, 'research') macro
-                            # — an anchored procedural Idea (recall-able by goal_class;
-                            # the winning source detail stays in research_recipes).
+                        _cnt, _signal = reasoning_store.record_research_recipe(
+                            goal_class=_gc, source=_src, epoch=float(_now_epoch()),
+                            mature_at=int(mature_at),
+                            macro_compose_min=int(macro_compose_min))
+                        if _signal == "initial":
+                            # (a)→(b): crystallize the base research::{gc} macro —
+                            # an anchored procedural Idea carrying its matured source
+                            # (M6), recall-able by goal_class.
                             reasoning_store.write_macro(
                                 reasoning_id=f"research::{_gc}", goal_class=_gc,
                                 action="research", signature=[], b_i=float(_cnt),
-                                c=1.0, time_cost=1.0, use_count=int(_cnt))
+                                c=1.0, time_cost=1.0, use_count=int(_cnt),
+                                source=_src)
                             logger.info("[synthesis_worker] DK.5 research-skill "
                                         "matured → crystallized macro research::%s "
                                         "(source=%s, n=%d)", _gc, _src[:40], _cnt)
+                        elif _signal == "reversion":
+                            # (M5) further recipe growth → mint the SUCCESSOR macro
+                            # research::{gc}::v{n+1} (composed_from the prior label,
+                            # D.4c mutate-not-update lineage) carrying the matured
+                            # source (M6).
+                            _prior, _nextv = reasoning_store.research_macro_lineage(_gc)
+                            _succ = f"research::{_gc}::v{int(_nextv)}"
+                            reasoning_store.write_macro(
+                                reasoning_id=_succ, goal_class=_gc,
+                                action="research", signature=[], b_i=float(_cnt),
+                                c=1.0, time_cost=1.0, use_count=int(_cnt),
+                                composed_from=([_prior] if _prior else None),
+                                source=_src)
+                            logger.info("[synthesis_worker] DK.5 (M5) research-skill "
+                                        "re-versioned → %s (from %s, source=%s, n=%d)",
+                                        _succ, _prior or "-", _src[:40], _cnt)
                 except Exception:  # noqa: BLE001
                     pass   # DK.5 never stalls the queue
             if seeded:
@@ -936,6 +987,36 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                 except Exception as _dk2e:  # noqa: BLE001
                     logger.debug("[synthesis_worker] DK.2 survey soft-fail: %s",
                                  _dk2e)
+            # DK.3 — wiki-lint (M2 TTL / M3 contradiction / M4 orphan). Throttled +
+            # queue-idle (FC-6 metabolic-gate: the population survey rides the idle
+            # rhythm, never the primary capture path). Capped per pass. Inert until
+            # the emergent-epoch slot is live (now_epochs==0 → M0 grandfather).
+            if _pass % _LINT_EVERY == 0 and not wiki_queue:
+                try:
+                    _ne = _now_epoch()
+                    _rc = None
+                    if attribution is not None:
+                        try:
+                            _rc = attribution.recall_counts_map()
+                        except Exception:  # noqa: BLE001
+                            _rc = None
+                    _ls = run_wiki_lint(
+                        engram_store=engram_store, now_epochs=int(_ne),
+                        lifetime_epochs=float(lifetime_epochs),
+                        recall_floor=float(recall_floor),
+                        judge_fn=judge_fn, recall_counts=_rc,
+                        contradiction_overlap=float(
+                            _caps.get("contradiction_overlap", 0.5)),
+                        decay_factor=float(_caps.get("decay_factor", 0.5)),
+                        max_concepts=int(_caps.get("max_concepts", 200)),
+                        max_contradiction_pairs=int(
+                            _caps.get("max_contradiction_pairs", 8)),
+                        max_orphans=int(_caps.get("max_orphans", 16)))
+                    if _ls.get("stale") or _ls.get("contradiction") or _ls.get("orphan"):
+                        logger.info("[synthesis_worker] DK.3 wiki-lint: %s", _ls)
+                except Exception as _dk3e:  # noqa: BLE001
+                    logger.debug("[synthesis_worker] DK.3 wiki-lint soft-fail: %s",
+                                 _dk3e)
         except Exception as e:  # noqa: BLE001
             logger.debug("[synthesis_worker] research-wiki pass failed: %s", e)
         stop_event.wait(interval_s)
@@ -2516,16 +2597,49 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # fallback when the proposer is unconfigured/declines.
     research_wiki_queue = _collections.deque(maxlen=256)
     if engram_store is not None and cgn_bridge is not None:
-        from titan_hcl.synthesis.research_wiki import make_research_name_fn
+        from titan_hcl.synthesis.research_wiki import (
+            make_research_name_fn, make_contradiction_judge)
         _wiki_name_fn = make_research_name_fn(propose_fn)
+        # DK.3 (M3) — the LLM-librarian contradiction adjudicator (YES/NO over two
+        # concept names; never authors a fact). Reuses the consolidation provider;
+        # None (provider unconfigured) → M3 is skipped (M2/M4 still run).
+        _wiki_provider = locals().get("provider")
+        _wiki_judge = (make_contradiction_judge(_wiki_provider)
+                       if _wiki_provider is not None else None)
+        # DK.3/DK.5 tunables — §7.D-knowledge M1/M2/M5; emergent-epoch lifetime +
+        # the recall floor DK.4 routes on. `[synthesis.research]` (titan_params).
+        _rcfg = (config or {}).get("synthesis", {}).get("research", {}) or {}
+        _grcfg = (config or {}).get("gatekeeper", {}).get(
+            "grounded_router", {}) or {}
+        _lint_caps = {
+            "contradiction_overlap": float(
+                _rcfg.get("contradiction_name_overlap", 0.5)),
+            "decay_factor": float(_rcfg.get("lint_decay_factor", 0.5)),
+            "max_concepts": int(_rcfg.get("lint_max_concepts", 200)),
+            "max_contradiction_pairs": int(
+                _rcfg.get("lint_max_contradiction_pairs", 8)),
+            "max_orphans": int(_rcfg.get("lint_max_orphans", 16)),
+        }
         threading.Thread(
             target=_research_wiki_loop,
             args=(research_wiki_queue, engram_store, cgn_bridge, _wiki_name_fn,
                   stop_event, interval_s),
-            kwargs={"reasoning_store": reasoning_store},  # DK.5 recipe→macro
+            kwargs={
+                "reasoning_store": reasoning_store,   # DK.5 recipe→macro
+                "judge_fn": _wiki_judge,              # DK.3 M3 adjudicator
+                "attribution": recall_attribution,    # DK.3 M4 orphan signal
+                "lifetime_epochs": float(
+                    _rcfg.get("volatile_lifetime_epochs", 417.0)),
+                "recall_floor": float(
+                    _grcfg.get("recall_known_floor", 0.65)),
+                "mature_at": int(_rcfg.get("recipe_mature_at", 2)),
+                "macro_compose_min": int(_rcfg.get("macro_compose_min", 2)),
+                "lint_caps": _lint_caps,
+            },
             daemon=True, name=f"synthesis-research-wiki-{name}").start()
-        logger.info("[synthesis_worker] DK.1/DK.5 research-wiki+skill daemon started "
-                    "(§7.D-knowledge; continuous, not dream-gated)")
+        logger.info("[synthesis_worker] DK.1/DK.3/DK.5 research-wiki+lint+skill "
+                    "daemon started (§7.D-knowledge; continuous, not dream-gated; "
+                    "M3 judge=%s)", "on" if _wiki_judge else "off")
 
     # EEL B1 (D-SPEC-153 / INV-Syn-29) — wire the OracleRouter's skill-score
     # capture to the store. At each companion-batch flush, every canonical

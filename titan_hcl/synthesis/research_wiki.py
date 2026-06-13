@@ -119,9 +119,12 @@ def seed_research_concept(
     name_fn: Callable[[str], tuple[str, str, str]],
     domain_hint: str = "",
     felt_coverage: float = 0.0,
+    created_epoch: float = 0.0,
 ) -> Optional[Any]:
     """DK.1 — seed (or refine) the declarative `Engram` concept for one confirmed
-    research finding. Returns the created/bumped `Engram` (v=n) or ``None`` on a
+    research finding. `created_epoch` (DK.3 / M0) stamps the new concept's
+    EMERGENT-epoch birth so the wiki-lint TTL can age it; a `bump` inherits the
+    original v=1 epoch (a refinement is not a re-birth). Returns the created/bumped `Engram` (v=n) or ``None`` on a
     soft failure (never raises — a librarian hiccup must not break the chat/
     promotion path that triggered it).
 
@@ -171,6 +174,7 @@ def seed_research_concept(
                 memory_type="declarative",
                 derivation_evidence=[tx_hash],
                 domain_hint=domain_hint,
+                created_epoch=float(created_epoch or 0.0),
             )
             _action = "create"
         else:
@@ -210,6 +214,58 @@ def seed_research_concept(
         _action, cv.concept_id, cv.version, str(tx_hash)[:12],
         domain_hint or "-")
     return cv
+
+
+_CONTRADICTION_SYSTEM_PROMPT = (
+    "You are part of Titan's synthesis engine acting as a knowledge-base "
+    "LIBRARIAN. You are given the NAMES of two of Titan's own declarative "
+    "knowledge concepts in the same domain. Decide ONLY whether they assert "
+    "DIRECTLY CONTRADICTORY facts about the same subject (one says X, the other "
+    "says not-X / a conflicting value). Two concepts that are merely related, "
+    "complementary, or about different subjects are NOT contradictory.\n\n"
+    "You do NOT rewrite, merge, or author any fact — you only judge.\n"
+    "Respond with EXACTLY one line:\n"
+    "VERDICT: YES | NO\n"
+)
+
+
+def make_contradiction_judge(provider: Any) -> Callable[[str, str], bool]:
+    """DK.3 (M3) — bind a provider into a sync `judge(name_a, name_b) -> bool`
+    that asks the LLM librarian whether two same-domain declarative concepts
+    assert contradictory facts. The LLM ONLY adjudicates YES/NO — it never
+    rewrites the fact (GD10 sovereignty gate); the caller lowers the weaker
+    concept's groundedness on YES. Mirrors `make_default_llm_propose`: the async
+    provider is bridged via `asyncio.run` (the synthesis daemon's loop is
+    thread-based). Provider failure / unparseable → False (conservative — never
+    flag a contradiction we are not sure of). Never raises."""
+    import asyncio
+
+    def _judge(name_a: str, name_b: str) -> bool:
+        a, b = (name_a or "").strip(), (name_b or "").strip()
+        if not a or not b:
+            return False
+        prompt = (f"Concept A: {a[:160]}\nConcept B: {b[:160]}\n\n"
+                  "Do A and B assert directly contradictory facts?")
+        try:
+            text = asyncio.run(provider.complete(
+                prompt=prompt,
+                system=_CONTRADICTION_SYSTEM_PROMPT,
+                temperature=0.0,
+                max_tokens=12,
+                timeout=30.0,
+            ))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[research_wiki] M3 contradiction judge provider "
+                         "failed: %s", e)
+            return False
+        for line in (text or "").splitlines():
+            line = line.strip().upper()
+            if line.startswith("VERDICT"):
+                return "YES" in line
+        # No explicit VERDICT line → look for a bare YES (lenient), else NO.
+        return "YES" in (text or "").strip().upper()[:8]
+
+    return _judge
 
 
 _SUMMARY_PREFIX = "summary::"
@@ -304,6 +360,7 @@ def compose_concept_summaries(
 __all__ = (
     "seed_research_concept",
     "make_research_name_fn",
+    "make_contradiction_judge",
     "fallback_concept_name",
     "compose_concept_summaries",
 )

@@ -42,11 +42,11 @@ class _FakeEngramStore:
 
     def create_concept(self, *, concept_id, name, memory_type,
                        derivation_evidence=None, composed_from=None,
-                       domain_hint=""):
+                       domain_hint="", created_epoch=0.0):
         self.created.append(dict(
             concept_id=concept_id, name=name, memory_type=memory_type,
             derivation_evidence=list(derivation_evidence or []),
-            domain_hint=domain_hint))
+            domain_hint=domain_hint, created_epoch=created_epoch))
         return Engram(concept_id, 1, name, memory_type, 0.1, "anchor_tx_v1", 0.0)
 
     def bump_version(self, *, concept_id, derivation_evidence=None,

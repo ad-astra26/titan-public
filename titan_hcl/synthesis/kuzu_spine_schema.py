@@ -61,6 +61,12 @@ _NODE_TABLES: tuple[tuple[str, str], ...] = (
         "pk STRING, concept_id STRING, version INT64, name STRING, "
         "memory_type STRING, groundedness DOUBLE, anchor_tx STRING, "
         "created_at DOUBLE, "
+        # §7.D-knowledge DK.3 (M0) — the EMERGENT-epoch creation stamp
+        # (consciousness_age.bin::age_epochs at create) so the wiki-lint TTL can
+        # compute age-in-epochs (age = now_epochs − created_epoch). Wall-clock
+        # `created_at` stays for human timestamps; epochs drive the volatile TTL.
+        # Legacy rows (NULL/0) grandfather as evergreen (never TTL'd).
+        "created_epoch DOUBLE, "
         # Phase B (RFP_synthesis_engram_grounding §7.B) — decomposed grounding
         # axes (BRAIN §3.4-native: used→B_i, verified→c, felt, fluent→time_cost)
         # + advisory domain_hint. Born here for fresh installs; existing Titans
@@ -122,6 +128,11 @@ _NODE_TABLES: tuple[tuple[str, str], ...] = (
         # synthesis hint mirroring the Engram.memory_type column; lets BRAIN ingest
         # Reasoning composites + Engrams under one Idea primitive.
         "idea_type STRING, "
+        # §7.D-knowledge DK.5 finisher (M6) — the matured research source on a
+        # crystallized `research::{gc}` macro ("research via <source>"), so the
+        # procedural Idea is deref-able to HOW it was found. '' on non-research
+        # reasoning (the recipe table stays the per-source reinforcement substrate).
+        "source STRING, "
         "PRIMARY KEY(reasoning_id)",
     ),
     (
@@ -220,7 +231,9 @@ def _column_exists(conn, table_name: str, column: str) -> bool:
 # §7.D D.3 Reasoning.idea_type) needs an ALTER. Each is idempotent (probe
 # first) + best-effort. APPEND-ONLY (never drop/rename here).
 _NODE_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
-    ("Reasoning", "idea_type", "STRING"),  # §7.D D.3 / FC-8
+    ("Reasoning", "idea_type", "STRING"),       # §7.D D.3 / FC-8
+    ("Engram", "created_epoch", "DOUBLE"),      # §7.D-knowledge DK.3 / M0
+    ("Reasoning", "source", "STRING"),          # §7.D-knowledge DK.5 / M6
 )
 
 
