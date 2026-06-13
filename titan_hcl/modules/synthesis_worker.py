@@ -2592,6 +2592,23 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         logger.warning("[synthesis_worker] ReasoningStore wiring failed (graphed records "
                        "off; reward loop unaffected): %s", _rs_err)
 
+    # §7.E (E.2) — the self-verifying prompt→solution cache (sole-writer, synthesis-
+    # side). Persists a verified (prompt → answer) so an identical durable re-ask is
+    # served literally (zero LLM/oracle) by the agno PromptSignatureReader. Soft.
+    prompt_signature_store = None
+    try:
+        from titan_hcl.synthesis.prompt_signature import PromptSignatureStore
+        prompt_signature_store = PromptSignatureStore(
+            store._conn,
+            faiss_path=os.path.join(_data_dir, "prompt_signature_vectors.faiss"),
+            snapshot_path=os.path.join(_data_dir, "prompt_signature_snapshot.json"),
+            graph=kuzu_graph_obj, embedder=_shared_embedder, writer=db_writer)
+        logger.info("[synthesis_worker] §7.E PromptSignatureStore ready (E.2 cache)")
+    except Exception as _ps_err:  # noqa: BLE001
+        prompt_signature_store = None
+        logger.warning("[synthesis_worker] PromptSignatureStore wiring failed "
+                       "(E.2 cache off; routing unaffected): %s", _ps_err)
+
     # ── §7.B (B.2) — the turn-judge daemon: reward NON-verifiable turns. The
     # TURN_REASONING_RECORD handler pushes FRESH (reasoning_id, prompt, response,
     # action, goal_class) into this bounded queue; the daemon scores them via the
@@ -3480,6 +3497,29 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     logger.debug(
                         "[synthesis_worker] tool-call verdict record failed: %s",
                         _tcv_err)
+                # ── §7.E (E.2) — cache the verified (prompt → answer) as a
+                # PromptSignature so an identical DURABLE re-ask is served literally
+                # (zero LLM/oracle) by the agno reader. Fires on ANY true tool
+                # verdict carrying a result; durable/volatile via the DK.3-shared
+                # research_volatility seam (volatile values are stored but the reader
+                # never serves them literally). Off the hot path; soft.
+                if (prompt_signature_store is not None
+                        and str(payload.get("verdict", "")) == "true"):
+                    try:
+                        from titan_hcl.synthesis.research_volatility import (
+                            classify_volatility)
+                        _e2_ans = str(payload.get("result_summary", "") or "")
+                        _e2_prompt = str(payload.get("parent_goal", "") or "")
+                        if _e2_ans and _e2_prompt:
+                            prompt_signature_store.write_signature(
+                                prompt=_e2_prompt, literal_answer=_e2_ans,
+                                solved_by=str(_ptx),
+                                durability=classify_volatility(_e2_prompt),
+                                created_epoch=float(_now_epoch()))
+                    except Exception as _e2_err:  # noqa: BLE001
+                        logger.debug(
+                            "[synthesis_worker] E.2 prompt-signature write skipped: %s",
+                            _e2_err)
                 # ── RFP_synthesis_self_learning_meta_reasoning v1.1 / C1 ──
                 # If this verdict carries an OuterMetaPolicy decision (the
                 # policy-driven ToolBackstop path), emit the reward to the

@@ -212,6 +212,11 @@ class ToolPlugBase:
                         # by construction); '' if not templatizable (→ E.1 LLM-
                         # fallback). Soft — never breaks the verdict path.
                         recipe_json=_build_recipe_json(self.tool_id, call),
+                        # §7.E (E.2) — the verified answer text so synthesis can
+                        # cache (prompt → answer) as a PromptSignature for the
+                        # literal top-tier serve. evidence_ref is a hash; the
+                        # result_summary is the human answer.
+                        result_summary=result_summary,
                     )
             except Exception:
                 logger.exception(

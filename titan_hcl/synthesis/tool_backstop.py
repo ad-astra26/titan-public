@@ -43,6 +43,7 @@ class BackstopResult:
     result_summary: str = ""       # sandbox stdout / error, truncated
     code: str = ""                 # the code that was run
     reason: str = ""               # why it didn't execute, when applicable
+    cached: bool = False           # §7.E E.2 — served from the PromptSignature cache (no run)
 
     def verdict_block(self, *, corrective: bool = False) -> str:
         """Render the verified-result block injected into the LLM context
@@ -52,6 +53,15 @@ class BackstopResult:
         tool so the UX can explain the extra latency."""
         if not self.executed:
             return ""
+        # §7.E (E.2) — a cached literal recall: an identical, durable, prior-verified
+        # answer served with NO sandbox run (honest framing — not "executed now").
+        if self.cached:
+            return (
+                "### Recalled Verified Result — E.2 cache\n"
+                "(Titan recalled this from a prior VERIFIED solve of the identical "
+                "question; answer it directly and concisely.)\n"
+                f"Answer: {self.result_summary or '(none)'}\n\n"
+            )
         status = "PASS ✅" if self.success else "FAIL ❌"
         header = (
             "### Tool Backstop — coding_sandbox\n"
@@ -157,6 +167,35 @@ def _e1_recipe_replay(plugin: Any, prompt: str, cfg: dict) -> str:
         return ""
 
 
+def _e2_literal_lookup(plugin: Any, prompt: str, cfg: dict) -> Optional[dict]:
+    """§7.E (E.2) — the TOP tier: an identical, durable, prior-verified answer served
+    literally (zero sandbox/LLM-derivation). Lock-free (PromptSignatureReader: faiss
+    FILE + snapshot). Returns `{literal_answer, solved_by, signature_id}` or None
+    (→ fall to E.1). Reuses the agno embed-once `_last_prompt_vec`; the durability /
+    params-identity / staleness discipline lives in the reader (DK.3-shared seam)."""
+    try:
+        ecfg = (cfg.get("e_prompt_cache", {}) or {})
+        if not ecfg.get("enabled", True):
+            return None
+        vec = getattr(plugin, "_last_prompt_vec", None)
+        if vec is None:
+            return None
+        reader = getattr(plugin, "_prompt_signature_reader", None)
+        if reader is None:
+            import os
+            from titan_hcl.synthesis.prompt_signature import PromptSignatureReader
+            ddir = os.environ.get("TITAN_DATA_DIR", "data")
+            reader = PromptSignatureReader(
+                os.path.join(ddir, "prompt_signature_vectors.faiss"),
+                os.path.join(ddir, "prompt_signature_snapshot.json"),
+                sim_floor=float(ecfg.get("sim_floor", 0.93)))
+            plugin._prompt_signature_reader = reader
+        return reader.lookup(prompt, vec)
+    except Exception as e:  # noqa: BLE001 — must never break the backstop
+        logger.debug("[ToolBackstop][E.2] literal lookup skipped (soft): %s", e)
+        return None
+
+
 def _invoke_sandbox(plug: Any, code: str, parent_goal: Optional[str] = None,
                     decision=None):
     """Run the coding_sandbox ToolPlug synchronously (called via to_thread).
@@ -229,7 +268,21 @@ async def run_tool_backstop(
     elif not intent.requires_tool and not _policy_wants_tool:
         return BackstopResult(fired=False, reason="no_intent")
 
-    # §7.E (E.1) — symbolic recipe REPLAY first (pre-phase only): a matched compute
+    # §7.E (E.2) — TOP tier (pre-phase): an identical, durable, prior-verified answer
+    #    is served literally with NO sandbox run at all (cheaper than E.1's replay).
+    #    Volatile / param-differ / stale ⇒ None ⇒ fall to E.1 below.
+    if phase == "pre":
+        _e2 = _e2_literal_lookup(plugin, prompt, cfg)
+        if _e2 is not None:
+            logger.info(
+                "[ToolBackstop][E.2] literal cache hit (zero sandbox) — sig=%s",
+                _e2.get("signature_id", ""))
+            return BackstopResult(
+                fired=True, executed=True, success=True, verdict="true",
+                result_summary=str(_e2.get("literal_answer", "")),
+                cached=True, reason="e2_literal")
+
+    # §7.E (E.1) — symbolic recipe REPLAY next (pre-phase only): a matched compute
     #    composite's templatized recipe, bound to this prompt's params, skips the LLM
     #    router entirely (the cheap reuse). '' ⇒ fall through to the router below.
     code = _e1_recipe_replay(plugin, prompt, cfg) if phase == "pre" else ""

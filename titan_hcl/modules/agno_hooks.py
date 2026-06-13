@@ -1111,6 +1111,9 @@ def create_pre_hook(plugin):
                 logger.warning(
                     "[PreHook] embed-once failed (paths self-embed): %s", _emb_err)
                 _prompt_vec = None
+        # §7.E (E.2) — stash the embed-once vector so the tool-backstop E.2 literal
+        # lookup reuses it (no extra embed) on the hot path.
+        plugin._last_prompt_vec = _prompt_vec
         # RFP_synthesis_decision_authority P4 — ENRICH (both, partitioned).
         # VCB (inner-titan state across 6 SQLite stores) AND the consolidated
         # legacy memory.query (titan_memory.duckdb) BOTH enrich every routed

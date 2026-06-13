@@ -995,7 +995,7 @@ def _build_local_tool_plugs(send_queue) -> dict:
                                 evidence_ref="", latency_ms=0,
                                 parent_goal="", tool_id="",
                                 decision_features=None, decision_action=None,
-                                recipe_json=""):
+                                recipe_json="", result_summary=""):
         try:
             _payload = {
                 "parent_tool_call_tx": parent_tool_call_tx,
@@ -1016,6 +1016,8 @@ def _build_local_tool_plugs(send_queue) -> dict:
             # symbolically replayed by E.1 on the hot path.
             if recipe_json:
                 _payload["recipe_json"] = str(recipe_json)
+            if result_summary:
+                _payload["result_summary"] = str(result_summary)  # §7.E E.2 literal answer
             send_queue.put_nowait({
                 "type": bus.TOOL_CALL_VERDICT_RECORD,
                 "src": "agno_worker", "dst": "synthesis", "ts": time.time(),
