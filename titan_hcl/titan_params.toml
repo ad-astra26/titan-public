@@ -3337,6 +3337,36 @@ router_timeout_s   = 12.0     # soft cap on the fast-model router call
 # dead weight + re-entrancy risk). Surfaced to the UI via CHAT_RESPONSE.tool_activity.
 backstop_mode      = "execute"
 
+# ── §7.E — the hot-path inference-time tier (amortize-once C/D, reuse-cheaply) ──
+# A decide-time cache hierarchy inside the backstop pre-path: E.2 literal → E.1
+# replay → E.3 research-source → normal route. Each tier is verified THIS turn (no
+# stale-cache trust); flag-off → the backstop behaves exactly as before. The whole
+# tier is additionally gated by `_self_learning_enabled` (no matched composite when
+# OML is off → these never fire).
+[synthesis.tool_backstop.e_compose]
+# E.1 — execute a matched compute composite by replaying its templatized recipe
+# (zero LLM derivation) + the synchronous oracle re-verify (the existing verdict).
+enabled = true
+floor   = 0.85    # composite_match_score gate (cosine·reward-weight) to attempt replay
+
+[synthesis.tool_backstop.e_prompt_cache]
+# E.2 — the PromptSignature top tier: an identical, durable, prior-verified prompt
+# is served from the stored answer (zero sandbox/LLM). Volatile → never literal (E.3
+# re-fetches); params differ → E.1 replays.
+enabled   = true
+sim_floor = 0.93  # cosine floor for "the same prompt" (below → not a literal hit)
+
+[synthesis.tool_backstop.e_research_tool]
+# E.3 — research→tool: a crystallized research::{gc} recipe's source is fetched
+# DIRECTLY (bypassing the full multi-URL research lane); the data is re-fetched fresh
+# (DK.5: the value decays, the recipe survives).
+enabled = true
+# Source-allowlist guard (Maker 2026-06-13): switchable, DEFAULT OFF — ship off to
+# measure the clean hot-path direct-call latency first, then enable + populate the
+# host list. When on, a non-allowlisted source falls through to full research.
+source_allowlist_enabled = false
+source_allowlist         = []   # hostnames (host or parent domain match), when enabled
+
 [microkernel]
 
 # ── Memory hygiene daemon (2026-05-01) ─────────────────────────────

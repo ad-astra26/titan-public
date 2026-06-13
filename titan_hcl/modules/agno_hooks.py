@@ -428,6 +428,51 @@ def _emit_research_confirmed(plugin, node) -> None:
         logger.debug("[PreHook][A2] research-confirmed emit skipped: %s", e)
 
 
+async def _e3_research_tool_fetch(plugin, prompt_text):
+    """§7.E (E.3) — research→tool crystallization. When the matched composite is a
+    crystallized `research::{gc}` recipe (DK.5) carrying a winning `source` (URL),
+    DIRECTLY fetch that one source — bypassing the full multi-URL research lane —
+    and return the finding text, or None (→ the full research path). The data is
+    re-fetched FRESH every time (a volatile value decays; the recipe/know-how is
+    forever — DK.5); reinforcement rides the existing DK.5 confirm flow.
+
+    🔒 Source-allowlist guard (Maker 2026-06-13): config-switchable, DEFAULT OFF (so
+    the clean hot-path direct-call latency is measured first). When ON, a source whose
+    host is not allowlisted ⇒ None ⇒ fall through to the full research lane. Never
+    raises (hot path; INV-OML-7)."""
+    try:
+        cfg = (((getattr(plugin, "_full_config", {}) or {}).get("synthesis", {}) or {})
+               .get("tool_backstop", {}) or {}).get("e_research_tool", {}) or {}
+        if not cfg.get("enabled", True):
+            return None
+        match = getattr(plugin, "_last_composite_match", None)
+        if not match or str(match.get("action", "")) != "research":
+            return None
+        source = str(match.get("source", "") or "").strip()
+        if not source or not source.startswith(("http://", "https://")):
+            return None
+        if cfg.get("source_allowlist_enabled", False):  # default OFF
+            from urllib.parse import urlparse
+            host = (urlparse(source).hostname or "").lower()
+            allow = [str(h).lower() for h in (cfg.get("source_allowlist", []) or [])]
+            if not any(host == h or host.endswith("." + h) for h in allow):
+                logger.info("[PreHook][E.3] source host %s not allowlisted → "
+                            "full research", host)
+                return None
+        researcher = getattr(plugin, "sage_researcher", None)
+        if researcher is None or not hasattr(researcher, "_scrape_single"):
+            return None
+        content = await researcher._scrape_single(source)
+        if content and str(content).strip():
+            logger.info("[PreHook][E.3] direct source fetch (bypassed full "
+                        "multi-URL research) — %s", source)
+            return "[Source: %s]\n%s" % (source, content)
+        return None
+    except Exception as e:  # noqa: BLE001 — never break chat
+        logger.debug("[PreHook][E.3] direct source fetch skipped: %s", e)
+        return None
+
+
 _DK4_STOPWORDS = frozenset((
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
     "was", "were", "what", "which", "who", "does", "do", "did", "how", "why",
@@ -2607,9 +2652,14 @@ def create_pre_hook(plugin):
                 # set by the A2 gate above), else the current prompt.
                 _research_gap = getattr(plugin, "_force_research_topic", None) or prompt_text
                 plugin._force_research_topic = None
-                sage_findings = await plugin.sage_researcher.research(
-                    knowledge_gap=_research_gap,
-                )
+                # §7.E (E.3) — research→tool: if a crystallized research recipe's
+                # source matches, fetch it DIRECTLY (bypass the full multi-URL lane);
+                # miss / non-allowlisted → the full research path.
+                sage_findings = await _e3_research_tool_fetch(plugin, prompt_text)
+                if not sage_findings:
+                    sage_findings = await plugin.sage_researcher.research(
+                        knowledge_gap=_research_gap,
+                    )
             if sage_findings:
                 injected += f"### Research Findings\n{sage_findings}\n\n"
                 plugin._last_research_sources = plugin._extract_sources_from_findings(sage_findings)
