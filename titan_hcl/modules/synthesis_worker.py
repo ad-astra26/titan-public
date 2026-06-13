@@ -3506,6 +3506,21 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     logger.debug(
                         "[synthesis_worker] tool-call verdict record failed: %s",
                         _tcv_err)
+                # §7.E live-diagnostic (2026-06-13, temporary): dump the verdict
+                # payload's E.2-relevant shape so we can see WHY E.2 skips on a
+                # verified tool turn (store-None / empty result_summary / parent_goal).
+                try:
+                    with open(os.path.join(_data_dir, "e2_payload_diag.txt"), "a") as _pf:
+                        _pf.write("store_not_none=%s verdict=%r keys=%s result_summary_len=%d parent_goal_len=%d features=%s oracle=%r\n" % (
+                            prompt_signature_store is not None,
+                            str(payload.get("verdict", "")),
+                            sorted(payload.keys()),
+                            len(str(payload.get("result_summary", "") or "")),
+                            len(str(payload.get("parent_goal", "") or "")),
+                            payload.get("features") is not None,
+                            str(payload.get("oracle_id", ""))))
+                except Exception:  # noqa: BLE001
+                    pass
                 # ── §7.E (E.2) — cache the verified (prompt → answer) as a
                 # PromptSignature so an identical DURABLE re-ask is served literally
                 # (zero LLM/oracle) by the agno reader. Fires on ANY true tool
