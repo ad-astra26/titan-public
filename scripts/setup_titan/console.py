@@ -109,6 +109,21 @@ def render_unit(*, install_root: Path, user: str, venv_python: str,
             .replace("{{DIST_DIR}}", str(dist_dir(install_root))))
 
 
+def _primary_ip() -> str:
+    """Best-effort primary outbound IPv4 (for the app-pairing hint). No traffic is
+    sent — connecting a UDP socket just selects the kernel's default route source
+    address. Returns "" if it can't be determined."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("203.0.113.10", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        s.close()
+
+
 def _sudo(cmd: list[str], *, explain: str) -> int:
     cprint(f"  [sudo] {explain}", role="warning")
     cprint(f"        $ sudo {' '.join(cmd)}", role="text_muted")
@@ -136,11 +151,18 @@ def _health_ok(port: int) -> bool:
 
 def run_console_phase(state: dict, install_root: Path, *, user: str,
                       port: int = DEFAULT_PORT, api_base: str = "http://127.0.0.1:7777",
-                      bind_host: str = "127.0.0.1") -> list[Result]:
+                      bind_host: str = "0.0.0.0") -> list[Result]:
     """Install + start the Console Agent. Default UI — always installed.
 
     Decoupling: runs on the SYSTEM python (stdlib-only) so a broken Titan venv
     can't take the console down with it.
+
+    Bind = 0.0.0.0 by default so a fresh VPS install is reachable out of the box:
+    the Maker can open TC² in a browser AND pair the mobile app, then reach the
+    running Titan through it. This is NOT a security downgrade — per SPEC AD-5 the
+    perimeter is the device key, not the bind: every non-local route requires a
+    verified device signature or operator token over pinned, fail-closed TLS
+    (AG-TLS). The network-layer firewall / cloud security-group still gates :{port}.
     """
     results: list[Result] = [ensure_token(), ensure_tls_cert(), ensure_bundle(install_root)]
 
@@ -164,9 +186,14 @@ def run_console_phase(state: dict, install_root: Path, *, user: str,
     tmp.unlink(missing_ok=True)
     state["console_enabled"] = True
 
+    # A wildcard bind isn't a browsable URL — show loopback for the local browser,
+    # and (below) the LAN/public IP for pairing the mobile app.
+    exposed = bind_host in ("0.0.0.0", "::", "")
+    display_host = "127.0.0.1" if exposed else bind_host
+
     if _health_ok(port):
         results.append(Result("console", "ok",
-                              f"Console Agent live at https://{bind_host}:{port} "
+                              f"Console Agent live at https://{display_host}:{port} "
                               f"(pinned TLS; stays up even if the Titan is down)"))
     else:
         results.append(Result("console", "warn",
@@ -187,12 +214,22 @@ def run_console_phase(state: dict, install_root: Path, *, user: str,
     # Final guidance — where the user goes next to meet their Titan.
     cprint("", role="text")
     cprint("  ✔ Your Titan's Console (TC²) is ready.", role="success", bold=True)
-    cprint(f"     Open it →  https://{bind_host}:{port}  (self-signed — your browser will ask once)",
+    cprint(f"     Open it →  https://{display_host}:{port}  (self-signed — your browser will ask once)",
            role="text_strong")
     cprint("     Chat with your Titan there, and watch its identity, memory, and",
            role="text_muted")
     cprint("     growth. That console is your window into your sovereign Titan.",
            role="text_muted")
+    if exposed:
+        net_ip = _primary_ip()
+        reach = f"https://{net_ip}:{port}" if net_ip else f"https://<this-VPS-IP>:{port}"
+        cprint("", role="text")
+        cprint(f"     📱 To pair the mobile app, reach TC² over the network at  {reach}",
+               role="text_strong")
+        cprint(f"        (open :{port} in your firewall / cloud security-group; the channel is",
+               role="text_muted")
+        cprint("         pinned TLS and every remote request needs your device key — SPEC AD-5.)",
+               role="text_muted")
     return results
 
 

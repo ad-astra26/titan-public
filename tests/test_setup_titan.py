@@ -851,6 +851,19 @@ def test_console_render_unit_fills_all_placeholders(tmp_path: Path):
     assert "Wants=titan" not in u
 
 
+def test_console_default_bind_is_all_interfaces():
+    # Out-of-the-box reachability: a fresh install must bind 0.0.0.0 so the Maker
+    # can open TC² over the network AND pair the mobile app (security floor held by
+    # AD-5 device-sig + AG-TLS pinned TLS, not the bind). Regression guard.
+    import inspect
+    sig = inspect.signature(console_phase.run_console_phase)
+    assert sig.parameters["bind_host"].default == "0.0.0.0"
+    u = console_phase.render_unit(
+        install_root=Path("/srv/titan"), user="bob", venv_python="/usr/bin/python3",
+        port=7799, api_base="http://127.0.0.1:7777", bind_host="0.0.0.0")
+    assert "--host 0.0.0.0" in u
+
+
 def test_console_ensure_bundle_detects_prebuilt(tmp_path: Path):
     spa = tmp_path / "titan-console" / "dist"
     spa.mkdir(parents=True)
