@@ -85,6 +85,13 @@ class ReasoningStore:
                 # '' on non-research reasoning. Additive (the anchor_tx/idea_type
                 # additive-column precedent).
                 "  source        TEXT    DEFAULT '',"
+                # §7.E (E1.1) — the executable tool-call recipe captured at the C1
+                # verdict seam: JSON {tool_id, args}. Lets E.1 symbolically REPLAY a
+                # matched composite on the hot path (deref → recipe → bind new params
+                # → re-run + oracle re-verify) instead of an LLM round-trip; '' on a
+                # record with no captured recipe (E.1 then uses the stripped-LLM
+                # fallback). Additive (the source/anchor_tx additive-column precedent).
+                "  recipe_json   TEXT    DEFAULT '',"
                 "  created_at    DOUBLE  NOT NULL"
                 ")")
             # §7.B (B.3) — the Maker↔Titan bond scalars (the MakerAssessment Kuzu
@@ -124,6 +131,7 @@ class ReasoningStore:
             # via IF NOT EXISTS; tolerated best-effort.
             for _table, _col, _decl in (
                 ("reasoning_records", "source", "TEXT DEFAULT ''"),
+                ("reasoning_records", "recipe_json", "TEXT DEFAULT ''"),  # §7.E E1.1
                 ("research_recipes", "crystallized_at_count", "INTEGER DEFAULT 0"),
             ):
                 try:
@@ -188,15 +196,18 @@ class ReasoningStore:
         self, *, reasoning_id: str, goal_class: str, action: str, oracle_id: str,
         verdict: str, reward: float, features: list, signature_text: str,
         b_i: float = 1.0, c: float = 1.0, time_cost: float = 1.0,
+        recipe_json: str = "",
     ) -> bool:
         """Persist a `Reasoning(kind='tool_use')` episode. Idempotent on
-        reasoning_id (the tool_call_tx). Soft-fail."""
+        reasoning_id (the tool_call_tx). `recipe_json` (§7.E E1.1) = the executable
+        tool-call {tool_id, args} captured at the verdict seam, so E.1 can replay a
+        matched composite symbolically. Soft-fail."""
         return self._write_record(
             reasoning_id=reasoning_id, kind="tool_use", goal_class=goal_class,
             action=action, oracle_id=oracle_id, verdict=verdict, reward=reward,
             features=features, signature_text=signature_text,
             b_i=b_i, c=c, time_cost=time_cost, anchor_tx=reasoning_id,
-            composed_from=None)
+            composed_from=None, recipe_json=recipe_json)
 
     def record_turn(
         self, *, reasoning_id: str, goal_class: str, action: str,
@@ -256,12 +267,14 @@ class ReasoningStore:
         self, *, reasoning_id: str, goal_class: str, action: str,
         signature: list, b_i: float, c: float, time_cost: float, use_count: int,
         anchor_tx: str = "", composed_from: Optional[list] = None,
-        source: str = "",
+        source: str = "", recipe_json: str = "",
     ) -> bool:
         """Persist a distilled `Reasoning(kind='macro_strategy')` (S2). The signature
         is the mean leaf feature vector; `composed_from` = the leaf reasoning_ids.
         `source` (§7.D-knowledge DK.5 / M6) = the matured research source on a
-        `research::{gc}` macro ("research via <src>"), '' on a strategy macro."""
+        `research::{gc}` macro ("research via <src>"), '' on a strategy macro.
+        `recipe_json` (§7.E E1.1) = the modal leaf tool-call {tool_id, args} so E.1
+        can replay the composite symbolically on the hot path; '' if no leaf recipe."""
         ok = self._write_record(
             reasoning_id=reasoning_id, kind="macro_strategy", goal_class=goal_class,
             action=action, oracle_id="", verdict="true", reward=1.0,
@@ -269,7 +282,7 @@ class ReasoningStore:
             b_i=b_i, c=c, time_cost=time_cost, use_count=int(use_count),
             anchor_tx=anchor_tx, composed_from=composed_from,
             idea_type="procedural",   # §7.D D.3 / FC-8 — a composite IS procedural Idea
-            source=source)
+            source=source, recipe_json=recipe_json)
         if ok:
             self.macros_written += 1
         return ok
@@ -375,7 +388,7 @@ class ReasoningStore:
     def _write_record(
         self, *, reasoning_id, kind, goal_class, action, oracle_id, verdict,
         reward, features, signature_text, b_i, c, time_cost, use_count=1,
-        anchor_tx="", composed_from=None, idea_type="", source="",
+        anchor_tx="", composed_from=None, idea_type="", source="", recipe_json="",
     ) -> bool:
         if not reasoning_id:
             return False
@@ -400,8 +413,8 @@ class ReasoningStore:
                     "INSERT INTO reasoning_records (reasoning_id, kind, goal_class, "
                     "action, oracle_id, verdict, reward, features_json, b_i, c, "
                     "time_cost, use_count, embedding_id, anchor_tx, source, "
-                    "created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "recipe_json, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT (reasoning_id) DO NOTHING",
                     [str(reasoning_id), str(kind), str(goal_class or ""),
                      str(action or ""), str(oracle_id or ""), str(verdict or ""),
@@ -409,7 +422,7 @@ class ReasoningStore:
                      json.dumps(list(features or [])),
                      int(b_i), float(c), float(time_cost), int(use_count),
                      int(emb_id), str(anchor_tx or ""), str(source or ""),
-                     float(self._clock())])
+                     str(recipe_json or ""), float(self._clock())])
             except Exception as e:  # noqa: BLE001
                 logger.warning("[ReasoningStore] duckdb insert failed: %s", e)
                 return False
@@ -494,7 +507,8 @@ class ReasoningStore:
             row = self._db.execute(
                 "SELECT reasoning_id, kind, goal_class, action, oracle_id, verdict, "
                 "reward, features_json, b_i, c, time_cost, use_count, anchor_tx, "
-                "created_at FROM reasoning_records WHERE reasoning_id = ?",
+                "created_at, source, recipe_json FROM reasoning_records "
+                "WHERE reasoning_id = ?",
                 [str(reasoning_id)]).fetchone()
             if not row:
                 return None
@@ -506,6 +520,8 @@ class ReasoningStore:
                 "features": json.loads(row[7]) if row[7] else [],
                 "b_i": row[8], "c": row[9], "time_cost": row[10],
                 "use_count": row[11], "anchor_tx": row[12], "created_at": row[13],
+                "source": row[14] or "",            # §7.D-knowledge DK.5 (E.3 reads)
+                "recipe_json": row[15] or "",       # §7.E E1.1 (E.1 replay reads)
             }
         except Exception as e:  # noqa: BLE001
             logger.debug("[ReasoningStore] get_record failed: %s", e)

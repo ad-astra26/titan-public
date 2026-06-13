@@ -20,6 +20,7 @@ action surface; no parallel paths.
 from __future__ import annotations
 
 import hashlib
+import json as _json
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -177,6 +178,13 @@ class ToolPlugBase:
                         # verdict-time C1 capture writes the Reasoning record + trains.
                         decision_features=call.decision_features,
                         decision_action=call.decision_action,
+                        # §7.E (E1.1) — the executable recipe so E.1 can replay a
+                        # matched composite symbolically (deref → recipe → bind new
+                        # params → re-run). The literal call; param-templating is
+                        # derived at replay via entity extraction.
+                        recipe_json=_json.dumps(
+                            {"tool_id": self.tool_id, "args": dict(call.args or {})},
+                            ensure_ascii=False, separators=(",", ":")),
                     )
             except Exception:
                 logger.exception(

@@ -994,7 +994,8 @@ def _build_local_tool_plugs(send_queue) -> dict:
     def _companion_verdict_sink(*, parent_tool_call_tx, oracle_id, verdict,
                                 evidence_ref="", latency_ms=0,
                                 parent_goal="", tool_id="",
-                                decision_features=None, decision_action=None):
+                                decision_features=None, decision_action=None,
+                                recipe_json=""):
         try:
             _payload = {
                 "parent_tool_call_tx": parent_tool_call_tx,
@@ -1010,6 +1011,11 @@ def _build_local_tool_plugs(send_queue) -> dict:
             if decision_features is not None and decision_action is not None:
                 _payload["features"] = list(decision_features)
                 _payload["action"] = int(decision_action)
+            # §7.E (E1.1) — carry the executable recipe to the C1 capture so the
+            # leaf Reasoning(tool_use) record (and the distilled composite) can be
+            # symbolically replayed by E.1 on the hot path.
+            if recipe_json:
+                _payload["recipe_json"] = str(recipe_json)
             send_queue.put_nowait({
                 "type": bus.TOOL_CALL_VERDICT_RECORD,
                 "src": "agno_worker", "dst": "synthesis", "ts": time.time(),

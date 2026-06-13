@@ -115,6 +115,52 @@ def test_snapshot_export_readable(tmp_path):
     assert snap["recent"][0]["reasoning_id"] == "tx_snap"
 
 
+def test_recipe_json_round_trips_on_tool_use(tmp_path):
+    """§7.E (E1.1) — the executable recipe captured at the verdict seam persists on
+    the leaf and derefs back, so E.1 can symbolically replay a matched composite."""
+    import json
+    s = _store(tmp_path)
+    recipe = json.dumps({"tool_id": "coding_sandbox",
+                         "args": {"code": "math.factorial(8)"}}, separators=(",", ":"))
+    ok = s.record_tool_use(
+        reasoning_id="tx_recipe", goal_class="combinatorics", action="tool",
+        oracle_id="coding_sandbox", verdict="true", reward=1.0, features=_feat(),
+        signature_text="order 8 routes", recipe_json=recipe)
+    assert ok is True
+    rec = s.get_record("tx_recipe")
+    assert rec is not None
+    assert rec["recipe_json"] == recipe
+    parsed = json.loads(rec["recipe_json"])
+    assert parsed["tool_id"] == "coding_sandbox"
+    assert parsed["args"]["code"] == "math.factorial(8)"
+
+
+def test_recipe_json_defaults_empty_when_not_captured(tmp_path):
+    """Backward-compat: a record written without a recipe (cold composite / the
+    LLM-fallback lane) has recipe_json='' — no silent None, no break."""
+    s = _store(tmp_path)
+    s.record_tool_use(
+        reasoning_id="tx_norecipe", goal_class="x", action="tool", oracle_id="o",
+        verdict="true", reward=1.0, features=_feat(), signature_text="x")
+    rec = s.get_record("tx_norecipe")
+    assert rec is not None and rec["recipe_json"] == ""
+
+
+def test_recipe_json_carries_onto_macro(tmp_path):
+    """§7.E (E1.1) — write_macro carries the modal leaf recipe so the composite
+    itself is replayable (not just its leaves)."""
+    import json
+    s = _store(tmp_path)
+    recipe = json.dumps({"tool_id": "coding_sandbox",
+                         "args": {"code": "math.factorial({n})"}}, separators=(",", ":"))
+    s.write_macro(
+        reasoning_id="macro_perm", goal_class="combinatorics", action="tool",
+        signature=_feat(), b_i=5, c=1.0, time_cost=1.0, use_count=5,
+        composed_from=["tx_leaf1"], recipe_json=recipe)
+    rec = s.get_record("macro_perm")
+    assert rec is not None and rec["recipe_json"] == recipe
+
+
 def test_no_embedder_still_persists_scalars(tmp_path):
     # no embedder → no FAISS signature, but the DuckDB record still lands (deref ok).
     conn = duckdb.connect(str(tmp_path / "synth2.duckdb"))

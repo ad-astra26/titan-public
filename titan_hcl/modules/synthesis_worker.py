@@ -3530,7 +3530,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                     oracle_id=str(payload.get("oracle_id", "") or ""),
                                     verdict=str(payload.get("verdict", "") or ""),
                                     reward=_reward, features=list(_decision_feats),
-                                    signature_text=str(payload.get("parent_goal", "") or ""))
+                                    signature_text=str(payload.get("parent_goal", "") or ""),
+                                    recipe_json=str(payload.get("recipe_json", "") or ""))  # §7.E E1.1
                         elif (_policy_action is not None
                               and str(payload.get("verdict", "")) == "false"):
                             # ── Fix 1 (§24.10) — CORRECTNESS-aware credit ──────────
@@ -3565,7 +3566,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                     oracle_id=str(payload.get("oracle_id", "") or ""),
                                     verdict="true", reward=1.0,
                                     features=list(_decision_feats),
-                                    signature_text=str(payload.get("parent_goal", "") or ""))
+                                    signature_text=str(payload.get("parent_goal", "") or ""),
+                                    recipe_json=str(payload.get("recipe_json", "") or ""))  # §7.E E1.1
                     except Exception as _sl_err:
                         logger.debug(
                             "[synthesis_worker] self-learn reward/record emit failed: %s",
