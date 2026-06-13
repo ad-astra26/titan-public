@@ -502,6 +502,17 @@ class RebirthBackup:
         ("data/titan_memory.duckdb", "titan_memory.duckdb"),      # ~34MB: all memory nodes
         ("data/memory_vectors.faiss", "memory_vectors.faiss"),    # ~4MB: FAISS semantic index
         ("data/memory_vectors.faiss.idmap.json", "memory_vectors.faiss.idmap.json"),  # ID map
+        # ── Synthesis spine + learning (Phase D — resurrection-completeness, added
+        # 2026-06-13). Without these a restored Titan comes back WITHOUT his sovereign
+        # wiki concepts (DK.1/2), macros/skills (D-strategy/EEL-B), research recipes
+        # (DK.5), and RL policy. The anchored TXs survive on the timechain chains, but
+        # the rebuildable indices + the sidecar deref-target are not chain-derivable
+        # cheaply, so they are snapshotted directly. See ARCHITECTURE_storage_topology.md.
+        ("data/synthesis.duckdb", "synthesis.duckdb"),            # skills, reasoning_records, engram axes, research_recipes
+        ("data/synthesis_spine.kuzu", "synthesis_spine.kuzu"),    # Engram concepts (wiki) + Reasoning macros + Production skills
+        ("data/reasoning_vectors.faiss", "reasoning_vectors.faiss"),  # macro signature embeddings (composite recall)
+        ("data/thought_sidecar.db", "thought_sidecar.db"),        # tx_hash→content deref bridge (concept evidence)
+        ("data/self_learning.duckdb", "self_learning.duckdb"),    # RL policy weights + reward/decision accounting
         ("data/experience_orchestrator.db", "experience_orchestrator.db"),  # ~336MB: learned action wisdom
         ("data/experience_memory.db", "experience_memory.db"),    # ~51MB: experience records
         ("data/episodic_memory.db", "episodic_memory.db"),        # ~99MB: episodic records
