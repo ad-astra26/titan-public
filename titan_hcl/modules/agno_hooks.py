@@ -2820,6 +2820,7 @@ def create_post_hook(plugin):
                 from titan_hcl.bus import make_msg as _mk2
                 from titan_hcl.synthesis.goal_class import goal_class as _gc_fn2
                 _feats_tr, _action_tr = _dec
+                _me_tr = getattr(plugin, "maker_engine", None)
                 _bus_tr.publish(_mk2(
                     _bus_mod2.TURN_REASONING_RECORD, "post_hook", "synthesis", {
                         "reasoning_id": _rid,
@@ -2829,6 +2830,9 @@ def create_post_hook(plugin):
                         "goal_class": _gc_fn2(user_prompt or ""),
                         "features": list(_feats_tr),
                         "user_id": user_id,
+                        # §7.1 — Maker attribution for the Maker-fact extractor (the app's
+                        # paired device is the Maker by default; non-Maker turns skip it).
+                        "is_maker": bool(_me_tr and _me_tr.is_maker(user_id)),
                     }))
         except Exception as _trr_err:
             logger.debug("[PostHook] §7.B turn record emit skipped: %s", _trr_err)

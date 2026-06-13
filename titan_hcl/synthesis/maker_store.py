@@ -41,7 +41,9 @@ logger = logging.getLogger(__name__)
 # Confidence is never absolute — INV-MIS-EPISTEMIC-HONESTY (nothing about the Maker is
 # 100% truth, not even maker-told).
 _CONF_CEIL: float = 0.98
-_PROVENANCE = ("maker-told", "observed", "inferred", "researched")
+# Provenance of a Maker fact (INV-MIS-EPISTEMIC-HONESTY). `birth-cert` = seeded from
+# Titan's identity/config at boot (wallet, X handle, pubkey); the rest are learned.
+_PROVENANCE = ("maker-told", "observed", "inferred", "researched", "birth-cert")
 
 
 def _slug(text: str) -> str:

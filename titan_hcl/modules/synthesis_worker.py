@@ -2607,6 +2607,22 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             except Exception as _mk_boot_err:  # noqa: BLE001
                 logger.debug("[synthesis_worker] Maker hub bootstrap soft-fail: %s",
                              _mk_boot_err)
+        # Seed birth-certificate facts (provenance="birth-cert") — the Maker's known
+        # identity from config (X handle, Telegram id, pubkey). High confidence but
+        # <1.0 (epistemic honesty). Idempotent: record_fact reinforces on re-boot.
+        try:
+            _mr = (config or {}).get("maker_relationship", {}) or {}
+            for _seed_cat, _seed_val in (
+                ("x_handle", str(_mr.get("maker_x_handle", "") or "")),
+                ("telegram_id", str(_mr.get("maker_telegram_id", "") or "")),
+                ("identity_pubkey", str((config or {}).get("maker_pubkey", "") or "")),
+            ):
+                if _seed_val:
+                    maker_store.record_fact(category=_seed_cat, value=_seed_val,
+                                            provenance="birth-cert", confidence=0.95)
+        except Exception as _seed_err:  # noqa: BLE001
+            logger.debug("[synthesis_worker] Maker birth-cert seed soft-fail: %s",
+                         _seed_err)
         logger.info("[synthesis_worker] §7.1 MakerStore ready (SELF→MAKER→MAKER_FACT)")
     except Exception as _ms_err:  # noqa: BLE001
         maker_store = None
@@ -2664,6 +2680,39 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                   interval_s),
             daemon=True, name=f"synthesis-turn-judge-{name}").start()
         logger.info("[synthesis_worker] §7.B TurnJudge daemon started (B.2)")
+
+    # §7.1 — the Maker-fact extractor daemon (sibling of the turn-judge): when the
+    # Maker is speaking (is_maker), a gated post-turn extraction learns durable facts
+    # about him → MakerStore. The TURN_REASONING_RECORD handler pushes is_maker turns
+    # into maker_fact_queue; the loop pre-filters cheaply, then makes ONE LLM call per
+    # survivor. OFF the recv loop (LLM is network I/O). Soft — never breaks chat.
+    maker_fact_queue = None
+    try:
+        _mf_provider = locals().get("provider")
+        if _mf_provider is not None and maker_store is not None:
+            import asyncio as _mf_asyncio
+
+            from titan_hcl.synthesis.maker_fact_extractor import (
+                maker_fact_loop as _maker_fact_loop)
+
+            def _maker_fact_llm(prompt, _p=_mf_provider):
+                return _mf_asyncio.run(_p.complete(
+                    prompt=prompt,
+                    system="You extract durable personal facts a person states about "
+                           "themselves. Output ONLY a JSON array.",
+                    temperature=0.1, max_tokens=300, timeout=30.0)) or ""
+
+            maker_fact_queue = _collections.deque(maxlen=256)
+            threading.Thread(
+                target=_maker_fact_loop,
+                args=(maker_fact_queue, maker_store, _maker_fact_llm, stop_event,
+                      interval_s),
+                daemon=True, name=f"synthesis-maker-fact-{name}").start()
+            logger.info("[synthesis_worker] §7.1 Maker-fact extractor daemon started")
+    except Exception as _mf_err:  # noqa: BLE001
+        maker_fact_queue = None
+        logger.warning("[synthesis_worker] Maker-fact extractor wiring failed "
+                       "(Maker-fact ingestion off; chat unaffected): %s", _mf_err)
 
     # DK.1 (§7.D-knowledge) — the sovereign LLM-Wiki research→declarative-concept
     # seed daemon. Drains RESEARCH_CONCEPT_SEED items (confirmed+anchored research
@@ -3672,6 +3721,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             "action": _act or "direct",
                             "goal_class": str(payload.get("goal_class", "") or ""),
                         })
+                    # §7.1 — if the MAKER is speaking, also queue the turn for the
+                    # Maker-fact extractor (gated + LLM off the recv loop).
+                    if (_rid and bool(payload.get("is_maker"))
+                            and maker_fact_queue is not None):
+                        maker_fact_queue.append(
+                            {"prompt": str(payload.get("prompt", "") or "")})
                 except Exception as _tr_err:
                     logger.debug("[synthesis_worker] turn record/judge-enqueue "
                                  "failed: %s", _tr_err)
