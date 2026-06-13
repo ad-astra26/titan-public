@@ -220,11 +220,18 @@ class ArweaveChainProvider(ChainProvider):
         for gw in _GATEWAYS:
             for _ in range(max(1, attempts)):
                 try:
+                    import asyncio
                     req = urllib.request.Request(f"{gw}/{tx_id}", method="HEAD")
-                    with urllib.request.urlopen(req, timeout=timeout) as resp:
-                        if 200 <= resp.status < 300:
-                            return "present"
-                        last = f"HTTP {resp.status}"
+                    # async-block fix (2026-06-13): the blocking HEAD must not run
+                    # on the event loop — run it in a worker thread. Behavior is
+                    # unchanged (HTTPError still propagates to the except below).
+                    def _head_status(r=req):
+                        with urllib.request.urlopen(r, timeout=timeout) as resp:
+                            return resp.status
+                    status = await asyncio.to_thread(_head_status)
+                    if 200 <= status < 300:
+                        return "present"
+                    last = f"HTTP {status}"
                 except urllib.error.HTTPError as e:
                     if e.code in (404, 410):
                         return "missing"  # definitive

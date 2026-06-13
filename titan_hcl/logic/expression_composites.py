@@ -148,10 +148,15 @@ class ExpressionComposite:
         for hormone, weight in self.hormone_weights.items():
             consumption[hormone] = weight * self.consumption_rate
 
-        logger.info("[EXPRESSION.%s] FIRED — urge=%.3f, threshold=%.3f, intensity=%.2f, "
-                    "consuming: %s",
-                    self.name, self._last_urge, self.threshold, intensity,
-                    {k: round(v, 3) for k, v in consumption.items()})
+        # DEBUG, not INFO: this is the real per-composite-fire spammer (high
+        # frequency). The 2026-06-09 fix downgraded the sibling at
+        # expression_worker.py but missed THIS one — the actual live emitter —
+        # leaving INFO spam on the fleet (caught by the 2026-06-13 T2 deploy test).
+        # (BUG-EXPRESSION-OUTER-INFO-LOG-VERBOSITY-20260530)
+        logger.debug("[EXPRESSION.%s] FIRED — urge=%.3f, threshold=%.3f, intensity=%.2f, "
+                     "consuming: %s",
+                     self.name, self._last_urge, self.threshold, intensity,
+                     {k: round(v, 3) for k, v in consumption.items()})
 
         return {
             "intensity": intensity,
