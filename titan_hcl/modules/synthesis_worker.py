@@ -3593,10 +3593,14 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                 solved_by=str(_ptx),
                                 durability=classify_volatility(_e2_prompt),
                                 created_epoch=0.0)
-                    except Exception as _e2_err:  # noqa: BLE001
-                        logger.debug(
-                            "[synthesis_worker] E.2 prompt-signature write skipped: %s",
-                            _e2_err)
+                    except Exception:  # noqa: BLE001
+                        # WARNING (not debug): this except guards a real write — a
+                        # silent debug here hid a _now_epoch NameError that killed
+                        # EVERY E.2 write (2026-06-13). A swallowed write-path error
+                        # must be visible. `exc_info` carries the full traceback.
+                        logger.warning(
+                            "[synthesis_worker] E.2 prompt-signature write FAILED "
+                            "(cache not populated this turn)", exc_info=True)
                 # ── RFP_synthesis_self_learning_meta_reasoning v1.1 / C1 ──
                 # If this verdict carries an OuterMetaPolicy decision (the
                 # policy-driven ToolBackstop path), emit the reward to the

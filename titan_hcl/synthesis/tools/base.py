@@ -63,6 +63,9 @@ def _build_recipe_json(tool_id: str, call: Any) -> str:
             payload = {"tool_id": tool_id, "args": args}
         return _json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     except Exception:  # noqa: BLE001 — recipe capture must never break the verdict
+        # …but it must NOT be invisible: a silent '' here loses the E.1 replay recipe.
+        logger.warning("[%s] §7.E recipe capture failed (E.1 replay degraded)",
+                       tool_id, exc_info=True)
         return ""
 
 

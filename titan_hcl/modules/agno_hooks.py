@@ -469,7 +469,7 @@ async def _e3_research_tool_fetch(plugin, prompt_text):
             return "[Source: %s]\n%s" % (source, content)
         return None
     except Exception as e:  # noqa: BLE001 — never break chat
-        logger.debug("[PreHook][E.3] direct source fetch skipped: %s", e)
+        logger.warning("[PreHook][E.3] direct source fetch error (fell through to full research)", exc_info=True)
         return None
 
 

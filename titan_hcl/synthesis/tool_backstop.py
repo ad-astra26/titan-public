@@ -163,7 +163,7 @@ def _e1_recipe_replay(plugin: Any, prompt: str, cfg: dict) -> str:
             return code
         return ""
     except Exception as e:  # noqa: BLE001 — replay must never break the backstop
-        logger.debug("[ToolBackstop][E.1] recipe replay skipped (soft): %s", e)
+        logger.warning("[ToolBackstop][E.1] recipe replay error (fell through to router)", exc_info=True)
         return ""
 
 
@@ -192,7 +192,7 @@ def _e2_literal_lookup(plugin: Any, prompt: str, cfg: dict) -> Optional[dict]:
             plugin._prompt_signature_reader = reader
         return reader.lookup(prompt, vec)
     except Exception as e:  # noqa: BLE001 — must never break the backstop
-        logger.debug("[ToolBackstop][E.2] literal lookup skipped (soft): %s", e)
+        logger.warning("[ToolBackstop][E.2] literal lookup error (fell through)", exc_info=True)
         return None
 
 

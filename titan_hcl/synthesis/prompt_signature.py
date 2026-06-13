@@ -94,7 +94,8 @@ class PromptSignatureStore:
         try:
             self.snapshot_export()
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning("[PromptSignatureStore] init snapshot_export failed",
+                           exc_info=True)
 
     # ── schema ──
     def _init_schema(self) -> None:
@@ -114,8 +115,11 @@ class PromptSignatureStore:
                 ")")
         try:
             self._writer.submit_sync(_create)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[PromptSignatureStore] schema init failed: %s", e)
+        except Exception:  # noqa: BLE001
+            # exc_info (not "%s", e): some exceptions stringify EMPTY — the bare "%s"
+            # warning printed nothing during the 2026-06-13 debug. Always emit the
+            # full traceback for a feature-disabling failure.
+            logger.warning("[PromptSignatureStore] schema init failed", exc_info=True)
 
     # ── faiss ──
     def _ensure_faiss(self) -> None:
@@ -208,8 +212,8 @@ class PromptSignatureStore:
                      str(literal_answer), str(solved_by or ""), str(durability or "durable"),
                      float(created_epoch or 0.0), int(emb_id), lineage,
                      float(self._clock())])
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[PromptSignatureStore] insert failed: %s", e)
+            except Exception:  # noqa: BLE001
+                logger.warning("[PromptSignatureStore] insert failed", exc_info=True)
                 return False
             if self._graph is not None and hasattr(
                     self._graph, "spine_create_prompt_signature"):
@@ -228,8 +232,8 @@ class PromptSignatureStore:
             if ok:
                 self.snapshot_export()
             return ok
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[PromptSignatureStore] write failed: %s", e)
+        except Exception:  # noqa: BLE001
+            logger.warning("[PromptSignatureStore] write failed", exc_info=True)
             return False
 
     # ── snapshot (lock-free read surface) ──
