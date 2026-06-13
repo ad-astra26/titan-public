@@ -621,11 +621,13 @@ class PostDispatchOrchestrator:
                         ctx, consumer=dq_consumer, descriptor=desc,
                         bus=self._bus_publish)
             advance = False
-            if result.status in ("verified", "posted"):
+            if result.status in ("verified", "posted", "unverified"):
+                # 'unverified' = soft-failed but the tweet likely landed; advance
+                # the delegate queue so it is NOT re-delegated (2026-06-13).
                 advance = True
                 logger.info(
-                    "[PostDispatch] DELEGATE %s posted: %s",
-                    dq_titan, getattr(result, "tweet_id", ""))
+                    "[PostDispatch] DELEGATE %s posted (%s): %s",
+                    dq_titan, result.status, getattr(result, "tweet_id", ""))
             elif pop_on_failure and result.status in (
                     "api_failed", "generation_failed", "quality_rejected"):
                 advance = True
@@ -1125,9 +1127,19 @@ class PostDispatchOrchestrator:
                 # post telemetry already feeds mind_worker via
                 # X_POST_PUBLISHED (chunk 9F).
                 self._emit_timechain_commit(result, full_config)
+            elif result is not None and result.status == "unverified":
+                # Soft-failed but the tweet likely landed (twitterapi.io couldn't
+                # parse its own response). NOT a failure — the row is S_UNVERIFIED
+                # and counts toward the daily latch + budget so it cannot re-fire
+                # duplicates. No tweet_id, so we skip the timechain commit. The
+                # min-interval (now unverified-aware) blocks any catalyst re-fire.
+                logger.info(
+                    "[PostDispatch] posted UNVERIFIED via gateway (likely landed,"
+                    " id unparseable): %s", getattr(result, "reason", ""))
             elif result is not None and result.status not in (
                     "disabled", "too_soon", "no_catalyst",
                     "hourly_limit", "daily_limit", "pending_exists",
+                    "must_post_hard_cap",
                     "consumer_blocked", "circuit_breaker"):
                 logger.warning(
                     "[PostDispatch] post failed: %s — %s",

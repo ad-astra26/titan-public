@@ -45,9 +45,16 @@ class SoulDiaryArchetype(ArchetypeBase):
                                 tzinfo=_dt.timezone.utc).timestamp()
         conn = self._conn()
         try:
+            # 'unverified' = soft-failed but the tweet very likely landed on the
+            # timeline (twitterapi.io couldn't parse its own response). It MUST
+            # close the daily latch, else this bypass_rate_limit must-post slot
+            # re-fires every opportunity and spams real duplicates (the
+            # 2026-06-13 hourly-runaway: soft-fails were marked 'failed', which
+            # this latch ignored).
             row = conn.execute(
                 "SELECT 1 FROM actions WHERE titan_id=? AND post_type=? "
-                "AND status IN ('posted','verified','pending','deleted') "
+                "AND status IN ('posted','verified','pending','deleted',"
+                "'unverified') "
                 "AND created_at >= ? LIMIT 1",
                 (titan_id, self.name, midnight),
             ).fetchone()

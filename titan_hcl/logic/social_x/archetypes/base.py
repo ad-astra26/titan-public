@@ -340,15 +340,16 @@ class ArchetypeBase:
         Enforces a minimum gap between two posts of the same archetype so a
         ≥2/day cap doesn't collapse into a back-to-back pair on the ~2h posting
         tick (Maker 2026-06-02). Counts only posts that actually reached — or
-        are reaching — the timeline (`posted`/`verified`/`pending`); a `failed`
-        attempt never appeared publicly, so it must not block the next try.
+        are reaching — the timeline (`posted`/`verified`/`pending`/`unverified`);
+        a `failed` attempt never appeared publicly, so it must not block the next
+        try. (`unverified` = soft-failed but the tweet likely landed, 2026-06-13.)
         """
         cutoff = (now if now is not None else time.time()) - spacing_seconds
         conn = self._conn()
         try:
             row = conn.execute(
                 "SELECT 1 FROM actions WHERE titan_id=? AND post_type=? "
-                "AND status IN ('posted','verified','pending') "
+                "AND status IN ('posted','verified','pending','unverified') "
                 "AND created_at >= ? LIMIT 1",
                 (titan_id, self.name, cutoff),
             ).fetchone()

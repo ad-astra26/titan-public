@@ -135,7 +135,10 @@ class ProofDayArchetype(ArchetypeBase):
         very next dispatch (it bypasses rate-limit + spacing) — observed 6
         re-fires on 2026-05-29. A delivered-then-deleted post still consumes
         the day's slot. 'failed' is deliberately EXCLUDED so a post that never
-        reached X can still retry within the same day.
+        reached X can still retry within the same day. 'unverified' IS counted
+        (2026-06-13): a soft-fail very likely landed on the timeline, so it
+        consumes the day's slot exactly like a posted proof — else this
+        bypass_rate_limit slot re-fires and spams duplicates.
         """
         n = now if now is not None else time.time()
         today = _dt.datetime.fromtimestamp(n, _dt.timezone.utc).date()
@@ -145,7 +148,8 @@ class ProofDayArchetype(ArchetypeBase):
         try:
             row = conn.execute(
                 "SELECT 1 FROM actions WHERE titan_id=? AND post_type=? "
-                "AND status IN ('posted','verified','pending','deleted') "
+                "AND status IN ('posted','verified','pending','deleted',"
+                "'unverified') "
                 "AND created_at >= ? LIMIT 1",
                 (titan_id, self.name, midnight),
             ).fetchone()
@@ -168,6 +172,8 @@ class ProofDayArchetype(ArchetypeBase):
         is not). 'deleted' counts as published (a deleted proof was still
         announced — don't re-announce the same one); 'failed' is excluded so a
         proof that never reached X can still post once a fresh anchor exists.
+        'unverified' IS counted (2026-06-13): a soft-fail likely landed, so the
+        anchor was already announced — don't re-announce it.
         """
         if not archive_hash:
             return False
@@ -177,7 +183,8 @@ class ProofDayArchetype(ArchetypeBase):
             # spaced metadata JSON) — unlike a LIKE pattern on the raw column.
             row = conn.execute(
                 "SELECT 1 FROM actions WHERE titan_id=? AND post_type=? "
-                "AND status IN ('posted','verified','pending','deleted') "
+                "AND status IN ('posted','verified','pending','deleted',"
+                "'unverified') "
                 "AND json_extract(metadata, '$.archive_hash') = ? LIMIT 1",
                 (titan_id, self.name, archive_hash),
             ).fetchone()

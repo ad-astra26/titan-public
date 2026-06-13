@@ -200,8 +200,28 @@ class SocialXGateway:
     S_PENDING = "pending"
     S_POSTED = "posted"
     S_VERIFIED = "verified"
+    # S_UNVERIFIED — twitterapi.io soft-failed with "could not extract tweet_id"
+    # (HTTP 200, status=error) AND the recency-guard verifier could not confirm
+    # the tweet on the timeline. The tweet very often DID land on X (twitterapi.io
+    # just couldn't parse its own response — see _call_x_api 422-vs-soft-fail
+    # note). We therefore treat it as a LANDED-BUT-UNVERIFIED post: it counts for
+    # every dedup / daily-latch / budget query exactly like a posted tweet, so a
+    # must-post archetype (soul_diary / proof_day) does NOT re-fire and spam real
+    # duplicates onto the timeline. It is NOT 'verified' (no real tweet_id), so
+    # tweet_id-dependent reads (engagement, per-user reply caps) still exclude it.
+    # (2026-06-13 — fixes the soul_diary hourly-runaway: the old code marked this
+    # case S_FAILED, which the latch ignored, so bypass_rate_limit re-fired it.)
+    S_UNVERIFIED = "unverified"
     S_FAILED = "failed"
     S_EXPIRED = "expired"
+
+    # Defense-in-depth runaway backstop: even a bypass_rate_limit must-post
+    # archetype may never exceed this many ATTEMPTS (ANY status, incl. failed/
+    # unverified) per (titan, post_type) per rolling 24h. A must-post slot is
+    # once/day, so this leaves ample headroom for legitimate transient retries
+    # while making an unbounded firehose structurally impossible. Config-
+    # overridable via [social_x] must_post_daily_hard_cap. (2026-06-13)
+    MUST_POST_DAILY_HARD_CAP = 3
 
     # Action type constants
     A_POST = "post"
@@ -705,7 +725,8 @@ class SocialXGateway:
 
     def _check_rate_limits(self, action_type: str, config: dict,
                           titan_id: str = "", *,
-                          bypass_caps: bool = False) -> ActionResult | None:
+                          bypass_caps: bool = False,
+                          post_type: str = "") -> ActionResult | None:
         """Check all rate limits for an action type.
 
         Checks both per-Titan hourly limits AND global daily limits.
@@ -716,16 +737,29 @@ class SocialXGateway:
         min-interval, so the once-per-day soul-diary always publishes even when
         the Titan is over its routine X budget (Maker 2026-06-11). MAX_PENDING is
         STILL enforced (never double-fire a post whose transport is in flight).
+
+        Runaway backstop (2026-06-13): even with ``bypass_caps=True`` a
+        ``MUST_POST_DAILY_HARD_CAP`` ceiling — counting ANY status incl.
+        ``failed``/``unverified`` — is enforced per (titan, ``post_type``). A
+        must-post slot is once/day, so this can never block a legitimate post,
+        but it makes an unbounded firehose structurally impossible if some
+        future bug ever re-opens a daily latch.
+
+        ``S_UNVERIFIED`` (soft-failed but the tweet likely landed) counts toward
+        every budget/interval window exactly like a posted tweet, so a soft-fail
+        never evades the budget the way a bare ``failed`` row did.
         """
         db = self._db()
         try:
             now = time.time()
             plural = self._PLURALS.get(action_type, f"{action_type}s")
-            statuses = (self.S_POSTED, self.S_VERIFIED, self.S_PENDING)
-            # For min_interval: ANY recent attempt should create cooldown
-            # (prevents burst retries when API fails)
-            statuses_for_interval = (self.S_POSTED, self.S_VERIFIED,
-                                     self.S_PENDING, self.S_FAILED)
+            # Posted/verified/pending/unverified all occupy a real post slot:
+            # an unverified soft-fail very likely landed on the timeline, so it
+            # must count for budgets exactly like a posted tweet (else a dead
+            # session's soft-fails evade the cap — the 2026-06-13 runaway).
+            statuses = (self.S_POSTED, self.S_VERIFIED, self.S_PENDING,
+                        self.S_UNVERIFIED)
+            _ph = ",".join("?" * len(statuses))  # dynamic IN(...) placeholders
 
             # 1. MAX_PENDING: any pending row for this action type?
             pending = db.execute(
@@ -736,10 +770,29 @@ class SocialXGateway:
                 return ActionResult(status="pending_exists",
                                     reason=f"{pending} pending {action_type}(s)")
 
+            # 1b. Runaway backstop — applies EVEN to must-post archetypes.
+            #     Counts EVERY status (incl. failed/unverified/expired) for this
+            #     (titan, post_type) in the rolling 24h. A must-post slot is
+            #     once/day so the cap can never block a real post, but it bounds
+            #     any future re-fire bug to a handful instead of a firehose.
+            if bypass_caps and post_type:
+                hard_cap = int(config.get("must_post_daily_hard_cap",
+                                          self.MUST_POST_DAILY_HARD_CAP))
+                attempts = db.execute(
+                    "SELECT COUNT(*) FROM actions WHERE action_type=? "
+                    "AND post_type=? AND titan_id=? AND created_at > ?",
+                    (action_type, post_type, titan_id, now - 86400)
+                ).fetchone()[0]
+                if attempts >= hard_cap:
+                    return ActionResult(
+                        status="must_post_hard_cap",
+                        reason=f"{post_type}: {attempts}/{hard_cap} attempts in "
+                               f"24h (runaway backstop) — refusing to re-fire")
+
             # Must-post archetypes bypass the budget caps + min-interval below —
-            # but only AFTER MAX_PENDING above, so a post mid-transport is never
-            # double-fired (the daily soul-diary is itself once/day via the
-            # archetype's already_posted_today gate).
+            # but only AFTER MAX_PENDING + the runaway backstop above, so a post
+            # mid-transport is never double-fired (the daily soul-diary is itself
+            # once/day via the archetype's already_posted_today gate).
             if bypass_caps:
                 return None
 
@@ -749,7 +802,7 @@ class SocialXGateway:
                 titan_max_hourly = titan_limits.get(f"max_{plural}_per_hour", 999)
                 titan_hourly = db.execute(
                     "SELECT COUNT(*) FROM actions WHERE action_type=? "
-                    "AND titan_id=? AND status IN (?,?,?) AND created_at > ?",
+                    f"AND titan_id=? AND status IN ({_ph}) AND created_at > ?",
                     (action_type, titan_id, *statuses, now - 3600)
                 ).fetchone()[0]
                 if titan_hourly >= titan_max_hourly:
@@ -763,7 +816,7 @@ class SocialXGateway:
             max_hourly = config.get(hour_key, 999)
             hourly = db.execute(
                 "SELECT COUNT(*) FROM actions WHERE action_type=? "
-                "AND status IN (?,?,?) AND created_at > ?",
+                f"AND status IN ({_ph}) AND created_at > ?",
                 (action_type, *statuses, now - 3600)
             ).fetchone()[0]
             if hourly >= max_hourly:
@@ -776,7 +829,7 @@ class SocialXGateway:
             max_daily = config.get(day_key, 999)
             daily = db.execute(
                 "SELECT COUNT(*) FROM actions WHERE action_type=? "
-                "AND status IN (?,?,?) AND created_at > ?",
+                f"AND status IN ({_ph}) AND created_at > ?",
                 (action_type, *statuses, now - 86400)
             ).fetchone()[0]
             if daily >= max_daily:
@@ -789,11 +842,14 @@ class SocialXGateway:
             interval_key = f"min_{action_type}_interval"
             min_interval = config.get(interval_key, 0)
             if min_interval > 0:
-                # Check successful posts globally (any Titan)
-                success_statuses = (self.S_POSTED, self.S_VERIFIED, self.S_PENDING)
+                # Check successful posts globally (any Titan); unverified landed
+                # too, so it gates the interval like a posted tweet.
+                success_statuses = (self.S_POSTED, self.S_VERIFIED,
+                                    self.S_PENDING, self.S_UNVERIFIED)
+                _sph = ",".join("?" * len(success_statuses))
                 last_success = db.execute(
                     "SELECT created_at FROM actions WHERE action_type=? "
-                    "AND status IN (?,?,?) ORDER BY created_at DESC LIMIT 1",
+                    f"AND status IN ({_sph}) ORDER BY created_at DESC LIMIT 1",
                     (action_type, *success_statuses)
                 ).fetchone()
                 if last_success:
@@ -828,10 +884,11 @@ class SocialXGateway:
                 titan_min_interval = titan_limits.get(interval_key, 0)
                 if titan_min_interval > 0:
                     titan_success_statuses = (self.S_POSTED, self.S_VERIFIED,
-                                              self.S_PENDING)
+                                              self.S_PENDING, self.S_UNVERIFIED)
+                    _tph = ",".join("?" * len(titan_success_statuses))
                     last_titan_success = db.execute(
                         "SELECT created_at FROM actions WHERE action_type=? "
-                        "AND titan_id=? AND status IN (?,?,?) "
+                        f"AND titan_id=? AND status IN ({_tph}) "
                         "ORDER BY created_at DESC LIMIT 1",
                         (action_type, titan_id, *titan_success_statuses)
                     ).fetchone()
@@ -912,6 +969,14 @@ class SocialXGateway:
                         "UPDATE actions SET status=?, verified_at=? "
                         "WHERE id=?",
                         (status, now, row_id))
+            elif status == self.S_UNVERIFIED:
+                # Landed-but-unverified: stamp posted_at (it occupies a post
+                # slot like a real tweet) and keep the soft-fail message for
+                # forensics. No tweet_id — we never parsed one.
+                db.execute(
+                    "UPDATE actions SET status=?, posted_at=?, error_message=? "
+                    "WHERE id=?",
+                    (status, now, error_message, row_id))
             elif status == self.S_FAILED:
                 db.execute(
                     "UPDATE actions SET status=?, error_message=? WHERE id=?",
@@ -3253,7 +3318,8 @@ class SocialXGateway:
         _cand = getattr(context, "archetype_candidate", None)
         limit_result = self._check_rate_limits(
             self.A_POST, config, titan_id=context.titan_id,
-            bypass_caps=bool(getattr(_cand, "bypass_rate_limit", False)))
+            bypass_caps=bool(getattr(_cand, "bypass_rate_limit", False)),
+            post_type=post_type)
         if limit_result:
             self._log_telemetry({
                 "event": "post_blocked", "reason": limit_result.status,
@@ -3584,14 +3650,21 @@ class SocialXGateway:
                 post_type=post_type, archetype_candidate=arc_cand,
                 status="posted")
         else:
-            # API returned error AND we couldn't find the tweet on X — real fail
-            self._update_status(row_id, self.S_FAILED, error_message=err_msg)
+            # soft_fail ("could not extract tweet_id") AND verify inconclusive.
+            # The tweet very likely DID land on X (twitterapi.io couldn't parse
+            # its own response), so we must NOT retry — a retry posts a real
+            # duplicate (the exact soul_diary hourly-runaway, 2026-06-13). Record
+            # S_UNVERIFIED: it counts for dedup / daily-latch / budget like a
+            # landed post (so a bypass_rate_limit must-post never re-fires), but
+            # is distinct from 'posted'/'verified' for tweet_id-dependent reads.
+            self._update_status(row_id, self.S_UNVERIFIED, error_message=err_msg)
             self._log_telemetry({
-                "event": "post_api_failed", "error": err_msg,
+                "event": "post_soft_fail_unverified", "error": err_msg,
                 "titan_id": context.titan_id, "action_id": row_id,
+                "post_type": post_type,
             })
-            return ActionResult(status="api_failed", reason=err_msg,
-                                action_id=row_id)
+            return ActionResult(status="unverified", reason=err_msg,
+                                text=final_text, action_id=row_id)
 
         tweet_id = found_id or api_tweet_id or "verified_no_id"
 
