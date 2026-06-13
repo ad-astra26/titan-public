@@ -245,6 +245,7 @@ class OuterCompositeReader:
         self._index = None
         self._macros: dict = {}        # embedding_id -> action_idx
         self._weights: dict = {}       # embedding_id -> match weight ∈ [0,1] (§24.12 Track 2)
+        self._meta: dict = {}          # §7.E embedding_id -> {goal_class, recipe_json, source, reasoning_id} (macro composites only)
         self._next_refresh = 0.0
 
     def _refresh(self, now: float) -> None:
@@ -259,6 +260,7 @@ class OuterCompositeReader:
             self._index = None
         macros: dict = {}
         weights: dict = {}
+        meta: dict = {}
         try:
             if os.path.exists(self._snapshot_path):
                 with open(self._snapshot_path) as f:
@@ -280,11 +282,23 @@ class OuterCompositeReader:
                     if eid >= 0 and act in OUTER_ACTIONS:
                         macros[eid] = OUTER_ACTIONS.index(act)
                         weights[eid] = 1.0
+                        # §7.E — the replay recipe (E.1) / research source (E.3) /
+                        # goal_class, so the agno fast path can deref a matched
+                        # composite lock-free (no DuckDB open).
+                        meta[eid] = {
+                            "goal_class": str(m.get("goal_class", "") or ""),
+                            "recipe_json": str(m.get("recipe_json", "") or ""),
+                            "source": str(m.get("source", "") or ""),
+                            "reasoning_id": str(m.get("reasoning_id", "") or ""),
+                            "action": act,
+                        }
         except Exception:
             macros = {}
             weights = {}
+            meta = {}
         self._macros = macros
         self._weights = weights
+        self._meta = meta
 
     def prior(self, prompt_vec, now: Optional[float] = None) -> tuple:
         """Return `(score, action_norm)` ∈ [0,1]² for the top matched macro
@@ -321,6 +335,42 @@ class OuterCompositeReader:
         except Exception:
             return (0.0, 0.0)
         return (0.0, 0.0)
+
+    def match(self, prompt_vec, now: Optional[float] = None) -> Optional[dict]:
+        """§7.E (E1/E3) — the top matched MACRO COMPOSITE with its replay metadata,
+        or None on any miss. Returns `{score, action, goal_class, recipe_json,
+        source, reasoning_id}`. Used by the agno fast path to actually EXECUTE a
+        matched composite (E.1 recipe replay / E.3 research-source direct call) —
+        `prior()` stays the policy-feature surface (unchanged). Macro composites
+        only (the `_meta` map); verified_priors have no recipe → not matchable here."""
+        if now is None:
+            now = time.time()
+        self._refresh(now)
+        if (self._index is None or not self._meta
+                or getattr(self._index, "ntotal", 0) == 0 or prompt_vec is None):
+            return None
+        try:
+            v = np.asarray(prompt_vec, dtype=np.float32).reshape(1, -1)
+            if v.shape[1] != self._index.d:
+                return None
+            k = min(10, int(self._index.ntotal))
+            dists, ids = self._index.search(v, k)
+            best_score, best_eid = -1.0, None
+            for i in range(k):
+                eid = int(ids[0][i])
+                if eid in self._meta:           # macro composites only
+                    cos = 1.0 - float(dists[0][i]) / 2.0
+                    score = _clip01(cos) * _clip01(self._weights.get(eid, 1.0))
+                    if score > best_score:
+                        best_score, best_eid = score, eid
+            if best_eid is not None:
+                m = self._meta[best_eid]
+                return {"score": _clip01(best_score), "action": m["action"],
+                        "goal_class": m["goal_class"], "recipe_json": m["recipe_json"],
+                        "source": m["source"], "reasoning_id": m["reasoning_id"]}
+        except Exception:
+            return None
+        return None
 
 
 def _clip01(v: float) -> float:

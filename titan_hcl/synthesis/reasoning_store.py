@@ -591,8 +591,8 @@ class ReasoningStore:
             # can NAME a matched composite (macro-of-macros provenance + reuse) and
             # the agno reader can deref it; `use_count` ranks library entries.
             macros = self._db.execute(
-                "SELECT embedding_id, action, goal_class, reasoning_id, use_count "
-                "FROM reasoning_records "
+                "SELECT embedding_id, action, goal_class, reasoning_id, use_count, "
+                "recipe_json, source FROM reasoning_records "  # §7.E E1 replay / E.3 source
                 "WHERE kind='macro_strategy' AND embedding_id >= 0").fetchall()
             # §24.12 Track 2 — the EMERGENT retrieval prior. The composite reader
             # should match a prompt not only against the rare hand-distilled
@@ -624,7 +624,9 @@ class ReasoningStore:
                 "macros": [
                     {"embedding_id": int(m[0]), "action": str(m[1] or ""),
                      "goal_class": str(m[2] or ""), "reasoning_id": str(m[3] or ""),
-                     "use_count": int(m[4] or 1)}
+                     "use_count": int(m[4] or 1),
+                     "recipe_json": str(m[5] or ""),   # §7.E E1 — replay recipe (lock-free)
+                     "source": str(m[6] or "")}        # §7.E E3 — research direct-call source
                     for m in macros],
                 "verified_priors": [
                     {"embedding_id": int(v[0]), "action": str(v[1] or ""),

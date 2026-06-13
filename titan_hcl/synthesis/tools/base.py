@@ -39,6 +39,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _build_recipe_json(tool_id: str, call: Any) -> str:
+    """§7.E (E1.1) — capture the verified tool-call as a replayable recipe.
+
+    For a code-bearing tool (coding_sandbox) the code is templatized NOW from the
+    numeric params known for this turn (`call.parent_goal`), so a later similar
+    prompt with DIFFERENT params reuses it (Option B). Stores either a templated
+    recipe `{tool_id, code_template, param_kinds, captured_params}` or, when the
+    code is not templatizable, the literal `{tool_id, args}` (replay-for-identical
+    only). Soft → '' (E.1 then uses the LLM fallback). Never raises."""
+    try:
+        args = dict(call.args or {})
+        code = args.get("code")
+        if isinstance(code, str) and code.strip():
+            from titan_hcl.synthesis.recipe_template import (
+                extract_numeric_params, templatize)
+            tmpl = templatize(code, extract_numeric_params(call.parent_goal or ""))
+            if tmpl is not None:
+                payload = {"tool_id": tool_id, **tmpl}
+            else:
+                payload = {"tool_id": tool_id, "args": args}  # literal (identical-only)
+        else:
+            payload = {"tool_id": tool_id, "args": args}
+        return _json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except Exception:  # noqa: BLE001 — recipe capture must never break the verdict
+        return ""
+
+
 class ToolPlugBase:
     """Base class for the four Phase-6 ToolPlugs.
 
@@ -180,11 +207,11 @@ class ToolPlugBase:
                         decision_action=call.decision_action,
                         # §7.E (E1.1) — the executable recipe so E.1 can replay a
                         # matched composite symbolically (deref → recipe → bind new
-                        # params → re-run). The literal call; param-templating is
-                        # derived at replay via entity extraction.
-                        recipe_json=_json.dumps(
-                            {"tool_id": self.tool_id, "args": dict(call.args or {})},
-                            ensure_ascii=False, separators=(",", ":")),
+                        # numeric params → re-run + oracle re-verify). Templatized
+                        # NOW from the params known for this turn (Option B, precise
+                        # by construction); '' if not templatizable (→ E.1 LLM-
+                        # fallback). Soft — never breaks the verdict path.
+                        recipe_json=_build_recipe_json(self.tool_id, call),
                     )
             except Exception:
                 logger.exception(

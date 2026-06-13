@@ -110,6 +110,53 @@ def _get_router(plugin: Any, cfg: dict) -> Optional[ToolRouter]:
         return None
 
 
+def _e1_recipe_replay(plugin: Any, prompt: str, cfg: dict) -> str:
+    """§7.E (E.1) — symbolic recipe replay BEFORE the LLM router.
+
+    If a high-confidence compute composite matched THIS prompt (stashed by the agno
+    decide via `OuterCompositeReader.match`) and carries a templatized recipe, bind
+    this prompt's numeric params and return runnable code → the router is skipped
+    (zero LLM derivation; the cheap reuse). Any miss / below-floor / non-numeric /
+    ambiguity ⇒ '' ⇒ the caller falls through to the router (the LLM fallback). The
+    oracle re-verify (the synchronous verdict at invoke) is the final safety net.
+
+    SAFE: substitutes ONLY sanitized numeric literals (recipe_template.bind); a
+    literal (non-templatized) recipe is NOT replayed without captured params (→
+    fallback) — we never run a recipe whose params we cannot verify match."""
+    try:
+        ecfg = (cfg.get("e_compose", {}) or {})
+        if not ecfg.get("enabled", True):
+            return ""
+        floor = float(ecfg.get("floor", 0.85))
+        match = getattr(plugin, "_last_composite_match", None)
+        if not match or float(match.get("score", 0.0) or 0.0) < floor:
+            return ""
+        if str(match.get("action", "")) not in ("tool", "skill_delegate"):
+            return ""  # compute lane only; E.3 (research) is a separate path
+        recipe_raw = str(match.get("recipe_json", "") or "")
+        if not recipe_raw:
+            return ""
+        import json
+        recipe = json.loads(recipe_raw)
+        if str(recipe.get("tool_id", "")) != "coding_sandbox":
+            return ""
+        if "code_template" not in recipe:
+            return ""  # literal recipe → no verifiable param match → LLM fallback
+        from titan_hcl.synthesis.recipe_template import (
+            bind, extract_numeric_params)
+        code = bind(recipe, extract_numeric_params(prompt or ""))
+        if code:
+            logger.info(
+                "[ToolBackstop][E.1] composite recipe replay (templated, score=%.3f) "
+                "for goal_class=%s — LLM router skipped",
+                float(match.get("score", 0.0) or 0.0), match.get("goal_class", ""))
+            return code
+        return ""
+    except Exception as e:  # noqa: BLE001 — replay must never break the backstop
+        logger.debug("[ToolBackstop][E.1] recipe replay skipped (soft): %s", e)
+        return ""
+
+
 def _invoke_sandbox(plug: Any, code: str, parent_goal: Optional[str] = None,
                     decision=None):
     """Run the coding_sandbox ToolPlug synchronously (called via to_thread).
@@ -182,11 +229,16 @@ async def run_tool_backstop(
     elif not intent.requires_tool and not _policy_wants_tool:
         return BackstopResult(fired=False, reason="no_intent")
 
+    # §7.E (E.1) — symbolic recipe REPLAY first (pre-phase only): a matched compute
+    #    composite's templatized recipe, bound to this prompt's params, skips the LLM
+    #    router entirely (the cheap reuse). '' ⇒ fall through to the router below.
+    code = _e1_recipe_replay(plugin, prompt, cfg) if phase == "pre" else ""
+
     # 2) fast-model router — reliable code on gated turns. The router also
     #    double-confirms need (suppresses a regex false-positive). Fall back to
     #    regex / response extraction when the router is unavailable or empty.
-    code = ""
-    router = _get_router(plugin, cfg)
+    #    SKIPPED when E.1 already produced code (the reuse win).
+    router = _get_router(plugin, cfg) if not code else None
     if router is not None:
         try:
             decision = await router.route(prompt or response)

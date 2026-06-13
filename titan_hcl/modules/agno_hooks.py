@@ -292,6 +292,13 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text, prompt_vec
                     _os.path.join(_ddir, "reasoning_snapshot.json"))
                 plugin._outer_composite_reader = creader
             _cm_score, _cm_action = creader.prior(prompt_vec)
+            # §7.E (E1/E3) — stash the matched composite (with its replay recipe /
+            # research source) so the tool-backstop fast path can EXECUTE it. Additive;
+            # the policy features above (prior) are unchanged.
+            try:
+                plugin._last_composite_match = creader.match(prompt_vec)
+            except Exception:
+                plugin._last_composite_match = None
         except Exception:
             _cm_score, _cm_action = 0.0, 0.0
     feats = OuterFeatures(
@@ -1430,6 +1437,7 @@ def create_pre_hook(plugin):
         # on a live user turn (no experiments on the user — INV-OML-9).
         plugin._last_outer_decision = None
         plugin._last_reasoning_id = None  # RFP §7.B (B.1) — set for non-verifiable turns
+        plugin._last_composite_match = None  # §7.E — the matched composite (E.1 replay / E.3 source)
         if _router_active and _self_learning_enabled(plugin):
             try:
                 _readout_for_policy = locals().get("_readout")
