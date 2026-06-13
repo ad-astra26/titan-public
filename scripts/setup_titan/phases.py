@@ -320,7 +320,8 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
                directives_file: str | None = None,
                inference_provider: str | None = None,
                inference_key: str | None = None,
-               simulate: bool = False) -> int:
+               simulate: bool = False,
+               best_effort: bool = False) -> int:
     """Walk the install phases (Phase 1 already ran in preflight). Returns exit code.
 
     ``prompter`` injects the input source: the default :class:`StdinPrompter`
@@ -352,7 +353,7 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
                                          titan_id=state.get("titan_id"), rpc_url=rpc_url,
                                          das_rpc_url=das_rpc_url,
                                          verify_only=verify_only, config_src=config_src,
-                                         titan_pubkey=titan_pubkey)),
+                                         titan_pubkey=titan_pubkey, best_effort=best_effort)),
             (PhaseDef("phase_7", "Systemd install + first start + health", "W1.e", None),
              lambda: run_systemd_phase(state, install_root, mode, default=default, prompter=prompter)),
             (PhaseDef("phase_console", "TC² Console Agent (owner UI)", "W8", None),

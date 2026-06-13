@@ -35,7 +35,8 @@ def run_resurrect_phase(install_root: Path, *, venv_python: Path,
                         das_rpc_url: str | None = None,
                         verify_only: bool = False, config_src: str | None = None,
                         shard1: str | None = None,
-                        titan_pubkey: str | None = None) -> list[Result]:
+                        titan_pubkey: str | None = None,
+                        best_effort: bool = False) -> list[Result]:
     """Recover a mainnet Titan from its on-chain sovereign backup chain.
 
     Inputs are sovereign-minimal (INV-MBR-0): the Maker's offline Shard-1 (secret,
@@ -118,6 +119,12 @@ def run_resurrect_phase(install_root: Path, *, venv_python: Path,
            "--shard1-stdin", "--commit", "--install-root", str(install_root)]
     if verify_only:
         cmd.append("--verify-only")
+    if best_effort:
+        # Recover the MAXIMUM state from a partially-broken chain (unreplayable
+        # per-file diff → logged + skipped, file keeps last-good) instead of a
+        # strict halt. Status becomes resurrected_partial. Needed for a chain
+        # with stale per-file hashes (e.g. a pre-clean-baseline divergence).
+        cmd.append("--best-effort")
     if rpc_url:
         cmd += ["--rpc-url", rpc_url]
     if das_rpc_url:

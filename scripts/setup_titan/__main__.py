@@ -94,6 +94,7 @@ def _cmd_resurrect(args: argparse.Namespace, repo_root: Path) -> int:
                       resurrect=True, rpc_url=args.rpc_url, das_rpc_url=args.das_rpc_url,
                       verify_only=args.verify_only,
                       config_src=args.config, titan_pubkey=args.titan_pubkey,
+                      best_effort=getattr(args, "best_effort", False),
                       toolchain_pins=toolchain.resolve_versions(args))
 
 
@@ -305,6 +306,12 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--verify-only", action="store_true",
                     help="With --resurrect: boot in RECOVERY observation mode (no "
                          "on-chain writes / backups / X) — the live restore-test guard.")
+    pi.add_argument("--best-effort", action="store_true",
+                    help="With --resurrect: recover the MAXIMUM restorable state from a "
+                         "partially-broken chain (an unreplayable per-file diff is logged "
+                         "+ skipped — file keeps last-good bytes — instead of a strict "
+                         "halt). Status becomes resurrected_partial. Use when a strict "
+                         "restore halts on chain damage (e.g. stale per-file hashes).")
     pi.add_argument("--rpc-url", default=None,
                     help="With --resurrect: Solana RPC for the chain walk "
                          "(default: public mainnet-beta). Prompted if omitted.")

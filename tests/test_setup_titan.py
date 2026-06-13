@@ -667,6 +667,30 @@ def test_resurrect_builds_cmd_and_pipes_shard_off_argv(tmp_path, monkeypatch):
     assert "deadbeef" not in " ".join(cmd)            # shard NEVER on the command line
 
 
+def test_resurrect_strict_by_default(tmp_path, monkeypatch):
+    venv_python = _fake_resurrect_tree(tmp_path)
+    cap = {}
+    monkeypatch.setattr("setup_titan.resurrect.subprocess.run",
+                        lambda cmd, input=None, text=None, cwd=None: cap.update(cmd=cmd) or _Proc())
+    run_resurrect_phase(tmp_path, venv_python=venv_python, titan_id="T1",
+                        shard1="deadbeef", titan_pubkey="J1cdk4f1")
+    assert "--best-effort" not in cap["cmd"]           # strict unless asked
+
+
+def test_resurrect_best_effort_threads_to_engine(tmp_path, monkeypatch):
+    # --best-effort recovers the max state from a chain with stale per-file hashes
+    # (e.g. a pre-clean-baseline divergence) instead of a strict halt.
+    venv_python = _fake_resurrect_tree(tmp_path)
+    cap = {}
+    monkeypatch.setattr("setup_titan.resurrect.subprocess.run",
+                        lambda cmd, input=None, text=None, cwd=None: cap.update(cmd=cmd) or _Proc())
+    res = run_resurrect_phase(tmp_path, venv_python=venv_python, titan_id="T1",
+                              verify_only=True, best_effort=True, shard1="deadbeef",
+                              titan_pubkey="J1cdk4f1")
+    assert all(r.severity != "fail" for r in res)
+    assert "--best-effort" in cap["cmd"]
+
+
 def test_resurrect_prompted_rpc_threads_to_both_chain_and_das(tmp_path, monkeypatch):
     """#32 — when no --rpc-url is passed, the phase PROMPTS; one supplied endpoint
     drives BOTH the chain walk (--rpc-url) and GenesisNFT identity discovery
