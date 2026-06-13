@@ -161,6 +161,43 @@ def test_recipe_json_carries_onto_macro(tmp_path):
     assert rec is not None and rec["recipe_json"] == recipe
 
 
+def test_modal_leaf_recipe_propagates_to_macro(tmp_path):
+    """§7.E (E1.1) — the macro-recipe propagation fix (gap caught live 2026-06-13):
+    a composite distilled from leaves that carry templatized recipes gets the modal
+    (shared) template → E.1 can replay it. Without this, macros had recipe_json='' →
+    E.1 could never fire."""
+    import json
+    s = _store(tmp_path)
+    tmpl = json.dumps({"tool_id": "coding_sandbox",
+                       "code_template": "math.factorial({p0})",
+                       "param_kinds": ["number"], "captured_params": ["8"]},
+                      separators=(",", ":"))
+    # three combinatorics wins, same template (different captured params)
+    for i, rid in enumerate(["lf1", "lf2", "lf3"]):
+        s.record_tool_use(reasoning_id=rid, goal_class="combinatorics", action="tool",
+                          oracle_id="coding_sandbox", verdict="true", reward=1.0,
+                          features=_feat(), signature_text=f"order {8+i} routes",
+                          recipe_json=tmpl)
+    # one stray leaf with no recipe (must not win the modal)
+    s.record_tool_use(reasoning_id="lf4", goal_class="combinatorics", action="tool",
+                      oracle_id="o", verdict="true", reward=1.0, features=_feat(),
+                      signature_text="x")
+    modal = s.modal_leaf_recipe(["lf1", "lf2", "lf3", "lf4"])
+    assert modal == tmpl                      # the shared template is the modal
+    s.write_macro(reasoning_id="macro_comb", goal_class="combinatorics", action="tool",
+                  signature=_feat(), b_i=3, c=1.0, time_cost=1.0, use_count=3,
+                  composed_from=["lf1", "lf2", "lf3"], recipe_json=modal)
+    assert s.get_record("macro_comb")["recipe_json"] == tmpl   # E.1 can now replay it
+
+
+def test_modal_leaf_recipe_empty_when_no_leaf_recipe(tmp_path):
+    s = _store(tmp_path)
+    s.record_tool_use(reasoning_id="nr1", goal_class="g", action="tool", oracle_id="o",
+                      verdict="true", reward=1.0, features=_feat(), signature_text="x")
+    assert s.modal_leaf_recipe(["nr1"]) == ""   # no recipe → '' → E.1 LLM fallback
+    assert s.modal_leaf_recipe([]) == ""
+
+
 def test_no_embedder_still_persists_scalars(tmp_path):
     # no embedder → no FAISS signature, but the DuckDB record still lands (deref ok).
     conn = duckdb.connect(str(tmp_path / "synth2.duckdb"))

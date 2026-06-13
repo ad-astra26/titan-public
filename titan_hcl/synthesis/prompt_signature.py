@@ -87,6 +87,14 @@ class PromptSignatureStore:
         self.written = 0
         self._clock = time.time
         self._init_schema()
+        # §7.E — write the (initially empty) snapshot at construction so its mere
+        # EXISTENCE after boot proves the store wired (constructor reached the end →
+        # prompt_signature_store ≠ None). A clean observability signal on a fleet
+        # whose module logs are not readily reachable.
+        try:
+            self.snapshot_export()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── schema ──
     def _init_schema(self) -> None:

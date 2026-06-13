@@ -3698,6 +3698,16 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     except Exception as _anchor_err:  # noqa: BLE001
                         logger.debug("[synthesis_worker] composite anchor soft-fail: %s",
                                      _anchor_err)
+                    # §7.E (E1.1) — carry the modal leaf recipe onto the composite so
+                    # E.1 can symbolically REPLAY it on the hot path (else the macro
+                    # has recipe_json='' → E.1 can NEVER fire — the gap caught live
+                    # fleet-wide 2026-06-13). '' for non-templatizable/cold goal_classes
+                    # (→ E.1's LLM fallback for that composite).
+                    _macro_recipe = ""
+                    try:
+                        _macro_recipe = reasoning_store.modal_leaf_recipe(composed_from)
+                    except Exception:  # noqa: BLE001
+                        _macro_recipe = ""
                     reasoning_store.write_macro(
                         reasoning_id=_rid,
                         goal_class=_gc,
@@ -3709,10 +3719,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         use_count=_ucount,
                         anchor_tx=_anchor_tx,
                         composed_from=composed_from,
+                        recipe_json=_macro_recipe,
                     )
                     logger.info("[synthesis_worker] v1.1 macro-strategy stored under Self: "
-                                "%s (anchored=%s, composed_from=%d)",
-                                _rid, bool(_anchor_tx), len(composed_from))
+                                "%s (anchored=%s, composed_from=%d, recipe=%s)",
+                                _rid, bool(_anchor_tx), len(composed_from),
+                                bool(_macro_recipe))
                 except Exception as _macro_err:  # noqa: BLE001
                     logger.debug("[synthesis_worker] macro store failed: %s", _macro_err)
                 continue

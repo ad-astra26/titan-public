@@ -479,6 +479,27 @@ class ReasoningStore:
             logger.debug("[ReasoningStore] leaf_reasoning_ids failed: %s", e)
             return []
 
+    def modal_leaf_recipe(self, reasoning_ids: list) -> str:
+        """§7.E (E1.1) — the most-common non-empty `recipe_json` among the given
+        leaf `tool_use` records, so a distilled composite carries a REPLAYABLE
+        recipe (E.1 symbolic replay). Recipes are templatized at capture, so the
+        leaves of one `goal_class` share the SAME template → the modal IS that
+        template. '' when no leaf has a recipe (→ the composite uses E.1's LLM
+        fallback). Soft-fail → ''."""
+        ids = [str(r) for r in (reasoning_ids or []) if r]
+        if not ids:
+            return ""
+        try:
+            ph = ",".join("?" * len(ids))
+            row = self._db.execute(
+                "SELECT recipe_json, COUNT(*) AS c FROM reasoning_records "
+                f"WHERE reasoning_id IN ({ph}) AND recipe_json <> '' "
+                "GROUP BY recipe_json ORDER BY c DESC LIMIT 1", ids).fetchone()
+            return str(row[0]) if row and row[0] else ""
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[ReasoningStore] modal_leaf_recipe failed: %s", e)
+            return ""
+
     # ── READ / SC-search (DEREF) ─────────────────────────────────────────
     def faiss_search(self, query_vec: Any, top_k: int = 10) -> list[tuple[int, float]]:
         try:
