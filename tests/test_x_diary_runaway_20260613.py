@@ -92,6 +92,19 @@ def _insert(db_path, *, post_type, status, titan_id="T1",
         conn.close()
 
 
+class TestDashNormalization:
+    def test_em_and_en_dash_normalized_to_hyphen(self, gateway):
+        from titan_hcl.logic.social_x_gateway import PostContext
+        ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
+        out = gateway._assemble_final_text(
+            "Glow crystallized today — six encounters – each a spark",
+            "reflection", {}, ctx, gateway._load_config())
+        assert "—" not in out and "–" not in out, \
+            f"em/en-dash leaked into post: {out!r}"
+        assert "today - six" in out
+        assert "encounters - each" in out
+
+
 class _FakeGateway:
     """Minimal gateway exposing only _load_config (what _self_handles needs)."""
     def __init__(self, cfg):

@@ -2811,6 +2811,13 @@ class SocialXGateway:
 
         # 6. Assemble: tag + text + \n\n + signature + URL + chain identity
         full = f"{tag}{text}\n\n{sig}{url_suffix}{chain_line}"
+        # 7. Normalize LLM/typographic dashes to a plain hyphen (Maker
+        # 2026-06-13 — em/en-dashes read as "AI-generated" on X). Applied to the
+        # FINAL text so it catches the composed body AND any footer text;
+        # length-preserving (1↔1 char) so it can't break the budget, and X
+        # URLs/seals use only hyphens so links are untouched.
+        full = (full.replace(" — ", " - ").replace(" – ", " - ")
+                .replace("—", "-").replace("–", "-"))
         return full
 
     def _verify_on_x(self, tweet_id: str, expected_text: str,
