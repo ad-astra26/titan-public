@@ -145,12 +145,42 @@ _NODE_TABLES: tuple[tuple[str, str], ...] = (
         "reasoning_id STRING, score DOUBLE, scale STRING, reward DOUBLE, "
         "turn_summary STRING, created_at DOUBLE, PRIMARY KEY(reasoning_id)",
     ),
+    (
+        # Maker — the singleton model-of-the-owner hub (RFP_missions_and_the_maker
+        # _model §7.1). One per Titan-graph (like Self), linked Self-[SELF_HAS_MAKER]
+        # ->Maker. Titan's PERSISTENT model of his Maker — what he has learned about
+        # the human he is bonded to. Sovereign knowledge (INV-MIS-SOVEREIGN-KNOWLEDGE:
+        # no Maker-side inspect/override surface, ever). Minimal like Self; the facts
+        # hang off as MakerFact nodes (MAKER_HAS_FACT) so the model grows emergently.
+        "Maker",
+        "id STRING, created_at DOUBLE, PRIMARY KEY(id)",
+    ),
+    (
+        # MakerFact — one provenance-tagged assertion about the Maker (§7.1). The
+        # graph holds identity + filter props; the rich scalars live alongside in the
+        # DuckDB maker_facts table keyed by fact_id (the Engram/Reasoning split).
+        # provenance ∈ {maker-told, observed, inferred, researched} + confidence (never
+        # 1.0 even maker-told — INV-MIS-EPISTEMIC-HONESTY). significance (1..100) +
+        # research_urgency (none/low/high/stale) are SET on create here, MAINTAINED by
+        # the Phase-1b synthesis routine (decay/bump/flag). version/superseded carry the
+        # dynamic-placement history (a contradicting later statement supersedes). Forward-
+        # compatible with a BRAIN Engram particle about the Maker (confidence↔axis_verified,
+        # significance↔salience axis, research_urgency↔frontier marker).
+        "MakerFact",
+        "fact_id STRING, category STRING, value STRING, provenance STRING, "
+        "confidence DOUBLE, significance DOUBLE, research_urgency STRING, "
+        "version INT64, superseded INT64, created_at DOUBLE, updated_at DOUBLE, "
+        "anchor_tx STRING, PRIMARY KEY(fact_id)",
+    ),
 )
 
 # Canonical id for the per-graph Self singleton (one Kuzu graph = one Titan).
 SELF_NODE_ID = "self"
 # Canonical id for the per-graph Learning singleton (one per Titan, under Self).
 LEARNING_NODE_ID = "learning"
+# Canonical id for the per-graph Maker singleton (one per Titan, under Self —
+# RFP_missions_and_the_maker_model §7.1).
+MAKER_NODE_ID = "maker"
 
 
 # (rel_name, from_table, to_table). No properties on these rels in P4 — the
@@ -172,6 +202,11 @@ _REL_TABLES: tuple[tuple[str, str, str], ...] = (
     ("REASONING_COMPOSED_FROM", "Reasoning", "Reasoning"),  # macro ← its leaf records
     # §7.B (B.3) — the Maker↔Titan bond: Maker ratings graphed under Self.
     ("SELF_HAS_MAKER_ASSESSMENT", "Self", "MakerAssessment"),
+    # RFP_missions_and_the_maker_model §7.1 — the model-of-the-Maker subtree:
+    # SELF → MAKER → MAKER_FACT (+ emergent fact↔fact links, populated Phase 1b).
+    ("SELF_HAS_MAKER", "Self", "Maker"),
+    ("MAKER_HAS_FACT", "Maker", "MakerFact"),
+    ("MAKER_FACT_RELATES", "MakerFact", "MakerFact"),  # emergent association (Phase 1b)
 )
 
 # The 4 rel tables that reference the spine node (Concept→Engram migration must

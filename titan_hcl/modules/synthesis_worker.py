@@ -85,6 +85,7 @@ from titan_hcl.bus import (
     TOOL_CALL_VERDICT_RECORD,
     TURN_REASONING_RECORD,
     MAKER_ASSESSMENT_RECORD,
+    MAKER_FACT_RECORD,
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
@@ -2592,6 +2593,26 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         logger.warning("[synthesis_worker] ReasoningStore wiring failed (graphed records "
                        "off; reward loop unaffected): %s", _rs_err)
 
+    # MakerStore (RFP_missions_and_the_maker_model §7.1): Titan's persistent, sovereign
+    # model of his Maker — provenance-tagged facts under the Maker hub (Self →
+    # SELF_HAS_MAKER → Maker → MAKER_HAS_FACT → MakerFact), single-writer. Bootstrap
+    # ensures the Maker hub node exists. Soft: a wiring failure disables the model only.
+    maker_store = None
+    try:
+        from titan_hcl.synthesis.maker_store import MakerStore
+        maker_store = MakerStore(store._conn, graph=kuzu_graph_obj, writer=db_writer)
+        if kuzu_graph_obj is not None:
+            try:
+                db_writer.submit_sync(kuzu_graph_obj.spine_ensure_maker_node)
+            except Exception as _mk_boot_err:  # noqa: BLE001
+                logger.debug("[synthesis_worker] Maker hub bootstrap soft-fail: %s",
+                             _mk_boot_err)
+        logger.info("[synthesis_worker] §7.1 MakerStore ready (SELF→MAKER→MAKER_FACT)")
+    except Exception as _ms_err:  # noqa: BLE001
+        maker_store = None
+        logger.warning("[synthesis_worker] MakerStore wiring failed (Maker model off; "
+                       "chat unaffected): %s", _ms_err)
+
     # §7.E (E.2) — the self-verifying prompt→solution cache (sole-writer, synthesis-
     # side). Persists a verified (prompt → answer) so an identical durable re-ask is
     # served literally (zero LLM/oracle) by the agno PromptSignatureReader. Soft.
@@ -3674,6 +3695,27 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 except Exception as _ma_err:
                     logger.debug("[synthesis_worker] maker_assessment write failed: %s",
                                  _ma_err)
+                continue
+
+            if msg_type == MAKER_FACT_RECORD:
+                # §7.1: a fact ABOUT the Maker (from the gated post-turn extractor) →
+                # persist a provenance-tagged MakerFact under the Maker hub (DuckDB +
+                # Kuzu), via the single writer. Dynamic placement (reinforce vs version)
+                # is inside MakerStore.record_fact. Sovereign + epistemic-honest. Soft.
+                try:
+                    if maker_store is not None:
+                        _cat = str(payload.get("category", "") or "")
+                        _val = str(payload.get("value", "") or "")
+                        if _cat and _val:
+                            maker_store.record_fact(
+                                category=_cat, value=_val,
+                                provenance=str(payload.get("provenance", "maker-told")
+                                               or "maker-told"),
+                                confidence=float(payload.get("confidence", 0.7) or 0.7),
+                                source_turn=str(payload.get("source_turn", "") or ""))
+                except Exception as _mf_err:
+                    logger.debug("[synthesis_worker] maker_fact write failed: %s",
+                                 _mf_err)
                 continue
 
             if msg_type == SELF_LEARN_MACRO_READY:

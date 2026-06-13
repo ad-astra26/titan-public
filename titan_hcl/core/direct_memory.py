@@ -850,6 +850,98 @@ class TitanKnowledgeGraph:
         return self._spine_link_self(
             "SELF_HAS_MAKER_ASSESSMENT", "MakerAssessment", "reasoning_id", reasoning_id)
 
+    # ── MAKER node + FACTS (RFP_missions_and_the_maker_model §7.1) — Titan's
+    # persistent, sovereign model of his Maker. Mirrors the Self-hub pattern:
+    # Self -[SELF_HAS_MAKER]-> Maker -[MAKER_HAS_FACT]-> MakerFact. ────────────
+
+    def spine_ensure_maker_node(self) -> bool:
+        """MERGE-equivalent: ensure the singleton `Maker` hub exists AND is linked
+        under Self (SELF_HAS_MAKER). Idempotent (one Kuzu graph = one Titan = one
+        Maker). Returns True on success."""
+        from titan_hcl.synthesis.kuzu_spine_schema import MAKER_NODE_ID
+        try:
+            qr = self._conn.execute(
+                "MATCH (m:Maker {id: $id}) RETURN COUNT(m)", {"id": MAKER_NODE_ID})
+            if not (qr.has_next() and qr.get_next()[0] > 0):
+                self._conn.execute(
+                    "CREATE (m:Maker {id: $id, created_at: $ts})",
+                    {"id": MAKER_NODE_ID, "ts": time.time()})
+                logger.info("[KnowledgeGraph] created Maker hub node (id=%s)",
+                            MAKER_NODE_ID)
+            # Link under Self (idempotent; ensures the Self hub first).
+            self.spine_ensure_self_node()
+            self._spine_link_self("SELF_HAS_MAKER", "Maker", "id", MAKER_NODE_ID)
+            return True
+        except Exception as e:
+            logger.warning("[KnowledgeGraph] spine_ensure_maker_node failed: %s", e)
+            return False
+
+    def spine_create_maker_fact_node(
+        self, fact_id: str, category: str, value: str, provenance: str,
+        confidence: float, significance: float, research_urgency: str,
+        version: int, created_at: float, updated_at: float,
+    ) -> bool:
+        """INSERT one MakerFact node (§7.1). Idempotent — returns False if the row
+        already exists (safe on replay). Mirrors spine_create_maker_assessment_node."""
+        try:
+            self._conn.execute(
+                "CREATE (f:MakerFact {fact_id: $fid, category: $cat, value: $val, "
+                "provenance: $prov, confidence: $conf, significance: $sig, "
+                "research_urgency: $ru, version: $ver, superseded: $sup, "
+                "created_at: $cat_at, updated_at: $upd_at, anchor_tx: $tx})",
+                {"fid": fact_id, "cat": str(category or ""), "val": str(value or ""),
+                 "prov": str(provenance or ""), "conf": float(confidence),
+                 "sig": float(significance), "ru": str(research_urgency or "none"),
+                 "ver": int(version), "sup": 0, "cat_at": float(created_at),
+                 "upd_at": float(updated_at), "tx": ""})
+            return True
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if any(k in msg for k in ("primary key", "duplicate", "constraint", "violates")):
+                return False
+            logger.warning("[KnowledgeGraph] spine_create_maker_fact_node(%s) failed: %s",
+                           fact_id, e)
+            raise
+
+    def spine_link_maker_fact(self, fact_id: str) -> bool:
+        """Link a MakerFact under the Maker hub (MAKER_HAS_FACT). Idempotent;
+        ensures the Maker hub exists first."""
+        from titan_hcl.synthesis.kuzu_spine_schema import MAKER_NODE_ID
+        self.spine_ensure_maker_node()
+        try:
+            qr = self._conn.execute(
+                "MATCH (f:MakerFact {fact_id: $v}) RETURN COUNT(f)", {"v": fact_id})
+            if not (qr.has_next() and qr.get_next()[0] > 0):
+                return False  # fact node absent
+            qr = self._conn.execute(
+                "MATCH (m:Maker {id: $mid})-[r:MAKER_HAS_FACT]->"
+                "(f:MakerFact {fact_id: $v}) RETURN COUNT(r)",
+                {"mid": MAKER_NODE_ID, "v": fact_id})
+            if qr.has_next() and qr.get_next()[0] > 0:
+                return True  # already linked — idempotent
+            self._conn.execute(
+                "MATCH (m:Maker {id: $mid}), (f:MakerFact {fact_id: $v}) "
+                "CREATE (m)-[:MAKER_HAS_FACT]->(f)",
+                {"mid": MAKER_NODE_ID, "v": fact_id})
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[KnowledgeGraph] spine_link_maker_fact(%s) failed: %s",
+                           fact_id, e)
+            return False
+
+    def spine_supersede_maker_fact(self, old_fact_id: str) -> bool:
+        """Mark a MakerFact superseded (version bump — a contradicting later
+        statement replaced it). Soft; idempotent."""
+        try:
+            self._conn.execute(
+                "MATCH (f:MakerFact {fact_id: $v}) SET f.superseded = 1",
+                {"v": old_fact_id})
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[KnowledgeGraph] spine_supersede_maker_fact(%s) failed: %s",
+                           old_fact_id, e)
+            return False
+
     # ── LEARNING → REASONING subtree (RFP_synthesis_self_learning_meta_reasoning
     # v1.1 / INV-OML-11). SELF → LEARNING → REASONING: the graphed outer
     # chain-of-thought. Real scalars live in DuckDB reasoning_records + the FAISS

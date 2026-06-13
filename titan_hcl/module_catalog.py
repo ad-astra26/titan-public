@@ -1272,6 +1272,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.TURN_REASONING_RECORD,
             # §7.B (B.3) — a Maker rating → graph a MakerAssessment bond node under Self.
             _bus_constants.MAKER_ASSESSMENT_RECORD,
+            # §7.1 (RFP_missions_and_the_maker_model) — a fact ABOUT the Maker → graph a
+            # MakerFact under the Maker hub (Self → SELF_HAS_MAKER → Maker → MakerFact).
+            _bus_constants.MAKER_FACT_RECORD,
             # Operator-closure telemetry (2026-06-01): recall latency + chi from
             # agno/cognitive (their own evaluator/ring) → synthesis §18 metrics
             # so retrieval.samples + chi reflect the real cross-process loop.

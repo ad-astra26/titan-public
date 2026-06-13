@@ -320,6 +320,15 @@ TURN_REASONING_RECORD = "TURN_REASONING_RECORD"
 # (source: maker|user). Payload: {reasoning_id, score, scale, reward, turn_summary, ts}.
 MAKER_ASSESSMENT_RECORD = "MAKER_ASSESSMENT_RECORD"
 
+# RFP_missions_and_the_maker_model §7.1 — a fact ABOUT the Maker (what Titan has
+# learned about the human he is bonded to) → synthesis_worker, persisted as a
+# `MakerFact` under the `Maker` hub (Self -[SELF_HAS_MAKER]-> Maker -[MAKER_HAS_FACT]->
+# MakerFact). Distinct from MAKER_ASSESSMENT_RECORD (that's the Maker rating Titan; this
+# is Titan modelling the Maker). Sovereign knowledge (INV-MIS-SOVEREIGN-KNOWLEDGE) +
+# epistemic-honest (provenance + confidence<1.0). Produced by the gated post-Maker-turn
+# extractor. Payload: {category, value, provenance, confidence, source_turn, ts}.
+MAKER_FACT_RECORD = "MAKER_FACT_RECORD"
+
 # Phase 2 standing-contract event (PLAN_synthesis_engine_Phase2.md 2B,
 # D-P2-4): emitted by the post-seal contract hook in
 # timechain_v2.Mempool/BlockBuilder for every TX sealed that matches an
