@@ -3754,3 +3754,15 @@ ema_alpha = 0.15      # EMA learning rate for the per-signal success-rate baseli
 sigma_init = 0.25     # initial σ before min_samples (wide → low early surprise)
 eps = 0.001           # σ floor in the surprise denominator
 min_samples = 2       # no nudge until the baseline has folded in this many ticks
+# ── Phase B (RFP §7.B) — the emergent AffectiveNudgeNet ──────────────────────
+# A small per-Titan numpy MLP (12→16→1, ~300 params) learns each signal's MARGINAL
+# affective value by training on the observed emot-delta following each nudge
+# (Hybrid attribution: pre-nudge vs post-dream-cycle 8-D grounding-V drift). It
+# REPLACES the fixed surprise×k_surprise magnitude once trained (cold-start →
+# Phase-A formula until trained_steps≥1). NUMPY-ONLY, never torch (BRAIN-INV-3,
+# mirrors OuterMetaPolicy). Habituation emerges: a flattened observed drift trains
+# the predicted magnitude toward 0. Weights persist at affective_nudge_net.npz.
+net_enabled = true    # use the learned net once trained; false → stay on the Phase-A formula
+net_lr = 0.05         # numpy-SGD learning rate (the net's only learning gain)
+net_l2 = 0.0001       # gentle weight decay
+net_hidden = 16       # hidden width (12→16→1)

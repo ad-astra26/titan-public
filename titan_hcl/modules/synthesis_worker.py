@@ -709,7 +709,8 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                             interval_s: float, name: str,
                             send_queue: Any = None, shm_bank: Any = None,
                             affective_cfg: Any = None,
-                            affective_state_path: Optional[str] = None) -> None:
+                            affective_state_path: Optional[str] = None,
+                            affective_runtime: Any = None) -> None:
     """Daemon thread — drain the `skill_score_events` queue into `skill_cells`
     off the hot path (EEL Pillar B1). Its OWN cadence (like `_tx_index_loop`) so
     a drain never delays the recompute watermark publish. All writes route through
@@ -745,18 +746,22 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                     "promoted=%d (cpu_load=%.2f)",
                     summary.get("drained", 0), summary.get("cells_touched", 0),
                     summary.get("promoted", 0), load)
-                # Affective Grounding Loop §7.A — competence-delta nudge from the
-                # same drained pass (flag-gated OFF by default; never raises into
-                # the drain — a nudge failure must not affect skill formation).
-                if (affective_cfg is not None and getattr(affective_cfg, "enabled", False)
-                        and send_queue is not None and affective_state_path):
+                # Affective Grounding Loop §7.A/§7.B — competence-delta nudge from
+                # the same drained pass (flag-gated OFF by default; never raises
+                # into the drain — a nudge failure must not affect skill formation).
+                # Phase B: the AffectiveNudgeRuntime scores the magnitude via the
+                # learned net (cold-start → Phase-A formula) AND records the pre-
+                # nudge emot snapshot for dream-boundary attribution.
+                if (affective_runtime is not None
+                        and getattr(affective_runtime.cfg, "enabled", False)
+                        and send_queue is not None):
                     try:
                         from titan_hcl.logic.affective_nudge import (
-                            compute_skill_score_nudge, SKILL_SCORE_MODULATOR)
-                        nudge = compute_skill_score_nudge(
+                            SKILL_SCORE_MODULATOR)
+                        nudge = affective_runtime.observe_drain(
                             int(summary.get("successes", 0)),
                             int(summary.get("failures", 0)),
-                            affective_state_path, cfg=affective_cfg)
+                            time.time())
                         if nudge is not None and nudge.magnitude > 0.0:
                             dev_age = 0.0
                             if shm_bank is not None:
@@ -772,13 +777,15 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                                       "developmental_age": dev_age,
                                       "source": "affective_grounding",
                                   })
+                            _net_steps = getattr(
+                                affective_runtime.net, "trained_steps", 0)
                             logger.info(
                                 "[synthesis_worker] affective nudge — signal=skill_score "
                                 "valence=%+d surprise=%.3f mag=%.4f target=%.1f "
-                                "(rate=%.3f mu=%.3f n=%d dev=%.2f)",
+                                "src=%s (rate=%.3f mu=%.3f n=%d dev=%.2f)",
                                 nudge.valence, nudge.surprise, nudge.magnitude,
-                                nudge.target, nudge.rate, nudge.mu_before, nudge.n,
-                                dev_age)
+                                nudge.target, "net" if _net_steps >= 1 else "formula",
+                                nudge.rate, nudge.mu_before, nudge.n, dev_age)
                     except Exception as e:
                         logger.debug(
                             "[synthesis_worker] affective nudge tick failed: %s", e)
@@ -2515,32 +2522,54 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # daemon. Its OWN thread (like tx-index) so a drain never delays the recompute
     # watermark; the per-tick DEFAULT_DRAIN_LIMIT bound is the resource discipline
     # (INV-EEL-1 off-hot-path) — no cpu_load backoff (that starved it on busy boxes).
+    _affective_runtime = None   # hoisted: the dream sequence closure reads it (§7.B train)
     if procedural_skill_store is not None:
-        # Affective Grounding Loop §7.A — load the [affective] config once + derive
-        # the per-Titan EMA baseline path; passed into the drain loop so the same
-        # off-hot-path tick that forms skills can ALSO emit a competence-delta nudge
-        # (flag-gated OFF by default → no behaviour change until live-proven).
+        # Affective Grounding Loop §7.A/§7.B — load the [affective] config once,
+        # build the per-Titan EMA baseline + learned-net runtime; passed into the
+        # drain loop so the same off-hot-path tick that forms skills can ALSO emit
+        # a competence-delta nudge (flag-gated OFF by default → no behaviour change
+        # until live-proven). The dream sequence trains the net on the cycle's
+        # observed emot-delta (§7.B Hybrid attribution).
         try:
-            from titan_hcl.logic.affective_nudge import load_affective_config
+            from titan_hcl.logic.affective_nudge import (
+                load_affective_config, AffectiveNudgeRuntime)
+            from titan_hcl.logic.emot_shm_protocol import (
+                ShmEmotReader, _default_state_path, _default_grounding_path)
             _affective_cfg = load_affective_config()
+            _affective_dir = os.path.join(os.path.dirname(db_path), "affective")
+            _affective_state_path = os.path.join(
+                _affective_dir, "affective_nudge_state.json")
+            _affective_net_path = os.path.join(
+                _affective_dir, "affective_nudge_net.npz")
+            # Phase B (RFP §7.B): the emergent net + wake-cycle pending buffer,
+            # shared between THIS drain thread (forward + pre-snapshot) and the
+            # single synthesis-dream thread (train). emot readers are SHM-direct
+            # (G18) per-Titan; None-safe if emot_cgn_worker isn't up yet.
+            _emot_reader = ShmEmotReader(
+                state_path=_default_state_path(titan_id),
+                grounding_path=_default_grounding_path(titan_id))
+            _affective_runtime = AffectiveNudgeRuntime(
+                _affective_cfg, _affective_state_path, _affective_net_path,
+                emot_state_reader=_emot_reader.read_state,
+                emot_grounding_reader=_emot_reader.read_grounding)
         except Exception as _aff_e:
-            _affective_cfg = None
-            logger.debug("[synthesis_worker] affective config load failed: %s", _aff_e)
-        _affective_state_path = os.path.join(
-            os.path.dirname(db_path), "affective", "affective_nudge_state.json")
+            _affective_runtime = None
+            logger.debug("[synthesis_worker] affective runtime init failed: %s", _aff_e)
         _skill_drain_thread = threading.Thread(
             target=_skill_score_drain_loop,
             args=(procedural_skill_store, stop_event, interval_s, name),
             kwargs={"send_queue": send_queue, "shm_bank": _shm_bank,
-                    "affective_cfg": _affective_cfg,
-                    "affective_state_path": _affective_state_path},
+                    "affective_runtime": _affective_runtime},
             daemon=True, name=f"synthesis-skill-drain-{name}")
         _skill_drain_thread.start()
+        _aff_on = (_affective_runtime is not None
+                   and getattr(_affective_runtime.cfg, "enabled", False))
         logger.info(
             "[synthesis_worker] EEL B1 skill-score drain daemon started "
-            "(affective_nudge=%s)",
-            "on" if (_affective_cfg is not None
-                     and getattr(_affective_cfg, "enabled", False)) else "off")
+            "(affective_nudge=%s net_steps=%s)",
+            "on" if _aff_on else "off",
+            getattr(_affective_runtime.net, "trained_steps", 0)
+            if _affective_runtime is not None else "-")
 
     # RFP_synthesis_self_learning_meta_reasoning v1.1 (§1.2 C1 / INV-OML-11) — the
     # ReasoningStore: every per-use reasoning episode graphed under SELF → LEARNING
@@ -3144,6 +3173,30 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     logger.warning(
                         "[synthesis_worker] companion flush failed: %s", e,
                         exc_info=True)
+            # 1b) Affective Grounding Loop §7.B — train the AffectiveNudgeNet on
+            #     this wake-cycle's observed emot-delta (Hybrid attribution: each
+            #     pending nudge's pre-snapshot vs the post-cycle 8-D grounding V).
+            #     Runs INLINE in the single ordered synthesis-dream thread
+            #     (INV-Syn-28) — pure numpy (no torch), persists the .npz. Soft:
+            #     a failure never affects the rest of the dream sequence.
+            if (_affective_runtime is not None
+                    and getattr(_affective_runtime.cfg, "enabled", False)
+                    and getattr(_affective_runtime.cfg, "net_enabled", False)):
+                try:
+                    _aff_train = _affective_runtime.train_on_dream()
+                    if _aff_train.get("trained"):
+                        logger.info(
+                            "[synthesis_worker] affective net trained — "
+                            "samples=%d skipped=%d loss=%.5f steps=%d "
+                            "target_abs_mean=%.4f",
+                            _aff_train.get("trained", 0),
+                            _aff_train.get("skipped", 0),
+                            _aff_train.get("loss", 0.0),
+                            _aff_train.get("trained_steps", 0),
+                            _aff_train.get("target_abs_mean", 0.0))
+                except Exception as e:
+                    logger.debug(
+                        "[synthesis_worker] affective net train failed: %s", e)
             # 2) LLM judge — scores the tool-call window (INV-Syn-21: BEFORE miner).
             if llm_judge is not None:
                 try:

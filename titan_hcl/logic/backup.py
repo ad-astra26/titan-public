@@ -513,6 +513,12 @@ class RebirthBackup:
         ("data/reasoning_vectors.faiss", "reasoning_vectors.faiss"),  # macro signature embeddings (composite recall)
         ("data/thought_sidecar.db", "thought_sidecar.db"),        # tx_hash→content deref bridge (concept evidence)
         ("data/self_learning.duckdb", "self_learning.duckdb"),    # RL policy weights + reward/decision accounting
+        # Affective Grounding Loop (RFP_affective_grounding_loop §7.B, added
+        # 2026-06-13). The per-Titan EMA baseline + the learned AffectiveNudgeNet
+        # weights ARE the Titan's divergent emotional personality (INV-AFF-SELF-
+        # SOVEREIGN) — without these a restored Titan loses its habituation
+        # history + felt-value net (it would re-learn from scratch). Tiny (<1MB).
+        ("data/affective/", "affective"),                          # affective_nudge_state.json + affective_nudge_net.npz
         ("data/experience_orchestrator.db", "experience_orchestrator.db"),  # ~336MB: learned action wisdom
         ("data/experience_memory.db", "experience_memory.db"),    # ~51MB: experience records
         ("data/episodic_memory.db", "episodic_memory.db"),        # ~99MB: episodic records

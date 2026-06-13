@@ -163,8 +163,11 @@ def test_state_persists_across_calls(tmp_path):
 # ── G6: config defaults OFF + the modulator mapping is DA ─────────────────────
 
 def test_config_default_disabled():
-    c = load_affective_config()
-    assert c.enabled is False                              # spine OFF until proven
+    # The SAFETY invariant (RFP §5) is the in-CODE default — a fresh install must
+    # boot with the loop OFF. The live titan_params.toml is deliberately flipped
+    # ON for the fleet soak (2026-06-13); that's the intended runtime state, not a
+    # regression — so assert the dataclass default, not the live-file value.
+    assert AffectiveConfig().enabled is False              # fresh-install OFF until proven
 
 
 def test_skill_score_maps_to_DA():
@@ -210,3 +213,227 @@ def test_empty_drain_tally_zero(tmp_path):
     assert summary["drained"] == 0
     assert summary["successes"] == 0
     assert summary["failures"] == 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE B — the emergent AffectiveNudgeNet (RFP §7.B)
+# ═════════════════════════════════════════════════════════════════════════════
+import numpy as np
+
+from titan_hcl.logic.affective_nudge import (
+    AffectiveNudgeNet, AffectiveNudgeRuntime, FEATURE_DIM, build_features,
+    signed_delta_target,
+)
+
+CFGB = AffectiveConfig(enabled=True, k_surprise=0.04, max_mag=0.06,
+                       ema_alpha=0.15, sigma_init=0.25, eps=1e-3, min_samples=2,
+                       net_enabled=True, net_lr=0.05, net_l2=1e-4, net_hidden=16)
+
+
+def _emot(v_blended=0.3, dominant_idx=0):
+    return lambda: {"V_blended": v_blended, "dominant_idx": dominant_idx}
+
+
+def _grounding(vals):
+    return lambda: [{"V": float(x)} for x in vals]
+
+
+# ── the net: forward / numpy-SGD backprop / persistence ──────────────────────
+
+def test_net_forward_shape_scalar():
+    net = AffectiveNudgeNet(hidden=16, seed=0)
+    out = net.forward(np.zeros(FEATURE_DIM))
+    assert isinstance(out, float)
+    assert net.W1.shape == (16, FEATURE_DIM)
+    assert net.W2.shape == (1, 16)
+
+
+def test_net_untrained_then_trained_flag():
+    net = AffectiveNudgeNet(hidden=8, seed=1)
+    assert net.is_trained is False
+    net.train_step(np.ones((3, FEATURE_DIM)), np.zeros(3), lr=0.05)
+    assert net.is_trained is True
+    assert net.trained_steps == 1
+
+
+def test_net_sgd_reduces_mse_toward_target():
+    # The numpy backprop must actually learn: fit a fixed (X→y) batch and watch
+    # the loss fall monotonically-ish to near zero.
+    rng = np.random.default_rng(7)
+    X = rng.random((16, FEATURE_DIM))
+    w_true = rng.standard_normal(FEATURE_DIM) * 0.1
+    y = X @ w_true                                           # a learnable (linear) signal
+    net = AffectiveNudgeNet(hidden=16, seed=2)
+    first = net.train_step(X, y, lr=0.1)
+    for _ in range(1500):
+        last = net.train_step(X, y, lr=0.1)
+    assert last < first * 0.1                                # ≥10× loss reduction = genuine learning
+    assert last < 1e-3                                       # genuinely fit a learnable target
+
+
+def test_net_learns_constant_magnitude_target():
+    # Habituation basis: a flattened observed drift (target→small) trains the
+    # predicted magnitude DOWN; a large drift trains it UP. Train two nets on
+    # constant targets and confirm forward tracks the target.
+    rng = np.random.default_rng(3)
+    X = rng.random((8, FEATURE_DIM))
+    lo = AffectiveNudgeNet(hidden=16, seed=4)
+    hi = AffectiveNudgeNet(hidden=16, seed=4)
+    for _ in range(500):
+        lo.train_step(X, np.zeros(8), lr=0.05)
+        hi.train_step(X, np.full(8, 0.5), lr=0.05)
+    probe = X[0]
+    assert abs(lo.forward(probe)) < 0.05                    # learned ~0 (habituated)
+    assert hi.forward(probe) > 0.3                           # learned strong
+
+
+def test_net_npz_roundtrip(tmp_path):
+    net = AffectiveNudgeNet(hidden=12, seed=5)
+    net.train_step(np.ones((4, FEATURE_DIM)), np.full(4, 0.2), lr=0.05)
+    path = str(tmp_path / "affective" / "net.npz")
+    net.save_npz(path)
+    probe = np.linspace(0, 1, FEATURE_DIM)
+    loaded = AffectiveNudgeNet.load_npz(path, hidden=12)
+    assert loaded.trained_steps == net.trained_steps
+    assert loaded.forward(probe) == pytest.approx(net.forward(probe), abs=1e-9)
+    assert loaded.is_trained is True
+
+
+def test_net_load_missing_returns_fresh(tmp_path):
+    net = AffectiveNudgeNet.load_npz(str(tmp_path / "nope.npz"), hidden=10)
+    assert net.is_trained is False
+    assert net.hidden == 10
+
+
+# ── features + attribution target ────────────────────────────────────────────
+
+def test_build_features_layout():
+    n = Nudge(magnitude=0.05, target=1.0, surprise=10.0, valence=1,
+              rate=0.9, mu_before=0.5, n=4)
+    f = build_features(n, {"V_blended": 0.4, "dominant_idx": 2})
+    assert f.shape == (FEATURE_DIM,)
+    assert f[0] == pytest.approx(min(3.0, 10.0 / 5.0))      # surprise scaled
+    assert f[2] == pytest.approx(abs(0.9 - 0.5))            # |deviation|
+    assert f[3] == pytest.approx(0.4)                       # V_blended
+    assert f[4 + 2] == 1.0                                   # dominant one-hot @ idx 2
+    assert f[4:12].sum() == 1.0                              # exactly one dominant
+
+
+def test_build_features_missing_emot_safe():
+    n = Nudge(magnitude=0.05, target=0.0, surprise=2.0, valence=-1,
+              rate=0.1, mu_before=0.5, n=3)
+    f = build_features(n, None)                              # emot SHM unavailable
+    assert f.shape == (FEATURE_DIM,)
+    assert f[3] == 0.0
+    assert f[4:12].sum() == 0.0                              # no dominant claimed
+
+
+def test_signed_delta_target_sign_and_magnitude():
+    pre = np.array([0.1] * 8)
+    up = np.array([0.3] * 8)
+    down = np.array([0.0] * 8)
+    t_up = signed_delta_target(pre, up)
+    t_down = signed_delta_target(pre, down)
+    assert t_up > 0 and t_down < 0                          # honest direction
+    assert abs(t_up) == pytest.approx(np.linalg.norm(up - pre))
+    assert signed_delta_target(pre, None) is None           # missing → skip
+    assert signed_delta_target(None, up) is None
+    assert signed_delta_target(pre, pre) == 0.0             # no movement
+
+
+# ── the runtime: cold-start fallback → net takeover, pending attribution ──────
+
+def _runtime(tmp_path, name="r", emot_v=0.3, grounding=None):
+    d = tmp_path / name
+    gr = grounding if grounding is not None else _grounding([0.1] * 8)
+    return AffectiveNudgeRuntime(
+        CFGB,
+        str(d / "state.json"),
+        str(d / "net.npz"),
+        emot_state_reader=_emot(emot_v),
+        emot_grounding_reader=gr,
+    )
+
+
+def test_runtime_cold_start_uses_formula_magnitude(tmp_path):
+    # Untrained net → observe_drain must return the SAME magnitude the Phase-A
+    # formula would (cold-start fallback, no regression vs Phase A).
+    rt = _runtime(tmp_path, "rt")
+    direct = _path(tmp_path, "direct.json")
+    # warm both baselines identically (n past min_samples)
+    for _ in range(2):
+        rt.observe_drain(1, 1, ts=0.0)
+        compute_skill_score_nudge(1, 1, direct, cfg=CFGB)
+    assert rt.net.is_trained is False
+    got = rt.observe_drain(10, 0, ts=1.0)
+    exp = compute_skill_score_nudge(10, 0, direct, cfg=CFGB)
+    assert got is not None and exp is not None
+    assert got.magnitude == pytest.approx(exp.magnitude)    # formula, not net
+
+
+def test_runtime_records_pending_and_trains_on_dream(tmp_path):
+    rt = _runtime(tmp_path, "rt2", grounding=_grounding([0.1] * 8))
+    for _ in range(2):
+        rt.observe_drain(1, 1, ts=0.0)                       # warm baseline
+    rt.observe_drain(10, 0, ts=1.0)                          # a real nudge fires
+    assert len(rt._pending) >= 1
+    # move emot for the post-snapshot so there is an attributable drift
+    rt._emot_grounding_reader = _grounding([0.4] * 8)
+    summary = rt.train_on_dream()
+    assert summary["trained"] >= 1
+    assert rt.net.is_trained is True
+    assert rt._pending == []                                 # buffer cleared
+
+
+def test_runtime_net_takes_over_after_training(tmp_path):
+    rt = _runtime(tmp_path, "rt3", grounding=_grounding([0.1] * 8))
+    for _ in range(2):
+        rt.observe_drain(1, 1, ts=0.0)
+    rt.observe_drain(9, 1, ts=1.0)
+    rt._emot_grounding_reader = _grounding([0.35] * 8)
+    rt.train_on_dream()
+    assert rt.net.is_trained
+    # next nudge magnitude now comes from the net (still clamped gentle)
+    got = rt.observe_drain(10, 0, ts=2.0)
+    assert got is not None
+    assert 0.0 < got.magnitude <= CFGB.max_mag
+
+
+def test_runtime_train_no_pending_is_noop(tmp_path):
+    rt = _runtime(tmp_path, "rt4")
+    summary = rt.train_on_dream()
+    assert summary.get("trained", 0) == 0
+    assert rt.net.is_trained is False
+
+
+def test_runtime_train_skips_when_no_emot(tmp_path):
+    # No grounding reader → no pre/post snapshot → cannot attribute → skip (never
+    # fabricate a delta, INV-AFF-HONEST).
+    rt = AffectiveNudgeRuntime(
+        CFGB, str(tmp_path / "s.json"), str(tmp_path / "n.npz"),
+        emot_state_reader=_emot(0.3), emot_grounding_reader=lambda: None)
+    for _ in range(2):
+        rt.observe_drain(1, 1, ts=0.0)
+    rt.observe_drain(10, 0, ts=1.0)
+    summary = rt.train_on_dream()
+    assert summary["trained"] == 0
+    assert summary["skipped"] >= 1
+    assert rt.net.is_trained is False
+
+
+def test_runtime_per_titan_net_divergence(tmp_path):
+    # Same nudge stimulus, DIFFERENT emot trajectories → divergent net weights
+    # (INV-AFF-SELF-SOVEREIGN; no shared weights).
+    a = _runtime(tmp_path, "A", grounding=_grounding([0.1] * 8))
+    b = _runtime(tmp_path, "B", grounding=_grounding([0.1] * 8))
+    for rt, post in ((a, [0.5] * 8), (b, [0.12] * 8)):       # A's world moves a lot; B's barely
+        for _ in range(2):
+            rt.observe_drain(1, 1, ts=0.0)
+        for k in range(5):
+            rt.observe_drain(9, 1, ts=float(k + 1))
+            rt._emot_grounding_reader = _grounding(post)
+            rt.train_on_dream()
+            rt._emot_grounding_reader = _grounding([0.1] * 8)
+    probe = build_features(
+        Nudge(0.05, 1.0, 5.0, 1, 0.9, 0.5, 6), {"V_blended": 0.3, "dominant_idx": 0})
+    assert a.net.forward(probe) != b.net.forward(probe)     # diverged
