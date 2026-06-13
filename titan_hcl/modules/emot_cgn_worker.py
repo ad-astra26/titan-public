@@ -136,7 +136,7 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
 
     # ── Instantiate EmotCGNConsumer (moved from meta_reasoning, Phase 1.6e.1)
     from titan_hcl.logic.emot_cgn import EmotCGNConsumer
-    from titan_hcl.logic.emotion_cluster import EMOT_PRIMITIVE_INDEX
+    from titan_hcl.logic.emotion_cluster import EMOT_PRIMITIVE_INDEX, EMOT_PRIMITIVES
     from titan_hcl.logic.emot_shm_protocol import (
         ShmEmotWriter, DEFAULT_STATE_PATH, DEFAULT_GROUNDING_PATH)
     # v3 bundle — Titan's whole being, lossless (rFP §19).
@@ -387,6 +387,32 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
             swallow_warn('[EmotCGNWorker] shm write_state failed', e,
                          key="modules.emot_cgn_worker.shm_write_state_failed", throttle=100)
             dom_idx = 0  # fall through to bundle write with neutral idx
+
+        # ── Per-primitive grounding shm (emot_grounding.bin: 8× {alpha,beta,V,
+        #    confidence,n_samples} ordered per EMOT_PRIMITIVES). WIRED 2026-06-13:
+        #    the slot + ShmEmotWriter.write_grounding existed but were NEVER called
+        #    (header stayed n=0 → read_grounding()==None fleet-wide) — a half-built
+        #    SHM fast-path superseded only on the read side by the disk-JSON
+        #    primitive_grounding.json. Now live (sub-ms, worker-backed) for the
+        #    dashboard SHM-prefer path + the Affective Grounding Loop's richer
+        #    attribution (RFP_affective_grounding_loop §7.B grounding note). The
+        #    176B repack is negligible; the Beta posteriors change slowly so a
+        #    write per state-event is fine.
+        try:
+            _grounding_snap = []
+            for _pid in EMOT_PRIMITIVES:
+                _p = emot_cgn._primitives.get(_pid)
+                if _p is None:
+                    break
+                _grounding_snap.append({
+                    "alpha": _p.alpha, "beta": _p.beta, "V": _p.V,
+                    "confidence": _p.confidence, "n_samples": _p.n_samples})
+            if len(_grounding_snap) == 8:
+                shm_writer.write_grounding(_grounding_snap)
+        except Exception as e:
+            swallow_warn('[EmotCGNWorker] shm write_grounding failed', e,
+                         key="modules.emot_cgn_worker.shm_write_grounding_failed",
+                         throttle=100)
 
         # ── v3 bundle — native Titan state + derived emergence fields.
         try:

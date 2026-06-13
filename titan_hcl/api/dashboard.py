@@ -8992,8 +8992,19 @@ async def get_v4_emot_cgn(request: Request):
             shm_state = ShmEmotReader().read_state()
         except Exception:
             shm_state = None
-        # Compact primitive summary (from disk)
+        # Per-primitive grounding: PREFER shm (sub-ms, worker-backed — the
+        # emot_grounding.bin slot was wired 2026-06-13; realizes this handler's
+        # "prefer ShmEmotReader" intent), fall back to disk-JSON
+        # primitive_grounding.json (fresh within ~save_interval).
         prims = grounding.get("primitives", {}) or {}
+        try:
+            from titan_hcl.logic.emot_shm_protocol import ShmEmotReader as _SER
+            from titan_hcl.logic.emotion_cluster import EMOT_PRIMITIVES as _EP
+            _shm_g = _SER().read_grounding()
+            if _shm_g and len(_shm_g) == 8:
+                prims = {_EP[i]: _shm_g[i] for i in range(8)}
+        except Exception:
+            pass  # shm unavailable / not-yet-written → keep disk-JSON prims
         prims_summary = {
             p_id: {
                 "V": round(float(p.get("V", 0.5)), 3),
