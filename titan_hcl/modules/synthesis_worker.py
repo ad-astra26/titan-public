@@ -845,7 +845,8 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                         per_pass_cap: int = 8, judge_fn=None, attribution=None,
                         lifetime_epochs: float = 417.0, recall_floor: float = 0.65,
                         mature_at: int = 2, macro_compose_min: int = 2,
-                        lint_caps: dict | None = None) -> None:
+                        lint_caps: dict | None = None,
+                        dk2_every: int = 20, lint_every: int = 30) -> None:
     """DK.1/DK.3/DK.5 (§7.D-knowledge) — the sovereign LLM-Wiki + research-skill +
     librarian-lint daemon. Drains the bounded queue of confirmed research findings
     (held by the RESEARCH_CONCEPT_SEED handler) and per item:
@@ -898,10 +899,12 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
         except Exception:  # noqa: BLE001
             return 0
     # DK.2/DK.3 ride a throttle (population surveys, not every tick): run once per
-    # _DK2_EVERY / _LINT_EVERY drained passes, and only when the seed queue is idle
-    # so curation never delays primary fact capture.
-    _DK2_EVERY = 20
-    _LINT_EVERY = 30
+    # _DK2_EVERY / _LINT_EVERY drained passes (× interval_s ≈ 60s), and only when
+    # the seed queue is idle so curation never delays primary fact capture. Config-
+    # tunable (`[synthesis.research].lint_every` / `dk2_every`) — conservative on
+    # mainnet, dialable down on devnet for a faster soak.
+    _DK2_EVERY = max(1, int(dk2_every))
+    _LINT_EVERY = max(1, int(lint_every))
     _caps = dict(lint_caps or {})
     _pass = 0
     while not stop_event.is_set():
@@ -2635,6 +2638,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 "mature_at": int(_rcfg.get("recipe_mature_at", 2)),
                 "macro_compose_min": int(_rcfg.get("macro_compose_min", 2)),
                 "lint_caps": _lint_caps,
+                "dk2_every": int(_rcfg.get("dk2_every", 20)),
+                "lint_every": int(_rcfg.get("lint_every", 30)),
             },
             daemon=True, name=f"synthesis-research-wiki-{name}").start()
         logger.info("[synthesis_worker] DK.1/DK.3/DK.5 research-wiki+lint+skill "

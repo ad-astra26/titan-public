@@ -3157,6 +3157,8 @@ lint_max_contradiction_pairs  = 8      # M3 — max LLM adjudications per pass (
 lint_max_orphans              = 16     # M4 — max orphan decays per pass
 recipe_mature_at              = 2      # DK.5 — success_count at which a recipe first crystallizes
 macro_compose_min             = 2      # M5 — extra successes before a macro re-versions
+lint_every                    = 30     # DK.3 — daemon passes (×~60s) between wiki-lint runs (≈30min; devnet override lower for soak)
+dk2_every                     = 20     # DK.2 — daemon passes between concept-of-concepts surveys (≈20min)
 
 [synthesis.engram.grounding]
 # Phase D (RFP_synthesis_engram_grounding §7.D) — the percentile-blend weights
