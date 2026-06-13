@@ -656,6 +656,15 @@ class SocialXGateway:
             # Titan's OWN handles — never engaged by outer archetypes (rFP X-post
             # PART B / INV-XENG-1). user_name is added implicitly by _self_handles.
             "self_handles": sx.get("self_handles", []),
+            # Fleet X-Engagement Coordination (RFP_fleet_x_engagement_coordination,
+            # 2026-06-13): deterministic author-hash partition across the shared
+            # @your_x_handle account so a human is engaged by ≤1 Titan/24h (INV-FX-1).
+            # engagement_fleet MUST be identical across all boxes.
+            "engagement_fleet": sx.get("engagement_fleet", ["T1", "T2", "T3"]),
+            "engagement_partition_enabled": sx.get(
+                "engagement_partition_enabled", True),
+            # Owned-author cooldown (Maker: 24h min). Was a hardcoded 48h.
+            "author_cooldown_seconds": sx.get("author_cooldown_seconds", 86400),
             # URL shortener domain
             "url_domain": sx.get("url_domain", "https://example.com"),
             # Per-Titan on-chain identity anchor (rFP X-post provenance PART A,

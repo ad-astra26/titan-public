@@ -120,11 +120,12 @@ def test_cooldown_expires_after_window(tmp_path):
     assert not ab.author_on_cooldown("olduser", titan_id="T1", now=now)
 
 
-def test_cooldown_window_is_48h():
-    # Maker 2026-06-03 (rFP X-post PART B / INV-XENG-2): 7d → 48h. A 7-day
-    # cooldown starved the ~5-author engagement pool to ≈0; 48h matches the
-    # felt_experience recency window.
-    assert DEFAULT_AUTHOR_COOLDOWN_S == 48 * 3600
+def test_cooldown_window_is_24h():
+    # History: 7d → 48h (2026-06-03) → 24h (2026-06-13, RFP_fleet_x_engagement_
+    # coordination INV-FX-2 — the owned-author re-engage floor). Under the
+    # deterministic author partition a given author is engaged by only ONE
+    # Titan, so this LOCAL 24h window bounds the shared account fleet-wide.
+    assert DEFAULT_AUTHOR_COOLDOWN_S == 24 * 3600
     assert "amplify" in OUTER_ENGAGEMENT_POST_TYPES
 
 
@@ -239,7 +240,13 @@ def _ctx(titan_id="T1"):
 
 def test_amplify_fires_on_eligible_followed_post(tmp_path):
     sx, et, sg = _amplify_dbs(tmp_path)
-    a = AmplifyArchetype(gateway=None, social_x_db_path=sx,
+    # This test verifies amplify *eligibility* logic, not the fleet author
+    # partition — disable partitioning so "vitalik" (which hashes to a non-T1
+    # owner) isn't filtered out. (Partition behavior is covered in
+    # tests/test_engagement_partition.py.)
+    _gw = types.SimpleNamespace(
+        _load_config=lambda: {"engagement_partition_enabled": False})
+    a = AmplifyArchetype(gateway=_gw, social_x_db_path=sx,
                          events_teacher_db=et, social_graph_db=sg)
     cand = a.find_candidate(_ctx())
     assert cand is not None

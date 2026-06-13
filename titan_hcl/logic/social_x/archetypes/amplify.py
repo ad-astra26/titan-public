@@ -71,6 +71,10 @@ class AmplifyArchetype(ArchetypeBase):
             return None
 
         author = row["author"]
+        # Fleet author partition (INV-FX-1): only the owning Titan amplifies
+        # this author → the shared @your_x_handle account never multi-engages.
+        if not self.is_my_engagement_partition(author, titan_id):
+            return None
         tweet_id = row["tweet_id"]
         fe_id = str(row["fe_id"])
 

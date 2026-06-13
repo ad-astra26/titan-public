@@ -876,7 +876,25 @@ class PostDispatchOrchestrator:
                     self._mention_empty_streak,
                     float((full_config.get("social_x") or {}).get(
                         "replies", {}).get("mention_backoff_cap_seconds", 7200.0)))
+            # Fleet reply partition (RFP_fleet_x_engagement_coordination
+            # INV-FX-7): only the Titan that OWNS a mention's author replies to
+            # it, so the shared @your_x_handle account never double-replies to one
+            # person across T1/T2/T3. Same deterministic author-hash as proactive
+            # engagement; zero coordination.
+            _sx_cfg = full_config.get("social_x") or {}
+            _reply_partition_on = bool(
+                _sx_cfg.get("engagement_partition_enabled", True))
+            _reply_roster = _sx_cfg.get("engagement_fleet") or ["T1", "T2", "T3"]
+            from titan_hcl.logic.social_x.archetypes.base import (
+                engagement_owner_for,
+            )
             for m in mentions[:max_replies]:
+                if _reply_partition_on:
+                    _owner = engagement_owner_for(
+                        m.get("author_handle") or m.get("author") or "",
+                        _reply_roster)
+                    if _owner and _owner != self._titan_id:
+                        continue
                 cgn_action: dict = {}
                 try:
                     from titan_hcl.logic.cgn_consumer_client import (

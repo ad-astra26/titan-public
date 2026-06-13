@@ -22,6 +22,7 @@ Universal invariants enforced here:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -55,11 +56,35 @@ DEFAULT_SAME_ARCHETYPE_SPACING_S = 6 * 3600
 OUTER_ENGAGEMENT_POST_TYPES = (
     "world_mirror", "outer_inner_bridge", "outer_rumination", "amplify",
 )
-DEFAULT_AUTHOR_COOLDOWN_S = 48 * 3600  # 48h (Maker 2026-06-03, rFP X-post PART B
-# / INV-XENG-2). Was 7*86400 — but a 7-day cooldown starved the tiny (~5-author)
-# engagement candidate pool to ≈0 (the engagement archetypes went silent 05-30).
-# 48h matches world_mirror's RECENCY_WINDOW_S so we don't re-engage an author
-# within the very window we look back over.
+DEFAULT_AUTHOR_COOLDOWN_S = 24 * 3600  # 24h (Maker 2026-06-13, RFP_fleet_x_
+# engagement_coordination INV-FX-2 — the owned-author re-engage floor). Was 48h.
+# Under the deterministic author-hash partition (INV-FX-1) a given author is
+# only ever engaged by ONE Titan, so this LOCAL window is sufficient to bound
+# the SHARED @your_x_handle account to ≤1 engagement/author/24h fleet-wide.
+# Config-overridable via [social_x].author_cooldown_seconds.
+
+# Fleet engagement roster default (RFP_fleet_x_engagement_coordination Q6).
+# Config [social_x].engagement_fleet overrides; MUST be identical across boxes.
+DEFAULT_ENGAGEMENT_FLEET = ("T1", "T2", "T3")
+
+
+def normalize_handle(author: str) -> str:
+    """Canonical handle form for hashing/matching (matches _self_handles)."""
+    return str(author or "").strip().lstrip("@").lower()
+
+
+def engagement_owner_for(author: str, roster) -> str:
+    """The single Titan owning engagement for `author`, via a STABLE
+    cross-process hash (sha256 — NOT builtin hash(), which is per-process
+    salted → would differ across boxes/restarts → silent multi-tag). Pure;
+    shared by ArchetypeBase (proactive engagement) and the reply cycle
+    (mention-replies, INV-FX-7). Returns '' when undeterminable."""
+    roster = tuple(str(t).strip() for t in (roster or ()) if str(t).strip())
+    norm = normalize_handle(author)
+    if not norm or not roster:
+        return ""
+    h = int(hashlib.sha256(norm.encode("utf-8")).hexdigest(), 16)
+    return roster[h % len(roster)]
 
 
 def ensure_handle_mention(text: str, handle: str) -> str:
@@ -246,12 +271,60 @@ class ArchetypeBase:
         self._self_handles_cache = handles
         return handles
 
+    # ── Fleet engagement partition (RFP_fleet_x_engagement_coordination) ──
+    # The three Titans share ONE X account (@your_x_handle). A deterministic
+    # author-hash partition assigns each author to exactly ONE owning Titan, so
+    # a human is engaged by ≤1 Titan/24h (INV-FX-1) with ZERO cross-box
+    # coordination — every box computes identical ownership from the config
+    # roster. Replaces the broken per-box-cooldown model for cross-Titan dedup.
+    def engagement_roster(self) -> tuple[str, ...]:
+        """Ordered fleet roster ([social_x].engagement_fleet). MUST match across
+        boxes. Cached per instance."""
+        cached = getattr(self, "_eng_roster_cache", None)
+        if cached is not None:
+            return cached
+        roster: tuple[str, ...] = DEFAULT_ENGAGEMENT_FLEET
+        try:
+            cfg = self.gateway._load_config() if self.gateway else {}
+            r = cfg.get("engagement_fleet") or []
+            cleaned = tuple(str(x).strip() for x in r if str(x).strip())
+            if cleaned:
+                roster = cleaned
+        except Exception:
+            pass
+        self._eng_roster_cache = roster
+        return roster
+
+    def engagement_owner(self, author: str) -> str:
+        """The single Titan that owns engagement for `author` (delegates to the
+        pure module-level `engagement_owner_for`). '' when undeterminable."""
+        return engagement_owner_for(author, self.engagement_roster())
+
+    def is_my_engagement_partition(self, author: str, titan_id: str) -> bool:
+        """True if THIS Titan owns engagement for `author` (or partitioning is
+        disabled). Used as an ADDITIVE candidate filter alongside the existing
+        author-cooldown / self-handle skips. Fail-CLOSED on an undeterminable
+        owner under an empty/misconfigured roster (safety > availability — a
+        roster mismatch is surfaced by the startup WARN)."""
+        try:
+            cfg = self.gateway._load_config() if self.gateway else {}
+            if not cfg.get("engagement_partition_enabled", True):
+                return True
+        except Exception:
+            pass
+        owner = self.engagement_owner(author)
+        if not owner:
+            # empty author → nothing to engage anyway; empty roster → misconfig
+            # → fail-closed (don't risk the whole fleet engaging everything).
+            return False
+        return owner == str(titan_id or "")
+
     def authors_on_cooldown(
         self,
         *,
         titan_id: str,
         now: float | None = None,
-        window_seconds: float = DEFAULT_AUTHOR_COOLDOWN_S,
+        window_seconds: float | None = None,
     ) -> set[str]:
         """Lowercased handles engaged by ANY outer-engagement archetype within
         the cooldown window (cross-archetype per-author dedup, Maker 2026-05-30).
@@ -259,7 +332,19 @@ class ArchetypeBase:
         Checks BOTH `metadata.author` (world_mirror, outer_inner_bridge,
         amplify) and `metadata.handle` (outer_rumination) since the archetypes
         historically used different metadata keys for the cited account.
+
+        `window_seconds=None` → resolve from config [social_x].author_cooldown_
+        seconds (default 24h, DEFAULT_AUTHOR_COOLDOWN_S). Under the fleet author
+        partition this LOCAL window bounds the shared account to ≤1/author/24h.
         """
+        if window_seconds is None:
+            window_seconds = DEFAULT_AUTHOR_COOLDOWN_S
+            try:
+                cfg = self.gateway._load_config() if self.gateway else {}
+                window_seconds = float(cfg.get(
+                    "author_cooldown_seconds", DEFAULT_AUTHOR_COOLDOWN_S))
+            except Exception:
+                pass
         cutoff = (now if now is not None else time.time()) - window_seconds
         placeholders = ",".join("?" * len(OUTER_ENGAGEMENT_POST_TYPES))
         conn = self._conn()

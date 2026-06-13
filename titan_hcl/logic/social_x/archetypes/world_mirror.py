@@ -215,6 +215,10 @@ class WorldMirrorArchetype(ArchetypeBase):
         for r in eligible:
             if (r["author"] or "").lower() in cooldown:
                 continue
+            # Fleet author partition (INV-FX-1): only the owning Titan engages
+            # this author → the shared @your_x_handle account never multi-tags.
+            if not self.is_my_engagement_partition(r["author"], titan_id):
+                continue
             cr = followed.get(r["author"])
             if cr:
                 tweet_text = cr.get("last_tweet_text") or ""

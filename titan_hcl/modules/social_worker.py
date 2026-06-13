@@ -243,6 +243,19 @@ def social_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         else "FLEET-CONSUMER (subscribes to broadcasts from %s)" % canonical_poller,
         canonical_poller, titan_id,
     )
+    # Fleet X-Engagement partition roster check (RFP_fleet_x_engagement_
+    # coordination Q6): if this Titan's id is NOT in engagement_fleet, the
+    # deterministic author-hash partition will NEVER assign it any author →
+    # it silently does zero outer-engagement. Surface that loudly; a roster
+    # that differs across boxes is the one real footgun of this design.
+    if social_x_cfg.get("engagement_partition_enabled", True):
+        _eng_fleet = social_x_cfg.get("engagement_fleet", ["T1", "T2", "T3"])
+        if titan_id not in (_eng_fleet or []):
+            logger.warning(
+                "[SocialWorker] ⚠ engagement_partition: this titan_id=%r is NOT "
+                "in engagement_fleet=%r → it will engage ZERO authors. Fix the "
+                "[social_x].engagement_fleet roster (MUST be identical + include "
+                "every posting Titan across all boxes).", titan_id, _eng_fleet)
 
     # ── Phase 11 §11.I.2 — slot transition: starting → booted ──
     # (legacy boot-signal bus emit deleted per locked D2 / no-shim policy)

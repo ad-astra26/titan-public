@@ -312,6 +312,9 @@ class OuterInnerBridgeArchetype(ArchetypeBase):
                 continue
             if (r["author"] or "").lower() in cooldown:
                 continue
+            # Fleet author partition (INV-FX-1): only the owning Titan engages.
+            if not self.is_my_engagement_partition(r["author"], titan_id):
+                continue
             cr = followed.get(r["author"])
             if cr:
                 d = dict(r)

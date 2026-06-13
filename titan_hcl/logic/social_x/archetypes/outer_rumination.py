@@ -109,7 +109,8 @@ class OuterRuminationArchetype(ArchetypeBase):
         b = self._pool_b(titan_id=titan_id, now=now, cooldown=cooldown)
         if b:
             candidates[POOL_B] = b
-        c = self._pool_c(now=now, cited=cited_lifetime, cooldown=cooldown)
+        c = self._pool_c(titan_id=titan_id, now=now, cited=cited_lifetime,
+                         cooldown=cooldown)
         if c:
             candidates[POOL_C] = c
 
@@ -177,6 +178,9 @@ class OuterRuminationArchetype(ArchetypeBase):
                 continue
             author = (r["author"] or "").lower()
             if author in cooldown:
+                continue
+            # Fleet author partition (INV-FX-1): only the owning Titan engages.
+            if not self.is_my_engagement_partition(r["author"], titan_id):
                 continue
             base = float(r["relevance"] or 0.0)
             penalty = (POOL_A_PER_AUTHOR_PENALTY
@@ -316,6 +320,9 @@ class OuterRuminationArchetype(ArchetypeBase):
                 continue
             if r["name"].lower() in cooldown:
                 continue
+            # Fleet author partition (INV-FX-1): only the owning Titan engages.
+            if not self.is_my_engagement_partition(r["name"], titan_id):
+                continue
             days_ago = max(1, int((now - r["last_seen"]) / 86400))
             sid = f"personB:{r['name']}"
             return {
@@ -354,7 +361,7 @@ class OuterRuminationArchetype(ArchetypeBase):
                     out.add(h)
         return out
 
-    def _pool_c(self, *, now: float, cited: set[str],
+    def _pool_c(self, *, titan_id: str, now: float, cited: set[str],
                 cooldown: set[str] | None = None) -> dict | None:
         cooldown = cooldown or set()
         try:
@@ -379,6 +386,10 @@ class OuterRuminationArchetype(ArchetypeBase):
             if sid in cited:
                 continue
             if (r["author_handle"] or r["author"] or "").lower() in cooldown:
+                continue
+            # Fleet author partition (INV-FX-1): only the owning Titan engages.
+            if not self.is_my_engagement_partition(
+                    r["author_handle"] or r["author"], titan_id):
                 continue
             days_ago = max(1, int((now - r["replied_at"]) / 86400))
             return {
