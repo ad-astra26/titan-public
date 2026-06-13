@@ -212,18 +212,29 @@ class ArchetypeBase:
                 out.add(str(sid))
         return out
 
+    # Owned-account FLOOR — Titan's own X accounts, ALWAYS excluded regardless
+    # of per-box config. INV-XENG-1 is a hard safety invariant ("never engage
+    # your own account"); it must NOT depend on a config key being present.
+    # 2026-06-13: T2+T3 config.toml had drifted WITHOUT `self_handles` under
+    # [social_x], so _self_handles returned only {your_x_handle} (from user_name)
+    # and the old "fallback only when the set is empty" never triggered →
+    # @iamtitantech leaked and world_mirror quote-posted our own automation
+    # account (twice). The floor is now always unioned, not a fallback.
+    _OWNED_ACCOUNT_FLOOR = frozenset({"your_x_handle", "iamtitantech"})
+
     def _self_handles(self) -> set[str]:
         """Titan's OWN X handles — PERMANENTLY ineligible for outer engagement
         (never reply to / mirror / amplify our own account). Seeds the cooldown
         set so every outer archetype's existing `if author in cooldown` check
-        skips them in one place. Config-sourced ([social_x] `self_handles` +
-        `user_name`), cached per instance. (rFP X-post PART B / INV-XENG-1,
-        2026-06-03 — `@iamtitantech` is followed + generated 42 felt_experiences,
-        so world_mirror was mirroring our own automation account.)"""
+        skips them in one place. The owned-account floor is ALWAYS applied and
+        unioned with config ([social_x] `self_handles` + `user_name`), so config
+        drift cannot silently disable the exclusion. Cached per instance.
+        (rFP X-post PART B / INV-XENG-1, 2026-06-03; floor-hardened 2026-06-13.)"""
         cached = getattr(self, "_self_handles_cache", None)
         if cached is not None:
             return cached
-        handles: set[str] = set()
+        # Start from the hard floor — never empty, never config-dependent.
+        handles: set[str] = set(self._OWNED_ACCOUNT_FLOOR)
         try:
             cfg = self.gateway._load_config() if self.gateway else {}
             for raw in [cfg.get("user_name", "")] + list(cfg.get("self_handles", []) or []):
@@ -232,9 +243,6 @@ class ArchetypeBase:
                     handles.add(h)
         except Exception:
             pass
-        if not handles:
-            # Defensive fallback to the agent's own identity (not a tunable).
-            handles = {"your_x_handle", "iamtitantech"}
         self._self_handles_cache = handles
         return handles
 

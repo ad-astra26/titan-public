@@ -34,6 +34,7 @@ from titan_hcl.logic.social_x_gateway import (
 )
 from titan_hcl.logic.social_x.archetypes.soul_diary import SoulDiaryArchetype
 from titan_hcl.logic.social_x.archetypes.proof_day import ProofDayArchetype
+from titan_hcl.logic.social_x.archetypes.base import ArchetypeBase
 
 
 @pytest.fixture
@@ -89,6 +90,44 @@ def _insert(db_path, *, post_type, status, titan_id="T1",
         conn.commit()
     finally:
         conn.close()
+
+
+class _FakeGateway:
+    """Minimal gateway exposing only _load_config (what _self_handles needs)."""
+    def __init__(self, cfg):
+        self._cfg = cfg
+    def _load_config(self):
+        return self._cfg
+
+
+# ── Root cause 2: self-handle exclusion floor (config-drift-proof) ───────
+
+class TestSelfHandleFloor:
+    def test_floor_applies_when_config_lacks_self_handles(self, tmp_db):
+        """The exact 2026-06-13 T2/T3 drift: config has user_name but NO
+        self_handles → the owned-account FLOOR must still exclude iamtitantech
+        (previously it returned only {your_x_handle} and leaked the own account)."""
+        gw = _FakeGateway({"user_name": "your_x_handle", "self_handles": []})
+        arch = ArchetypeBase(gateway=gw, social_x_db_path=tmp_db)
+        h = arch._self_handles()
+        assert "iamtitantech" in h, "owned-account floor must always exclude iamtitantech"
+        assert "your_x_handle" in h
+
+    def test_floor_unions_with_config_extras(self, tmp_db):
+        """Config-supplied extra handles are unioned ON TOP of the floor."""
+        gw = _FakeGateway({"user_name": "your_x_handle",
+                           "self_handles": ["@MyOtherBot", "iamtitantech"]})
+        arch = ArchetypeBase(gateway=gw, social_x_db_path=tmp_db)
+        h = arch._self_handles()
+        assert {"your_x_handle", "iamtitantech", "myotherbot"} <= h
+
+    def test_floor_survives_config_load_failure(self, tmp_db):
+        """If _load_config raises, the floor still holds (never empty)."""
+        class Boom:
+            def _load_config(self):
+                raise RuntimeError("config gone")
+        arch = ArchetypeBase(gateway=Boom(), social_x_db_path=tmp_db)
+        assert arch._self_handles() == {"your_x_handle", "iamtitantech"}
 
 
 def _utc_midnight_ts(now=None):
