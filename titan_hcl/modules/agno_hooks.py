@@ -1159,6 +1159,10 @@ def create_pre_hook(plugin):
         # §7.E (E.2) — stash the embed-once vector so the tool-backstop E.2 literal
         # lookup reuses it (no extra embed) on the hot path.
         plugin._last_prompt_vec = _prompt_vec
+        # §7.E (Finding-2 fix) — stash this turn's prompt so the PostHook OVG path
+        # has a reliable parent_goal source (its run_output.input extraction can be
+        # empty → empty parent_goal → E.2 + EEL skill-formation lose the prompt).
+        plugin._last_prompt_text = prompt_text
         # RFP_synthesis_decision_authority P4 — ENRICH (both, partitioned).
         # VCB (inner-titan state across 6 SQLite stores) AND the consolidated
         # legacy memory.query (titan_memory.duckdb) BOTH enrich every routed
@@ -2783,6 +2787,14 @@ def create_post_hook(plugin):
                     user_prompt = str(run_output.input.input_content)
             if not user_prompt and hasattr(agent, '_current_user_prompt'):
                 user_prompt = agent._current_user_prompt
+            # §7.E (Finding-2 fix, 2026-06-13) — reliable fallback to the prompt the
+            # PreHook saw this turn. The `run_output.input`/`agent` extraction can
+            # return empty → the OVG-verification ToolCall then carries parent_goal=''
+            # → the verdict record reaches synthesis WITHOUT the prompt → E.2 can't
+            # key the (prompt→answer) cache AND EEL skill-formation drops the goal
+            # (oracle_router.py:570 `if not e.parent_goal`). Stashed in the PreHook.
+            if not user_prompt:
+                user_prompt = getattr(plugin, '_last_prompt_text', '') or ''
         except Exception as e:
             logger.warning("[PostHook] Failed to extract prompt/response: %s", e)
             return
