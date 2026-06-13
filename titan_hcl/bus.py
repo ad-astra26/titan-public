@@ -1359,7 +1359,7 @@ class DivineBus:
             )
             with self._lock:
                 snapshot = []
-                for mod_name, queues in self._subscribers.items():
+                for mod_name, queues in list(self._subscribers.items()):
                     if mod_name == src:
                         continue
                     if mod_name in self._reply_only:
@@ -1452,7 +1452,7 @@ class DivineBus:
             )
             with self._lock:
                 snapshot = []
-                for mod_name, queues in self._subscribers.items():
+                for mod_name, queues in list(self._subscribers.items()):
                     if mod_name == src:
                         continue
                     if mod_name in self._reply_only:
