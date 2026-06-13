@@ -3535,12 +3535,24 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         _e2_ans = str(payload.get("result_summary", "") or "")
                         _e2_prompt = str(payload.get("parent_goal", "") or "")
                         if _e2_ans and _e2_prompt:
-                            prompt_signature_store.write_signature(
+                            _e2_ok = prompt_signature_store.write_signature(
                                 prompt=_e2_prompt, literal_answer=_e2_ans,
                                 solved_by=str(_ptx),
                                 durability=classify_volatility(_e2_prompt),
                                 created_epoch=float(_now_epoch()))
+                            try:  # §7.E live-diagnostic (temporary)
+                                with open(os.path.join(_data_dir, "e2_write_diag.txt"), "a") as _wf:
+                                    _wf.write("write_signature -> %r ans=%r promptlen=%d\n" % (
+                                        _e2_ok, _e2_ans, len(_e2_prompt)))
+                            except Exception:  # noqa: BLE001
+                                pass
                     except Exception as _e2_err:  # noqa: BLE001
+                        try:  # §7.E live-diagnostic — dump the swallowed exception
+                            import traceback as _tb2
+                            with open(os.path.join(_data_dir, "e2_write_diag.txt"), "a") as _wf:
+                                _wf.write("EXC: " + _tb2.format_exc() + "\n")
+                        except Exception:  # noqa: BLE001
+                            pass
                         logger.debug(
                             "[synthesis_worker] E.2 prompt-signature write skipped: %s",
                             _e2_err)
