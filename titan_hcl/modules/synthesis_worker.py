@@ -2608,6 +2608,15 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         prompt_signature_store = None
         logger.warning("[synthesis_worker] PromptSignatureStore wiring failed "
                        "(E.2 cache off; routing unaffected): %s", _ps_err)
+        # §7.E live-diagnostic (2026-06-13): the fleet logs aren't readable, so
+        # persist the actual init traceback to a file to close the Finding-2 root
+        # cause. (Temporary — removed once diagnosed.)
+        try:
+            import traceback as _tb
+            with open(os.path.join(_data_dir, "e2_init_error.txt"), "w") as _ef:
+                _ef.write(_tb.format_exc())
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── §7.B (B.2) — the turn-judge daemon: reward NON-verifiable turns. The
     # TURN_REASONING_RECORD handler pushes FRESH (reasoning_id, prompt, response,
