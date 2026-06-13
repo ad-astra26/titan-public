@@ -927,6 +927,15 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         COGNITIVE_PERSIST_EVERY_N_EPOCHS,
     )
 
+    # v0 app-inbox consumer (RFP_titan_app_event_channel §7.3) — drains phone→kernel
+    # Channel-2 responses/feedback + logs declared availability. Observability ONLY (no
+    # self-regulation; that's missions RFP Phase 4). Best-effort daemon; never fatal.
+    try:
+        from titan_hcl.utils.app_inbox_consumer import start_app_inbox_consumer
+        state_refs["_app_inbox_stop_event"] = start_app_inbox_consumer()
+    except Exception as e:
+        logger.warning("[CognitiveWorker] app-inbox consumer not started: %s", e)
+
     # === BOILERPLATE: Phase B.1 readiness reporter ===
     # Lets shadow_swap orchestrator drain this worker's state before
     # kernel swap. The `save_state_cb` is MODULE-SPECIFIC — return a

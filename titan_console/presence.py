@@ -13,6 +13,8 @@ from .events import _device_dir, _safe_id
 from .pairing import _read_json, _write_json
 
 _STATES = {"foreground", "background", "active", "inactive"}
+# The Maker's declared availability (RFP §7.3 3b). Transport-level only.
+_AVAILABILITY = {"available", "busy", "dnd"}
 
 
 def put(ctx, device_id: str, hb: dict) -> dict:
@@ -20,11 +22,18 @@ def put(ctx, device_id: str, hb: dict) -> dict:
     _safe_id(device_id)
     hb = hb if isinstance(hb, dict) else {}
     state = hb.get("state")
+    # availability is the Maker's *declared* status (RFP §7.3 3b) — a transport signal,
+    # NOT a coded gate on Titan's speech. Default "available". What "busy" *means* is
+    # learned in the cognition (missions RFP P4), never an if-busy mute here.
+    avail = hb.get("availability")
+    until = hb.get("availability_until")
     rec = {
         "state": state if state in _STATES else "unknown",
         "last_seen": time.time(),
         "battery": hb.get("battery"),
         "ack_cursor": hb.get("ack_cursor"),
+        "availability": avail if avail in _AVAILABILITY else "available",
+        "availability_until": until if isinstance(until, (int, float)) else None,
     }
     _write_json(_device_dir(ctx, device_id) / "presence.json", rec)
     return rec

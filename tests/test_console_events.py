@@ -235,3 +235,136 @@ def test_enqueue_unknown_device(tmp_path):
     s, _ = dispatch(ctx, "POST", "/console/events/enqueue", {}, body,
                     {"x-titan-internal-key": _INTERNAL_KEY}, True)
     assert s == 404
+
+
+# ── Phase 3 §7.3: inbox (respond/feedback) + availability ─────────────────────
+def test_inbox_append_drain_ack_unit(tmp_path):
+    ctx = _ctx(tmp_path)
+    a = events.append_inbox(ctx, "dev-1", {"kind": "action", "action_id": "retry"})
+    b = events.append_inbox(ctx, "dev-1", {"kind": "feedback", "reaction": "useful"})
+    assert a["seq"] == 1 and b["seq"] == 2 and a["ts"] > 0
+    items, cursor = events.drain_inbox(ctx, "dev-1", 0)
+    assert [i["seq"] for i in items] == [1, 2] and cursor == 2
+    assert items[0]["action_id"] == "retry" and items[1]["reaction"] == "useful"
+    assert events.ack_inbox(ctx, "dev-1", 2) == 2
+    assert events.drain_inbox(ctx, "dev-1", 0) == ([], 0)
+
+
+def test_inbox_cursor_monotonic_across_prune(tmp_path):
+    ctx = _ctx(tmp_path)
+    events.append_inbox(ctx, "dev-1", {"kind": "feedback", "reaction": "thrilled"})
+    events.ack_inbox(ctx, "dev-1", 1)
+    nxt = events.append_inbox(ctx, "dev-1", {"kind": "feedback", "reaction": "useful"})
+    assert nxt["seq"] == 2  # cursor never resets on prune
+
+
+def test_respond_route_lands_in_inbox(tmp_path):
+    ctx = _ctx(tmp_path)
+    seed, _ = _register_signed_device(ctx)
+    body = b'{"in_reply_to":42,"kind":"action","action_id":"retry"}'
+    s, r = dispatch(ctx, "POST", "/console/events/respond", {}, body,
+                    _signed_headers(seed, "POST", "/console/events/respond", body), True)
+    assert s == 200 and r["ok"] is True and r["seq"] == 1
+    items, _ = events.drain_inbox(ctx, "dev-1", 0)
+    assert items[0]["kind"] == "action" and items[0]["in_reply_to"] == 42
+    assert items[0]["action_id"] == "retry"
+
+
+def test_respond_requires_device_signature(tmp_path):
+    ctx = _ctx(tmp_path)
+    _register_signed_device(ctx)
+    body = b'{"kind":"feedback","reaction":"useful"}'
+    assert dispatch(ctx, "POST", "/console/events/respond", {}, body, {}, True)[0] == 401
+    assert dispatch(ctx, "POST", "/console/events/respond", {}, body, {}, False)[0] == 401
+
+
+def test_respond_rejects_bad_kind(tmp_path):
+    ctx = _ctx(tmp_path)
+    seed, _ = _register_signed_device(ctx)
+    body = b'{"kind":"nonsense"}'
+    s, _ = dispatch(ctx, "POST", "/console/events/respond", {}, body,
+                    _signed_headers(seed, "POST", "/console/events/respond", body), True)
+    assert s == 400
+
+
+def test_inbox_drain_ack_routes_internal_key(tmp_path):
+    ctx = _ctx(tmp_path)
+    seed, _ = _register_signed_device(ctx)
+    rbody = b'{"kind":"feedback","reaction":"interesting","stars":4}'
+    dispatch(ctx, "POST", "/console/events/respond", {}, rbody,
+             _signed_headers(seed, "POST", "/console/events/respond", rbody), True)
+    # kernel drains with the internal key (local-only)
+    s, r = dispatch(ctx, "GET", "/console/events/inbox",
+                    {"device_id": ["dev-1"], "since": ["0"]}, b"",
+                    {"x-titan-internal-key": _INTERNAL_KEY}, True)
+    assert s == 200 and r["items"][0]["reaction"] == "interesting" and r["cursor"] == 1
+    # ack prunes
+    abody = b'{"device_id":"dev-1","cursor":1}'
+    s, r = dispatch(ctx, "POST", "/console/events/inbox/ack", {}, abody,
+                    {"x-titan-internal-key": _INTERNAL_KEY}, True)
+    assert s == 200 and r["pruned"] == 1
+    assert events.drain_inbox(ctx, "dev-1", 0) == ([], 0)
+
+
+def test_inbox_drain_requires_internal_key(tmp_path):
+    ctx = _ctx(tmp_path)
+    _register_signed_device(ctx)
+    # no key on localhost → 401 (handler internal-key check); non-local → the AD-5 gate
+    # returns 401 before the handler even runs (mirrors test_enqueue_is_local_only).
+    assert dispatch(ctx, "GET", "/console/events/inbox", {"device_id": ["dev-1"]},
+                    b"", {}, True)[0] == 401
+    assert dispatch(ctx, "GET", "/console/events/inbox", {"device_id": ["dev-1"]},
+                    b"", {"x-titan-internal-key": _INTERNAL_KEY}, False)[0] == 401
+
+
+def test_heartbeat_stores_availability(tmp_path):
+    ctx = _ctx(tmp_path)
+    seed, _ = _register_signed_device(ctx)
+    hb = b'{"state":"foreground","availability":"busy","availability_until":1781400000}'
+    s, _ = dispatch(ctx, "POST", "/console/app/heartbeat", {}, hb,
+                    _signed_headers(seed, "POST", "/console/app/heartbeat", hb), True)
+    assert s == 200
+    p = presence.get(ctx, "dev-1")
+    assert p["availability"] == "busy" and p["availability_until"] == 1781400000
+
+
+def test_availability_defaults_to_available(tmp_path):
+    ctx = _ctx(tmp_path)
+    # an unrecognized availability falls back to "available" (never a coded mute)
+    rec = presence.put(ctx, "dev-1", {"state": "foreground", "availability": "??"})
+    assert rec["availability"] == "available"
+    rec2 = presence.put(ctx, "dev-1", {"state": "foreground"})  # absent → default
+    assert rec2["availability"] == "available"
+
+
+# ── Phase 3 §7.3: notify_maker app sink ───────────────────────────────────────
+def test_notify_maker_app_sink_enqueues_system_event(tmp_path, monkeypatch):
+    import json as _json
+    monkeypatch.setenv("HOME", str(tmp_path))
+    titan_dir = tmp_path / ".titan"
+    titan_dir.mkdir()
+    (titan_dir / "secrets.toml").write_text(f'[api]\ninternal_key = "{_INTERNAL_KEY}"\n')
+    (titan_dir / "devices.json").write_text('[{"device_id":"dev-1"}]')
+    captured = {}
+
+    class _Resp:
+        def read(self): return b"{}"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _fake_urlopen(req, timeout=None, context=None):
+        captured["url"] = req.full_url
+        captured["key"] = req.headers.get("X-titan-internal-key")
+        captured["body"] = _json.loads(req.data.decode())
+        return _Resp()
+
+    import urllib.request as _ur
+    monkeypatch.setattr(_ur, "urlopen", _fake_urlopen)
+    from titan_hcl.utils import maker_notify
+    maker_notify._enqueue_app_sink("backup_failure", "T1", "Backup failed.")
+    assert captured["url"].endswith("/console/events/enqueue")
+    assert captured["key"] == _INTERNAL_KEY
+    assert captured["body"]["type"] == "system"
+    assert captured["body"]["device_id"] == "dev-1"
+    assert "Backup failed." in captured["body"]["payload"]["text"]
+    assert captured["body"]["dedupe_key"] == "backup_failure:T1"

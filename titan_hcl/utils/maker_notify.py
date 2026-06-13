@@ -66,6 +66,57 @@ def _save_dedup(state: dict) -> None:
                      key="utils.maker_notify.dedup_save_failed", throttle=100)
 
 
+def _enqueue_app_sink(alert_class: str, titan_id: str, text: str) -> None:
+    """Channel-2 app sink (RFP_titan_app_event_channel §7.3): also deliver an ops/system
+    alert to every paired phone as a ``type:"system"`` event. ADDITIVE to Telegram — the
+    Console Agent's enqueue is local-only + internal-key (we're co-located in the kernel),
+    and the whole thing is best-effort: any failure is swallowed (Telegram stays
+    authoritative). The console's per-event ``dedupe_key`` prevents a double app-notify
+    while a prior identical alert is still un-acked."""
+    try:
+        import ssl
+        import tomllib
+        import urllib.request as _ur
+        titan_dir = os.path.expanduser("~/.titan")
+        key = None
+        sp = os.path.join(titan_dir, "secrets.toml")
+        if os.path.exists(sp):
+            with open(sp, "rb") as f:
+                key = (tomllib.load(f).get("api") or {}).get("internal_key")
+        if not key:
+            return  # no internal key → can't authenticate to the console; skip
+        dev_path = os.path.join(titan_dir, "devices.json")
+        if not os.path.exists(dev_path):
+            return
+        with open(dev_path) as f:
+            devices = json.load(f)
+        ids = [d.get("device_id") for d in devices
+               if isinstance(d, dict) and d.get("device_id")]
+        if not ids:
+            return
+        port = int(os.environ.get("TITAN_CONSOLE_PORT", "7799"))
+        sslctx = ssl.create_default_context()
+        sslctx.check_hostname = False
+        sslctx.verify_mode = ssl.CERT_NONE  # self-signed pinned cert on loopback
+        for did in ids:
+            payload = json.dumps({
+                "device_id": did, "type": "system",
+                "payload": {"text": f"[{titan_id}] {text}"},
+                "dedupe_key": f"{alert_class}:{titan_id}",
+            }).encode("utf-8")
+            req = _ur.Request(
+                f"https://127.0.0.1:{port}/console/events/enqueue",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json",
+                         "X-Titan-Internal-Key": key})
+            try:
+                _ur.urlopen(req, timeout=3, context=sslctx).read()
+            except Exception:
+                pass  # best-effort per device — never let the app sink break alerting
+    except Exception as e:
+        logger.debug("[MakerNotify] app sink skipped: %s", e)
+
+
 def notify_maker(alert_class: str, titan_id: str, text: str,
                  cooldown_s: int = _DEFAULT_COOLDOWN_S,
                  force: bool = False) -> bool:
@@ -82,11 +133,6 @@ def notify_maker(alert_class: str, titan_id: str, text: str,
 
     Returns True if message was sent (reached Telegram API ok=true), else False.
     """
-    token, chat_id = _get_telegram_creds()
-    if not token or not chat_id:
-        logger.debug("[MakerNotify] No Telegram creds — skipping")
-        return False
-
     now = time.time()
     key = f"{alert_class}:{titan_id}"
     dedup = _load_dedup()
@@ -98,6 +144,17 @@ def notify_maker(alert_class: str, titan_id: str, text: str,
                 "[MakerNotify] Dedup hit: %s fired %.1fh ago (cooldown=%.1fh)",
                 key, (now - last) / 3600.0, cooldown_s / 3600.0)
             return False
+
+    # Channel-2 app sink (RFP §7.3) — additive, best-effort, independent of Telegram.
+    _enqueue_app_sink(alert_class, titan_id, text)
+
+    token, chat_id = _get_telegram_creds()
+    if not token or not chat_id:
+        # App-sink-only delivery — still mark the cooldown so the app isn't re-notified.
+        logger.debug("[MakerNotify] No Telegram creds — app-sink only")
+        dedup[key] = now
+        _save_dedup(dedup)
+        return False
 
     # Send via Telegram Bot API
     try:

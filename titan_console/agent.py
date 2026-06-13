@@ -40,7 +40,8 @@ from .host import read_host_resources
 from .titan_status import titan_status
 
 _MUTATIONS = {"/console/restart", "/console/clean-hdd", "/console/config/set",
-              "/console/chat", "/console/backup/config", "/console/app/heartbeat"}
+              "/console/chat", "/console/backup/config", "/console/app/heartbeat",
+              "/console/events/respond"}
 # Pairing CONTROL routes are operator-only (mint/confirm/inspect device pairings).
 # /console/pair/submit is deliberately NOT here — it's the unauthenticated bootstrap,
 # gated by the single-use pairing token inside pairing.submit_device.
@@ -260,6 +261,25 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             except ValueError as e:
                 return 400, {"error": str(e)}
             return 200, {"events": evs, "cursor": cursor}
+        if path == "/console/events/inbox":
+            # The co-located kernel consumer drains phone→kernel responses/feedback for a
+            # device (RFP §7.3). Local-only + internal-key, mirroring /console/events/enqueue.
+            if not is_local:
+                return 403, {"error": "inbox drain is local-only"}
+            expected = alerts.resolve_internal_key(ctx)
+            provided = headers.get("x-titan-internal-key", "")
+            if not expected or not hmac.compare_digest(provided, expected):
+                return 401, {"error": "internal key required"}
+            device_id = (query.get("device_id", [""])[0] or "")
+            try:
+                since = int((query.get("since", ["0"])[0] or "0"))
+            except (TypeError, ValueError):
+                return 400, {"error": "since must be an integer"}
+            try:
+                items, cursor = events.drain_inbox(ctx, device_id, since)
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            return 200, {"items": items, "cursor": cursor}
         if path.startswith("/console/api/"):
             v6 = path[len("/console/api"):]  # → "/v6/..."
             if query:
@@ -322,6 +342,39 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             except ValueError as e:
                 return 400, {"error": str(e)}
             return 200, {"ok": True, "seq": evt["seq"]}
+        if path == "/console/events/respond":
+            # Maker taps a Channel-2 action button or a feedback chip (RFP §7.3). Device-authed
+            # (in _MUTATIONS). Lands durably in the per-device inbox; the kernel consumes it when
+            # up (AG-EVT-3 — survives a kernel-down because the Console Agent is the crash domain).
+            if not device_authed:
+                return 401, {"error": "valid device signature required"}
+            kind = str(data.get("kind", ""))
+            if kind not in ("action", "feedback"):
+                return 400, {"error": "kind must be 'action' or 'feedback'"}
+            item = {"kind": kind, "in_reply_to": data.get("in_reply_to"),
+                    "action_id": data.get("action_id"), "reaction": data.get("reaction"),
+                    "stars": data.get("stars")}
+            try:
+                stored = events.append_inbox(ctx, headers.get("x-device-id", ""), item)
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            return 200, {"ok": True, "seq": stored["seq"]}
+        if path == "/console/events/inbox/ack":
+            # The kernel consumer prunes inbox items it has read. Local-only + internal-key.
+            if not is_local:
+                return 403, {"error": "inbox ack is local-only"}
+            expected = alerts.resolve_internal_key(ctx)
+            provided = headers.get("x-titan-internal-key", "")
+            if not expected or not hmac.compare_digest(provided, expected):
+                return 401, {"error": "internal key required"}
+            cursor = data.get("cursor")
+            if not isinstance(cursor, int) or isinstance(cursor, bool):
+                return 400, {"error": "cursor must be an integer"}
+            try:
+                pruned = events.ack_inbox(ctx, data.get("device_id", ""), cursor)
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            return 200, {"ok": True, "pruned": pruned}
         if path == "/console/app/heartbeat":
             # Phone reports presence (+ acks delivered events). Device-authed (in _MUTATIONS).
             if not device_authed:

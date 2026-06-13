@@ -161,6 +161,58 @@ def ack(ctx, device_id: str, cursor: int) -> int:
     return pruned
 
 
+# ── inbound queue (phone → console → kernel) ─────────────────────────────────
+# The symmetric mirror of the outbox: when the Maker taps a Channel-2 action button
+# or a feedback chip (RFP §7.3), the phone POSTs /console/events/respond and the item
+# lands here, durably. The co-located kernel consumer drains it over a local internal-key
+# route. Sole-writer = the Console Agent (AG-EVT-1); it survives a kernel-down (AG-EVT-3)
+# because the Console Agent is the stable crash domain — the kernel reads it when back up.
+
+def append_inbox(ctx, device_id: str, item: dict) -> dict:
+    """Append a phone→kernel item (an action response or a feedback chip) to the device's
+    inbox and return it with an allocated monotonic ``seq`` + ``ts``. The kernel drains it
+    via ``drain_inbox``; this never blocks (no held wait — the consumer polls)."""
+    sid = _safe_id(device_id)
+    item = item if isinstance(item, dict) else {}
+    with _lock_for(sid):
+        d = _device_dir(ctx, device_id)
+        d.mkdir(parents=True, exist_ok=True)
+        cur = _read_json(d / "inbox_cursor.json", {"next_seq": 1})
+        seq = int(cur.get("next_seq", 1))
+        cur["next_seq"] = seq + 1
+        _write_json(d / "inbox_cursor.json", cur)  # reserve seq before append (crash → gap, not reuse)
+        stored = dict(item)
+        stored["seq"] = seq
+        stored["ts"] = time.time()
+        with open(d / "inbox.jsonl", "a") as f:
+            f.write(json.dumps(stored) + "\n")
+    return stored
+
+
+def drain_inbox(ctx, device_id: str, since: int) -> tuple[list, int]:
+    """Inbox items with ``seq > since`` plus the new cursor (highest seq now present)."""
+    _safe_id(device_id)
+    items = _read_events(_device_dir(ctx, device_id) / "inbox.jsonl")
+    fresh = [e for e in items if int(e.get("seq", 0)) > since]
+    cursor = since
+    for e in fresh:
+        cursor = max(cursor, int(e.get("seq", 0)))
+    return fresh, cursor
+
+
+def ack_inbox(ctx, device_id: str, cursor: int) -> int:
+    """Prune every consumed inbox item (``seq <= cursor``). Returns how many were pruned."""
+    sid = _safe_id(device_id)
+    with _lock_for(sid):
+        inbox = _device_dir(ctx, device_id) / "inbox.jsonl"
+        items = _read_events(inbox)
+        keep = [e for e in items if int(e.get("seq", 0)) > cursor]
+        pruned = len(items) - len(keep)
+        if pruned:
+            _rewrite(inbox, keep)
+    return pruned
+
+
 def _reset_registries() -> None:
     """Test hygiene — drop the per-device locks/waiters (process-global otherwise)."""
     with _registry_lock:
