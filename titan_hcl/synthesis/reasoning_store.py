@@ -93,6 +93,22 @@ class ReasoningStore:
                 "  turn_summary TEXT,"
                 "  created_at   DOUBLE NOT NULL"
                 ")")
+            # §7.D-knowledge DK.5 — the research-path-as-skill recipe (Axis-2).
+            # Keyed (goal_class, source); `success_count` reinforces on every
+            # successful research-confirm (the recurring source rises). This is the
+            # reinforced learning substrate (a) that SURVIVES the volatile data
+            # decay — the "how I find X" know-how. A matured recipe crystallizes
+            # the (goal_class, action='research') macro (b). `last_used_epoch` is
+            # Titan's emergent epoch (not wall-clock). Synthesis-owned, no cross-DB.
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS research_recipes ("
+                "  goal_class      TEXT NOT NULL,"
+                "  source          TEXT NOT NULL,"
+                "  success_count   INTEGER DEFAULT 0,"
+                "  last_used_epoch DOUBLE  DEFAULT 0,"
+                "  created_at      DOUBLE  NOT NULL,"
+                "  PRIMARY KEY (goal_class, source)"
+                ")")
         try:
             self._writer.submit_sync(_create)
         except Exception as e:  # noqa: BLE001
@@ -229,6 +245,42 @@ class ReasoningStore:
         if ok:
             self.macros_written += 1
         return ok
+
+    def record_research_recipe(
+        self, *, goal_class: str, source: str, epoch: float, mature_at: int = 2,
+    ) -> tuple[int, bool]:
+        """§7.D-knowledge DK.5 (a) — reinforce the research recipe for a
+        successful (goal_class, source). Upsert: `success_count += 1`,
+        `last_used_epoch = epoch`. Returns `(success_count, just_matured)` where
+        `just_matured` is True exactly on the bump that REACHES `mature_at`
+        (so the caller crystallizes the (goal_class, 'research') macro once). The
+        recipe is the LIVING reinforced skill — it keeps growing past maturity,
+        surviving the volatile data's decay. Soft → (0, False)."""
+        gc = str(goal_class or "").strip()
+        src = str(source or "").strip()
+        if not gc or not src:
+            return (0, False)
+
+        def _do() -> tuple[int, bool]:
+            self._db.execute(
+                "INSERT INTO research_recipes "
+                "(goal_class, source, success_count, last_used_epoch, created_at) "
+                "VALUES (?,?,1,?,?) "
+                "ON CONFLICT (goal_class, source) DO UPDATE SET "
+                "  success_count = research_recipes.success_count + 1, "
+                "  last_used_epoch = excluded.last_used_epoch",
+                [gc, src, float(epoch), float(self._clock())])
+            row = self._db.execute(
+                "SELECT success_count FROM research_recipes "
+                "WHERE goal_class=? AND source=?", [gc, src]).fetchone()
+            cnt = int(row[0]) if row else 0
+            return (cnt, cnt == int(mature_at))
+
+        try:
+            return self._writer.submit_sync(_do)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[ReasoningStore] record_research_recipe soft-fail: %s", e)
+            return (0, False)
 
     def _write_record(
         self, *, reasoning_id, kind, goal_class, action, oracle_id, verdict,

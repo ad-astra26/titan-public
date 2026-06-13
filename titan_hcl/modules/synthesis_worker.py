@@ -794,19 +794,33 @@ def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
 
 def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                         stop_event: threading.Event, interval_s: float,
+                        reasoning_store=None, life_reader=None,
                         per_pass_cap: int = 8) -> None:
-    """DK.1 (§7.D-knowledge) — the sovereign LLM-Wiki seed daemon. Drains the
-    bounded queue of confirmed+anchored research findings (held by the
-    RESEARCH_CONCEPT_SEED handler) and seeds/refines a declarative `Engram`
-    concept for each via `seed_research_concept`. OFF the recv loop AND off the
-    writer thread: the LLM librarian name-call is network I/O (releases the GIL),
-    and the EngramStore writes auto-route to the writer thread (@on_writer) — so
-    a slow provider never starves the recv-loop heartbeat (the synthesis
-    crash-loop guard). Continuous, NOT dream-gated (INV-OML-12). Soft — a seed
-    failure is logged, never raised, never blocks the next."""
+    """DK.1/DK.5 (§7.D-knowledge) — the sovereign LLM-Wiki + research-skill seed
+    daemon. Drains the bounded queue of confirmed research findings (held by the
+    RESEARCH_CONCEPT_SEED handler) and per item:
+      • **DK.1** (durable only — `tx_hash` present, not volatile): seed/refine a
+        declarative `Engram` concept via `seed_research_concept`.
+      • **DK.5** (BOTH classes — the research SKILL survives the data decay):
+        reinforce the `(goal_class, source)` recipe; a matured recipe crystallizes
+        the `(goal_class, 'research')` macro (a→b).
+    OFF the recv loop AND off the writer thread (the LLM name-call is network I/O;
+    EngramStore/ReasoningStore writes auto-route to the writer @on_writer) — so a
+    slow provider never starves the heartbeat (the synthesis crash-loop guard).
+    Continuous, NOT dream-gated (INV-OML-12). Soft — a failure never stalls the queue."""
     from titan_hcl.synthesis.research_wiki import (
         seed_research_concept, compose_concept_summaries)
+    from titan_hcl.synthesis.goal_class import goal_class as _goal_class_fn
     stop_event.wait(min(interval_s, 20.0))   # settle; offset from other passes
+
+    def _now_epoch() -> float:
+        # Titan emergent epoch (not wall-clock). life_reader exposes the epoch
+        # counter; 0.0 if unavailable (the recipe still reinforces — only the
+        # last_used_epoch timestamp degrades).
+        try:
+            return float(life_reader.get_epoch_count()) if life_reader else 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
     # DK.2 concept-of-concepts rides a throttle (a population survey, not every
     # tick): run it once per _DK2_EVERY drained passes, and only when the seed
     # queue is idle so curation never delays primary fact capture.
@@ -822,18 +836,42 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                     item = wiki_queue.popleft()
                 except IndexError:
                     break
+                _content = str(item.get("content", "") or "")
+                # DK.1 — durable findings only (volatile items carry no tx_hash →
+                # seed_research_concept refuses; explicit guard for clarity).
                 try:
-                    cv = seed_research_concept(
-                        engram_store=engram_store, cgn_bridge=cgn_bridge,
-                        tx_hash=str(item.get("tx_hash", "") or ""),
-                        content=str(item.get("content", "") or ""),
-                        name_fn=name_fn,
-                        domain_hint=str(item.get("domain_hint", "") or ""),
-                        felt_coverage=float(item.get("felt_coverage", 0.0) or 0.0))
-                    if cv is not None:
-                        seeded += 1
+                    if str(item.get("tx_hash", "") or "") and not item.get("volatile"):
+                        cv = seed_research_concept(
+                            engram_store=engram_store, cgn_bridge=cgn_bridge,
+                            tx_hash=str(item.get("tx_hash", "") or ""),
+                            content=_content, name_fn=name_fn,
+                            domain_hint=str(item.get("domain_hint", "") or ""),
+                            felt_coverage=float(item.get("felt_coverage", 0.0) or 0.0))
+                        if cv is not None:
+                            seeded += 1
                 except Exception:  # noqa: BLE001
-                    continue   # one bad seed never stalls the queue
+                    pass   # one bad seed never stalls the queue
+                # DK.5 — BOTH classes: reinforce the research SKILL (which source
+                # answered this goal-class). Survives the volatile data's decay.
+                try:
+                    _src = str(item.get("source", "") or "")
+                    if reasoning_store is not None and _src and _content:
+                        _gc = _goal_class_fn(_content)
+                        _cnt, _matured = reasoning_store.record_research_recipe(
+                            goal_class=_gc, source=_src, epoch=_now_epoch())
+                        if _matured:
+                            # (a)→(b): crystallize the (goal_class, 'research') macro
+                            # — an anchored procedural Idea (recall-able by goal_class;
+                            # the winning source detail stays in research_recipes).
+                            reasoning_store.write_macro(
+                                reasoning_id=f"research::{_gc}", goal_class=_gc,
+                                action="research", signature=[], b_i=float(_cnt),
+                                c=1.0, time_cost=1.0, use_count=int(_cnt))
+                            logger.info("[synthesis_worker] DK.5 research-skill "
+                                        "matured → crystallized macro research::%s "
+                                        "(source=%s, n=%d)", _gc, _src[:40], _cnt)
+                except Exception:  # noqa: BLE001
+                    pass   # DK.5 never stalls the queue
             if seeded:
                 logger.info("[synthesis_worker] DK.1 research-wiki seeded %d "
                             "declarative concept(s) (queue=%d)",
@@ -2418,8 +2456,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             target=_research_wiki_loop,
             args=(research_wiki_queue, engram_store, cgn_bridge, _wiki_name_fn,
                   stop_event, interval_s),
+            kwargs={"reasoning_store": reasoning_store},  # DK.5 recipe→macro
             daemon=True, name=f"synthesis-research-wiki-{name}").start()
-        logger.info("[synthesis_worker] DK.1 research-wiki seed daemon started "
+        logger.info("[synthesis_worker] DK.1/DK.5 research-wiki+skill daemon started "
                     "(§7.D-knowledge; continuous, not dream-gated)")
 
     # EEL B1 (D-SPEC-153 / INV-Syn-29) — wire the OracleRouter's skill-score
@@ -3403,6 +3442,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         "tx_hash": str(payload.get("tx_hash", "") or ""),
                         "content": str(payload.get("content", "") or ""),
                         "domain_hint": str(payload.get("domain_hint", "") or ""),
+                        "source": str(payload.get("source", "") or ""),       # DK.5
+                        "volatile": bool(payload.get("volatile", False)),     # DK.5/Axis-1
                         "felt_coverage": float(payload.get("felt_coverage", 0.0) or 0.0),
                     })
                 except Exception as _seed_err:  # noqa: BLE001
