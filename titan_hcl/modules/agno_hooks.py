@@ -153,13 +153,22 @@ def _synthesis_decision_authority_enabled(plugin) -> bool:
     """P2 (RFP_synthesis_decision_authority) — the D4 transient feature flag.
 
     When ON, the grounded router routes on the EngineRecall top cosine (RELEVANCE
-    over the spine, INV-SDA-2) with gibberish-calibrated self-floors; when OFF
-    (default), the legacy VCB/memory-composite recall + static floors (byte-
-    identical to P1). Config: `[synthesis.decision_authority] enabled` (default
-    false; default-on after one clean T3 soak per D4)."""
+    over the spine, INV-SDA-2) with gibberish-calibrated self-floors; when OFF,
+    the legacy VCB/memory-composite recall + static floors (byte-identical to P1).
+    Config: `[synthesis.decision_authority] enabled`.
+
+    DEFAULT NOW TRUE (2026-06-14): D4 prescribed default-on after one clean T3
+    soak; T3 + T2 have run p2=true cleanly for days. The legacy (p2-off) path
+    feeds an UNBOUNDED mempool `effective_weight` into the `recall_top_cosine`
+    feature (documented [0,1]) → it clips to 1.0 → the OML policy reads "knows
+    everything" → collapses to `direct` (this is exactly what stranded T1-mainnet
+    when its config.toml silently lacked the section). p2 is the proven-correct
+    path; make it the default everywhere so config drift can't re-strand a box.
+    An explicit `enabled = false` still honors the legacy path; a config-read
+    failure conservatively falls back to legacy."""
     try:
         cfg = (getattr(plugin, "_full_config", {}) or {}).get("synthesis", {}) or {}
-        return bool((cfg.get("decision_authority", {}) or {}).get("enabled", False))
+        return bool((cfg.get("decision_authority", {}) or {}).get("enabled", True))
     except Exception:
         return False
 

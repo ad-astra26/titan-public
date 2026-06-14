@@ -236,7 +236,15 @@ def recall_score_from_memories(memories) -> float:
     recalled in the PreHook (reused, not re-computed — INV-EEL-1). 0.0 when
     nothing was recalled, which is what opens the research branch. Covers both
     recall paths: VCB records expose `effective_weight` (= chain confidence);
-    `memory.query` nodes expose `effective_weight` / `mempool_weight`."""
+    `memory.query` nodes expose `effective_weight` / `mempool_weight`.
+
+    NOTE (2026-06-14): `effective_weight`/`mempool_weight` is an UNBOUNDED chain-
+    confidence weight that GROWS with reinforcement (observed live: 1.18 → 1.39,
+    still climbing). The consumer feature `recall_top_cosine` is contracted as
+    [0,1]; an unbounded value silently saturates it at the clip ceiling → the OML
+    policy reads "knows everything" → collapses to `direct`. So clamp to [0,1]
+    here at the source. (The p2/decision-authority path uses a true EngineRecall
+    cosine and is unaffected; this guards the legacy fallback.)"""
     top = 0.0
     for m in (memories or []):
         if isinstance(m, dict):
@@ -251,4 +259,4 @@ def recall_score_from_memories(memories) -> float:
             w = 0.0
         if w > top:
             top = w
-    return top
+    return max(0.0, min(1.0, top))
