@@ -2261,7 +2261,14 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                     _gres = cgn_social.ground(_cf, _gh_ctx)
                                     if _gres and _gres.transition:
                                         cgn_social.send_transition(_gres.transition)
-                                _g_reward = 0.02 + _grel * 0.04
+                                # RFP_soar_haov_chunking_loop §7.1 (Phase 1,
+                                # reward foundation): the old 0.02+_grel*0.04
+                                # capped social reward at [0.02,0.06] — mostly
+                                # BELOW the reward>0.05 impasse gate (cgn.py:982)
+                                # → social hovered in false-stuck. _grel is
+                                # already a real felt-relevance in [0,1]; reward
+                                # the social grounding by it directly. INV-SOAR-2.
+                                _g_reward = round(_grel, 4)
                                 _cgn_forward_outcome(
                                     "social", _gid, _g_reward,
                                     {"type": "events_concept",

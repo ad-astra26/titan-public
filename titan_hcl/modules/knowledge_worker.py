@@ -514,9 +514,16 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                     _distribute(send_queue, name, requestor, topic,
                                 internal[0], source="internal_recall",
                                 request_id=_request_id)
+                    # RFP_soar_haov_chunking_loop §7.1 (Phase 1, reward
+                    # foundation): a SUCCESSFUL internal recall is a real
+                    # positive outcome — reward it by its recall confidence
+                    # (in scope here, gated >0.4 above → [0.4,1.0]) instead of
+                    # the old hardcoded 0.0 (`type="experience"` self-matched it
+                    # as the FINAL reward → knowledge looked chronically "stuck"
+                    # → 100% HAOV falsification). INV-SOAR-2.
                     _send_transition(send_queue, name, cgn_client,
                                      topic, 0, neuromods,
-                                     reward=0.0)  # Delayed reward
+                                     reward=float(internal[0]["confidence"]))
                     logger.info("[KnowledgeWorker] Internal recall: '%s' "
                                 "(conf=%.2f)", topic[:40],
                                 internal[0]["confidence"])
