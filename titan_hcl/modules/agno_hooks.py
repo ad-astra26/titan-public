@@ -473,6 +473,65 @@ async def _e3_research_tool_fetch(plugin, prompt_text):
         return None
 
 
+async def _dispatch_knowledge_research(plugin, gap: str) -> str:
+    """Route a chat research gap through the unified knowledge_dispatcher
+    IN-PROCESS, with the agno worker's in-process StealthSage as the web-research
+    fallback backend.
+
+    WHY the dispatcher instead of bare sage.research(): classify_query + the
+    _BACKEND_CHAINS try the DIRECT REST backends first — wikipedia_direct /
+    wiktionary / free_dictionary (official open APIs: no SearXNG, no proxy, no
+    CAPTCHA, sub-second) — for dictionary/encyclopedic gaps, and only fall through
+    to the full SearXNG+scrape Sage pipeline (the `searxng_*` chain entries, which
+    `_run_chain` routes to `_invoke_sage_backend` when a sage is supplied) for
+    conceptual/web gaps. This makes chat research (a) faster for factual/
+    definitional questions and (b) resilient when SearXNG / the residential proxy
+    degrades — on 2026-06-15 every web engine was CAPTCHA/rate-blocked so bare-sage
+    research returned EMPTY, while the direct routes would still have answered.
+
+    Stateless first cut (Maker 2026-06-15): cache=None + learner=None — no
+    cross-process SQLite writes. The shared cache/learner are a follow-up, routed
+    through the knowledge cache's IMW single-writer daemon. We TRUST the
+    dispatcher's own routing chains (a dictionary-classified gap that misses all
+    dictionary backends is intentionally NOT web-searched) — no ad-hoc override.
+    On a clean no-result we return "" (the chat proceeds without findings); only on
+    a dispatch EXCEPTION do we fall back to bare sage.research so an integration
+    fault can never regress the known-good path. Never raises (hot path)."""
+    sage = getattr(plugin, "sage_researcher", None)
+    if sage is None:
+        return ""
+    try:
+        from titan_hcl.logic.knowledge_dispatcher import dispatch
+        host = (getattr(sage, "_searxng_host", "") or "").rstrip("/")
+        searxng_url = (host + "/search") if host else ""
+        dr = await dispatch(
+            topic=gap,
+            sage=sage,
+            searxng_url=searxng_url,
+            timeout_per_backend=10.0,
+            requestor="agno_chat",
+        )
+        if dr.success and dr.result and dr.result.raw_text:
+            logger.info(
+                "[PreHook] knowledge_dispatch answered via backend=%s "
+                "(qt=%s, attempts=%d, %dms)",
+                dr.backend_used, dr.query_type.value, len(dr.attempts),
+                round(dr.latency_ms_total))
+            return "[SAGE_RESEARCH_FINDINGS]: %s" % dr.result.raw_text
+        logger.info(
+            "[PreHook] knowledge_dispatch no result (qt=%s rejected=%s attempts=%s)",
+            getattr(dr.query_type, "value", "?"), dr.rejected, dr.attempts)
+        return ""
+    except Exception:
+        logger.warning(
+            "[PreHook] knowledge_dispatch error → bare-sage fallback", exc_info=True)
+        try:
+            return await sage.research(knowledge_gap=gap) or ""
+        except Exception:
+            logger.warning("[PreHook] bare-sage fallback also failed", exc_info=True)
+            return ""
+
+
 _DK4_STOPWORDS = frozenset((
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
     "was", "were", "what", "which", "who", "does", "do", "did", "how", "why",
@@ -2661,9 +2720,10 @@ def create_pre_hook(plugin):
                 # miss / non-allowlisted → the full research path.
                 sage_findings = await _e3_research_tool_fetch(plugin, prompt_text)
                 if not sage_findings:
-                    sage_findings = await plugin.sage_researcher.research(
-                        knowledge_gap=_research_gap,
-                    )
+                    # Unified knowledge pipeline: direct REST backends (wiki/dict)
+                    # first, full Sage (SearXNG+scrape) as the conceptual fallback.
+                    sage_findings = await _dispatch_knowledge_research(
+                        plugin, _research_gap)
             if sage_findings:
                 injected += f"### Research Findings\n{sage_findings}\n\n"
                 plugin._last_research_sources = plugin._extract_sources_from_findings(sage_findings)

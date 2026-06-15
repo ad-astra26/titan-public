@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -213,13 +214,22 @@ class StealthSageResearcher:
         sources_used: list[str] = []
         doc_summaries: list[str] = []
 
+        # [PERF-INSTRUMENT 2026-06-15] Per-phase wall-clock timing — logging only,
+        # zero behavior change. Diagnoses the ~80s research turn (research-speed
+        # MUST-DO). Remove or demote to debug once the round/phase fix lands.
+        _t_start = time.monotonic()
+        _ms = lambda t0: round((time.monotonic() - t0) * 1000)
+
         # ---- Step A: Discovery (URLs + per-result snippets in ONE call) ----
+        _t_search = time.monotonic()
         if self._firecrawl_api_key and self._scrape_strategy == "firecrawl":
             urls = await self._firecrawl_search(knowledge_gap)
             results = [{"url": u, "title": "", "content": ""} for u in urls]
         else:
             results = await self._searxng_search(knowledge_gap)
             urls = [r["url"] for r in results]
+        log.info("[PERF] search phase: %d ms (%d urls)",
+                 _ms(_t_search), len(urls))
 
         # Assemble the snippet evidence the search already handed us (free).
         snippet_parts = [
@@ -231,25 +241,38 @@ class StealthSageResearcher:
         # search already returned (no scrape, ~3s). Fall through to the scrape
         # tier only when the snippets are too thin OR the distiller flags them
         # insufficient (the INSUFFICIENT sentinel). ----
-        if (self._snippet_first
+        _tier1_eligible = (self._snippet_first
                 and len(snippet_parts) >= self._snippet_min_results
-                and len(snippet_evidence) >= self._snippet_min_chars):
+                and len(snippet_evidence) >= self._snippet_min_chars)
+        log.info("[PERF] tier-1 eligible=%s (snippets=%d/%d min, chars=%d/%d min)",
+                 _tier1_eligible, len(snippet_parts), self._snippet_min_results,
+                 len(snippet_evidence), self._snippet_min_chars)
+        if _tier1_eligible:
+            _t_t1 = time.monotonic()
             snippet_distilled = await self._distill_with_ollama(
                 knowledge_gap, snippet_evidence, sufficiency_check=True)
-            if snippet_distilled and snippet_distilled.strip() != _INSUFFICIENT_SENTINEL:
+            _t1_sufficient = bool(
+                snippet_distilled and snippet_distilled.strip() != _INSUFFICIENT_SENTINEL)
+            log.info("[PERF] tier-1 distill: %d ms, sufficient=%s (result_len=%d)",
+                     _ms(_t_t1), _t1_sufficient,
+                     len(snippet_distilled or ""))
+            if _t1_sufficient:
                 self._write_research_log(
                     knowledge_gap=knowledge_gap, sources_used=["WebSnippet"],
                     urls_scraped=urls, distilled_summary=snippet_distilled)
                 log.info("[StealthSage] Tier-1 snippet-first answered '%s' "
-                         "(%d chars, no scrape).", knowledge_gap,
-                         len(snippet_distilled))
+                         "(%d chars, no scrape). [PERF] TOTAL %d ms",
+                         knowledge_gap, len(snippet_distilled), _ms(_t_start))
                 return f"[SAGE_RESEARCH_FINDINGS]: {snippet_distilled}"
             log.info("[StealthSage] Tier-1 snippets insufficient for '%s' → "
                      "scrape tier.", knowledge_gap)
 
         # ---- Tier 2: Scrape (trafilatura main-content) + Document Deep-Dive ----
         if urls:
+            _t_scrape = time.monotonic()
             scrape_results, doc_results = await self._scrape_urls(urls)
+            log.info("[PERF] tier-2 scrape: %d ms (%d web chunks, %d docs from %d urls)",
+                     _ms(_t_scrape), len(scrape_results), len(doc_results), len(urls))
             raw_chunks.extend(scrape_results)
             doc_summaries.extend(doc_results)
 
@@ -279,9 +302,13 @@ class StealthSageResearcher:
         combined_raw = "\n\n---\n\n".join(all_content_parts)
 
         # ---- Step D: Local Distillation (/v4/llm-distill) ----
+        _t_t2 = time.monotonic()
         distilled = await self._distill_with_ollama(knowledge_gap, combined_raw)
+        log.info("[PERF] tier-2 distill: %d ms (%d raw chars in, %d out)",
+                 _ms(_t_t2), len(combined_raw), len(distilled or ""))
 
         if not distilled:
+            log.info("[PERF] TOTAL (tier-2 empty): %d ms", _ms(_t_start))
             return ""
 
         # ---- Step E: Memory Ingestion + Audit Log ----
@@ -295,7 +322,8 @@ class StealthSageResearcher:
         findings = f"[SAGE_RESEARCH_FINDINGS]: {distilled}"
         log.info(
             f"[StealthSage] Research complete for '{knowledge_gap}'. "
-            f"Sources: {sources_used}. Length: {len(distilled)} chars."
+            f"Sources: {sources_used}. Length: {len(distilled)} chars. "
+            f"[PERF] TOTAL %d ms" % _ms(_t_start)
         )
         return findings
 
