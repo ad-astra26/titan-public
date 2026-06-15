@@ -502,26 +502,32 @@ async def _dispatch_knowledge_research(plugin, gap: str) -> str:
         return ""
     try:
         from titan_hcl.logic.knowledge_dispatcher import dispatch
-        host = (getattr(sage, "_searxng_host", "") or "").rstrip("/")
-        searxng_url = (host + "/search") if host else ""
+        # ── Phase 1 — DIRECT REST backends ONLY (sage=None). ──────────────
+        # With sage=None the chain's `searxng_*` entries hit `_run_chain`'s
+        # "skipped" branch (no fetcher, no raw mode, no sage), so ONLY the
+        # direct BACKEND_REGISTRY routes (wiktionary / free_dictionary /
+        # wikipedia_direct) run here. This is the fix for the multi-run cost:
+        # the OLD `sage=sage` form re-invoked the FULL Sage pipeline once per
+        # searxng_* chain entry (2–4 search+scrape+distill runs per chat when
+        # early backends failed under load — verified live 2026-06-15, T1
+        # load-10 → 27.9s + 8.8s sage runs). Direct routes are sub-second +
+        # proxy-free → the resilience floor.
         dr = await dispatch(
-            topic=gap,
-            sage=sage,
-            searxng_url=searxng_url,
-            timeout_per_backend=10.0,
-            requestor="agno_chat",
-        )
+            topic=gap, sage=None, cache=None, learner=None,
+            timeout_per_backend=8.0, requestor="agno_chat")
         if dr.success and dr.result and dr.result.raw_text:
             logger.info(
-                "[PreHook] knowledge_dispatch answered via backend=%s "
-                "(qt=%s, attempts=%d, %dms)",
-                dr.backend_used, dr.query_type.value, len(dr.attempts),
-                round(dr.latency_ms_total))
+                "[PreHook] knowledge_dispatch DIRECT backend=%s (qt=%s, %dms)",
+                dr.backend_used, dr.query_type.value, round(dr.latency_ms_total))
             return "[SAGE_RESEARCH_FINDINGS]: %s" % dr.result.raw_text
+        # ── Phase 2 — no direct hit → EXACTLY ONE full Sage run. ──────────
+        # Identical cost to the pre-dispatch bare-sage path (one search+scrape+
+        # distill). Conceptual/web gaps land here; dictionary/encyclopedic gaps
+        # were answered direct above.
         logger.info(
-            "[PreHook] knowledge_dispatch no result (qt=%s rejected=%s attempts=%s)",
-            getattr(dr.query_type, "value", "?"), dr.rejected, dr.attempts)
-        return ""
+            "[PreHook] knowledge_dispatch no direct hit (qt=%s) → single sage run",
+            getattr(dr.query_type, "value", "?"))
+        return await sage.research(knowledge_gap=gap) or ""
     except Exception:
         logger.warning(
             "[PreHook] knowledge_dispatch error → bare-sage fallback", exc_info=True)
