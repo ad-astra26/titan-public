@@ -940,7 +940,10 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                         if cv is not None:
                             seeded += 1
                 except Exception:  # noqa: BLE001
-                    pass   # one bad seed never stalls the queue
+                    # never stall the queue, but DO surface the error (no silent
+                    # except — Maker directive 2026-06-15).
+                    logger.warning("[synthesis_worker] DK.1 concept seed failed "
+                                   "(one bad seed, continuing)", exc_info=True)
                 # DK.5 — BOTH classes: reinforce the research SKILL (which source
                 # answered this goal-class). Survives the volatile data's decay.
                 try:
@@ -980,7 +983,11 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                                         "re-versioned → %s (from %s, source=%s, n=%d)",
                                         _succ, _prior or "-", _src[:40], _cnt)
                 except Exception:  # noqa: BLE001
-                    pass   # DK.5 never stalls the queue
+                    # never stall the queue, but DO surface the error (no silent
+                    # except — Maker directive 2026-06-15; this except was hiding
+                    # why DK.5 recipes weren't maturing on the chat-confirm feed).
+                    logger.warning("[synthesis_worker] DK.5 research-recipe record "
+                                   "failed (continuing)", exc_info=True)
             if seeded:
                 logger.info("[synthesis_worker] DK.1 research-wiki seeded %d "
                             "declarative concept(s) (queue=%d)",
