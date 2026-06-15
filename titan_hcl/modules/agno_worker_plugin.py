@@ -241,7 +241,14 @@ class WorkerPlugin:
                 _cfg: dict[str, Any] = {}
                 _cfg.update(self._full_config.get("inference", {}) or {})
                 _cfg.update(self._full_config.get("stealth_sage", {}) or {})
-                _sage = StealthSageResearcher(_build_sage_config(_cfg))
+                _sage_cfg = _build_sage_config(_cfg)
+                # Research DISTILLATION (turning scraped pages into an answer) goes
+                # through /v4/llm-distill, which StealthSage reads from config["api"]
+                # (internal_key + port). _build_sage_config drops the api section, so
+                # without this the distiller logs "No internal_key … distillation
+                # disabled" → research gathers data but returns EMPTY (2026-06-15).
+                _sage_cfg["api"] = self._full_config.get("api", {}) or {}
+                _sage = StealthSageResearcher(_sage_cfg)
                 _wire_ollama_cloud(_sage, _cfg)
                 self._local_sage_instance = _sage
                 logger.info(
