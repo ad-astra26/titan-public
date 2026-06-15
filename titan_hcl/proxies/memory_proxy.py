@@ -601,10 +601,15 @@ class MemoryProxy:
     # self-learning feed was silently dead. Reads = work-RPC (G19, the `query`
     # pattern); writes = one-way bus events (G19, the `add_to_mempool` pattern).
 
-    def find_pending_confirmation_nodes(self, user_identifier: str) -> list:
+    async def find_pending_confirmation_nodes(self, user_identifier: str) -> list:
         """READ work-RPC → memory.find_pending_confirmation_nodes (core:481).
-        SYNC — the EEL-A2 gate (agno_hooks.py) calls it un-awaited."""
-        reply = self._work_rpc_sync(
+        ASYNC: the only caller is the agno PreHook EEL-A2 gate, which runs INSIDE
+        the worker event loop — a sync work-RPC there hits `_work_rpc_sync`'s
+        in-loop fallback `self._bus.request`, which the worker `_WorkerBusClient`
+        does NOT implement (only `request_async`). So this is async + awaited at
+        the call site (the canonical TieredMemoryGraph method is sync; the proxy
+        transport requires async, like `query`)."""
+        reply = await self._work_rpc_async(
             {"action": "find_pending_confirmation_nodes",
              "user_identifier": user_identifier}, 5.0)
         if reply:

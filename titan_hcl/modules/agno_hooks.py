@@ -1588,7 +1588,11 @@ def create_pre_hook(plugin):
         # path. Confirm → +δ (promote); dispute → −δ + re-research the ORIGINAL
         # topic; neutral → elapse one turn (weak-confirm on window expiry).
         try:
-            _a2_pendings = plugin.memory.find_pending_confirmation_nodes(user_id)
+            # await — the proxy method is async (worker-context work-RPC needs
+            # request_async; a sync work-RPC here hit the missing _WorkerBusClient
+            # .request, 2026-06-15). The canonical TitanMemory method is sync, but
+            # the agno worker always holds a MemoryProxy here.
+            _a2_pendings = await plugin.memory.find_pending_confirmation_nodes(user_id)
             if _a2_pendings:
                 from titan_hcl.synthesis.confirmation_intent import detect_confirmation
                 from titan_hcl.params import get_params as _get_params
