@@ -594,6 +594,70 @@ class MemoryProxy:
         `add_to_mempool` MEMORY_MEMPOOL_ADD pattern)."""
         return None
 
+    # ── EEL-A2 confirmation gate + recall methods (interface-drift fix, ──
+    # 2026-06-15; audit: titan-docs/audits/AUDIT_memoryproxy_interface_drift_*).
+    # The canonical TieredMemoryGraph exposes these; the agno-worker proxy
+    # lacked them → AttributeError (swallowed at debug) → the EEL confirm→seed
+    # self-learning feed was silently dead. Reads = work-RPC (G19, the `query`
+    # pattern); writes = one-way bus events (G19, the `add_to_mempool` pattern).
+
+    def find_pending_confirmation_nodes(self, user_identifier: str) -> list:
+        """READ work-RPC → memory.find_pending_confirmation_nodes (core:481).
+        SYNC — the EEL-A2 gate (agno_hooks.py) calls it un-awaited."""
+        reply = self._work_rpc_sync(
+            {"action": "find_pending_confirmation_nodes",
+             "user_identifier": user_identifier}, 5.0)
+        if reply:
+            return reply.get("payload", {}).get("nodes", []) or []
+        return []
+
+    def reinforce_mempool_node(self, node_id, delta=None) -> None:
+        """WRITE one-way event → memory.reinforce_mempool_node (core:446).
+        SYNC fire-and-forget (the EEL-A2 confirm/dispute path doesn't use a
+        return value); writes never block the chat hot path (G19)."""
+        from titan_hcl.bus import make_msg, MEMORY_REINFORCE_NODE
+        try:
+            self._bus.publish(make_msg(
+                MEMORY_REINFORCE_NODE, "memory_proxy", "memory",
+                {"node_id": node_id, "delta": delta}))
+        except Exception as e:
+            logger.warning(
+                "[MemoryProxy] reinforce_mempool_node publish raised: %s", e)
+
+    def tick_confirmation_window(self, node_id, weak_delta) -> str:
+        """WRITE one-way event → memory.tick_confirmation_window (core:498).
+        SYNC fire-and-forget; the real status string ("expired_weak"/"pending"/
+        "gone") lives in the worker — the proxy returns "" (the EEL-A2 neutral
+        path does not consume the return)."""
+        from titan_hcl.bus import make_msg, MEMORY_TICK_CONFIRMATION
+        try:
+            self._bus.publish(make_msg(
+                MEMORY_TICK_CONFIRMATION, "memory_proxy", "memory",
+                {"node_id": node_id, "weak_delta": weak_delta}))
+        except Exception as e:
+            logger.warning(
+                "[MemoryProxy] tick_confirmation_window publish raised: %s", e)
+        return ""
+
+    async def graph_completion_search(self, prompt: str, top_k: int = 3) -> list:
+        """READ work-RPC → memory.graph_completion_search (core:878). ASYNC."""
+        reply = await self._work_rpc_async(
+            {"action": "graph_completion_search",
+             "prompt": prompt, "top_k": top_k}, 5.0)
+        if reply:
+            return reply.get("payload", {}).get("results", []) or []
+        return []
+
+    async def query_user_memories(self, prompt: str, user_id: str,
+                                  limit: int = 3) -> list:
+        """READ work-RPC → memory.query_user_memories (core:645). ASYNC."""
+        reply = await self._work_rpc_async(
+            {"action": "query_user_memories",
+             "prompt": prompt, "user_id": user_id, "limit": limit}, 5.0)
+        if reply:
+            return reply.get("payload", {}).get("memories", []) or []
+        return []
+
     def get_growth_metrics(self, node_saturation_24h: int = 30) -> dict:
         """Get growth metrics (learning velocity, directive alignment).
         SHM-direct via memory_state.bin (Session 2 §4.C.13).

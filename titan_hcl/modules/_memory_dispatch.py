@@ -147,6 +147,11 @@ READ_ACTIONS = frozenset({
     "knowledge_graph",
     "count",
     "status",
+    # EEL-A2 + recall reads (interface-drift fix 2026-06-15) — the agno-worker
+    # proxy was missing these → AttributeError → dead EEL confirm→seed feed.
+    "find_pending_confirmation_nodes",
+    "graph_completion_search",
+    "query_user_memories",
 })
 
 WRITE_ACTIONS = frozenset({
@@ -329,6 +334,8 @@ class ActionRouter:
         handle_memory_add: ActionHandler,
         handle_mempool_add: ActionHandler,
         handle_memory_ingest_request: Optional[ActionHandler] = None,
+        handle_reinforce_node: Optional[ActionHandler] = None,
+        handle_tick_confirmation: Optional[ActionHandler] = None,
         max_read_workers: int = 8,
     ) -> None:
         self.ctx = ctx
@@ -340,6 +347,10 @@ class ActionRouter:
         # without a registered handler, dispatch logs + drops to avoid
         # hanging the producer (which is fire-and-forget anyway).
         self._handle_memory_ingest_request = handle_memory_ingest_request
+        # EEL-A2 write events (interface-drift fix 2026-06-15) — one-way,
+        # fire-and-forget, writer pool (like MEMORY_MEMPOOL_ADD).
+        self._handle_reinforce_node = handle_reinforce_node
+        self._handle_tick_confirmation = handle_tick_confirmation
 
         self._read_pool = ThreadPoolExecutor(
             max_workers=max_read_workers,
@@ -392,6 +403,16 @@ class ActionRouter:
         if msg_type == bus.MEMORY_MEMPOOL_ADD:
             self._writer_pool.submit(
                 self._safe_run, self._handle_mempool_add, msg)
+            return
+        if msg_type == bus.MEMORY_REINFORCE_NODE:
+            if self._handle_reinforce_node is not None:
+                self._writer_pool.submit(
+                    self._safe_run, self._handle_reinforce_node, msg)
+            return
+        if msg_type == bus.MEMORY_TICK_CONFIRMATION:
+            if self._handle_tick_confirmation is not None:
+                self._writer_pool.submit(
+                    self._safe_run, self._handle_tick_confirmation, msg)
             return
         if msg_type == bus.QUERY:
             payload = msg.get("payload", {}) or {}

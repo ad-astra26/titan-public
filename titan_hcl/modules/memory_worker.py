@@ -562,6 +562,8 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         handle_memory_add=_handle_memory_add,
         handle_mempool_add=_handle_mempool_add,
         handle_memory_ingest_request=_handle_memory_ingest_request,
+        handle_reinforce_node=_handle_reinforce_node,
+        handle_tick_confirmation=_handle_tick_confirmation,
     )
     logger.info(
         "[MemoryWorker] dispatch router ready — read_pool=8 writer_pool=1 "
@@ -1111,6 +1113,36 @@ def _handle_query(msg: dict, ctx: WorkerContext) -> None:
         elif action == "count":
             count = memory.get_persistent_count()
             _send_response(send_queue, name, src, {"count": count}, rid)
+
+        elif action == "find_pending_confirmation_nodes":
+            # EEL-A2 confirm gate (interface-drift fix 2026-06-15). SYNC core
+            # method → returns List[Dict] of pending-confirmation mempool nodes.
+            nodes = memory.find_pending_confirmation_nodes(
+                payload.get("user_identifier", "")) or []
+            _send_response(send_queue, name, src, {"nodes": nodes}, rid)
+
+        elif action == "graph_completion_search":
+            # ASYNC core method → Kuzu graph traversal (no LLM).
+            results = loop.run_until_complete(
+                asyncio.wait_for(
+                    memory.graph_completion_search(
+                        payload.get("prompt", ""),
+                        top_k=int(payload.get("top_k", 3))),
+                    timeout=10.0))
+            _send_response(send_queue, name, src,
+                           {"results": results or []}, rid)
+
+        elif action == "query_user_memories":
+            # ASYNC core method → per-user recall (mempool + persistent).
+            mems = loop.run_until_complete(
+                asyncio.wait_for(
+                    memory.query_user_memories(
+                        payload.get("prompt", ""),
+                        payload.get("user_id", ""),
+                        limit=int(payload.get("limit", 3))),
+                    timeout=10.0))
+            _send_response(send_queue, name, src,
+                           {"memories": mems or []}, rid)
 
         elif action == "fetch_mempool":
             mempool = loop.run_until_complete(memory.fetch_mempool()) or []
@@ -1713,6 +1745,52 @@ def _handle_mempool_add(msg: dict, ctx: WorkerContext) -> None:
         )
     except Exception as e:
         logger.warning("[MemoryWorker] MEMORY_MEMPOOL_ADD handler error: %s",
+                       e, exc_info=True)
+
+
+def _handle_reinforce_node(msg: dict, ctx: WorkerContext) -> None:
+    """Handle bus.MEMORY_REINFORCE_NODE — one-way EEL-A2 confirm/dispute write.
+
+    Interface-drift fix (2026-06-15): the agno-worker proxy lacked
+    reinforce_mempool_node, so the EEL confirm gate silently no-op'd. The proxy
+    now publishes this event; we reinforce the mempool node under the write lock
+    (writer pool, single-writer per G21). Fire-and-forget — no response."""
+    payload = msg.get("payload", {}) or {}
+    node_id = payload.get("node_id")
+    delta = payload.get("delta")
+    if node_id is None:
+        logger.debug("[MemoryWorker] MEMORY_REINFORCE_NODE ignored (no node_id)")
+        return
+    try:
+        with ctx.write_lock:
+            ctx.memory.reinforce_mempool_node(int(node_id), delta)
+        logger.info("[MemoryWorker] MEMORY_REINFORCE_NODE node=%s delta=%s",
+                    node_id, delta)
+    except Exception as e:
+        logger.warning("[MemoryWorker] MEMORY_REINFORCE_NODE handler error: %s",
+                       e, exc_info=True)
+
+
+def _handle_tick_confirmation(msg: dict, ctx: WorkerContext) -> None:
+    """Handle bus.MEMORY_TICK_CONFIRMATION — one-way EEL-A2 neutral-turn write.
+
+    Elapses one turn of a pending node's confirmation window (weak-confirm on
+    expiry). Fire-and-forget; the status string stays here (the proxy returns
+    "")."""
+    payload = msg.get("payload", {}) or {}
+    node_id = payload.get("node_id")
+    weak_delta = payload.get("weak_delta")
+    if node_id is None:
+        logger.debug("[MemoryWorker] MEMORY_TICK_CONFIRMATION ignored (no node_id)")
+        return
+    try:
+        with ctx.write_lock:
+            status = ctx.memory.tick_confirmation_window(
+                int(node_id), float(weak_delta))
+        logger.info("[MemoryWorker] MEMORY_TICK_CONFIRMATION node=%s → %s",
+                    node_id, status)
+    except Exception as e:
+        logger.warning("[MemoryWorker] MEMORY_TICK_CONFIRMATION handler error: %s",
                        e, exc_info=True)
 
 

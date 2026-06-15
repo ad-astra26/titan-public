@@ -2523,6 +2523,8 @@ MEMORY_ADD                 = "MEMORY_ADD"
 MEMORY_INGEST_COMPLETED    = "MEMORY_INGEST_COMPLETED"           # memory worker → all (broadcast, completion ack for INGEST_REQUEST; carries node_id + weight + effective_weight, filtered by request_id)
 MEMORY_INGEST_REQUEST      = "MEMORY_INGEST_REQUEST"             # producers → memory worker (one-way, no RPC; replaces work-RPC `add` action — Phase B rFP §3.4.1)
 MEMORY_MEMPOOL_ADD         = "MEMORY_MEMPOOL_ADD"                # chat → memory worker (one-way, no RPC)
+MEMORY_REINFORCE_NODE      = "MEMORY_REINFORCE_NODE"            # EEL-A2 confirm/dispute → reinforce mempool node (one-way)
+MEMORY_TICK_CONFIRMATION   = "MEMORY_TICK_CONFIRMATION"         # EEL-A2 neutral → tick a pending node's confirmation window (one-way)
 MEMORY_RECALL_PERTURBATION = "MEMORY_RECALL_PERTURBATION"
 
 # Meta-reasoning rewards + signals
