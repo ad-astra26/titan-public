@@ -247,7 +247,19 @@ class WorkerPlugin:
                 # (internal_key + port). _build_sage_config drops the api section, so
                 # without this the distiller logs "No internal_key … distillation
                 # disabled" → research gathers data but returns EMPTY (2026-06-15).
-                _sage_cfg["api"] = self._full_config.get("api", {}) or {}
+                # The internal_key lives in secrets.toml; this worker's _full_config
+                # may not carry the merged secret, so resolve it canonically
+                # (load_titan_config merges secrets) when _full_config lacks it.
+                _api_cfg = dict(self._full_config.get("api", {}) or {})
+                if not _api_cfg.get("internal_key"):
+                    try:
+                        from titan_hcl.config_loader import load_titan_config
+                        _merged_api = (load_titan_config().get("api", {}) or {})
+                        if _merged_api.get("internal_key"):
+                            _api_cfg = _merged_api
+                    except Exception:
+                        pass
+                _sage_cfg["api"] = _api_cfg
                 _sage = StealthSageResearcher(_sage_cfg)
                 _wire_ollama_cloud(_sage, _cfg)
                 self._local_sage_instance = _sage
