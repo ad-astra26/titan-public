@@ -3207,6 +3207,33 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
             logger.debug("[DreamingMeta] dream-entry consult skipped: %s", _dm_err)
     state_refs["_dreaming_meta_was_dreaming"] = _epoch_is_dreaming
 
+    # ── CGN dream consolidation trigger (restore — dropped at D8-3) ──────
+    # On the waking→dreaming RISING EDGE, emit CGN_DREAM_CONSOLIDATE so CGN
+    # runs its full dream consolidation. This emit lived in the deleted
+    # spirit_worker BEGIN_DREAMING block and was never re-homed at the §4.I /
+    # D8-3 spirit→cognitive migration → CGN dream consolidation went dead
+    # fleet-wide (last real one 2026-05-14; cgn.consolidate(dream_phase=True)
+    # had zero invoker → per-consumer policy training, cross-insight transfer,
+    # decay + the consolidation telemetry/timechain procedural fork all frozen).
+    # Symmetric to the DreamingMeta rising-edge consult above. language_worker
+    # is the live consumer (forwards → CGN_CONSOLIDATE → cgn.consolidate(
+    # dream_phase=True)); the cognitive_worker CGN_DREAM_CONSOLIDATE subscriber
+    # routes to dreaming.consolidate_pending (currently a no-op — method absent).
+    # Read-only here + non-blocking emit; touches no dream/engine state; fires
+    # once per dream cycle. Restored 2026-06-15 (RFP_cgn_canonical_iql_upgrade
+    # session — surfaced while verifying the IQL dream-training path live).
+    if _epoch_is_dreaming and not state_refs.get(
+            "_cgn_consolidate_was_dreaming", False):
+        try:
+            _send_msg(send_queue, bus.CGN_DREAM_CONSOLIDATE, name, "language",
+                      {"dream_phase": True, "trigger": "dream_onset"})
+            logger.info("[CGN] dream-onset → CGN_DREAM_CONSOLIDATE emitted "
+                        "(restored rising-edge hook; was dead since D8-3)")
+        except Exception as _cgn_cons_err:
+            logger.warning("[CGN] dream-onset consolidate emit failed: %s",
+                           _cgn_cons_err, exc_info=True)
+    state_refs["_cgn_consolidate_was_dreaming"] = _epoch_is_dreaming
+
     # ── Dream Bridge A (rFP §3G Phase 10G restore) ──────────────────────
     # Symmetric to the DreamingMeta rising-edge consult above: on the
     # dreaming→waking FALLING EDGE (dream just ended), harvest crystallized
