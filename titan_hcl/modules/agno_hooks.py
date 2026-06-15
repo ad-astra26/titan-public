@@ -3289,8 +3289,9 @@ def create_post_hook(plugin):
         _acq_source = getattr(plugin, "_acquired_research_source", None)
         plugin._acquired_research_source = None
         _acq_tags = ["acquired:research"] if _acq_source else None
-        logger.info("[PostHook][EEL-A1] mempool persist tags=%s source=%s user=%s",
-                    _acq_tags, _acq_source, user_id)
+        if _acq_source:  # research turn — log the provenance tagging (low-freq)
+            logger.info("[PostHook][EEL-A1] mempool node tagged acquired:research "
+                        "(source=%s user=%s) → confirm window opened", _acq_source, user_id)
 
         async def _log_to_mempool_bg(user_prompt_v, response_text_v, user_id_v,
                                      neuromod_context_v=None,

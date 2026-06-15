@@ -493,22 +493,6 @@ class TieredMemoryGraph:
             and (v.get("confirm_turns_left") or 0) > 0
         ]
         pending.sort(key=lambda n: n.get("created_at", 0), reverse=True)
-        # DIAG (2026-06-15, remove after EEL last-mile fix): break down WHY a
-        # user's mempool nodes do/don't qualify as pending-confirmation.
-        try:
-            mempool = [v for v in self._node_store.values()
-                       if v.get("type") == "MemoryNode"
-                       and v.get("status") == "mempool"]
-            mine = [v for v in mempool if v.get("source_id") == sid]
-            tagged = [v for v in mine if "acquired:research" in (v.get("tags") or [])]
-            windowed = [v for v in tagged if (v.get("confirm_turns_left") or 0) > 0]
-            logger.info(
-                "[Memory][EEL-A2 DIAG] sid=%s | mempool_total=%d mine=%d "
-                "acquired:research=%d windowed=%d → pending=%d | sample_sids=%s",
-                sid, len(mempool), len(mine), len(tagged), len(windowed),
-                len(pending), [v.get("source_id") for v in mempool[:4]])
-        except Exception:  # noqa: BLE001
-            pass
         return pending
 
     def tick_confirmation_window(self, node_id: int, weak_delta: float) -> str:
