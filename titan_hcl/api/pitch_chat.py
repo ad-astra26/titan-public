@@ -181,6 +181,12 @@ class PitchChatResponse(BaseModel):
     # Empty on decline. Frontend renders each entry as a chevron via
     # ChainProofDrawer.
     proofs: list[PitchChainProof] = Field(default_factory=list)
+    # §7.B (B.4) — reasoning_id of a NON-verifiable turn (direct/research/IDK).
+    # Present so the wallet-less PitchClient can render the voluntary rating
+    # footer and POST a "teach him" rating to /v6/pitch/rate keyed by this id.
+    # None on a declined turn, a verifiable (tool/skill) turn, or when the OML
+    # router minted no decision.
+    reasoning_id: Optional[str] = None
 
 
 # ── Recording ─────────────────────────────────────────────────────────
@@ -643,8 +649,15 @@ async def pitch_chat(
     # replies — a "why declined" card already carries its substrate
     # explanation; chevroning a decline would be visual noise.
     proofs: list[PitchChainProof] = []
+    reasoning_id: Optional[str] = None
     if decline is None and reply_text:
         proofs = _compute_pitch_proofs(request)
+        # §7.B (B.4) — the non-verifiable-turn id (agno_proxy._translate_reply
+        # surfaces it from the worker payload). Lets the visitor rate this turn
+        # via /v6/pitch/rate. Absent on a verifiable (tool/skill) turn.
+        _rid = body_inner.get("reasoning_id") if isinstance(body_inner, dict) else None
+        if isinstance(_rid, str) and _rid.strip():
+            reasoning_id = _rid.strip()
 
     # ── Recording: outbound ───────────────────────────────────────
     _append_recording(thread_id, "out", {
@@ -653,6 +666,7 @@ async def pitch_chat(
         "decline_reason": decline[0] if decline else None,
         "internal_time": internal.model_dump(),
         "proofs": [p.model_dump() for p in proofs],
+        "reasoning_id": reasoning_id,
     })
 
     return PitchChatResponse(
@@ -664,6 +678,91 @@ async def pitch_chat(
         decline_reason=decline[0] if decline else None,
         decline_explanation=decline[1] if decline else None,
         proofs=proofs,
+        reasoning_id=reasoning_id,
+    )
+
+
+class PitchRateRequest(BaseModel):
+    """A wallet-less visitor rating a non-verifiable pitch turn (§7.B B.4).
+    `reasoning_id` is the one returned by /v6/pitch/chat for this turn."""
+    thread_id: str = Field(..., min_length=8, max_length=64)
+    reasoning_id: str = Field(..., min_length=8, max_length=64)
+    score: float = Field(..., description="stars5: 1–5 · research3: 1–3")
+    scale: str = Field("stars5", description="stars5 | research3")
+
+
+# A pitch reasoning_id is a uuid4().hex minted in the PreHook
+# (agno_hooks.py:_emit_nonverifiable_decision). Validate the shape so a
+# malformed id never reaches the bus.
+_REASONING_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+@router.post("/rate")
+async def pitch_rate(
+    req: PitchRateRequest,
+    request: Request,
+    x_pitch_token: Optional[str] = Header(None, alias="X-Pitch-Token"),
+) -> JSONResponse:
+    """Rate a non-verifiable pitch turn → teach the Titan's OuterMetaPolicy.
+
+    The wallet-less twin of POST /v6/synthesis/turn_feedback (§7.B B.3/B.4):
+    a VC/visitor on the /v/<token>/pitch route rates a reply (★1–5 or the
+    research 3-point lane); the reward trains the policy keyed by the turn's
+    `reasoning_id`. Always `source="user"` — a pitch visitor is never the
+    Maker, so this never writes a graphed MakerAssessment bond (that stays
+    exclusive to the authenticated /chat path).
+
+    Security model — the same token-gated island as /v6/pitch/chat:
+      • X-Pitch-Token gate (bad token → 404, route never confirmed).
+      • The reasoning_id must match a decision the self_learning worker
+        actually stashed this session, so a visitor can only rate turns they
+        themselves generated; an unknown id joins nothing in _handle_reward
+        (no-op). The frontend footer disables after one rating per turn.
+    Reuses turn_feedback_reward() so the reward formula can never drift from
+    the wallet-gated rating path. Fire-and-forget; returns {ok, reward}."""
+    _validate_pitch_token_or_404(x_pitch_token)
+
+    rid = req.reasoning_id.strip()
+    if not _REASONING_ID_RE.match(rid):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_reasoning_id"})
+
+    from titan_hcl.api.synthesis_metrics_handlers import turn_feedback_reward
+    reward, err = turn_feedback_reward(req.scale, req.score)
+    if err is not None:
+        return JSONResponse(status_code=400, content={"ok": False, "error": err})
+
+    titan_state = getattr(request.app.state, "titan_state", None)
+    if titan_state is None:
+        titan_state = getattr(request.app.state, "titan", None)
+    if titan_state is None or getattr(titan_state, "bus", None) is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "titan_state_unavailable"})
+
+    from titan_hcl import bus
+    from titan_hcl.bus import make_msg
+    try:
+        titan_state.bus.publish(make_msg(
+            bus.SELF_LEARN_REWARD, "pitch", "self_learning", {
+                "parent_tool_call_tx": rid,
+                "reward": reward,
+                "source": "user",
+                "goal_class": "",
+            }))
+    except Exception as e:
+        logger.warning("[PitchChat] rate publish failed: %s", e, exc_info=True)
+        return JSONResponse(status_code=500, content={"ok": False, "error": "publish_failed"})
+
+    # Recording (rFP §5.5) — the rating is part of the session transcript.
+    try:
+        _append_recording(_safe_thread_id(req.thread_id), "rating", {
+            "reasoning_id": rid, "score": req.score, "scale": req.scale, "reward": reward,
+        })
+    except HTTPException:
+        pass  # bad thread_id — the reward already fired; don't fail the rating
+
+    return JSONResponse(
+        status_code=200,
+        content={"ok": True, "accepted": True, "reward": reward, "source": "user"},
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -1162,6 +1261,15 @@ _m.register(
         kind="readout",
         summary="Pitch chat health probe — no auth, returns rate-limit constants for the frontend connection banner.",
         replaces=("/v4/pitch-chat/health",),
+    ),
+    RouteSpec(
+        path="/v6/pitch/rate",
+        method="POST",
+        group="pitch",
+        kind="mutation",
+        summary="Wallet-less per-turn rating (§7.B B.4): X-Pitch-Token gated; publishes SELF_LEARN_REWARD (source=user) keyed by the turn's reasoning_id. Never writes a MakerAssessment bond (visitor ≠ Maker).",
+        command="commands.pitch_rate",
+        producers=("self_learning",),
     ),
     RouteSpec(
         path="/v6/pitch/witness-tail",

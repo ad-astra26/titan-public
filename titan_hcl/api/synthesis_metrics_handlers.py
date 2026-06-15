@@ -181,6 +181,32 @@ async def post_v6_synthesis_feedback(request: Request):
 VALID_TURN_SCALES = ("stars5", "research3")
 
 
+def turn_feedback_reward(scale: str, score) -> tuple[Optional[float], Optional[str]]:
+    """Map a per-lane rating to the OuterMetaPolicy reward ∈ [−1, 1] (§7.B B.3).
+
+    stars5   → (score−3)/2  ∈ [−1, 1]
+    research3 (1=wrong / 2=good / 3=excellent) → score−2 ∈ {−1, 0, +1}
+
+    Returns (reward, None) on success or (None, error_code) on a bad scale or
+    out-of-range score. Shared by POST /v6/synthesis/turn_feedback (wallet-gated)
+    and the wallet-less POST /v6/pitch/rate so the two rating surfaces can never
+    drift on the reward formula."""
+    if scale not in VALID_TURN_SCALES:
+        return None, "scale_must_be_stars5_or_research3"
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        return None, "score_required_numeric"
+    if scale == "stars5":
+        if not (1.0 <= score <= 5.0):
+            return None, "stars_must_be_1_to_5"
+        return (score - 3.0) / 2.0, None
+    # research3
+    if not (1.0 <= score <= 3.0):
+        return None, "research_score_must_be_1_to_3"
+    return score - 2.0, None
+
+
 async def post_v6_synthesis_turn_feedback(request: Request):
     """POST /v6/synthesis/turn_feedback — §7.B (B.3). A user/Maker rates a
     NON-verifiable turn (direct/research/IDK) → a reward for the OuterMetaPolicy,
@@ -201,20 +227,10 @@ async def post_v6_synthesis_turn_feedback(request: Request):
     score = body.get("score")
     if not isinstance(reasoning_id, str) or not reasoning_id.strip():
         return {"ok": False, "error": "reasoning_id_required"}
-    if scale not in VALID_TURN_SCALES:
-        return {"ok": False, "error": "scale_must_be_stars5_or_research3"}
-    try:
-        score = float(score)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "score_required_numeric"}
-    if scale == "stars5":
-        if not (1.0 <= score <= 5.0):
-            return {"ok": False, "error": "stars_must_be_1_to_5"}
-        reward = (score - 3.0) / 2.0
-    else:  # research3: 1=wrong → −1, 2=good → 0, 3=excellent → +1
-        if not (1.0 <= score <= 3.0):
-            return {"ok": False, "error": "research_score_must_be_1_to_3"}
-        reward = score - 2.0
+    reward, err = turn_feedback_reward(scale, score)
+    if err is not None:
+        return {"ok": False, "error": err}
+    score = float(score)  # validated by turn_feedback_reward above
 
     user_id = (request.headers.get("X-Titan-User-Id")
                or body.get("user_id") or "anonymous")

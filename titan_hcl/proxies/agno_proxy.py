@@ -367,6 +367,12 @@ def _translate_reply(reply: Optional[dict],
         # Tool-backstop activity (2026-06-01) — non-null when a deterministic
         # tool ran this turn; lets the frontend/comma show "verified via sandbox".
         "tool_activity": body.get("tool_activity"),
+        # §7.B (B.4) — reasoning_id of a NON-verifiable turn (direct/research/IDK;
+        # None otherwise). The SSE path surfaces this for the wallet-gated /chat
+        # rating footer; carry it on the non-streaming envelope too so the
+        # wallet-less pitch route (/v6/pitch/chat → /v6/pitch/rate) can attach a
+        # visitor's "teach him" rating against the same turn.
+        "reasoning_id": body.get("reasoning_id"),
     }
     extra_headers = _build_ovg_headers(body.get("ovg_data") or {})
     return {
