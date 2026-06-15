@@ -45,6 +45,20 @@ from titan_hcl.synthesis.grounding_combiner import GroundingCombiner
 
 logger = logging.getLogger(__name__)
 
+# ── GIL-yield cadence for the long row-iteration loops in export_snapshot ──────
+# The spine export iterates the full Engram graph + serializes it; that work is
+# pure-Python and holds the GIL for its whole duration. Being on its own daemon
+# thread does NOT help (threads share one GIL), so a large spine under box load
+# stretched the export to ~10s, starving the synthesis HEARTBEAT thread → the
+# Supervisor's false `shm_pid_dead` kill → 5-in-600s flap → terminate (root-cause
+# 2026-06-15; cf. feedback_no_bulk_cpu_on_worker_thread_gil_starves_heartbeat).
+# A periodic `time.sleep` RELEASES the GIL, giving the heartbeat thread a window
+# to tick, so the per-chunk GIL-hold is bounded to ~one chunk's work (ms) — well
+# under the ~1s shm_pid_dead threshold — at ANY spine size or load. These yield
+# points are the designated progress-counter sites for the GIL-free liveness RFP.
+_EXPORT_YIELD_EVERY = 256    # rows between GIL yields
+_EXPORT_YIELD_S = 0.0005     # tiny sleep — guarantees a GIL-release window
+
 # §7.E — default persisted location of the learned grounding combiner. CWD-
 # relative `data/`, matching synthesis.duckdb's default (synthesis_worker runs
 # with CWD=repo root); overridable via EngramStore(combiner_path=…) for tests.
@@ -917,6 +931,7 @@ class EngramStore:
                 "c.groundedness, c.anchor_tx, c.created_at, c.axis_used, "
                 "c.axis_verified, c.axis_felt, c.axis_fluent, c.domain_hint"
             )
+            _yi = 0
             while qr.has_next():
                 row = qr.get_next()
                 concepts.append({
@@ -935,6 +950,9 @@ class EngramStore:
                     # §7.F advisory domain hint (free-text; "" when unset).
                     "domain_hint": row[11] if row[11] is not None else "",
                 })
+                _yi += 1
+                if _yi % _EXPORT_YIELD_EVERY == 0:
+                    time.sleep(_EXPORT_YIELD_S)   # release GIL → heartbeat ticks
         except Exception as e:
             logger.warning(
                 "[EngramStore] export_snapshot: concept fetch failed: %s", e,
@@ -951,12 +969,16 @@ class EngramStore:
                     f"MATCH (a:Engram)-[:{rel}]->(b:Engram) "
                     f"RETURN a.concept_id, a.version, b.concept_id, b.version"
                 )
+                _yi = 0
                 while qr.has_next():
                     row = qr.get_next()
                     bucket.append([
                         [row[0], int(row[1])],
                         [row[2], int(row[3])],
                     ])
+                    _yi += 1
+                    if _yi % _EXPORT_YIELD_EVERY == 0:
+                        time.sleep(_EXPORT_YIELD_S)   # release GIL → heartbeat ticks
             except Exception as e:
                 logger.debug(
                     "[EngramStore] export_snapshot: %s edge fetch failed: %s",
