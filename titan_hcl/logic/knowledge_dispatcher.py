@@ -36,6 +36,7 @@ from titan_hcl.logic.knowledge_router import (
     normalize_query,
     query_hash,
     route,
+    _strip_question_form,
 )
 from titan_hcl.logic.knowledge_routing_learner import RoutingLearner
 
@@ -128,16 +129,28 @@ async def _invoke_sage_backend(sage: SageLike, topic: str,
 def _transform_for_backend(topic: str, qt: QueryType, backend: str) -> str:
     """Prepare the query string for a specific backend.
 
-    Dictionary_phrase queries ("own meaning", "chi definition") need to
-    drop the definition marker for REST dictionary backends, which look
-    up single words. SearXNG and Wikipedia handle phrases directly.
+    Phase C (RFP §7.C completion): strip the leading question/imperative form so
+    the FETCH targets the CORE — "antikythera mechanism", not "what is the
+    antikythera mechanism" (which 404s wikipedia_direct → the direct hit is
+    defeated and the gap falls to sage). The classifier already strips for
+    ROUTING (classify_query); the fetch MUST strip too or Phase C never reaches
+    a direct backend (verified live T3 2026-06-15: qt=wikipedia_like but "no
+    direct hit" because the backend got the full question). No-op on already-
+    terse topics (knowledge_worker's META-CGN topics) — INV-RR-5 additive. Does
+    NOT affect cache keys (computed from normalize_query(topic) at the
+    dispatcher, independent of this fetch string).
+
+    Dictionary_phrase queries ("own meaning", "chi definition") additionally
+    drop the definition marker for the REST dictionary backends, which look up
+    single words. SearXNG and Wikipedia handle phrases directly.
     """
+    core = _strip_question_form(normalize_query(topic))
     if backend in ("wiktionary", "free_dictionary"):
         if qt == QueryType.DICTIONARY_PHRASE:
-            tokens = topic.strip().lower().split()
+            tokens = core.split()
             if tokens:
                 return tokens[0]
-    return topic
+    return core or topic
 
 
 # ── Core dispatch ────────────────────────────────────────────────────

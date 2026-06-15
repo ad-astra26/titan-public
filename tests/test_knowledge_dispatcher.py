@@ -18,6 +18,7 @@ from titan_hcl.logic.knowledge_dispatcher import (
     DispatchResult,
     dispatch,
     dispatch_sync,
+    _transform_for_backend,
 )
 from titan_hcl.logic.knowledge_router import QueryType
 
@@ -330,3 +331,40 @@ class TestDispatchResult:
         r = DispatchResult(topic="t", normalized="t",
                            query_type=QueryType.DICTIONARY)
         assert r.success is False
+
+
+# ── Phase C completion (RFP §7.C): the FETCH topic is question-stripped ──────
+
+class TestTransformStripsQuestionForm:
+    """Phase C must strip the question form for the BACKEND FETCH, not only for
+    classification — else wikipedia_direct/wiktionary get the full question and
+    404 (verified live T3 2026-06-15: qt=wikipedia_like but "no direct hit")."""
+
+    def test_wikipedia_direct_gets_stripped_core(self):
+        out = _transform_for_backend(
+            "what is the Antikythera mechanism",
+            QueryType.WIKIPEDIA_LIKE, "wikipedia_direct")
+        assert out == "antikythera mechanism"          # not the full question
+
+    def test_wiktionary_dictionary_gets_stripped_word(self):
+        out = _transform_for_backend(
+            "what is photosynthesis", QueryType.DICTIONARY, "wiktionary")
+        assert out == "photosynthesis"
+
+    def test_dictionary_phrase_still_drops_marker(self):
+        # existing behavior preserved on top of the strip
+        out = _transform_for_backend(
+            "own meaning", QueryType.DICTIONARY_PHRASE, "wiktionary")
+        assert out == "own"
+
+    def test_terse_topic_is_noop(self):
+        # knowledge_worker's META-CGN terse topics are unaffected (INV-RR-5)
+        out = _transform_for_backend(
+            "mitochondrial biogenesis", QueryType.WIKIPEDIA_LIKE, "wikipedia_direct")
+        assert out == "mitochondrial biogenesis"
+
+    def test_searxng_backend_also_gets_core(self):
+        out = _transform_for_backend(
+            "tell me about quantum computing",
+            QueryType.WIKIPEDIA_LIKE, "searxng_wikipedia")
+        assert out == "quantum computing"
