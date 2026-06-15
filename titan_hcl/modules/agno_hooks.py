@@ -538,6 +538,44 @@ async def _dispatch_knowledge_research(plugin, gap: str) -> str:
             return ""
 
 
+# ── Phase F — per-turn research invocation cap (RFP §7.F) ────────────────────
+# The agno LLM tool-loop can re-call the `research` tool (agno_tools.py:128) with
+# reformulated queries within ONE chat turn → multiple full Sage runs (the real
+# "multiple rounds": verified live 2026-06-15, 2 runs "…June 15 2026" + "…Germany"
+# → 90s CHAT_REQUEST timeout). A counter on `plugin`, reset once at PreHook entry,
+# caps the COMBINED research entry-calls (the agno tool AND the RESEARCH reflex)
+# per turn. Fail-OPEN: a counter error must never block a chat turn.
+_RESEARCH_TURN_CAP = 2
+
+
+def _research_cap_reset(plugin) -> None:
+    """Reset the per-turn research invocation counter. Called once at PreHook
+    entry (every real, non-limbo chat turn) — both the agno tool and the RESEARCH
+    reflex fire inside the same turn, after this reset, so they share the counter."""
+    try:
+        plugin._research_call_count = 0
+    except Exception:
+        logger.warning("[research-cap] reset failed", exc_info=True)
+
+
+def _research_cap_allow(plugin) -> bool:
+    """Return True (and increment) while research calls remain this turn; False
+    once `_RESEARCH_TURN_CAP` is reached. Fail-OPEN on any error (never block)."""
+    try:
+        n = int(getattr(plugin, "_research_call_count", 0) or 0)
+        if n >= _RESEARCH_TURN_CAP:
+            logger.info(
+                "[research-cap] per-turn cap %d reached → short-circuit",
+                _RESEARCH_TURN_CAP)
+            return False
+        plugin._research_call_count = n + 1
+        return True
+    except Exception:
+        logger.warning("[research-cap] check failed → allowing (fail-open)",
+                       exc_info=True)
+        return True
+
+
 _DK4_STOPWORDS = frozenset((
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
     "was", "were", "what", "which", "who", "does", "do", "did", "how", "why",
@@ -1031,6 +1069,11 @@ def create_pre_hook(plugin):
             logger.info("[PreHook:t] stage=%s t+%dms rss=%dMB",
                         name, elapsed_ms, _ph_rss_mb())
         _ph_stage("entry")
+
+        # ── Phase F — reset the per-turn research invocation cap (RFP §7.F) ──
+        # Once per real chat turn, before the agno tool-loop or RESEARCH reflex
+        # can fire — both share this counter to bound multi-round research.
+        _research_cap_reset(plugin)
 
         # ── PRIME DIRECTIVE VERIFICATION — before ANY LLM processing ──
         if _directive_verified and _directive_hash:

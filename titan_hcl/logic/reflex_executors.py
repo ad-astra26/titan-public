@@ -468,9 +468,17 @@ def register_reflex_executors(collector, plugin) -> int:
             if not query:
                 return {"findings": ""}
 
-            findings = await plugin.sage_researcher.research(
-                knowledge_gap=query,
-            )
+            # Phase F (RFP §7.F): shared per-turn cap + route through the unified
+            # knowledge_dispatcher (direct REST first, ONE sage run on miss) — the
+            # same helper the agno tool + PreHook use. The cap counter is reset at
+            # PreHook entry and shared with the agno research tool, so the combined
+            # research runs per turn are bounded (stops agent-level multi-round).
+            from titan_hcl.modules.agno_hooks import (
+                _research_cap_allow, _dispatch_knowledge_research)
+            if not _research_cap_allow(plugin):
+                return {"findings": "", "error": "research cap reached"}
+
+            findings = await _dispatch_knowledge_research(plugin, query)
             if findings:
                 # EEL-A1: mark research provenance so the PostHook tags the
                 # node acquired:research → confirm window → self-learning seed

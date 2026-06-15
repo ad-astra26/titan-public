@@ -164,6 +164,17 @@ def create_tools(plugin):
         Returns:
             Formatted research findings block, or empty string if nothing found.
         """
+        # Phase F (RFP §7.F): per-turn invocation cap. The LLM tool-loop can
+        # re-call this tool with reformulated queries within ONE turn → multiple
+        # full Sage runs (the real multi-round → 90s timeout). The counter is
+        # shared with the RESEARCH reflex and reset at PreHook entry. Steer the
+        # model to stop rather than silently failing.
+        from titan_hcl.modules.agno_hooks import (
+            _research_cap_allow, _dispatch_knowledge_research)
+        if not _research_cap_allow(plugin):
+            return ("Research limit reached for this turn — answer from the "
+                    "findings already gathered; do not call research again now.")
+
         # Phase 6: if KnowledgeTool is wired, route through it so the
         # invocation lands a procedural-fork TX (INV-12); fall back to
         # the legacy direct sage_researcher path when not yet wired.
@@ -183,16 +194,13 @@ def create_tools(plugin):
                 _set_eel_research_provenance(plugin, _p6_findings)
                 return result.result_summary or "No findings — knowledge tool returned empty."
 
-        # Legacy fallback (pre-P6 path; same shape as before).
-        if not plugin.sage_researcher:
-            findings = ""
-        else:
-            # research() dropped its `transition_id` arg — passing it raised
-            # TypeError (latent until sage_researcher stopped being None on the
-            # agno_worker, 2026-06-15). Call with the current signature.
-            findings = await plugin.sage_researcher.research(
-                knowledge_gap=query,
-            )
+        # Legacy fallback (pre-P6 path) — Phase F: route through the unified
+        # knowledge_dispatcher (DIRECT REST routes first: wiktionary/free_dict/
+        # wikipedia_direct, proxy-free sub-second; ONE Sage run on miss) instead
+        # of the bare sage.research call. Same resilience + single-run guarantee
+        # as the PreHook (Phase B). _dispatch_knowledge_research never raises and
+        # handles sage_researcher==None internally (returns "").
+        findings = await _dispatch_knowledge_research(plugin, query)
         if findings:
             _set_eel_research_provenance(plugin, findings)
             plugin.memory.add_research_topic(query[:200])
