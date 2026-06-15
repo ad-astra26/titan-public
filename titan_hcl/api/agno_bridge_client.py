@@ -434,6 +434,11 @@ def _translate_agno_reply(reply: Optional[dict],
         "state_narration": body.get("state_narration"),
         "state_snapshot": body.get("state_snapshot"),
         "ovg": body.get("ovg_data"),
+        # §7.B (B.4) — reasoning_id of a NON-verifiable turn (direct/research/IDK;
+        # None otherwise). The in-process bridge is the live chat path, so this is
+        # what /v6/pitch/chat reads to surface the id for the wallet-less rating
+        # footer (→ /v6/pitch/rate). Mirrors agno_proxy._translate_reply (bus path).
+        "reasoning_id": body.get("reasoning_id"),
     }
     extra_headers = _build_ovg_headers(body.get("ovg_data") or {})
     return {
