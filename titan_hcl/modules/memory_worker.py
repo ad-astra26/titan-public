@@ -1117,8 +1117,10 @@ def _handle_query(msg: dict, ctx: WorkerContext) -> None:
         elif action == "find_pending_confirmation_nodes":
             # EEL-A2 confirm gate (interface-drift fix 2026-06-15). SYNC core
             # method → returns List[Dict] of pending-confirmation mempool nodes.
-            nodes = memory.find_pending_confirmation_nodes(
-                payload.get("user_identifier", "")) or []
+            _uid = payload.get("user_identifier", "")
+            nodes = memory.find_pending_confirmation_nodes(_uid) or []
+            logger.info("[MemoryWorker] find_pending_confirmation_nodes(%s) → "
+                        "%d pending node(s)", _uid, len(nodes))
             _send_response(send_queue, name, src, {"nodes": nodes}, rid)
 
         elif action == "graph_completion_search":

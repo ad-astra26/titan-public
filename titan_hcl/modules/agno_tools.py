@@ -43,6 +43,8 @@ def _set_eel_research_provenance(plugin, findings: str) -> None:
             if isinstance(srcs, (list, tuple)) and srcs else "research")
     except Exception:  # noqa: BLE001 — provenance best-effort, never break chat
         plugin._acquired_research_source = "research"
+    logger.info("[EEL-A1] research provenance set (source=%s) — tool path",
+                plugin._acquired_research_source)
 
 
 def create_tools(plugin):
