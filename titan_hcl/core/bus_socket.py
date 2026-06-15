@@ -859,15 +859,32 @@ class BusSocketClient:
             self._hb_last_cpu_ts = now
         except Exception:  # noqa: BLE001 — never break the heartbeat
             payload.setdefault("cpu_delta_s", 0.0)
-        # rss_mb — fill only if the emit site didn't already provide it
-        # (several workers self-report; respect their value, cover the rest).
+        # rss_mb — report real PRIVATE memory (RssAnon), NOT VmRSS. VmRSS counts
+        # file-backed mmap'd pages too (the FAISS/Kuzu/DuckDB page-cache for the
+        # DB-heavy workers), which are RECLAIMABLE and inflate the reading — a
+        # 2026-06-15 false-positive that rss-flapped `synthesis` to death (VmRSS
+        # 741MB tripped its 700MB limit while real RssAnon was ~427MB, the mmap
+        # delta). The supervisor's rss-limit guard must measure the memory that
+        # actually counts toward OOM pressure = private anonymous pages. Fall back
+        # to VmRSS only if RssAnon is absent (pre-4.5 kernels). Fill only if the
+        # emit site didn't already provide it (several workers self-report).
         if "rss_mb" not in payload:
             try:
+                _anon_kb = None
+                _vmrss_kb = None
                 with open("/proc/self/status") as f:
                     for line in f:
-                        if line.startswith("VmRSS:"):
-                            payload["rss_mb"] = round(int(line.split()[1]) / 1024.0, 1)
-                            break
+                        if line.startswith("RssAnon:"):
+                            _anon_kb = int(line.split()[1])
+                            if _vmrss_kb is not None:
+                                break
+                        elif line.startswith("VmRSS:"):
+                            _vmrss_kb = int(line.split()[1])
+                            if _anon_kb is not None:
+                                break
+                _kb = _anon_kb if _anon_kb is not None else _vmrss_kb
+                if _kb is not None:
+                    payload["rss_mb"] = round(_kb / 1024.0, 1)
             except Exception:  # noqa: BLE001
                 pass
 
