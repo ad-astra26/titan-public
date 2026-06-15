@@ -473,6 +473,24 @@ async def _e3_research_tool_fetch(plugin, prompt_text):
         return None
 
 
+def _mark_acquired_research(plugin, source: str) -> None:
+    """EEL-A1 (INV-EEL-6): stamp this turn's research provenance so the PostHook
+    persists the node tagged `acquired:research` → it becomes a pending-confirmation
+    node the EEL-A2 gate can confirm (→ DK.1/DK.5 self-learning). Set HERE (inside
+    the shared dispatch helper) so EVERY research path stamps it — not only the
+    PreHook STATE_NEED_RESEARCH branch. Before this, when the PreHook research came
+    back empty and the agno TOOL/reflex did the real research (which DON'T set the
+    flag), the node was persisted untagged → find_pending excluded it → the
+    self-learning loop never fired (verified live T3 2026-06-15, tags=None).
+    Set-if-unset so the PreHook's more-specific extracted-source assignment still
+    wins; cleared per-turn by the PostHook. RFP_research_resilience §7.D Bug 1."""
+    try:
+        if not getattr(plugin, "_acquired_research_source", None):
+            plugin._acquired_research_source = source or "research"
+    except Exception:
+        logger.warning("[research] _mark_acquired_research failed", exc_info=True)
+
+
 async def _dispatch_knowledge_research(plugin, gap: str) -> str:
     """Route a chat research gap through the unified knowledge_dispatcher
     IN-PROCESS, with the agno worker's in-process StealthSage as the web-research
@@ -519,6 +537,7 @@ async def _dispatch_knowledge_research(plugin, gap: str) -> str:
             logger.info(
                 "[PreHook] knowledge_dispatch DIRECT backend=%s (qt=%s, %dms)",
                 dr.backend_used, dr.query_type.value, round(dr.latency_ms_total))
+            _mark_acquired_research(plugin, dr.backend_used or "research")  # EEL-A1
             return "[SAGE_RESEARCH_FINDINGS]: %s" % dr.result.raw_text
         # ── Phase 2 — no direct hit → EXACTLY ONE full Sage run. ──────────
         # Identical cost to the pre-dispatch bare-sage path (one search+scrape+
@@ -527,12 +546,18 @@ async def _dispatch_knowledge_research(plugin, gap: str) -> str:
         logger.info(
             "[PreHook] knowledge_dispatch no direct hit (qt=%s) → single sage run",
             getattr(dr.query_type, "value", "?"))
-        return await sage.research(knowledge_gap=gap) or ""
+        _sage_out = await sage.research(knowledge_gap=gap) or ""
+        if _sage_out:
+            _mark_acquired_research(plugin, "research")  # EEL-A1 (sage findings)
+        return _sage_out
     except Exception:
         logger.warning(
             "[PreHook] knowledge_dispatch error → bare-sage fallback", exc_info=True)
         try:
-            return await sage.research(knowledge_gap=gap) or ""
+            _sage_out = await sage.research(knowledge_gap=gap) or ""
+            if _sage_out:
+                _mark_acquired_research(plugin, "research")  # EEL-A1
+            return _sage_out
         except Exception:
             logger.warning("[PreHook] bare-sage fallback also failed", exc_info=True)
             return ""
@@ -1140,7 +1165,19 @@ def create_pre_hook(plugin):
         # Resolves user across social_graph.db + events_teacher.db + social_x.db
         # ζ.1: gated on "user_recognition" feature — skipped for greeting tier
         # since KnownUserResolver opens 3 sqlite connections (~50-200ms).
-        user_id = kwargs.get("user_id") or getattr(agent, '_current_user_id', None) or "anonymous"
+        # Prefer the AUTHORITATIVE per-request user_id (agno_worker sets
+        # plugin._current_user_id from the CHAT_REQUEST payload at :504/:831,
+        # before agent.arun) over agent._current_user_id, which is NOT set
+        # per-request and goes STALE — it leaked a prior turn's identity
+        # (e.g. a social-interaction handle) into the chat user_id, flipping
+        # the user across turns and breaking per-user memory matching incl. the
+        # EEL-A2 confirm gate (find_pending_confirmation_nodes(user_id) on turn
+        # N+1 couldn't match turn N's persist). Verified live T3 2026-06-15
+        # (@lumi_wonders ↔ internal flip). RFP_research_resilience §7.D Bug 2.
+        user_id = (kwargs.get("user_id")
+                   or getattr(plugin, '_current_user_id', None)
+                   or getattr(agent, '_current_user_id', None)
+                   or "anonymous")
         social_context = ""
         engagement_level = "minimal"
 
