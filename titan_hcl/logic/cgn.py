@@ -15,6 +15,9 @@ Learner (two selectable paths, `cgn_iql_enabled` DNA flag):
     regression + Bellman-Q backup with V(s') (never max_a Q) + advantage-
     weighted policy extraction (AWR). Multi-step over the per-concept,
     per-consumer grounding trajectory (s' = the concept's next grounding).
+    Trains on the periodic offline batch consolidation (every N transitions)
+    + the dream pass; the per-outcome online micro-step is frozen (s' unknown
+    at record time). All updates read only the buffer (offline-stable).
 
 ADDITIVE: If CGN fails, consumers fall back to their legacy paths.
 CGN enhances and optimizes — never blocks.
@@ -231,6 +234,7 @@ class ConceptGroundingNetwork:
         self._q_targets: Dict[str, ConsumerQNet] = {}
         self._q_optimizers: Dict[str, torch.optim.Adam] = {}
         self._policy_lr = policy_lr
+        self._online_iql_count = 0  # throttled-telemetry counter (awake IQL batches)
         # H.4 Phase 1 (v1) — causal hypothesis generator config.
         # Default: enabled=False (flag-default-false per design lock).
         self._causal_cfg = causal_generator_config or {}
@@ -541,10 +545,11 @@ class ConceptGroundingNetwork:
 
                 # Sigma: one V(s) micro-update (continuous gradient learning).
                 # The consumer_freq bookkeeping always runs (legacy path +
-                # telemetry need it). The actual online gradient step is frozen
-                # to dream-only when cgn_iql_enabled: IQL is offline-stable
-                # (INV-CGN-IQL-4 — value/Q/policy update reads only the buffer
-                # at dream consolidation), and s' isn't known yet at record time.
+                # telemetry need it). The per-outcome online gradient step is
+                # frozen when cgn_iql_enabled: s' isn't known yet at record time
+                # (the next grounding hasn't happened). IQL instead trains on the
+                # periodic offline batch consolidation (consolidate(), which
+                # derives s' from the buffer) — INV-CGN-IQL-4 offline-stability.
                 try:
                     self._consumer_freq[consumer] = self._consumer_freq.get(consumer, 0) + 1
                     if not self._iql_enabled:
@@ -721,9 +726,34 @@ class ConceptGroundingNetwork:
 
         if not dream_phase:
             if self._iql_enabled:
-                # IQL is dream-only (INV-CGN-IQL-4) — no awake micro-pass.
-                return {"trained": False, "reason": "iql_dream_only",
-                        "buffer_size": self._buffer.size()}
+                # Periodic OFFLINE IQL batch — fires every
+                # online_consolidation_every transitions (cgn_worker), the
+                # reliable training cadence (legacy trains V here too; the
+                # dream_phase=True trigger is sparse). Offline-stable
+                # (INV-CGN-IQL-4): reads ONLY the buffer, derives s' from it,
+                # no live-LLM. The per-OUTCOME online micro-step in
+                # record_outcome stays frozen — THAT can't know s' yet; this
+                # periodic batch can. Light pass (steps=5, batch=16 in _train_iql).
+                iql_stats = self._train_iql(dream_phase=False)
+                stats["v_loss"] = round(iql_stats.get("v_loss", 0.0), 6)
+                stats["learner"] = "iql"
+                stats["consumers"] = iql_stats.get("consumers", {})
+                # Observability: log every Nth online IQL batch (throttled) so a
+                # soak can confirm IQL is actually training off the awake cadence
+                # (the awake path is otherwise silent). Trained-consumer losses
+                # only (skipped consumers omitted).
+                self._online_iql_count += 1
+                if self._online_iql_count % 10 == 1:
+                    _trained = {k: v for k, v in iql_stats.get("consumers", {}).items()
+                                if isinstance(v, dict) and "v_loss" in v}
+                    if _trained:
+                        self._log_telemetry({
+                            "event": "iql_online_consolidation",
+                            "online_batch": self._online_iql_count,
+                            "v_loss": stats["v_loss"],
+                            "consumers": _trained,
+                        })
+                return stats
             # Lightweight online update — V(s) only (legacy)
             v_loss = self._train_value_net(batch_size=16, steps=5)
             stats["v_loss"] = round(v_loss, 6)

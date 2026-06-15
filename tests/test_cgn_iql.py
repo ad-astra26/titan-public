@@ -141,18 +141,19 @@ def test_flag_off_uses_legacy_reinforce_path():
         assert stats["learner"] == "reinforce"
 
 
-def test_flag_on_uses_iql_path_and_is_dream_only():
+def test_flag_on_uses_iql_path_awake_and_dream():
     with tempfile.TemporaryDirectory() as td:
         cgn = _make_cgn(td, iql_enabled=True)
         _seed_buffer(cgn)
-        # awake consolidation is a no-op under IQL (dream-only)
+        # the awake periodic batch ALSO runs IQL (the reliable cadence —
+        # legacy trains V here; dream-trigger is sparse/dead in production)
         awake = cgn.consolidate(dream_phase=False)
-        assert awake["trained"] is False
-        assert awake["reason"] == "iql_dream_only"
-        # dream consolidation runs the IQL learner
+        assert awake["learner"] == "iql"
+        assert "lang0" in awake["consumers"]
+        assert {"v_loss", "q_loss", "policy_loss"} <= set(awake["consumers"]["lang0"])
+        # dream consolidation runs the full IQL pass
         dream = cgn.consolidate(dream_phase=True)
         assert dream["learner"] == "iql"
-        assert "lang0" in dream["consumers"]
         m = dream["consumers"]["lang0"]
         assert {"v_loss", "q_loss", "policy_loss"} <= set(m)
 
