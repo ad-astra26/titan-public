@@ -470,7 +470,6 @@ def register_reflex_executors(collector, plugin) -> int:
 
             findings = await plugin.sage_researcher.research(
                 knowledge_gap=query,
-                transition_id=-1,
             )
             if findings:
                 # Store research topic in memory

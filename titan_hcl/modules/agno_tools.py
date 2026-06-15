@@ -157,17 +157,14 @@ def create_tools(plugin):
                 return result.result_summary or "No findings — knowledge tool returned empty."
 
         # Legacy fallback (pre-P6 path; same shape as before).
-        try:
-            transition_id = len(plugin.recorder.buffer) if plugin.recorder.buffer else -1
-        except Exception:
-            transition_id = -1
-
         if not plugin.sage_researcher:
             findings = ""
         else:
+            # research() dropped its `transition_id` arg — passing it raised
+            # TypeError (latent until sage_researcher stopped being None on the
+            # agno_worker, 2026-06-15). Call with the current signature.
             findings = await plugin.sage_researcher.research(
                 knowledge_gap=query,
-                transition_id=transition_id,
             )
         if findings:
             plugin._last_research_sources = plugin._extract_sources_from_findings(findings)
