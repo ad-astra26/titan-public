@@ -22,6 +22,29 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _set_eel_research_provenance(plugin, findings: str) -> None:
+    """EEL-A1 (INV-EEL-6): mark this turn's research provenance so the PostHook
+    persist tags the node `acquired:research` → opens the confirm/dispute window
+    → feeds the self-learning confirm→seed loop.
+
+    The PreHook STATE_NEED_RESEARCH path already sets this; the agno TOOL research
+    path (this file) + the reflex path did NOT — so research-via-tool produced no
+    pending-confirmation node and the self-learning seed never fired even after a
+    solid research turn (root-caused 2026-06-15). Per-research-event (no
+    staleness); the PostHook read-and-clears `_acquired_research_source` per turn.
+    Soft — never break the turn."""
+    if not findings:
+        return
+    try:
+        srcs = plugin._extract_sources_from_findings(findings)
+        plugin._last_research_sources = srcs
+        plugin._acquired_research_source = (
+            "; ".join(str(s) for s in srcs)
+            if isinstance(srcs, (list, tuple)) and srcs else "research")
+    except Exception:  # noqa: BLE001 — provenance best-effort, never break chat
+        plugin._acquired_research_source = "research"
+
+
 def create_tools(plugin):
     """
     Factory: creates a list of Agno-compatible tool functions bound to a TitanHCL.
@@ -151,9 +174,11 @@ def create_tools(plugin):
                 # The KnowledgeTool's invoke_fn returns findings as
                 # result_full_payload (the full text) and a brief
                 # result_summary; agno expects the rich text back.
-                # Producers that need the source extraction still call
-                # plugin._extract_sources_from_findings on the returned
-                # string.
+                _p6_findings = getattr(result, "result_full_payload", "") \
+                    or result.result_summary or ""
+                # EEL-A1: tool research must set provenance too (→ acquired:research
+                # node → confirm window → self-learning seed).
+                _set_eel_research_provenance(plugin, _p6_findings)
                 return result.result_summary or "No findings — knowledge tool returned empty."
 
         # Legacy fallback (pre-P6 path; same shape as before).
@@ -167,7 +192,7 @@ def create_tools(plugin):
                 knowledge_gap=query,
             )
         if findings:
-            plugin._last_research_sources = plugin._extract_sources_from_findings(findings)
+            _set_eel_research_provenance(plugin, findings)
             plugin.memory.add_research_topic(query[:200])
         return findings or "No findings — research pipeline returned empty."
 

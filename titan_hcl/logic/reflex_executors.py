@@ -472,6 +472,15 @@ def register_reflex_executors(collector, plugin) -> int:
                 knowledge_gap=query,
             )
             if findings:
+                # EEL-A1: mark research provenance so the PostHook tags the
+                # node acquired:research → confirm window → self-learning seed
+                # (the reflex research path lacked this — 2026-06-15).
+                try:
+                    from titan_hcl.modules.agno_tools import (
+                        _set_eel_research_provenance)
+                    _set_eel_research_provenance(plugin, findings)
+                except Exception:  # noqa: BLE001 — provenance best-effort
+                    pass
                 # Store research topic in memory
                 if hasattr(plugin, 'memory') and plugin.memory:
                     plugin.memory.add_research_topic(query[:200])
