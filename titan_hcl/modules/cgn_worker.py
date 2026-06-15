@@ -350,9 +350,30 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         logger.info("[CGNWorker] Using default causal_generator config: %s", _cg_err)
         causal_generator_config = {"enabled": False}
 
+    # Canonical IQL learner config (RFP_cgn_canonical_iql_upgrade).
+    # Flag-default-false: legacy advantage-REINFORCE until soak-green.
+    iql_config: dict = {}
+    try:
+        iql_config = {
+            "enabled": bool(config.get("cgn_iql_enabled", False)),
+            "tau": float(config.get("cgn_iql_tau", 0.7)),
+            "beta": float(config.get("cgn_iql_beta", 3.0)),
+            "adv_clip": float(config.get("cgn_iql_adv_clip", 100.0)),
+            "polyak": float(config.get("cgn_iql_polyak", 0.005)),
+            "gamma": float(config.get("cgn_iql_gamma", 0.99)),
+        }
+        logger.info("[CGNWorker] IQL learner: enabled=%s (tau=%.2f beta=%.2f "
+                    "gamma=%.2f polyak=%.4f)", iql_config["enabled"],
+                    iql_config["tau"], iql_config["beta"],
+                    iql_config["gamma"], iql_config["polyak"])
+    except Exception as _iq_err:
+        logger.info("[CGNWorker] Using default (disabled) IQL config: %s", _iq_err)
+        iql_config = {"enabled": False}
+
     cgn = ConceptGroundingNetwork(
         db_path=db_path, state_dir=state_dir, haov_config=haov_config,
-        causal_generator_config=causal_generator_config)
+        causal_generator_config=causal_generator_config,
+        iql_config=iql_config)
     # _load_state() called in __init__
 
     # ── Pre-register "reasoning" consumer for ARC (runs as standalone script) ──

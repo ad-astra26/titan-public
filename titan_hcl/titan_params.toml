@@ -1601,6 +1601,18 @@ sigma_micro_updates = true
 shm_write_on_every_outcome = true
 online_consolidation_every = 50
 
+# ── Canonical IQL learner (RFP_cgn_canonical_iql_upgrade) ────────────────
+# Flag-default-false (INV-CGN-IQL-3): legacy advantage-REINFORCE runs until
+# IQL is devnet-soak-green. When true, dream consolidation routes through the
+# 3 canonical IQL losses — expectile-V + Bellman-Q-with-V(s') + AWR policy —
+# multi-step over the per-concept/per-consumer grounding trajectory.
+cgn_iql_enabled = false
+cgn_iql_tau = 0.7        # expectile asymmetry (>0.5 ⇒ optimistic upper-V)
+cgn_iql_beta = 3.0       # AWR temperature
+cgn_iql_adv_clip = 100.0 # AWR exp-weight clamp (stability)
+cgn_iql_polyak = 0.005   # Q-target EMA rate
+cgn_iql_gamma = 0.99     # Bellman discount
+
 [cgn.haov]
 # HAOV (Hypothesize-Act-Observe-Verify) — per-consumer epistemic engine
 # Controls how Titan forms, tests, and verifies hypotheses about the world

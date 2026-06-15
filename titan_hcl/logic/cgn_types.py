@@ -173,6 +173,13 @@ class CGNTransition:
     action_params: np.ndarray  # continuous action parameters
     reward: float = 0.0
     terminal: bool = False
+    # next_state (s') — the state of this concept's NEXT grounding by the same
+    # consumer. DERIVED at train time (RFP_cgn_canonical_iql_upgrade §7.A) by
+    # _build_trajectory_links, NOT captured at record time (the next encounter
+    # hasn't happened yet). Persisted as part of the transition for round-trip
+    # completeness; recomputed on every IQL pass so it can never go stale.
+    # None ⇔ terminal (no successor in the buffer for this (consumer, concept)).
+    next_state: Optional[np.ndarray] = None
     timestamp: float = 0.0
     epoch: int = 0
     metadata: dict = field(default_factory=dict)

@@ -6,8 +6,15 @@ and abstract reasoning. Implements a single concept grounding algorithm shared
 across all higher cognitive consumers (language, reasoning, creative, social).
 
 Design: Shared V(s) value net (what states are good for concept learning) +
-per-consumer Q(s,a) action nets (what to DO about a concept in each domain).
-IQL training via shared buffer, dream-consolidated.
+per-consumer policy nets (what to DO about a concept in each domain) +
+per-consumer Q(s,a) nets. Dream-consolidated from a shared replay buffer.
+
+Learner (two selectable paths, `cgn_iql_enabled` DNA flag):
+  • legacy (flag off, default): advantage-REINFORCE policy + MC value net.
+  • canonical IQL (flag on, RFP_cgn_canonical_iql_upgrade): expectile-V
+    regression + Bellman-Q backup with V(s') (never max_a Q) + advantage-
+    weighted policy extraction (AWR). Multi-step over the per-concept,
+    per-consumer grounding trajectory (s' = the concept's next grounding).
 
 ADDITIVE: If CGN fails, consumers fall back to their legacy paths.
 CGN enhances and optimizes — never blocks.
@@ -81,7 +88,14 @@ class SharedValueNet(nn.Module):
 
 
 class ConsumerActionNet(nn.Module):
-    """Q(s,a) — per-consumer action policy. Selects grounding action + continuous params."""
+    """π(a|s) — per-consumer policy. Selects grounding action + continuous params.
+
+    NOTE: this is the POLICY net (emits action logits), NOT a Q-value net. The
+    learned action-value function Q(s,a) lives in ConsumerQNet below (added by
+    RFP_cgn_canonical_iql_upgrade for canonical IQL). The old "Q(s,a)" docstring
+    here was inaccurate — under legacy REINFORCE the only value net was V(s) and
+    the advantage used raw reward as the Q proxy.
+    """
 
     def __init__(self, input_dim: int = 30, action_dims: int = 8):
         super().__init__()
@@ -102,6 +116,31 @@ class ConsumerActionNet(nn.Module):
         action_logits = self.action_head(features)
         params = torch.sigmoid(self.param_head(features))  # All in [0, 1]
         return action_logits, params
+
+
+class ConsumerQNet(nn.Module):
+    """Q(s,a) — per-consumer action-value net (canonical IQL).
+
+    Outputs one Q-value per discrete grounding action (action_dims). Trained by
+    Bellman backup toward r + γ·V(s') (RFP_cgn_canonical_iql_upgrade §1.2); a
+    Polyak-averaged target copy supplies the V-expectile regression target.
+    Only used/trained when cgn_iql_enabled — additive, the legacy path never
+    references it. Mirrors ConsumerActionNet's backbone width (30→24→12).
+    """
+
+    def __init__(self, input_dim: int = 30, action_dims: int = 8):
+        super().__init__()
+        self.action_dims = action_dims
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 24),
+            nn.ReLU(),
+            nn.Linear(24, 12),
+            nn.ReLU(),
+            nn.Linear(12, action_dims),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)  # (B, action_dims) Q-values
 
 
 # ── Transition Buffer ─────────────────────────��─────────────────────────────
@@ -167,11 +206,31 @@ class ConceptGroundingNetwork:
                  policy_lr: float = 3e-4,
                  gamma: float = 0.99,
                  haov_config: dict = None,
-                 causal_generator_config: dict = None):
+                 causal_generator_config: dict = None,
+                 iql_config: dict = None):
         self._db_path = db_path
         self._state_dir = state_dir
         self._gamma = gamma
         self._haov_config = haov_config or {}
+
+        # ── Canonical IQL learner (RFP_cgn_canonical_iql_upgrade) ──────────
+        # ADDITIVE + reversible (INV-CGN-IQL-3): when disabled the legacy
+        # advantage-REINFORCE path (_train_value_net / _train_consumer_policy)
+        # runs unchanged. When enabled the dream consolidation routes through
+        # _train_iql (expectile-V + Bellman-Q-with-V + AWR-policy), multi-step
+        # over the per-concept/per-consumer grounding trajectory.
+        _iql = iql_config or {}
+        self._iql_enabled = bool(_iql.get("enabled", False))
+        self._iql_tau = float(_iql.get("tau", 0.7))      # expectile asymmetry
+        self._iql_beta = float(_iql.get("beta", 3.0))    # AWR temperature
+        self._iql_adv_clip = float(_iql.get("adv_clip", 100.0))  # AWR weight cap
+        self._iql_polyak = float(_iql.get("polyak", 0.005))      # target EMA τ
+        self._iql_gamma = float(_iql.get("gamma", gamma))        # Bellman discount
+        # per-consumer Q(s,a) + slow target copy (built in register_consumer)
+        self._q_nets: Dict[str, ConsumerQNet] = {}
+        self._q_targets: Dict[str, ConsumerQNet] = {}
+        self._q_optimizers: Dict[str, torch.optim.Adam] = {}
+        self._policy_lr = policy_lr
         # H.4 Phase 1 (v1) — causal hypothesis generator config.
         # Default: enabled=False (flag-default-false per design lock).
         self._causal_cfg = causal_generator_config or {}
@@ -272,7 +331,24 @@ class ConceptGroundingNetwork:
             action_dims=config.action_dims)
         self._action_nets[config.name] = net
         self._action_optimizers[config.name] = torch.optim.Adam(
-            net.parameters(), lr=3e-4)
+            net.parameters(), lr=self._policy_lr)
+
+        # Canonical-IQL Q(s,a) + Polyak target (built unconditionally so the
+        # cgn_iql_enabled flag can flip at runtime without re-registration;
+        # only _train_iql ever reads/updates them — additive, INV-CGN-IQL-3).
+        q_net = ConsumerQNet(
+            input_dim=config.feature_dims,
+            action_dims=config.action_dims)
+        q_target = ConsumerQNet(
+            input_dim=config.feature_dims,
+            action_dims=config.action_dims)
+        q_target.load_state_dict(q_net.state_dict())
+        for _p in q_target.parameters():
+            _p.requires_grad_(False)
+        self._q_nets[config.name] = q_net
+        self._q_targets[config.name] = q_target
+        self._q_optimizers[config.name] = torch.optim.Adam(
+            q_net.parameters(), lr=self._policy_lr)
 
         # Create per-consumer HAOV tracker (generalized hypothesis testing)
         if config.name not in self._haov_trackers:
@@ -463,29 +539,35 @@ class ConceptGroundingNetwork:
                         "first_consumer": _j.get("first_consumer", consumer),
                     })
 
-                # Sigma: one V(s) micro-update (continuous gradient learning)
+                # Sigma: one V(s) micro-update (continuous gradient learning).
+                # The consumer_freq bookkeeping always runs (legacy path +
+                # telemetry need it). The actual online gradient step is frozen
+                # to dream-only when cgn_iql_enabled: IQL is offline-stable
+                # (INV-CGN-IQL-4 — value/Q/policy update reads only the buffer
+                # at dream consolidation), and s' isn't known yet at record time.
                 try:
                     self._consumer_freq[consumer] = self._consumer_freq.get(consumer, 0) + 1
-                    freq = self._consumer_freq[consumer]
-                    total_freq = max(1, sum(self._consumer_freq.values()))
-                    n_consumers = max(1, len(self._consumer_freq))
-                    # Scale lr inversely by relative frequency to prevent dominant consumers
-                    freq_scale = min(2.0, total_freq / max(1, freq * n_consumers))
-                    scaled_lr = self._online_lr * freq_scale
+                    if not self._iql_enabled:
+                        freq = self._consumer_freq[consumer]
+                        total_freq = max(1, sum(self._consumer_freq.values()))
+                        n_consumers = max(1, len(self._consumer_freq))
+                        # Scale lr inversely by relative frequency to prevent dominant consumers
+                        freq_scale = min(2.0, total_freq / max(1, freq * n_consumers))
+                        scaled_lr = self._online_lr * freq_scale
 
-                    state_t = torch.FloatTensor(t.state).unsqueeze(0)
-                    v_pred = self._value_net(state_t).squeeze()
-                    target = torch.tensor(reward, dtype=torch.float32)
-                    loss = torch.nn.functional.mse_loss(v_pred, target)
-                    self._value_optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self._value_net.parameters(), 0.5)
-                    # Apply with scaled lr, then restore dream lr
-                    for pg in self._value_optimizer.param_groups:
-                        pg['lr'] = scaled_lr
-                    self._value_optimizer.step()
-                    for pg in self._value_optimizer.param_groups:
-                        pg['lr'] = self._value_lr
+                        state_t = torch.FloatTensor(t.state).unsqueeze(0)
+                        v_pred = self._value_net(state_t).squeeze()
+                        target = torch.tensor(reward, dtype=torch.float32)
+                        loss = torch.nn.functional.mse_loss(v_pred, target)
+                        self._value_optimizer.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self._value_net.parameters(), 0.5)
+                        # Apply with scaled lr, then restore dream lr
+                        for pg in self._value_optimizer.param_groups:
+                            pg['lr'] = scaled_lr
+                        self._value_optimizer.step()
+                        for pg in self._value_optimizer.param_groups:
+                            pg['lr'] = self._value_lr
                 except Exception:
                     pass  # Non-critical — don't break reward recording
 
@@ -638,35 +720,49 @@ class ConceptGroundingNetwork:
         stats = {"trained": True, "consumers": {}}
 
         if not dream_phase:
-            # Lightweight online update — V(s) only
+            if self._iql_enabled:
+                # IQL is dream-only (INV-CGN-IQL-4) — no awake micro-pass.
+                return {"trained": False, "reason": "iql_dream_only",
+                        "buffer_size": self._buffer.size()}
+            # Lightweight online update — V(s) only (legacy)
             v_loss = self._train_value_net(batch_size=16, steps=5)
             stats["v_loss"] = round(v_loss, 6)
             return stats
 
         # Full dream consolidation
-        # 1. Train shared V(s) from all transitions
-        v_loss = self._train_value_net(batch_size=32, steps=20)
-        stats["v_loss"] = round(v_loss, 6)
+        if self._iql_enabled:
+            # Canonical IQL: expectile-V + Bellman-Q-with-V + AWR policy, over
+            # the per-concept/per-consumer trajectory (RFP §1.2). Replaces both
+            # the MC value net and the REINFORCE policy in one offline pass.
+            iql_stats = self._train_iql(dream_phase=True)
+            v_loss = iql_stats.get("v_loss", 0.0)
+            stats["v_loss"] = round(v_loss, 6)
+            stats["learner"] = "iql"
+            stats["consumers"] = iql_stats.get("consumers", {})
+        else:
+            # Legacy: 1. shared V(s) MC regression, 2. per-consumer REINFORCE.
+            # Dynamic priority: reward velocity + static priority (Sigma-inspired)
+            v_loss = self._train_value_net(batch_size=32, steps=20)
+            stats["v_loss"] = round(v_loss, 6)
+            stats["learner"] = "reinforce"
 
-        # 2. Train each consumer's Q(s,a) with advantage
-        # Dynamic priority: reward velocity + static priority (Sigma-inspired)
-        sorted_consumers = sorted(
-            self._consumers.items(),
-            key=lambda x: (-self._compute_reward_velocity(x[0]),
-                           x[1].consolidation_priority))
+            sorted_consumers = sorted(
+                self._consumers.items(),
+                key=lambda x: (-self._compute_reward_velocity(x[0]),
+                               x[1].consolidation_priority))
 
-        for name, config in sorted_consumers:
-            transitions = self._buffer.get_consumer_transitions(name)
-            if len(transitions) < 5:
-                stats["consumers"][name] = {"skipped": True,
-                                            "transitions": len(transitions)}
-                continue
+            for name, config in sorted_consumers:
+                transitions = self._buffer.get_consumer_transitions(name)
+                if len(transitions) < 5:
+                    stats["consumers"][name] = {"skipped": True,
+                                                "transitions": len(transitions)}
+                    continue
 
-            q_loss = self._train_consumer_policy(name, batch_size=32, steps=15)
-            stats["consumers"][name] = {
-                "q_loss": round(q_loss, 6),
-                "transitions": len(transitions),
-            }
+                q_loss = self._train_consumer_policy(name, batch_size=32, steps=15)
+                stats["consumers"][name] = {
+                    "q_loss": round(q_loss, 6),
+                    "transitions": len(transitions),
+                }
 
         # 3. Decay low-confidence concepts (gentle)
         self._decay_unused_concepts(factor=0.995)
@@ -1461,6 +1557,172 @@ class ConceptGroundingNetwork:
 
         return total_loss / max(steps, 1)
 
+    # ── Canonical IQL learner (RFP_cgn_canonical_iql_upgrade §1.2) ─────────
+
+    def _build_trajectory_links(self) -> None:
+        """Derive s' / terminal for every buffered transition (RFP §7.A).
+
+        The grounding trajectory is per (consumer, concept_id): a concept's
+        next state is its state at the next time the SAME consumer grounds it.
+        Computed lazily here (not at record time — the successor hasn't happened
+        yet), so next_state can never go stale. The tail transition of each
+        trajectory has no successor → terminal=True, V(s')=0 in the backup.
+        Mutates the live CGNTransition objects in the buffer in place.
+        """
+        from collections import defaultdict
+        groups: Dict[tuple, List[CGNTransition]] = defaultdict(list)
+        for t in self._buffer.get_all():
+            groups[(t.consumer, t.concept_id)].append(t)
+        for _key, seq in groups.items():
+            seq.sort(key=lambda x: x.timestamp)
+            for i, t in enumerate(seq):
+                if i + 1 < len(seq):
+                    t.next_state = seq[i + 1].state
+                    t.terminal = False
+                else:
+                    t.next_state = None
+                    t.terminal = True
+
+    @staticmethod
+    def _expectile_loss(diff: torch.Tensor, tau: float) -> torch.Tensor:
+        """Asymmetric expectile regression loss L_τ(u)=|τ−1(u<0)|·u².
+
+        diff = target − pred. τ>0.5 penalises under-estimation (pred<target)
+        more heavily → V learns an OPTIMISTIC (upper-) expectile of Q, the
+        core of IQL's implicit max without ever querying OOD actions. τ=0.5
+        recovers ½·MSE.
+        """
+        weight = torch.where(diff < 0.0,
+                             torch.as_tensor(1.0 - tau, dtype=diff.dtype),
+                             torch.as_tensor(tau, dtype=diff.dtype))
+        return (weight * diff.pow(2)).mean()
+
+    @staticmethod
+    def _soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
+        """Polyak (EMA) update: θ_target ← (1−τ)·θ_target + τ·θ_source."""
+        with torch.no_grad():
+            for tp, sp in zip(target.parameters(), source.parameters()):
+                tp.mul_(1.0 - tau).add_(tau * sp)
+
+    def _train_iql(self, dream_phase: bool = True) -> dict:
+        """Canonical IQL consolidation pass over the shared buffer.
+
+        Per consumer: expectile-V regression toward Q_target(s,a), Bellman-Q
+        backup toward r+γ·(1−done)·V(s'), and advantage-weighted-regression
+        policy extraction. V(s) is shared across consumers (trained against each
+        consumer's Q_target at its taken action); Q(s,a) and π(a|s) are
+        per-consumer. Returns {"v_loss": mean, "consumers": {name: {...}}}.
+        """
+        self._build_trajectory_links()
+        steps = 20 if dream_phase else 5
+        batch_size = 32 if dream_phase else 16
+        out: Dict[str, dict] = {}
+        v_losses: List[float] = []
+
+        # Same dynamic-priority ordering as the legacy path (Sigma-inspired).
+        sorted_consumers = sorted(
+            self._consumers.items(),
+            key=lambda x: (-self._compute_reward_velocity(x[0]),
+                           x[1].consolidation_priority))
+
+        for name, _config in sorted_consumers:
+            transitions = self._buffer.get_consumer_transitions(name)
+            if len(transitions) < 5 or name not in self._q_nets:
+                out[name] = {"skipped": True, "transitions": len(transitions)}
+                continue
+            v_l, q_l, p_l = self._iql_update_consumer(
+                name, transitions, batch_size=batch_size, steps=steps)
+            v_losses.append(v_l)
+            out[name] = {
+                "v_loss": round(v_l, 6),
+                "q_loss": round(q_l, 6),
+                "policy_loss": round(p_l, 6),
+                "transitions": len(transitions),
+            }
+
+        return {"v_loss": (sum(v_losses) / len(v_losses)) if v_losses else 0.0,
+                "consumers": out}
+
+    def _iql_update_consumer(self, consumer: str,
+                             transitions: List[CGNTransition],
+                             batch_size: int = 32,
+                             steps: int = 20) -> Tuple[float, float, float]:
+        """One consumer's IQL update loop. Returns (v_loss, q_loss, policy_loss)."""
+        if len(transitions) < batch_size:
+            batch_size = len(transitions)
+        if batch_size < 2:
+            return 0.0, 0.0, 0.0
+
+        pi_net = self._action_nets[consumer]
+        q_net = self._q_nets[consumer]
+        q_target = self._q_targets[consumer]
+        pi_opt = self._action_optimizers[consumer]
+        q_opt = self._q_optimizers[consumer]
+        feat_dim = self._consumers[consumer].feature_dims
+
+        tau, beta, gamma = self._iql_tau, self._iql_beta, self._iql_gamma
+        adv_clip, polyak = self._iql_adv_clip, self._iql_polyak
+
+        tot_v = tot_q = tot_p = 0.0
+        for _ in range(steps):
+            idx = np.random.choice(len(transitions),
+                                   min(batch_size, len(transitions)),
+                                   replace=False)
+            batch = [transitions[i] for i in idx]
+            states = torch.FloatTensor(np.array([b.state for b in batch]))
+            actions = torch.LongTensor([int(b.action) for b in batch])
+            rewards = torch.FloatTensor([float(b.reward) for b in batch])
+            nonterminal = torch.FloatTensor(
+                [0.0 if b.terminal else 1.0 for b in batch])
+            next_states = torch.FloatTensor(np.array([
+                (b.next_state if b.next_state is not None
+                 else np.zeros(feat_dim, dtype=np.float32)) for b in batch]))
+            act_idx = actions.unsqueeze(1)
+
+            # 1. V update — expectile regression toward Q_target(s, a_taken).
+            with torch.no_grad():
+                q_sa_tgt = q_target(states).gather(1, act_idx).squeeze(1)
+            v_pred = self._value_net(states)
+            v_loss = self._expectile_loss(q_sa_tgt - v_pred, tau)
+            self._value_optimizer.zero_grad()
+            v_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self._value_net.parameters(), 1.0)
+            self._value_optimizer.step()
+
+            # 2. Q update — Bellman backup with V(s') (never max_a Q → no OOD).
+            with torch.no_grad():
+                v_next = self._value_net(next_states) * nonterminal
+                q_backup = rewards + gamma * v_next
+            q_sa = q_net(states).gather(1, act_idx).squeeze(1)
+            q_loss = nn.functional.mse_loss(q_sa, q_backup)
+            q_opt.zero_grad()
+            q_loss.backward()
+            torch.nn.utils.clip_grad_norm_(q_net.parameters(), 1.0)
+            q_opt.step()
+
+            # 3. Policy update — advantage-weighted regression (AWR).
+            with torch.no_grad():
+                adv = q_net(states).gather(1, act_idx).squeeze(1) \
+                    - self._value_net(states)
+                weight = torch.exp(beta * adv).clamp(max=adv_clip)
+            logits, _ = pi_net(states)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            selected = log_probs.gather(1, act_idx).squeeze(1)
+            policy_loss = -(weight * selected).mean()
+            pi_opt.zero_grad()
+            policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(pi_net.parameters(), 1.0)
+            pi_opt.step()
+
+            # 4. Polyak target update.
+            self._soft_update(q_target, q_net, polyak)
+
+            tot_v += float(v_loss.item())
+            tot_q += float(q_loss.item())
+            tot_p += float(policy_loss.item())
+
+        return tot_v / steps, tot_q / steps, tot_p / steps
+
     def _decay_unused_concepts(self, factor: float = 0.995) -> None:
         """Gentle decay of concepts not recently encountered."""
         # Implemented via DB query — decay cross_modal_conf for stale words
@@ -1556,7 +1818,7 @@ class ConceptGroundingNetwork:
                 "consumers": {},
             }
             for name, net in self._action_nets.items():
-                state["consumers"][name] = {
+                _consumer_state = {
                     "action_net": net.state_dict(),
                     "config": {
                         "name": self._consumers[name].name,
@@ -1565,6 +1827,11 @@ class ConceptGroundingNetwork:
                         "action_names": self._consumers[name].action_names,
                     },
                 }
+                # Persist the IQL Q(s,a) net (RFP §1.2). Target is re-derived as
+                # a copy on load, so only the online Q net needs saving.
+                if name in self._q_nets:
+                    _consumer_state["q_net"] = self._q_nets[name].state_dict()
+                state["consumers"][name] = _consumer_state
 
             # Save buffer (last 500 transitions for cold-start)
             buf_transitions = self._buffer.get_all(500)
@@ -1657,6 +1924,12 @@ class ConceptGroundingNetwork:
                 )
                 self.register_consumer(config)
                 self._action_nets[name].load_state_dict(cstate["action_net"])
+                # Restore the IQL Q net if present (legacy state files predate
+                # it → leave the freshly-initialised Q net). Re-sync the target.
+                _q_sd = cstate.get("q_net")
+                if _q_sd is not None and name in self._q_nets:
+                    self._q_nets[name].load_state_dict(_q_sd)
+                    self._q_targets[name].load_state_dict(_q_sd)
 
             # Restore buffer
             for bt in state.get("buffer", []):
