@@ -554,6 +554,31 @@ class MemoryProxy:
         except Exception as e:
             logger.warning("[MemoryProxy] add_to_mempool publish raised: %s", e)
 
+    def add_research_topic(self, topic: str) -> None:
+        """Record a research topic (synchronicity tracking). SYNC — callers
+        invoke it un-awaited, matching the canonical `TieredMemoryGraph`.
+
+        On the agno-worker MemoryProxy this is a best-effort NO-OP by design:
+        the canonical `ResearchTopicNode` store + its only reader
+        (`get_recent_research_topics` → `expressive/social.py:498`, already
+        `hasattr`-guarded) live with the real memory in memory_worker; the proxy
+        is an explicit *partial* drop-in (SHM reads + one-way write events).
+
+        WHY THIS EXISTS: the 3 agno research callers (`agno_tools.py:171` the
+        TOOL, `reflex_executors.py:477` the reflex, `agno_hooks.py:2745` the
+        PreHook) called this unconditionally → `AttributeError` → the agno
+        research TOOL reported failure → the agent RETRIED with reformulated
+        queries → multi-round → 90s CHAT_REQUEST timeout (research returned real
+        findings then crashed on the write — verified live T1 2026-06-15).
+        Defining it here (never raises) closes that breakage; it removes nothing
+        that ever worked (this call always threw from the proxy).
+
+        FOLLOW-UP (RFP_research_resilience §7.F): forward via a one-way
+        `MEMORY_RESEARCH_TOPIC_ADD` bus event + a memory_worker handler so
+        agno-path topics actually feed social synchronicity (the established
+        `add_to_mempool` MEMORY_MEMPOOL_ADD pattern)."""
+        return None
+
     def get_growth_metrics(self, node_saturation_24h: int = 30) -> dict:
         """Get growth metrics (learning velocity, directive alignment).
         SHM-direct via memory_state.bin (Session 2 §4.C.13).
