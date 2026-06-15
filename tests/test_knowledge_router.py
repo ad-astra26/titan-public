@@ -15,6 +15,7 @@ from titan_hcl.logic.knowledge_router import (
     normalize_query,
     query_hash,
     route,
+    _strip_question_form,
 )
 
 
@@ -265,3 +266,70 @@ class TestQueryTypeEnum:
         assert QueryType.TECHNICAL.value == "technical"
         assert QueryType.NEWS.value == "news"
         assert QueryType.INTERNAL_REJECTED.value == "internal_rejected"
+
+
+# ── Phase C (RFP §7.C): question-form strip ──────────────────────────────────
+
+class TestPhaseCQuestionForm:
+    """The leading-interrogative strip promotes `what is X` / `define X` /
+    `tell me about X Y` gaps to direct (dictionary/wikipedia) routes, WITHOUT
+    regressing terse classification or query_hash (INV-RR-5)."""
+
+    # (a) positive forms → DICTIONARY / WIKIPEDIA_LIKE
+    @pytest.mark.parametrize("topic,expected", [
+        ("what is photosynthesis", QueryType.DICTIONARY),
+        ("what's gravity", QueryType.DICTIONARY),
+        ("what are tardigrades", QueryType.DICTIONARY),
+        ("define ephemeral", QueryType.DICTIONARY),
+        ("the word ephemeral", QueryType.DICTIONARY),
+        ("what is an apple", QueryType.DICTIONARY),          # article dropped
+        ("tell me about quantum computing", QueryType.WIKIPEDIA_LIKE),
+        ("what is mitochondrial biogenesis", QueryType.WIKIPEDIA_LIKE),
+    ])
+    def test_positive_forms_route_direct(self, topic, expected):
+        assert classify_query(topic) == expected
+
+    # (b) the §7.C.2 counter-example stays CONCEPTUAL (stopword in core)
+    @pytest.mark.parametrize("topic", [
+        "what is the capital of France",     # core "capital of france" — "of"
+        "explain the theory of relativity",  # core "theory of relativity"
+        "why do we dream",                   # no listed prefix; abstract
+    ])
+    def test_stopword_core_stays_conceptual(self, topic):
+        assert classify_query(topic) == QueryType.CONCEPTUAL
+
+    # (c) regression — terse / no-prefix queries are UNCHANGED by the strip
+    @pytest.mark.parametrize("topic,expected", [
+        ("photosynthesis", QueryType.DICTIONARY),
+        ("mitochondrial biogenesis", QueryType.WIKIPEDIA_LIKE),
+        ("the french revolution", QueryType.CONCEPTUAL),     # bare article, no prefix
+        ("latest python news", QueryType.NEWS),
+        ("python async deadlock", QueryType.TECHNICAL),
+        ("inner_spirit", QueryType.INTERNAL_REJECTED),       # guard runs pre-strip
+        ("own meaning", QueryType.DICTIONARY_PHRASE),
+    ])
+    def test_terse_classification_unchanged(self, topic, expected):
+        assert classify_query(topic) == expected
+
+    # the strip itself is a no-op on prefix-less input
+    def test_strip_noop_without_prefix(self):
+        assert _strip_question_form("mitochondrial biogenesis") == "mitochondrial biogenesis"
+        assert _strip_question_form("photosynthesis") == "photosynthesis"
+
+    def test_strip_drops_prefix_and_article(self):
+        assert _strip_question_form("what is the capital of france") == "capital of france"
+        assert _strip_question_form("tell me about quantum computing") == "quantum computing"
+        assert _strip_question_form("what is photosynthesis?") == "photosynthesis"
+
+    def test_strip_keeps_bare_interrogative(self):
+        # a query that IS only the prefix must not become empty
+        assert _strip_question_form("explain") == "explain"
+
+    # (d) hash-stability — query_hash is over the FULL normalized string, never
+    # the stripped core, so cache keys are unaffected by Phase C.
+    def test_query_hash_uses_full_normalized_not_core(self):
+        t = "what is photosynthesis"
+        full = query_hash(normalize_query(t), QueryType.DICTIONARY, "wiktionary")
+        core = query_hash("photosynthesis", QueryType.DICTIONARY, "wiktionary")
+        assert full != core                                   # strip did NOT leak into the hash
+        assert full == query_hash(t, QueryType.DICTIONARY, "wiktionary")

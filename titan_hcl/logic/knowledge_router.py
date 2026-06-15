@@ -173,6 +173,51 @@ def _has_marker(tokens: List[str], markers: frozenset) -> bool:
     return False
 
 
+# Phase C (RFP §7.C) — leading interrogative/imperative prefixes stripped before
+# classification so a `what is X` / `define X` / `tell me about X Y` chat gap
+# classifies on its CORE (X) and reaches the DIRECT REST backends, instead of
+# defaulting to CONCEPTUAL→sage. Longest-first so a longer phrase wins over a
+# shorter head (e.g. "definition of" before "define"). ADDITIVE (INV-RR-5):
+# normalize_query / query_hash are untouched — only the classifier's internal
+# token view changes; cache keys (computed from normalize_query at the
+# dispatcher) stay byte-identical.
+_QUESTION_PREFIXES = (
+    "tell me about", "definition of", "meaning of", "the word",
+    "what is", "what's", "what are", "who is", "who's",
+    "where is", "when is", "why is", "how does",
+    "define", "explain",
+)
+_LEADING_ARTICLES = frozenset(("the", "a", "an"))
+
+
+def _strip_question_form(normalized: str) -> str:
+    """Strip ONE leading interrogative/imperative prefix (and, if one matched, a
+    following article) + a trailing '?'. Returns the core for Stages 2-7.
+
+    ADDITIVE coverage for the common `what is X` / `define X` / `tell me about
+    X Y` forms whose core is a single word or short no-stopword phrase. NOT full
+    entity extraction (RFP §6 Q1): stopword-bearing cores (e.g. "capital of
+    france") correctly stay CONCEPTUAL→sage. No-prefix input is returned
+    unchanged. Never touches normalize_query / query_hash (INV-RR-5)."""
+    if not normalized:
+        return normalized
+    core = normalized.rstrip("?").strip()
+    if not core:
+        return normalized
+    for pref in _QUESTION_PREFIXES:
+        if core == pref:
+            # the query IS just the interrogative (e.g. bare "explain") — keep it
+            return core
+        if core.startswith(pref + " "):
+            stripped = core[len(pref) + 1:].strip()
+            # drop one leading article ("what is THE capital…" → "capital…")
+            parts = stripped.split(" ", 1)
+            if len(parts) == 2 and parts[0] in _LEADING_ARTICLES:
+                stripped = parts[1].strip()
+            return stripped or core
+    return core
+
+
 def classify_query(topic: str) -> QueryType:
     """Map a raw topic string to a QueryType (rFP §3.1, Layer 1).
 
@@ -184,17 +229,25 @@ def classify_query(topic: str) -> QueryType:
       5. DICTIONARY — single alpha word, 3-20 chars
       6. WIKIPEDIA_LIKE — 2-4 noun-phrase words without abstract markers
       7. CONCEPTUAL — default for any multi-word query
+
+    Phase C (RFP §7.C): a leading question/imperative prefix is stripped (the
+    Stage-1 internal guard still runs on the FULL normalized string first) so
+    full-question chat gaps classify on their core.
     """
     topic_raw = topic or ""
     normalized = normalize_query(topic_raw)
     if not normalized:
         return QueryType.INTERNAL_REJECTED
 
-    # Stage 1 — Titan-internal guard (exact Stage A heuristics)
+    # Stage 1 — Titan-internal guard (exact Stage A heuristics) on the FULL
+    # normalized string (before the question-form strip), so internal codes
+    # are still rejected regardless of any accidental prefix match.
     if _is_titan_internal(topic_raw, normalized):
         return QueryType.INTERNAL_REJECTED
 
-    tokens = _tokens(normalized)
+    # Phase C — classify on the question-stripped core (INV-RR-5 additive).
+    core = _strip_question_form(normalized)
+    tokens = _tokens(core)
 
     # Stage 2 — news markers before anything else so "latest python async"
     # classifies as news rather than technical. The news backend still has
