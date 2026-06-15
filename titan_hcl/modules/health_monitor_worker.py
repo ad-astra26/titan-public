@@ -640,6 +640,14 @@ def health_monitor_worker_main(recv_queue, send_queue, name: str,
 
     now = time.time()
     runtimes: dict[str, _PluginRuntime] = {}
+
+    # RFP_supervision_lifecycle §7.D / Phase D.1 — bus-INDEPENDENT save of the
+    # health runtimes on any shutdown (SIGTERM/control-group/PDEATHSIG). runtimes
+    # is mutated IN PLACE (stable ref), so the closure reads current state at
+    # shutdown. _save_state is an atomic file write (idempotent).
+    from titan_hcl.core.worker_shutdown import register_shutdown_save
+    register_shutdown_save(name, lambda: _save_state(state_path, runtimes))
+
     for plugin in plugins:
         saved = saved_plugins.get(plugin.name) or {}
         runtimes[plugin.name] = _PluginRuntime(

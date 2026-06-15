@@ -267,6 +267,37 @@ impl KernelChildSupervisor {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// SPEC §18.4 / RFP_supervision_lifecycle §7.D — explicitly SIGTERM every
+    /// supervised child (substrate, guardian_hcl, titan_hcl, titan_hcl_api) at
+    /// SHUTDOWN_BEGIN, while the bus broker is still alive.
+    ///
+    /// This is the ordered-drain trigger under `KillMode=mixed`: systemd
+    /// signals only the kernel ($MAINPID), so the kernel — not systemd, not
+    /// PDEATHSIG — must start the children draining. Without this, the children
+    /// would only get SIGTERM via PDEATHSIG when the kernel EXITS, i.e. AFTER
+    /// `broker.stop()`, so every worker's bus-dependent save-handshake would
+    /// hang → SIGKILL (the pre-fix bug). The kernel then awaits the watch
+    /// handles (children drain over the LIVE bus) before stopping the broker.
+    ///
+    /// `mark_shutdown_active()` MUST be called first so the resulting child
+    /// exits are classified clean (no respawn). Best-effort: a missing/already-
+    /// dead pid is logged, not fatal.
+    pub async fn sigterm_children(&self) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let pids = self.supervisor.lock().running_pids();
+        for (name, pid) in pids {
+            if pid == 0 {
+                continue;
+            }
+            info!(child = %name, pid, "kernel shutdown: SIGTERM to supervised child");
+            if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+                warn!(child = %name, pid, err = ?e,
+                    "kernel shutdown: SIGTERM to child failed (already exited?)");
+            }
+        }
+    }
+
     /// True iff a watch task escalated to Terminate (kernel must exit
     /// with code 64 so systemd cascades a fresh restart per SPEC §11.B.1
     /// step 6b + §15 escalation range).

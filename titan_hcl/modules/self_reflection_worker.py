@@ -539,6 +539,15 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
     coding_explorer = _init_coding_explorer(config, db_path, send_queue)
     prediction_engine = _init_prediction_engine(config)
 
+    # RFP_supervision_lifecycle §7.D / Phase D.1 — bus-INDEPENDENT save of the
+    # PredictionEngine's learned state on any shutdown (SIGTERM/control-group/
+    # PDEATHSIG). _save_state is atomic + idempotent; guarded against None init.
+    from titan_hcl.core.worker_shutdown import register_shutdown_save
+    register_shutdown_save(
+        name,
+        lambda: prediction_engine._save_state() if prediction_engine is not None else None,
+    )
+
     if self_reasoning is None and coding_explorer is None and prediction_engine is None:
         # All 3 engines failed to init — defensive heartbeat-only.
         logger.warning(

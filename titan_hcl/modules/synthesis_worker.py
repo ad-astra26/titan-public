@@ -147,16 +147,6 @@ def _set_engine_recall(er: Optional[EngineRecall]) -> None:
 logger = logging.getLogger(__name__)
 
 
-def _synth_tel():
-    """Lazy synthesis-worker Telemetry (RFP_worker_telemetry §7.B). Never raises
-    → None on failure so instrumentation can't break the synthesis loop."""
-    try:
-        from titan_hcl.logic.worker_telemetry import get_telemetry
-        return get_telemetry("synthesis")
-    except Exception:  # noqa: BLE001
-        return None
-
-
 # Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
 # Flipped True after ActivationStore + StandingBundleStore + EngineRecall init
 # complete. Gates SHM-slot heartbeat (see _heartbeat_loop) so titan_hcl's
@@ -927,8 +917,6 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
     _pass = 0
     while not stop_event.is_set():
         seeded = 0
-        _wiki_drain_t0 = time.monotonic()   # RFP_worker_telemetry §7.B
-        _wiki_drained = 0
         try:
             for _ in range(int(per_pass_cap)):
                 if stop_event.is_set():
@@ -937,7 +925,6 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                     item = wiki_queue.popleft()
                 except IndexError:
                     break
-                _wiki_drained += 1
                 _content = str(item.get("content", "") or "")
                 # DK.1 — durable findings only (volatile items carry no tx_hash →
                 # seed_research_concept refuses; explicit guard for clarity).
@@ -1001,21 +988,6 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                     # why DK.5 recipes weren't maturing on the chat-confirm feed).
                     logger.warning("[synthesis_worker] DK.5 research-recipe record "
                                    "failed (continuing)", exc_info=True)
-            # RFP_worker_telemetry §7.B — attribute the DK research-wiki drain
-            # to feature='research' on synthesis (the synthesis-side cost of a
-            # chat research turn). Only when the pass actually drained items, so
-            # idle 60s passes don't flood op_events.
-            if _wiki_drained:
-                try:
-                    _t = _synth_tel()
-                    if _t is not None:
-                        _t.record_stage(
-                            "dk_wiki_drain",
-                            (time.monotonic() - _wiki_drain_t0) * 1000.0,
-                            feature="research", drained=int(_wiki_drained),
-                            seeded=int(seeded), queue=len(wiki_queue))
-                except Exception:  # noqa: BLE001
-                    pass
             if seeded:
                 logger.info("[synthesis_worker] DK.1 research-wiki seeded %d "
                             "declarative concept(s) (queue=%d)",
@@ -1240,16 +1212,6 @@ def _export_loop(store: "ActivationStore",
     the rest have their own internal locks / are independent."""
     stop_event.wait(min(interval_s, 12.0))   # settle + offset from the recompute pass
     pass_count = 0
-    # RFP_synthesis_agno_hot_path_optimization P2a — throttle the spine export.
-    # Its full-history json.dump is CPU-bound (~9s, telemetry T3 2026-06-16) and
-    # HOLDS THE GIL → starves the recompute/heartbeat thread even from this
-    # separate export thread (the historical ~34s/pass flap mode). The spine
-    # snapshot is an eventually-consistent cross-process READ cache, so a longer
-    # cadence is safe. Export at most every _spine_min_interval_s (4 export
-    # cycles, ≥240s floor); the other exports keep the ~interval_s cadence.
-    # P2b (follow-on) will dirty-gate (engram write-counter) + incrementalize.
-    _spine_min_interval_s = max(interval_s * 4.0, 240.0)
-    _spine_last_export = 0.0   # monotonic ts of the last spine export (0 = force first)
     while not stop_event.is_set():
         t0 = time.monotonic()
         timings: dict[str, int] = {}
@@ -1262,16 +1224,7 @@ def _export_loop(store: "ActivationStore",
             except Exception as _e:   # per-step soft-fail (matches the old inline guards)
                 logger.debug("[synthesis_worker] export step %s failed: %s", label, _e)
             finally:
-                _dur = (time.monotonic() - _s) * 1000.0
-                timings[label] = int(_dur)
-                # RFP_worker_telemetry §7.B — persist each export step (spine
-                # export was the GIL-yield flap culprit) under feature='export'.
-                try:
-                    _t = _synth_tel()
-                    if _t is not None:
-                        _t.record_stage("export:" + label, _dur, feature="export")
-                except Exception:  # noqa: BLE001
-                    pass
+                timings[label] = int((time.monotonic() - _s) * 1000)
 
         # Activation snapshot — the only step that reads the activation cache.
         with cache_lock:
@@ -1281,13 +1234,7 @@ def _export_loop(store: "ActivationStore",
             nonlocal bundles
             bundles = bundle_store.export_snapshot(bundle_snapshot_path) or 0
         _timed("bundle", _bundle)                                  # own internal lock
-        # P2a throttle — spine export only every _spine_min_interval_s (the 9s
-        # GIL-held json.dump is the heartbeat-starvation risk; skip it on the
-        # other passes). First pass (_spine_last_export==0) always exports.
-        _now_spine = time.monotonic()
-        if _now_spine - _spine_last_export >= _spine_min_interval_s:
-            _timed("spine", lambda: spine_exporter_holder["fn"]())  # Engram spine → JSON
-            _spine_last_export = _now_spine
+        _timed("spine", lambda: spine_exporter_holder["fn"]())     # Engram spine → JSON
         _timed("fork_activation", lambda: fork_activation_updater_holder["fn"]())
         _timed("fork", lambda: fork_exporter_holder["fn"]())
         _timed("oracle", lambda: oracle_exporter_holder["fn"]())
@@ -1665,6 +1612,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     "[synthesis_worker] Kuzu checkpoint tick failed: %s", _ck_err)
 
         kuzu_checkpoint_holder["fn"] = _kuzu_checkpoint_tick
+
+        # RFP_supervision_lifecycle §7.D / Phase D.1 — bus-INDEPENDENT
+        # UNCONDITIONAL Kuzu spine checkpoint on any shutdown (SIGTERM/
+        # control-group/PDEATHSIG). synthesis is full-restart-only, so without
+        # this a control-group SIGTERM left a dirty WAL that replayed +420 MB on
+        # next open (the OOM-loop). checkpoint() is idempotent + G21 sole-writer.
+        from titan_hcl.core.worker_shutdown import register_shutdown_save
+        register_shutdown_save(
+            name,
+            lambda: kuzu_graph_obj.checkpoint() if kuzu_graph_obj is not None else None,
+        )
 
     # Phase 2 D-P2-1 EngineRecall — contract-driven recall coordinator.
     # Lazy-open a read-only sqlite handle on data/timechain/index.db so
@@ -3420,22 +3378,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         result.pass_id, len(result.concepts_created),
                         len(result.concepts_bumped), result.rejected_clusters,
                         result.llm_calls, result.txs_mined, result.duration_ms)
-                    # RFP_worker_telemetry §7.B — consolidation was a prime flap
-                    # suspect (DREAM_STATE_CHANGED-gated, O(clusters) on the loop
-                    # thread). Record the pass's OWN measured duration (no double
-                    # timing) + size-context so the analysis can attribute a stall.
-                    try:
-                        _t = _synth_tel()
-                        if _t is not None:
-                            _t.record_stage(
-                                "consolidation", float(result.duration_ms),
-                                feature="consolidation",
-                                created=len(result.concepts_created),
-                                bumped=len(result.concepts_bumped),
-                                rejected=int(result.rejected_clusters),
-                                llm_calls=int(result.llm_calls))
-                    except Exception:  # noqa: BLE001
-                        pass
                 except Exception as e:
                     logger.warning(
                         "[synthesis_worker] consolidation_pass crashed: %s", e,

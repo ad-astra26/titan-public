@@ -1307,7 +1307,60 @@ class RebirthBackup:
             logger.info("[Backup] v=3 memo anchored: tier=%s evt=%s tx=%s",
                         comp.get("tier"), event_id[:8],
                         sig[:16] if len(sig) > 16 else sig)
+
+        # ── ZK-compressed audit trail (SPEC §B4 — `append_epoch_snapshot`) ──
+        # On the HEAD backup event, fire the Light-Protocol compressed-account
+        # snapshot in-process (same network client), gated by the per-Titan
+        # switch. NON-BLOCKING: the v=3 chain + commit_state already committed
+        # above; a failure here never regresses them (PLAN_zk_vault_proof_completion).
+        if commit_state and head_sig and self._zk_compressed_audit_enabled():
+            try:
+                from titan_hcl.logic.zk_vault_state import (
+                    emit_epoch_snapshot, read_timechain_block_count,
+                    write_zk_audit_state,
+                )
+                mem_count = read_timechain_block_count()
+                if mem_count is None:
+                    # INV-NO-STUBS: never write a 0 memory_count — skip honestly.
+                    logger.warning(
+                        "[Backup] ZK audit: timechain count unavailable — "
+                        "skipping epoch snapshot (no 0-stub)")
+                    write_zk_audit_state(
+                        self._titan_id, enabled=True,
+                        last_error="memory_count_unavailable")
+                else:
+                    head_comp = components[0]
+                    arweave_tx = head_comp.get("tx_id", "") or ""
+                    arweave_url = (f"https://arweave.net/{arweave_tx}"
+                                   if arweave_tx else "")
+                    await emit_epoch_snapshot(
+                        self.network,
+                        state_root_hex=event_merkle_root,
+                        sovereignty_bp=sovereignty_bp,
+                        archive_hash=head_comp.get("arc", "") or "",
+                        arweave_url=arweave_url,
+                        titan_id=self._titan_id,
+                        memory_count=mem_count,
+                        program_id_str=vault_program_id,
+                        photon=getattr(self, "_photon", None),
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[Backup] ZK-compressed audit snapshot failed "
+                    "(non-critical): %s", e)
+
         return {"head_sig": head_sig, "component_sigs": component_sigs}
+
+    def _zk_compressed_audit_enabled(self) -> bool:
+        """Per-Titan switch for the ZK-compressed audit trail (SPEC §B4
+        append_epoch_snapshot on the backup event). Default OFF."""
+        try:
+            return bool(
+                (self._full_config or {}).get("backup", {}).get(
+                    "zk_compressed_audit_enabled", False)
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     # ── SPEC §24 — Unified backup pipeline (Phase 5.5, 2026-05-16) ─────────
     #
