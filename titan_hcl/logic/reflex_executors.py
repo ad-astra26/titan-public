@@ -478,7 +478,7 @@ def register_reflex_executors(collector, plugin) -> int:
                 return {"findings": findings[:500], "success": True}
             return {"findings": "", "error": "no findings"}
         except Exception as e:
-            logger.warning("[ReflexExec] research error: %s", e)
+            logger.warning("[ReflexExec] research error: %s", e, exc_info=True)
             return {"findings": "", "error": str(e)}
 
     collector.register_executor(ReflexType.RESEARCH, execute_research)

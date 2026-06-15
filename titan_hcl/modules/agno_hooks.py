@@ -1618,7 +1618,12 @@ def create_pre_hook(plugin):
                     for _a2_pn in _a2_pendings:
                         plugin.memory.tick_confirmation_window(_a2_pn["id"], _a2_weak)
         except Exception as _a2_err:
-            logger.debug("[PreHook][A2] confirmation gate skipped: %s", _a2_err)
+            # NOT debug — a swallowed-at-debug AttributeError here (the proxy was
+            # missing find_pending_confirmation_nodes/reinforce_mempool_node/
+            # tick_confirmation_window) silently killed the EEL confirm→seed feed
+            # for a long time, invisibly. Surface it loudly (no silent except).
+            logger.warning("[PreHook][A2] confirmation gate skipped: %s",
+                           _a2_err, exc_info=True)
 
         # P2 gibberish-baseline calibration (flag-gated) — periodically probe the
         # embedder's noise floor so the recall floors SELF-CALIBRATE to the live
@@ -3295,8 +3300,11 @@ def create_post_hook(plugin):
                     "felt=%s)", user_id_v, user_prompt_v[:40], len(response_text_v),
                     bool(neuromod_context_v))
             except Exception as e:
+                # exc_info — this is the chat→mempool write (load-bearing for ~all
+                # outer systems); a bare "%s" hid the add_to_mempool(tags=…)
+                # signature drift as a one-liner for a long time. Full trace.
                 logger.warning(
-                    "[PostHook][bg] Memory logging failed: %s", e)
+                    "[PostHook][bg] Memory logging failed: %s", e, exc_info=True)
 
         try:
             asyncio.create_task(_log_to_mempool_bg(
