@@ -500,6 +500,85 @@ def _mark_acquired_research(plugin, source: str) -> None:
         logger.warning("[research] _mark_acquired_research failed", exc_info=True)
 
 
+def _get_shared_cache_learner(plugin):
+    """Phase E (RFP §7.E) — the SHARED knowledge cache + routing learner agno
+    co-mines with knowledge_worker. Returns (cache, learner) when enabled, else
+    (None, None). Lazy-built once on the plugin (re-uses the same WAL SQLite
+    files knowledge_worker opens — `[knowledge] search_cache_path` etc., resolved
+    identically since both workers share cwd + config).
+
+    🔓 SANCTIONED INV-RR-1 EXCEPTION (Maker-ratified 2026-06-15): agno writes the
+    cache/learner DIRECTLY (not via the bus / a new writer-service). Both workers
+    produce the SAME data class (research findings → cache; routing outcomes →
+    learner), so ONE shared store both can mine is the right model. SQLite WAL
+    safely serializes the two LOW-volume writers (research is sparse: autonomous
+    knowledge_worker + chat research capped at 2/turn by Phase F; short-lived
+    conns + timeout=5.0). The bus alternative would put research-finding DATA on
+    the event bus — an anti-pattern (bus = events, not bulk data) — and a
+    dedicated writer-service would ALSO move the data over the bus + add a whole
+    L3 module, disproportionate to a 2-writer cache. Scope of the exception:
+    ONLY this cache + learner, ONLY agno+knowledge_worker, WAL required. Flag
+    `[knowledge] agno_shared_cache_enabled` **default ON** (ships enabled — Maker rule; `=false` = kill-switch).
+    See SPEC ARCHITECTURE_storage_topology.md "Knowledge cache — 2-writer
+    exception"."""
+    cfg = getattr(plugin, "_full_config", {}) or {}
+    kcfg = cfg.get("knowledge", {}) or {}
+    if not kcfg.get("agno_shared_cache_enabled", True):
+        return None, None
+    cache = getattr(plugin, "_shared_knowledge_cache", None)
+    if cache is None:
+        try:
+            from titan_hcl.logic.knowledge_cache import KnowledgeCache
+            from titan_hcl.logic.knowledge_routing_learner import RoutingLearner
+            cpath = kcfg.get("search_cache_path", "data/search_cache.db")
+            lpath = kcfg.get("routing_stats_path",
+                             "data/knowledge_routing_stats.db")
+            cache = KnowledgeCache(
+                db_path=cpath,
+                size_cap=int(kcfg.get("search_cache_size_cap", 10_000)))
+            plugin._shared_knowledge_cache = cache
+            plugin._shared_routing_learner = RoutingLearner(db_path=lpath)
+            logger.info("[PreHook] Phase E shared cache+learner ON "
+                        "(cache=%s, learner=%s)", cpath, lpath)
+        except Exception:
+            logger.warning("[PreHook] Phase E shared cache init failed → "
+                           "stateless", exc_info=True)
+            return None, None
+    return (getattr(plugin, "_shared_knowledge_cache", None),
+            getattr(plugin, "_shared_routing_learner", None))
+
+
+def _cache_phase2_research(cache, learner, gap, dr, raw_text) -> None:
+    """Phase E: cache agno's Phase-2 sage findings (the conceptual research the
+    dispatch never cached — the sage run is OUTSIDE dispatch). Keyed under the
+    chain's FIRST backend (`route(gap, qt)[0]`) so the next Phase-1 dispatch's
+    per-backend `cache.get` hits it (cross-call + cross-worker). DIRECT WAL write
+    — the sanctioned INV-RR-1 exception (see _get_shared_cache_learner). Payload
+    mirrors the dispatcher's own (`raw_text/structured/status_code`). No-op when
+    caching is OFF; never raises (hot path)."""
+    if cache is None or not raw_text:
+        return
+    try:
+        from titan_hcl.logic.knowledge_router import (
+            query_hash, normalize_query, route)
+        qt = dr.query_type
+        normalized = dr.normalized or normalize_query(gap)
+        backend = (route(gap, qt) or ["searxng"])[0]
+        cache.put(
+            query_hash=query_hash(normalized, qt, backend),
+            query_text=normalized, query_type=qt, backend=backend,
+            result_payload={"raw_text": raw_text, "structured": None,
+                            "status_code": 200},
+            success=True)
+        if learner is not None:
+            learner.record_outcome(query_type=qt, backend=backend, success=True)
+        logger.info("[PreHook] Phase E cached agno sage research "
+                    "(backend=%s, qt=%s, %d chars)", backend, qt.value,
+                    len(raw_text))
+    except Exception:
+        logger.warning("[PreHook] Phase E phase-2 cache.put failed", exc_info=True)
+
+
 async def _dispatch_knowledge_research(plugin, gap: str) -> str:
     """Route a chat research gap through the unified knowledge_dispatcher
     IN-PROCESS, with the agno worker's in-process StealthSage as the web-research
@@ -516,17 +595,22 @@ async def _dispatch_knowledge_research(plugin, gap: str) -> str:
     degrades — on 2026-06-15 every web engine was CAPTCHA/rate-blocked so bare-sage
     research returned EMPTY, while the direct routes would still have answered.
 
-    Stateless first cut (Maker 2026-06-15): cache=None + learner=None — no
-    cross-process SQLite writes. The shared cache/learner are a follow-up, routed
-    through the knowledge cache's IMW single-writer daemon. We TRUST the
-    dispatcher's own routing chains (a dictionary-classified gap that misses all
-    dictionary backends is intentionally NOT web-searched) — no ad-hoc override.
+    Phase E (RFP §7.E, flag `[knowledge] agno_shared_cache_enabled`): when ON,
+    agno co-mines the SAME WAL cache+learner as knowledge_worker (direct WAL
+    writes — the sanctioned INV-RR-1 exception, see _get_shared_cache_learner) →
+    cross-worker cache HITS + agno research cached. When OFF: cache=None,
+    learner=None — stateless (the original cut). We TRUST the dispatcher's own
+    routing chains (a dictionary-classified gap that misses all dictionary
+    backends is intentionally NOT web-searched) — no ad-hoc override.
     On a clean no-result we return "" (the chat proceeds without findings); only on
     a dispatch EXCEPTION do we fall back to bare sage.research so an integration
     fault can never regress the known-good path. Never raises (hot path)."""
     sage = getattr(plugin, "sage_researcher", None)
     if sage is None:
         return ""
+    # Phase E (RFP §7.E) — the SHARED cache+learner agno co-mines with
+    # knowledge_worker (None,None when the flag is OFF → stateless, as before).
+    cache, learner = _get_shared_cache_learner(plugin)
     try:
         from titan_hcl.logic.knowledge_dispatcher import dispatch
         # ── Phase 1 — DIRECT REST backends ONLY (sage=None). ──────────────
@@ -539,12 +623,16 @@ async def _dispatch_knowledge_research(plugin, gap: str) -> str:
         # early backends failed under load — verified live 2026-06-15, T1
         # load-10 → 27.9s + 8.8s sage runs). Direct routes are sub-second +
         # proxy-free → the resilience floor.
+        # Phase E: `cache.get` runs per-backend BEFORE the sage-skip, so a
+        # CROSS-WORKER hit (a gap knowledge_worker already cached — incl. its
+        # searxng/sage results) short-circuits here with NO fetch.
         dr = await dispatch(
-            topic=gap, sage=None, cache=None, learner=None,
+            topic=gap, sage=None, cache=cache, learner=learner,
             timeout_per_backend=8.0, requestor="agno_chat")
         if dr.success and dr.result and dr.result.raw_text:
             logger.info(
-                "[PreHook] knowledge_dispatch DIRECT backend=%s (qt=%s, %dms)",
+                "[PreHook] knowledge_dispatch %s backend=%s (qt=%s, %dms)",
+                "CACHE_HIT" if dr.cache_hit else "DIRECT",
                 dr.backend_used, dr.query_type.value, round(dr.latency_ms_total))
             _mark_acquired_research(plugin, dr.backend_used or "research")  # EEL-A1
             return "[SAGE_RESEARCH_FINDINGS]: %s" % dr.result.raw_text
@@ -558,6 +646,11 @@ async def _dispatch_knowledge_research(plugin, gap: str) -> str:
         _sage_out = await sage.research(knowledge_gap=gap) or ""
         if _sage_out:
             _mark_acquired_research(plugin, "research")  # EEL-A1 (sage findings)
+            # Phase E: cache agno's OWN conceptual research (the Phase-2 sage run
+            # is outside dispatch → cache it manually) under the chain's first
+            # backend, so the NEXT lookup (any worker) hits it. DIRECT WAL write
+            # — the sanctioned INV-RR-1 exception (see _get_shared_cache_learner).
+            _cache_phase2_research(cache, learner, gap, dr, _sage_out)
         return _sage_out
     except Exception:
         logger.warning(
