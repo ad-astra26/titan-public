@@ -520,12 +520,25 @@ class MemoryProxy:
 
     async def add_to_mempool(self, user_prompt: str, agent_response: str,
                             user_identifier: str = "Anonymous",
-                            neuromod_context: dict = None) -> None:
+                            neuromod_context: dict = None,
+                            tags: Optional[list] = None,
+                            source: Optional[str] = None) -> None:
         """Add conversation to mempool — ONE-WAY fire-and-forget bus event.
 
         `neuromod_context` (§7.C): the felt-at-lived-time snapshot, forwarded in
         the bus payload so the promoted chat thought carries felt into the
         synthesis felt axis (memory_worker._handle_mempool_add → core add_to_mempool).
+
+        `tags` + `source` (provenance — EEL-A1 / INV-SD-15): advisory tags +
+        origin label carried onto the mempool node. The canonical
+        `TitanMemory.add_to_mempool` (core/memory.py:959), the
+        `MEMORY_MEMPOOL_ADD` handler (memory_worker._handle_mempool_add reads
+        payload `tags`/`source`), and the PostHook caller (agno_hooks.py:3288)
+        ALL carry these — this proxy signature had drifted stale and lacked
+        them, so the agno PostHook's `add_to_mempool(..., tags=…, source=…)`
+        threw `unexpected keyword argument 'tags'` → the chat→mempool write
+        SILENTLY FAILED every turn (load-bearing for ~all outer systems +
+        the EEL self-learning confirm feed). Restored 2026-06-15.
 
         2026-05-12 migration: was bus.request_async("add_to_mempool", ...)
         which serialized through memory_worker's single-threaded dispatch
@@ -549,6 +562,8 @@ class MemoryProxy:
                     "agent_response": agent_response,
                     "user_identifier": user_identifier,
                     "neuromod_context": neuromod_context,
+                    "tags": tags,
+                    "source": source,
                 },
             ))
         except Exception as e:
