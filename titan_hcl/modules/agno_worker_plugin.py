@@ -212,17 +212,46 @@ class WorkerPlugin:
     def mood_engine(self):
         return self.mind
 
-    # consciousness + sage_researcher are NOT separate L2 workers today —
-    # both still live in the parent process. For agno_worker context,
-    # hooks accessing them get None and degrade gracefully (every
-    # access site in agno_hooks.py uses getattr with None fallback).
+    # consciousness is NOT a separate L2 worker today — it lives in the parent
+    # process. For agno_worker context, hooks accessing it get None and degrade
+    # gracefully (access sites in agno_hooks.py use getattr with None fallback).
     @property
     def consciousness(self):
         return None
 
     @property
     def sage_researcher(self):
-        return None
+        # The chat research lane (agno_hooks STATE_NEED_RESEARCH) runs in THIS
+        # agno_worker process, so it needs a real researcher HERE. Construct
+        # StealthSageResearcher IN-PROCESS — the same decision as _output_verifier
+        # below (worker-context bus-RPC to knowledge_worker is unreliable — RESPONSE
+        # delivery to agno_worker's recv_queue times out). Stateless (SearXNG httpx
+        # + LLM-distill, no DB) → safe + cheap in-process. Lazy + cached. Returns
+        # None on init failure → the research lane degrades to internal-recall-only.
+        # 2026-06-15 FIX: this property previously hardcoded `return None`, so every
+        # chat research request (router → STATE_NEED_RESEARCH) silently degraded to
+        # empty ("research pipeline returned no results") — the web-fetch backend was
+        # healthy the whole time; the researcher object was just never wired here.
+        if not hasattr(self, "_local_sage_instance"):
+            self._local_sage_instance = None
+            try:
+                from titan_hcl.modules.knowledge_worker import (
+                    _build_sage_config, _wire_ollama_cloud)
+                from titan_hcl.logic.sage.researcher import StealthSageResearcher
+                _cfg: dict[str, Any] = {}
+                _cfg.update(self._full_config.get("inference", {}) or {})
+                _cfg.update(self._full_config.get("stealth_sage", {}) or {})
+                _sage = StealthSageResearcher(_build_sage_config(_cfg))
+                _wire_ollama_cloud(_sage, _cfg)
+                self._local_sage_instance = _sage
+                logger.info(
+                    "[agno_plugin] in-process StealthSage initialized "
+                    "(searxng=%s)", getattr(_sage, "_searxng_host", "?"))
+            except Exception:
+                logger.warning(
+                    "[agno_plugin] in-process sage init failed — research degrades "
+                    "to internal recall only", exc_info=True)
+        return self._local_sage_instance
 
     # ── output_verifier — LOCAL instance (D-SPEC-75 hotfix 2026-05-18) ──
     #
