@@ -636,12 +636,15 @@ class AffectiveNudgeRuntime:
 
     # ── chain_reuse (outer competence-reuse) accumulator ──────────────────────
     def note_chat_reuse(self, n: int = 1) -> None:
-        """Record `n` outer competence-reuse events — each agno `skill_delegate`
-        decision (a learned skill matched → reuse, no re-run). Called from the
-        synthesis dispatch loop's TURN_REASONING_RECORD handler (chat-active,
-        unlike the sparse inner meta_wisdom reuse). Thread-safe; the drain loop
-        drains the accumulated count, keeping all observe_* on the ONE drain
-        thread (single-consumer EMA-file contract)."""
+        """Record `n` outer competence-reuse events. Two chat-active sources feed
+        this (combined per the Maker's 2026-06-16 call): (1) each agno
+        `skill_delegate` decision (a learned skill matched → reuse, no re-run),
+        noted by synthesis's TURN_REASONING_RECORD handler; (2) each knowledge-cache
+        reuse (answering a gap from cache vs re-researching), via the agno-emitted
+        KNOWLEDGE_REUSE_HIT bus event. Both are chat-active (unlike the sparse inner
+        meta_wisdom reuse this repointed away from). Thread-safe; the drain loop
+        drains the accumulated count, keeping all observe_* on the ONE drain thread
+        (single-consumer EMA-file contract)."""
         if n <= 0:
             return
         with self._lock:

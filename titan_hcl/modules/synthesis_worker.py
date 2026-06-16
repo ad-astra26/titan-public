@@ -90,6 +90,7 @@ from titan_hcl.bus import (
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
     USER_FEEDBACK_SIGNAL,
+    KNOWLEDGE_REUSE_HIT,
     make_msg,
 )
 from titan_hcl.synthesis.activation import (
@@ -3636,6 +3637,18 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     events_recorded, store.items_tracked(),
                     bundles_maintained, bundle_store.entities_tracked())
                 break
+
+            if msg_type == KNOWLEDGE_REUSE_HIT:
+                # Affective Grounding Loop §7.C chain_reuse — agno reused cached
+                # knowledge instead of re-researching (competence-reuse). Note it on
+                # the runtime; the drain loop folds the accumulated count into a
+                # chain_reuse nudge (chat-active; combines with skill_delegate turns).
+                if _affective_runtime is not None:
+                    try:
+                        _affective_runtime.note_chat_reuse()
+                    except Exception:
+                        pass
+                continue
 
             if msg_type == MEMORY_RETRIEVAL_USED:
                 item_id = payload.get("item_id")

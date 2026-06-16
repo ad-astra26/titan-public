@@ -1328,6 +1328,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # sole consumer (INV-Syn-24 Tier-2 override via UserFeedbackOverride).
             _bus_constants.SKILL_REPAIR_FORK_SPAWNED,
             _bus_constants.USER_FEEDBACK_SIGNAL,
+            # Affective Grounding Loop §7.C chain_reuse — agno emits KNOWLEDGE_REUSE_HIT
+            # on a knowledge-cache reuse; synthesis folds it into the chain_reuse nudge.
+            _bus_constants.KNOWLEDGE_REUSE_HIT,
             # Inner↔Outer Felt-Teaching Bridge §7.2 — event-sourced CGN grounded-set.
             # Emitted by cgn_worker (to=cognitive_worker) when a concept matures across
             # ≥2 consumers; synthesis_worker subscribes too (broadcast pub/sub) to feed

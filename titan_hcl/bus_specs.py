@@ -157,6 +157,7 @@ MSG_SPECS: dict[str, BusMsgSpec] = {
     "MENTION_RECEIVED":                 BusMsgSpec("MENTION_RECEIVED",                 priority=3),
     "FELT_EXPERIENCE_CAPTURED":         BusMsgSpec("FELT_EXPERIENCE_CAPTURED",         priority=3),
     "ENGAGEMENT_SNAPSHOT_TAKEN":        BusMsgSpec("ENGAGEMENT_SNAPSHOT_TAKEN",        priority=3),
+    "KNOWLEDGE_REUSE_HIT":              BusMsgSpec("KNOWLEDGE_REUSE_HIT",              priority=3),
 
     # rFP_titan_hcl_l2_separation_strategy §4.P + D-SPEC-50 (v1.7.1, 2026-05-14).
     # social_graph_worker publishers. READY is P1 one-shot lifecycle (never drop);

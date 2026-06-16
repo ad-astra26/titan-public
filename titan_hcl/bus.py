@@ -2672,6 +2672,7 @@ FATIGUE_LEVEL_CRITICAL           = "FATIGUE_LEVEL_CRITICAL"            # life_fo
 MENTION_RECEIVED                 = "MENTION_RECEIVED"                  # canonical poller → other social_workers
 FELT_EXPERIENCE_CAPTURED         = "FELT_EXPERIENCE_CAPTURED"          # canonical poller → other social_workers
 ENGAGEMENT_SNAPSHOT_TAKEN        = "ENGAGEMENT_SNAPSHOT_TAKEN"         # canonical poller → other social_workers
+KNOWLEDGE_REUSE_HIT              = "KNOWLEDGE_REUSE_HIT"               # agno knowledge-cache reuse → synthesis chain_reuse (Affective §7.C)
 
 # rFP_health_monitor_worker.md + D-SPEC-67 (SPEC v1.12.0, 2026-05-17) — pluggable
 # L3 health-monitor framework bus surface. SOLE-sanctioned heal path = bus

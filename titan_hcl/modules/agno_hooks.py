@@ -673,6 +673,21 @@ async def _dispatch_knowledge_research_impl(plugin, gap: str) -> str:
                 "CACHE_HIT" if dr.cache_hit else "DIRECT",
                 dr.backend_used, dr.query_type.value, round(dr.latency_ms_total))
             _mark_acquired_research(plugin, dr.backend_used or "research")  # EEL-A1
+            if dr.cache_hit:
+                # Affective Grounding Loop §7.C chain_reuse — answering a knowledge
+                # gap from cache (vs re-researching) is a competence-reuse event;
+                # signal synthesis (its affective runtime folds it into chain_reuse).
+                # Fire-and-forget; never break chat (INV-OML-7).
+                try:
+                    _kr_bus = getattr(plugin, "bus", None)
+                    if _kr_bus is not None:
+                        from titan_hcl import bus as _kr_bus_mod
+                        from titan_hcl.bus import make_msg as _kr_mk
+                        _kr_bus.publish(_kr_mk(
+                            _kr_bus_mod.KNOWLEDGE_REUSE_HIT, "pre_hook", "synthesis",
+                            {"backend": dr.backend_used or ""}))
+                except Exception:
+                    pass
             return "[SAGE_RESEARCH_FINDINGS]: %s" % dr.result.raw_text
         # ── Phase 2 — no direct hit → EXACTLY ONE full Sage run. ──────────
         # Identical cost to the pre-dispatch bare-sage path (one search+scrape+
