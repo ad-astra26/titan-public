@@ -147,6 +147,16 @@ def _set_engine_recall(er: Optional[EngineRecall]) -> None:
 logger = logging.getLogger(__name__)
 
 
+def _synth_tel():
+    """Lazy synthesis-worker Telemetry (RFP_worker_telemetry §7.B). Never raises
+    → None on failure so instrumentation can't break the synthesis loop."""
+    try:
+        from titan_hcl.logic.worker_telemetry import get_telemetry
+        return get_telemetry("synthesis")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
 # Flipped True after ActivationStore + StandingBundleStore + EngineRecall init
 # complete. Gates SHM-slot heartbeat (see _heartbeat_loop) so titan_hcl's
@@ -1224,7 +1234,16 @@ def _export_loop(store: "ActivationStore",
             except Exception as _e:   # per-step soft-fail (matches the old inline guards)
                 logger.debug("[synthesis_worker] export step %s failed: %s", label, _e)
             finally:
-                timings[label] = int((time.monotonic() - _s) * 1000)
+                _dur = (time.monotonic() - _s) * 1000.0
+                timings[label] = int(_dur)
+                # RFP_worker_telemetry §7.B — persist each export step (spine
+                # export was the GIL-yield flap culprit) under feature='export'.
+                try:
+                    _t = _synth_tel()
+                    if _t is not None:
+                        _t.record_stage("export:" + label, _dur, feature="export")
+                except Exception:  # noqa: BLE001
+                    pass
 
         # Activation snapshot — the only step that reads the activation cache.
         with cache_lock:
