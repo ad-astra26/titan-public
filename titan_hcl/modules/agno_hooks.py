@@ -35,31 +35,6 @@ def _ph_rss_mb() -> int:
         return 0
 
 
-def _agno_tel():
-    """Lazy agno-worker Telemetry (RFP_worker_telemetry §7.B). Never raises →
-    returns None on any import/init failure so instrumentation can't break chat."""
-    try:
-        from titan_hcl.logic.worker_telemetry import get_telemetry
-        return get_telemetry("agno")
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _ph_feature(stage: str) -> str:
-    """Coarse feature bucket for a PreHook stage name → the --by-feature grouping
-    ("which feature strains the chat path most"). The op name keeps the detail."""
-    s = stage.lower()
-    if "recall" in s or "vcb" in s or "memory" in s:
-        return "recall"
-    if "research" in s:
-        return "research"
-    if "enrich" in s or "v5" in s:
-        return "enrichment"
-    if "gatekeeper" in s or "directive" in s:
-        return "guard"
-    return "prehook"
-
-
 # ─────────────────────────────────────────────────────────────────────
 # Phase 2 Chunk γ (D-SPEC-78, 2026-05-18) — PreHook TTL cache.
 # ─────────────────────────────────────────────────────────────────────
@@ -605,19 +580,6 @@ def _cache_phase2_research(cache, learner, gap, dr, raw_text) -> None:
 
 
 async def _dispatch_knowledge_research(plugin, gap: str) -> str:
-    """RFP_worker_telemetry §7.B — time the WHOLE research operation under
-    feature='research' (the canonical entry for all 3 research paths: PreHook,
-    agno tool, reflex) so the load-test analysis can attribute synthesis/agno
-    strain to research vs other features. Null-safe; never breaks the chat."""
-    _tel = _agno_tel()
-    if _tel is None:
-        return await _dispatch_knowledge_research_impl(plugin, gap)
-    with _tel.timed("research_dispatch", feature="research",
-                    trigger_id=getattr(plugin, "_telemetry_trigger_id", None)):
-        return await _dispatch_knowledge_research_impl(plugin, gap)
-
-
-async def _dispatch_knowledge_research_impl(plugin, gap: str) -> str:
     """Route a chat research gap through the unified knowledge_dispatcher
     IN-PROCESS, with the agno worker's in-process StealthSage as the web-research
     fallback backend.
@@ -1229,21 +1191,10 @@ def create_pre_hook(plugin):
         # see exactly where the 7-28s on T3 goes. Strip after optimization.
         import time as _ph_time
         _ph_t0 = _ph_time.monotonic()
-        _ph_last = [_ph_t0]
-        _ph_telemetry = _agno_tel()   # RFP_worker_telemetry §7.B — persist stages
         def _ph_stage(name: str) -> None:
-            _now = _ph_time.monotonic()
-            elapsed_ms = int((_now - _ph_t0) * 1000)
-            _stage_ms = (_now - _ph_last[0]) * 1000.0   # PER-STAGE delta (the cost)
-            _ph_last[0] = _now
-            _rss = _ph_rss_mb()
+            elapsed_ms = int((_ph_time.monotonic() - _ph_t0) * 1000)
             logger.info("[PreHook:t] stage=%s t+%dms rss=%dMB",
-                        name, elapsed_ms, _rss)
-            if _ph_telemetry is not None:
-                _ph_telemetry.record_stage(
-                    "prehook:" + name, _stage_ms, rss_mb=float(_rss),
-                    feature=_ph_feature(name),
-                    trigger_id=getattr(plugin, "_telemetry_trigger_id", None))
+                        name, elapsed_ms, _ph_rss_mb())
         _ph_stage("entry")
 
         # ── Phase F — reset the per-turn research invocation cap (RFP §7.F) ──
