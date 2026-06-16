@@ -168,25 +168,6 @@ impl Supervisor {
         self.children.get(child_name).map(|s| s.lifecycle.clone())
     }
 
-    /// `(name, pid)` for every child currently in the `Running` state.
-    ///
-    /// Used by the kernel's graceful-shutdown path (SPEC §18.4 /
-    /// RFP_supervision_lifecycle §7.D): the kernel must explicitly SIGTERM its
-    /// supervised children at SHUTDOWN_BEGIN — under `KillMode=mixed` systemd
-    /// signals only the kernel ($MAINPID), and PDEATHSIG fires only on kernel
-    /// *exit*, which is too late (the bus broker must stay alive THROUGH the
-    /// child drain). The actual `Child` handles live inside each watch task, so
-    /// the supervisor's pid bookkeeping is the source for who to signal.
-    pub fn running_pids(&self) -> Vec<(String, u32)> {
-        self.children
-            .iter()
-            .filter_map(|(name, state)| match state.lifecycle {
-                ChildLifecycle::Running { pid } => Some((name.clone(), pid)),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Mark a child as Running (called by kernel after successful spawn).
     pub fn mark_running(&mut self, child_name: &str, pid: u32) -> Result<(), SupervisorError> {
         let state = self
@@ -574,37 +555,6 @@ mod tests {
             sup.lifecycle_of("a").unwrap(),
             ChildLifecycle::Running { pid: 1234 }
         );
-    }
-
-    #[test]
-    fn running_pids_returns_only_running_children() {
-        // SPEC §18.4 / RFP_supervision_lifecycle §7.D — the shutdown path
-        // SIGTERMs exactly the children the supervisor believes are Running.
-        let (_, _, mut sup) = make_supervisor();
-        sup.register_child(ChildSpec::new("running_a")).unwrap();
-        sup.register_child(ChildSpec::new("running_b")).unwrap();
-        sup.register_child(ChildSpec::new("never_started")).unwrap();
-        sup.mark_running("running_a", 111).unwrap();
-        sup.mark_running("running_b", 222).unwrap();
-        // never_started stays in the default (Dead) lifecycle → excluded.
-
-        let mut pids = sup.running_pids();
-        pids.sort_by_key(|(_, pid)| *pid);
-        assert_eq!(
-            pids,
-            vec![("running_a".into(), 111), ("running_b".into(), 222)]
-        );
-    }
-
-    #[test]
-    fn running_pids_excludes_crashed_child() {
-        // A child that exited (handle_child_exit) must NOT be re-SIGTERM'd.
-        let (_, _, mut sup) = make_supervisor();
-        sup.register_child(ChildSpec::new("a")).unwrap();
-        sup.mark_running("a", 100).unwrap();
-        let _ = sup.handle_child_exit("a", SupervisionReason::Panic, "test", Some(1));
-        // After a crash the lifecycle is no longer Running { pid }.
-        assert!(sup.running_pids().iter().all(|(n, _)| n != "a"));
     }
 
     #[test]

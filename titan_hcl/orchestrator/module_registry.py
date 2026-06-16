@@ -259,6 +259,7 @@ class ModuleInfo:
     last_cpu_time: float = 0.0           # /proc/<pid>/stat utime+stime sample (seconds)
     last_cpu_sample_ts: float = 0.0      # when last_cpu_time was sampled
     consecutive_starved_cycles: int = 0  # heartbeat misses where CPU grew (alive-but-starved)
+    consecutive_rss_over_cycles: int = 0  # cycles RssAnon > rss_limit — THROTTLE not respawn (INV-SUP-1/2, RFP §7.B/F)
     cpu_delta_s: float = 0.0             # SPEC §1339 — per-interval CPU seconds self-reported in MODULE_HEARTBEAT
     # Microkernel v2 Phase B.2.1 (2026-04-27): worker supervision-transfer.
     # When True, this ModuleInfo refers to an externally-spawned worker
