@@ -92,7 +92,7 @@ RESTART_BACKOFF_BASE = 2.0      # exponential backoff base (seconds)
 MAX_RESTARTS_IN_WINDOW = 5      # max restarts allowed in the sliding window
 RESTART_WINDOW_SECONDS = 600.0  # 10-minute sliding window for restart tracking
 SUSTAINED_UPTIME_RESET = 300.0  # 5 minutes of uptime before restart count resets
-REENABLE_COOLDOWN_S = 600.0    # 10 minutes before auto-re-enabling a disabled module
+REENABLE_COOLDOWN_S = 180.0    # RFP_supervision_lifecycle §7.C — 3min (was 600) auto-re-enable cooldown
 # CPU-aware heartbeat (added 2026-04-21) — when heartbeat times out, sample
 # /proc/<pid>/stat CPU time. If CPU grew ≥ MIN_CPU_DELTA_FOR_ALIVE since last
 # sample, the module is alive-but-CPU-starved (not deadlocked). Defer restart

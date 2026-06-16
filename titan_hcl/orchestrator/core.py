@@ -121,7 +121,7 @@ BOOT_GRACE_SECONDS = 45.0       # boot window during which rss faults are uncoun
 # RFP_supervision_lifecycle §7.B — only modules at/above this rss_limit are
 # "heavy" enough to starve the box on boot; lighter ones are never throttled.
 BOOT_THROTTLE_HEAVY_MIN_RSS_MB = 400.0
-REENABLE_COOLDOWN_S = 600.0    # 10 minutes before auto-re-enabling a disabled module
+REENABLE_COOLDOWN_S = 180.0    # RFP_supervision_lifecycle §7.C — 3min (was 600) auto-re-enable cooldown
 # CPU-aware heartbeat (added 2026-04-21) — when heartbeat times out, sample
 # /proc/<pid>/stat CPU time. If CPU grew ≥ MIN_CPU_DELTA_FOR_ALIVE since last
 # sample, the module is alive-but-CPU-starved (not deadlocked). Defer restart
@@ -1381,7 +1381,20 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 name, REENABLE_COOLDOWN_S)
 
     def enable(self, name: str) -> bool:
-        """Re-enable a disabled module, reset restart counters, and start it. Thread-safe via _module_lock."""
+        """Re-enable a DISABLED module: reset counters + initiate a NON-BLOCKING start.
+
+        RFP_supervision_lifecycle §7.C — the reset (clear DISABLED + counters) is
+        done synchronously under the lock, then `start()` is submitted to the
+        restart executor and this returns IMMEDIATELY ("initiated"). Previously
+        enable() called `self.start(name)` inline, which blocks up to
+        SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S on dep-activation — that was
+        the 60s enable-RPC-timeout that forced full restarts to recover a
+        DISABLED module (synthesis incident 2026-06-15). Both callers benefit:
+        the chat-bridge enable RPC (returns fast, no timeout) AND the supervisor
+        auto-re-enable in monitor_tick (no longer stalls the monitor loop).
+        start()'s own state-guard dedups a double-submit; the supervisor
+        monitor_tick confirms the module reaches healthy. Keystone: §7.B lets the
+        module actually boot once enable initiates it."""
         with self._module_lock:
             info = self._modules.get(name)
             if not info:
@@ -1390,11 +1403,21 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             if info.state != ModuleState.DISABLED:
                 logger.info("[Guardian] Module '%s' is not disabled (state=%s)", name, info.state)
                 return True  # already enabled
-            logger.info("[Guardian] Re-enabling module '%s' — resetting restart counters", name)
+            logger.info(
+                "[Guardian] Re-enabling module '%s' — resetting counters, "
+                "initiating non-blocking start", name)
             info.state = ModuleState.STOPPED
             info.restart_count = 0
             info.restart_timestamps.clear()
-            return self.start(name)
+            info.disabled_at = 0.0  # no longer disabled — clears the reenable-eta
+        # Outside the lock: initiate start in the background so neither the enable
+        # RPC nor the monitor loop blocks on dep-activation.
+        try:
+            self._restart_executor.submit(self.start, name)
+        except Exception as e:  # noqa: BLE001 — executor shut down during teardown
+            logger.warning("[Guardian] enable('%s') start-submit failed: %s", name, e)
+            return False
+        return True
 
     def _compute_boot_order(self, names: list[str]) -> list[str]:
         """Phase 9 Chunk 9L — order autostart modules: dependency-correct
@@ -2477,6 +2500,13 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 # Microkernel v2 Phase B.2.1 — adoption sentinel + timestamp.
                 "adopted": info.adopted,
                 "adopt_ts": info.adopt_ts if info.adopted else 0.0,
+                # RFP_supervision_lifecycle §7.C — seconds until the supervisor
+                # auto-re-enables this DISABLED module ("re-enabling in Ns"
+                # observable); None when not disabled.
+                "reenable_eta_s": (
+                    round(max(0.0, REENABLE_COOLDOWN_S - (time.time() - info.disabled_at)), 1)
+                    if info.state == ModuleState.DISABLED and info.disabled_at > 0
+                    else None),
             }
         return result
 
