@@ -3767,18 +3767,32 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 _ptx = payload.get("parent_tool_call_tx")
                 if not isinstance(_ptx, str) or not _ptx:
                     continue
+                _tcv_oracle = str(payload.get("oracle_id", "coding_sandbox"))
+                _tcv_tool = str(payload.get("tool_id", "") or "")
+                # EEL B1 (2026-06-16): chat-driven tool verdicts arrive with an EMPTY
+                # parent_goal, so the companion-flush dropped them
+                # (oracle_router.py: `if not e.parent_goal: continue`) → skill_score's
+                # source was dry, the affective skill_score signal NEVER fired. Give
+                # the verdict a non-empty goal so it forms an outcome key and scores:
+                # the prompt-derived goal_class when present (parent_goal carries the
+                # prompt on populated paths), else fall back to the tool/oracle used
+                # ("competence at using <tool>"). The affective tally is rate-based,
+                # so any stable key suffices; tool-use verdicts are occasional, so
+                # skill_score stays an honest, sparse competence signal.
+                _tcv_goal = str(payload.get("parent_goal", "") or "") \
+                    or _tcv_tool or _tcv_oracle
                 try:
                     oracle_router.record_companion_verdict(
                         parent_tool_call_tx=_ptx,
-                        oracle_id=str(payload.get("oracle_id", "coding_sandbox")),
+                        oracle_id=_tcv_oracle,
                         verdict=str(payload.get("verdict", "unknown")),
                         evidence_ref=str(payload.get("evidence_ref", "")),
                         latency_ms=int(payload.get("latency_ms", 0) or 0),
                         fork="procedural",
                         # EEL B1 — carry goal+tool so the flush can form the
                         # (outcome, task-shape) skill-score event (INV-Syn-29).
-                        parent_goal=str(payload.get("parent_goal", "") or ""),
-                        tool_id=str(payload.get("tool_id", "") or ""),
+                        parent_goal=_tcv_goal,
+                        tool_id=_tcv_tool,
                     )
                 except Exception as _tcv_err:
                     logger.debug(
