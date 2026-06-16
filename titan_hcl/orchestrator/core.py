@@ -2425,12 +2425,39 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
 
     @staticmethod
     def _get_rss_mb(pid: int) -> float:
-        """Read RSS from /proc/{pid}/status (Linux only)."""
+        """Read REAL resident memory from /proc/{pid}/status — RssAnon, NOT VmRSS.
+
+        RFP_supervision_lifecycle §7.B / the proper false-OOM fix (2026-06-16).
+        The supervisor's rss_limit guard (supervisor/core.py:343) compares this
+        to `rss_limit_mb`. It MUST measure private anonymous pages (the memory
+        that actually counts toward OOM pressure), NOT VmRSS — VmRSS over-counts
+        the RECLAIMABLE file-backed mmap'd pages that the DB-heavy + embedder
+        workers map (FAISS/Kuzu/DuckDB/ONNX page-cache, ~100-300 MB). That delta
+        drove a VmRSS false-OOM restart cascade: synthesis (VmRSS 706 vs 700 cap,
+        real RssAnon 498) and agno (VmRSS 880 vs 1000, real RssAnon 815), T1
+        mainnet 2026-06-15/16 — verified live via worker telemetry. The
+        bus_socket._enrich_heartbeat fix (79aa5a68) corrected the REPORTED value;
+        this fixes the one the supervisor actually ENFORCES. A genuine leak still
+        trips (RssAnon grows with real allocation). Fall back to VmRSS only if
+        RssAnon is absent (pre-4.5 kernels).
+        """
         try:
+            _anon: Optional[float] = None
+            _vmrss: Optional[float] = None
             with open(f"/proc/{pid}/status") as f:
                 for line in f:
-                    if line.startswith("VmRSS:"):
-                        return int(line.split()[1]) / 1024.0  # kB → MB
+                    if line.startswith("RssAnon:"):
+                        _anon = int(line.split()[1]) / 1024.0  # kB → MB
+                        if _vmrss is not None:
+                            break
+                    elif line.startswith("VmRSS:"):
+                        _vmrss = int(line.split()[1]) / 1024.0
+                        if _anon is not None:
+                            break
+            if _anon is not None:
+                return _anon
+            if _vmrss is not None:
+                return _vmrss
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             pass
         return 0.0
