@@ -721,7 +721,9 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                             send_queue: Any = None, shm_bank: Any = None,
                             affective_cfg: Any = None,
                             affective_state_path: Optional[str] = None,
-                            affective_runtime: Any = None) -> None:
+                            affective_runtime: Any = None,
+                            solana_oracle: Any = None,
+                            maker_pubkey: str = "") -> None:
     """Daemon thread — drain the `skill_score_events` queue into `skill_cells`
     off the hot path (EEL Pillar B1). Its OWN cadence (like `_tx_index_loop`) so
     a drain never delays the recompute watermark publish. All writes route through
@@ -733,6 +735,12 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
     /bad real outcomes gently move emot-cgn. Off-hot-path (this daemon, post-drain),
     flag-gated OFF by default. `send_queue`/`shm_bank`/`affective_*` are None when
     the loop runs without the affective tap (e.g. unit scenarios) → spine unchanged.
+
+    Affective Grounding Loop §7.C (2026-06-16): this same tick ALSO runs the
+    broadened EVENT taps (sol_receipt + maker_bond) on EVERY iteration — NOT gated
+    on a skill-score drain, since SOL movement flows independently of the
+    dream-gated skill-score source. `solana_oracle` (reused SolanaRpcOracle) +
+    `maker_pubkey` are the maker_bond feePayer attribution; both optional/soft.
 
     NO cpu_load backoff (removed 2026-06-10): the drain is LIGHTWEIGHT — bounded to
     DEFAULT_DRAIN_LIMIT upserts/tick, on this dedicated daemon thread, off the
@@ -747,6 +755,37 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
         from titan_hcl.utils.system_sensor import get_cpu_load
     except Exception:
         get_cpu_load = None
+
+    def _emit_affective_nudge(signal_type: str, nudge: Any, modulator: str) -> None:
+        """Compose a fired nudge onto the neuromod substrate + log. Shared by every
+        signal tap (§7.A skill_score + §7.C event signals). `developmental_age`
+        gates the nudge inside apply_external_nudge (dev <0.1 → suppressed)."""
+        if nudge is None or nudge.magnitude <= 0.0:
+            return
+        dev_age = 0.0
+        if shm_bank is not None:
+            try:
+                pi = shm_bank.read_pi_heartbeat() or {}
+                dev_age = float(pi.get("developmental_age", 0.0) or 0.0)
+            except Exception:
+                dev_age = 0.0
+        _send(send_queue, bus.NEUROMOD_EXTERNAL_NUDGE, name, "neuromod", {
+            "nudge_map": {modulator: nudge.target},
+            "max_delta": nudge.magnitude,
+            "developmental_age": dev_age,
+            "source": "affective_grounding",
+        })
+        _net_steps = getattr(affective_runtime.net, "trained_steps", 0)
+        logger.info(
+            "[synthesis_worker] affective nudge — signal=%s valence=%+d "
+            "surprise=%.3f mag=%.4f target=%.1f src=%s (val=%.3f mu=%.3f n=%d "
+            "dev=%.2f)",
+            signal_type, nudge.valence, nudge.surprise, nudge.magnitude,
+            nudge.target, "net" if _net_steps >= 1 else "formula",
+            nudge.rate, nudge.mu_before, nudge.n, dev_age)
+
+    _last_balance: Optional[float] = None   # §7.C sol_receipt: last seen balance_sol
+    _SOL_DELTA_EPS = 1e-7                    # skip sub-100-lamport float noise
     while not stop_event.is_set():
         try:
             summary = skill_store.drain_score_events()
@@ -769,37 +808,60 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                     try:
                         from titan_hcl.logic.affective_nudge import (
                             SKILL_SCORE_MODULATOR)
-                        nudge = affective_runtime.observe_drain(
-                            int(summary.get("successes", 0)),
-                            int(summary.get("failures", 0)),
-                            time.time())
-                        if nudge is not None and nudge.magnitude > 0.0:
-                            dev_age = 0.0
-                            if shm_bank is not None:
-                                try:
-                                    pi = shm_bank.read_pi_heartbeat() or {}
-                                    dev_age = float(pi.get("developmental_age", 0.0) or 0.0)
-                                except Exception:
-                                    dev_age = 0.0
-                            _send(send_queue, bus.NEUROMOD_EXTERNAL_NUDGE,
-                                  name, "neuromod", {
-                                      "nudge_map": {SKILL_SCORE_MODULATOR: nudge.target},
-                                      "max_delta": nudge.magnitude,
-                                      "developmental_age": dev_age,
-                                      "source": "affective_grounding",
-                                  })
-                            _net_steps = getattr(
-                                affective_runtime.net, "trained_steps", 0)
-                            logger.info(
-                                "[synthesis_worker] affective nudge — signal=skill_score "
-                                "valence=%+d surprise=%.3f mag=%.4f target=%.1f "
-                                "src=%s (rate=%.3f mu=%.3f n=%d dev=%.2f)",
-                                nudge.valence, nudge.surprise, nudge.magnitude,
-                                nudge.target, "net" if _net_steps >= 1 else "formula",
-                                nudge.rate, nudge.mu_before, nudge.n, dev_age)
+                        _emit_affective_nudge(
+                            "skill_score",
+                            affective_runtime.observe_drain(
+                                int(summary.get("successes", 0)),
+                                int(summary.get("failures", 0)),
+                                time.time()),
+                            SKILL_SCORE_MODULATOR)
                     except Exception as e:
                         logger.debug(
                             "[synthesis_worker] affective nudge tick failed: %s", e)
+
+            # Affective Grounding Loop §7.C — broadened EVENT taps (sol_receipt +
+            # maker_bond), run EVERY tick (NOT gated on a skill-score drain — SOL
+            # movement flows independently of the dream-gated skill-score source,
+            # which is why the channel was organically inert fleet-wide). Off-hot-
+            # path, flag-gated, soft-fail (never affects skill formation).
+            if (affective_runtime is not None
+                    and getattr(affective_runtime.cfg, "enabled", False)
+                    and send_queue is not None and shm_bank is not None):
+                try:
+                    from titan_hcl.logic.affective_nudge import SIGNAL_MODULATOR
+                    _ns = shm_bank.read_network_state()
+                    _bal = (float(_ns["balance_sol"])
+                            if isinstance(_ns, dict)
+                            and _ns.get("balance_sol") is not None else None)
+                    if _bal is not None:
+                        if _last_balance is not None:
+                            _delta = _bal - _last_balance
+                            if abs(_delta) > _SOL_DELTA_EPS:
+                                _now = time.time()
+                                # sol_receipt — symmetric (receipt + / spend −).
+                                _emit_affective_nudge(
+                                    "sol_receipt",
+                                    affective_runtime.observe_signal(
+                                        "sol_receipt", _delta, _now),
+                                    SIGNAL_MODULATOR["sol_receipt"])
+                                # maker_bond — a +receipt whose funding feePayer is
+                                # the Maker (ONE metered RPC pair, only on +delta).
+                                if (_delta > 0.0 and solana_oracle is not None
+                                        and maker_pubkey):
+                                    _wallet = str((_ns or {}).get("pubkey") or "")
+                                    _fp = (solana_oracle.latest_funding_feepayer(
+                                        _wallet) if _wallet else None)
+                                    if _fp and _fp == maker_pubkey:
+                                        _emit_affective_nudge(
+                                            "maker_bond",
+                                            affective_runtime.observe_signal(
+                                                "maker_bond", _delta, _now,
+                                                intrinsic_positive=True),
+                                            SIGNAL_MODULATOR["maker_bond"])
+                        _last_balance = _bal
+                except Exception as e:
+                    logger.debug(
+                        "[synthesis_worker] affective event-tap tick failed: %s", e)
         except Exception as e:
             logger.debug("[synthesis_worker] skill-score drain tick failed: %s", e)
         stop_event.wait(interval_s)
@@ -2216,6 +2278,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     proof_registry: Optional[Any] = None
     cgn_meaning_oracle: Optional[Any] = None
     oracle_snapshot_exporter: Optional[Any] = None
+    # Hoisted: the affective drain loop reuses the SolanaRpcOracle for the
+    # maker_bond feePayer lookup (§7.C). It is assigned inside the oracle-init
+    # try below, which may raise before binding it → keep it always-defined.
+    solana_oracle: Optional[Any] = None
     try:
         if 'writer' not in locals() or writer is None:
             raise RuntimeError(
@@ -2627,11 +2693,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         except Exception as _aff_e:
             _affective_runtime = None
             logger.debug("[synthesis_worker] affective runtime init failed: %s", _aff_e)
+        # §7.C maker_bond attribution: the Maker pubkey (config, set at birth) +
+        # the reused SolanaRpcOracle (hoisted; None if oracle-init failed → the
+        # tap soft-skips maker_bond while sol_receipt still fires).
+        _maker_pubkey_str = str((config or {}).get("maker_pubkey", "") or "")
         _skill_drain_thread = threading.Thread(
             target=_skill_score_drain_loop,
             args=(procedural_skill_store, stop_event, interval_s, name),
             kwargs={"send_queue": send_queue, "shm_bank": _shm_bank,
-                    "affective_runtime": _affective_runtime},
+                    "affective_runtime": _affective_runtime,
+                    "solana_oracle": solana_oracle,
+                    "maker_pubkey": _maker_pubkey_str},
             daemon=True, name=f"synthesis-skill-drain-{name}")
         _skill_drain_thread.start()
         _aff_on = (_affective_runtime is not None

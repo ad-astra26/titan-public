@@ -20,6 +20,16 @@ flattened → its training target → 0 → the net scores it down; a rare signa
 still moves the felt-state stays strong. Each Titan trains only on its own emot
 trajectory ⇒ divergent emotional personalities (INV-AFF-SELF-SOVEREIGN).
 
+PHASE C (broaden the taps — §7.C): the SAME one net now learns from MANY signals,
+not just skill_score. A `signal_type` one-hot is appended to the feature vector
+(SIGNAL_TYPES / build_features) so one shared net learns each signal's marginal
+value (D2). Phase C adds `sol_receipt` (balance-SHM delta, receipt + / spend −),
+`maker_bond` (a receipt whose funding feePayer == the Maker), `x_engagement`
+(ENGAGEMENT_SNAPSHOT_TAKEN delta) and `chain_reuse` (times_reused delta) — each a
+real event with a real state-delta, all → DA in v1 (multi-modulator spread = C.2).
+Event signals use `compute_event_nudge` (magnitude = log1p(|state-delta|) into the
+per-signal EMA; valence = the intrinsic state-delta direction).
+
   NUMPY-ONLY (BRAIN-INV-3): the net is pure-numpy forward AND pure-numpy SGD
   backprop — NEVER torch. This mirrors the OuterMetaPolicy learning operator
   (main SPEC §13 / BRAIN-INV-3 "RL scaffolding only … never torch"; the IQL/torch
@@ -64,9 +74,31 @@ import numpy as np
 
 logger = logging.getLogger("titan.affective_nudge")
 
-# The modulator the skill-score (competence/achievement) signal maps to.
-# RFP D4: achievement → DA ("sharp reward signals", neuromodulator.py:33).
-SKILL_SCORE_MODULATOR = "DA"
+# ── Signal registry (RFP §7.C — broaden from one signal to many) ──────────────
+# The ONE shared net (Phase B) learns each signal's marginal affective value via a
+# `signal_type` one-hot appended to the feature vector. ORDER IS THE ONE-HOT INDEX:
+# APPEND new signals, NEVER reorder/remove — a saved net's one-hot columns are
+# positional, and `_SignalBaseline`s in affective_nudge_state.json are keyed by the
+# name (so the EMA/surprise/habituation stay per-signal). Phase A/B = "skill_score";
+# Phase C adds the next four (sol_receipt + maker_bond clean-in-process this build;
+# x_engagement + chain_reuse = Tier 2 cross-process).
+SIGNAL_TYPES: tuple = (
+    "skill_score",     # Phase A/B — synthesis competence delta
+    "sol_receipt",     # Phase C — balance-SHM delta (receipt + / spend −)
+    "maker_bond",      # Phase C — a sol_receipt whose funding feePayer == the Maker
+    "x_engagement",    # Phase C (Tier 2) — ENGAGEMENT_SNAPSHOT_TAKEN delta
+    "chain_reuse",     # Phase C (Tier 2) — meta_wisdom times_reused delta
+)
+SIGNAL_INDEX = {name: i for i, name in enumerate(SIGNAL_TYPES)}
+N_SIGNAL_TYPES = len(SIGNAL_TYPES)
+
+# Modulator mapping (Maker-decided 2026-06-13): ALL signals → DA in Phase C v1
+# (prove the multi-signal net on one channel first). Multi-modulator spread
+# (sol/maker_bond→5HT/Endorphin, x→NE) = C.2 follow-up — kept as a map so C.2 can
+# diverge per signal without touching the taps. RFP D4: achievement/reward → DA
+# ("sharp reward signals", neuromodulator.py:33).
+SIGNAL_MODULATOR = {name: "DA" for name in SIGNAL_TYPES}
+SKILL_SCORE_MODULATOR = "DA"   # back-compat alias (existing synthesis_worker import)
 
 
 # ── Config (titan_params.toml [affective]) ───────────────────────────────────
@@ -184,29 +216,32 @@ class Nudge:
     n: int
 
 
-def compute_skill_score_nudge(
-    successes: int,
-    failures: int,
+def _fold_metric_nudge(
+    metric: float,
     state_path: str,
     *,
-    cfg: Optional[AffectiveConfig] = None,
-    signal_type: str = "skill_score",
+    cfg: AffectiveConfig,
+    signal_type: str,
+    valence_override: Optional[int] = None,
 ) -> Optional[Nudge]:
-    """Fold this tick's skill-score outcomes into the per-signal EMA baseline,
-    derive a surprise-scaled, honest-valence DA nudge, persist the updated
-    baseline, and return the Nudge (or None when there is nothing to emit).
+    """The signal-agnostic EMA-fold + surprise + honest-valence core (RFP §7.A
+    machinery, generalized for §7.C). `metric` = the signal's natural-scale scalar
+    folded into its OWN per-signal EMA baseline (skill_score: success_rate; event
+    signals: log1p(|state-delta|) — the event's MAGNITUDE).
 
-    Returns None when: no outcomes this tick · baseline still warming up
-    (n < min_samples) · the outcome exactly matches baseline (surprise → 0,
-    valence 0). All three are honest "no real movement" cases — Phase A never
-    emits a nudge that isn't grounded in a real deviation.
-    """
-    cfg = cfg or AffectiveConfig()
-    total = int(successes) + int(failures)
-    if total <= 0:
-        return None
-    rate = float(successes) / float(total)
+    Valence:
+      • `valence_override is None` (skill_score) → the honest above/below-baseline
+        competence sign = sign(metric − μ). A LEVEL signal: doing better/worse
+        than my own running rate.
+      • `valence_override ∈ {+1,−1}` (event signals) → the intrinsic state-delta
+        direction (a SOL spend is −, a receipt/engagement/reuse is +); the EMA
+        gives the MAGNITUDE's surprise, not the direction. INV-AFF-HONEST holds:
+        valence still derives from a real state-delta, never a forced positivity.
 
+    Returns None on the honest "no real movement" cases: first-ever observation
+    (seed only — no prior → no definable surprise), still warming up
+    (n < min_samples), or surprise → 0 (magnitude collapses to 0 = habituated /
+    on-baseline). Persists the updated per-signal baseline before returning."""
     state = _load_state(state_path)
     base = _SignalBaseline.from_dict(state.get(signal_type, {}))
     mu_before, n_before = base.mu, base.n
@@ -217,14 +252,14 @@ def compute_skill_score_nudge(
     if base.n == 0:
         # First-ever observation: seed the baseline, emit nothing (no prior →
         # no surprise is definable; claiming one would be a hardcoded magnitude).
-        base.mu = rate
+        base.mu = metric
         base.sigma = cfg.sigma_init
         base.n = 1
         state[signal_type] = base.to_dict()
         _save_state(state_path, state)
         return None
 
-    deviation = rate - mu_before
+    deviation = metric - mu_before
     sigma_for_surprise = max(base.sigma, cfg.eps) if base.n >= cfg.min_samples \
         else max(cfg.sigma_init, cfg.eps)
     surprise = abs(deviation) / (sigma_for_surprise + cfg.eps)
@@ -232,7 +267,7 @@ def compute_skill_score_nudge(
     # EMA update (mean + variance-EMA → σ). Welford-flavoured EMA: variance
     # tracks the squared deviation from the OLD mean, the standard EMA-var form.
     a = cfg.ema_alpha
-    new_mu = (1.0 - a) * base.mu + a * rate
+    new_mu = (1.0 - a) * base.mu + a * metric
     new_var = (1.0 - a) * (base.sigma ** 2) + a * (deviation ** 2)
     base.mu = new_mu
     base.sigma = math.sqrt(max(0.0, new_var))
@@ -244,8 +279,15 @@ def compute_skill_score_nudge(
     if n_before < cfg.min_samples:
         return None
 
-    # Valence = sign of the real competence delta (INV-AFF-HONEST, symmetric).
-    if deviation > 0:
+    # Valence: intrinsic event direction (override) or the competence-delta sign.
+    if valence_override is not None:
+        if valence_override > 0:
+            valence, target = 1, 1.0
+        elif valence_override < 0:
+            valence, target = -1, 0.0
+        else:
+            return None
+    elif deviation > 0:
         valence, target = 1, 1.0
     elif deviation < 0:
         valence, target = -1, 0.0
@@ -261,33 +303,93 @@ def compute_skill_score_nudge(
         target=float(target),
         surprise=float(surprise),
         valence=int(valence),
-        rate=float(rate),
+        rate=float(metric),
         mu_before=float(mu_before),
         n=int(n_before),
     )
+
+
+def compute_skill_score_nudge(
+    successes: int,
+    failures: int,
+    state_path: str,
+    *,
+    cfg: Optional[AffectiveConfig] = None,
+    signal_type: str = "skill_score",
+) -> Optional[Nudge]:
+    """Phase A/B skill-score signal: fold this tick's success_rate into the
+    per-signal EMA baseline and derive a surprise-scaled, honest-valence DA nudge
+    (or None when there is nothing to emit — no outcomes / warming up / on
+    baseline). Valence = the above/below-baseline competence sign. Byte-identical
+    to the pre-§7.C behaviour (delegates to the shared core with no override)."""
+    cfg = cfg or AffectiveConfig()
+    total = int(successes) + int(failures)
+    if total <= 0:
+        return None
+    rate = float(successes) / float(total)
+    return _fold_metric_nudge(rate, state_path, cfg=cfg, signal_type=signal_type)
+
+
+def compute_event_nudge(
+    signed_delta: float,
+    state_path: str,
+    *,
+    signal_type: str,
+    cfg: Optional[AffectiveConfig] = None,
+    intrinsic_positive: bool = False,
+) -> Optional[Nudge]:
+    """Phase C event signal (sol_receipt / maker_bond / x_engagement / chain_reuse).
+
+    `signed_delta` = the raw state-delta on its NATURAL scale (SOL for sol/maker,
+    engagement count for x, reuse count for chain). The EVENT'S MAGNITUDE
+    `log1p(|signed_delta|)` folds into the signal's OWN per-signal EMA → surprise
+    measures how unexpectedly large this event is vs the signal's running typical
+    size, so habituation emerges per-signal (a stream of same-size events → μ
+    matches → surprise → 0). Valence is the intrinsic state-delta direction:
+      • `intrinsic_positive=True` (engagement / reuse / maker_bond — can't be
+        negative) → always +.
+      • else → sign(signed_delta) (sol_receipt: a receipt is +, a spend is −,
+        symmetric per INV-AFF-HONEST).
+    Returns None for a zero delta (no real event) and the same warming-up /
+    habituated cases as the core."""
+    cfg = cfg or AffectiveConfig()
+    d = float(signed_delta)
+    if d == 0.0:
+        return None
+    magnitude_metric = math.log1p(abs(d))   # natural-scale event magnitude
+    valence_override = 1 if (intrinsic_positive or d > 0) else -1
+    return _fold_metric_nudge(
+        magnitude_metric, state_path, cfg=cfg, signal_type=signal_type,
+        valence_override=valence_override)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE B — the emergent AffectiveNudgeNet (D2)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Feature vector fed to the net (RFP §7.B):
-#   [0] surprise          — |rate−μ|/(σ+ε), scaled (the deviation's unexpectedness)
+# Feature vector fed to the net (RFP §7.B base + §7.C signal one-hot):
+#   [0] surprise          — |metric−μ|/(σ+ε), scaled (the deviation's unexpectedness)
 #   [1] recent_freq       — log1p(n) proxy for how often this signal has fired
-#   [2] |deviation|       — |rate−μ|, the raw competence-delta magnitude
+#   [2] |deviation|       — |metric−μ|, the raw state-delta magnitude
 #   [3] emot_V_blended    — current dominant blended valence (felt context)
 #   [4..11] dominant 1-hot — which of the 8 emot primitives is dominant now
-FEATURE_DIM = 12
+#   [12..12+N) signal_type one-hot (§7.C) — lets the ONE shared net learn each
+#              signal's marginal value (D2). Positional → SIGNAL_INDEX order.
+_BASE_FEATURE_DIM = 12
+FEATURE_DIM = _BASE_FEATURE_DIM + N_SIGNAL_TYPES   # 12 + 5 = 17
 
 
 def build_features(nudge: "Nudge",
                    emot_state: Optional[dict],
-                   *, n_freq_scale: float = 8.0) -> np.ndarray:
+                   *, signal_type: str = "skill_score",
+                   n_freq_scale: float = 8.0) -> np.ndarray:
     """Build the net input vector from a fired Nudge + the emot SHM snapshot.
 
     Pure + deterministic (testable). Robust to a missing emot read (None →
     felt-context features default to 0 / no dominant). Features are kept in
-    roughly [0,1]/[-1,1] ranges so the small net needs no LayerNorm."""
+    roughly [0,1]/[-1,1] ranges so the small net needs no LayerNorm. The
+    `signal_type` one-hot (§7.C) tells the shared net which signal this is, so it
+    can learn a per-signal marginal value while sharing the felt-context weights."""
     feat = np.zeros(FEATURE_DIM, dtype=np.float64)
     feat[0] = float(np.clip(nudge.surprise / 5.0, 0.0, 3.0))   # surprise (scaled)
     feat[1] = float(min(1.0, math.log1p(max(0, nudge.n)) / n_freq_scale))
@@ -297,6 +399,9 @@ def build_features(nudge: "Nudge",
         idx = int(emot_state.get("dominant_idx", -1))
         if 0 <= idx < 8:
             feat[4 + idx] = 1.0
+    sidx = SIGNAL_INDEX.get(signal_type)
+    if sidx is not None:
+        feat[_BASE_FEATURE_DIM + sidx] = 1.0
     return feat
 
 
@@ -429,7 +534,20 @@ class AffectiveNudgeNet:
         try:
             if os.path.exists(path):
                 with np.load(path) as data:
-                    net.load_state_dict({k: data[k] for k in data.files})
+                    sd = {k: data[k] for k in data.files}
+                # §7.C feature-dim guard: a net saved under a DIFFERENT input dim
+                # (e.g. a pre-Phase-C 12-D net before the signal_type one-hot) is
+                # incompatible with the current FEATURE_DIM feature layout. Discard
+                # it + start fresh (cold-start → Phase-A formula until re-trained)
+                # rather than crash on a shape mismatch at the first forward().
+                w1 = np.asarray(sd.get("W1"))
+                if w1.ndim == 2 and int(w1.shape[1]) == FEATURE_DIM:
+                    net.load_state_dict(sd)
+                else:
+                    logger.info(
+                        "[affective_nudge] saved net in_dim=%s != FEATURE_DIM=%d "
+                        "— starting fresh (Phase C feature-layout change)",
+                        (int(w1.shape[1]) if w1.ndim == 2 else "?"), FEATURE_DIM)
         except Exception as e:
             logger.debug("[affective_nudge] net load failed (fresh net): %s", e)
         return net
@@ -495,23 +613,24 @@ class AffectiveNudgeRuntime:
             return None
 
     # ── drain-tick path (forward) ──────────────────────────────────────────────
-    def observe_drain(self, successes: int, failures: int,
-                      ts: float) -> Optional[Nudge]:
-        """Phase-B forward at a drain tick. Folds the EMA baseline + derives the
-        honest valence/surprise via the Phase-A helper, then OVERRIDES the
-        magnitude with the learned net (once trained; else keeps the Phase-A
-        formula magnitude = cold-start fallback). Records the pre-nudge emot
+    def _observe(self, signal_type: str, base_nudge: Optional[Nudge],
+                 ts: float) -> Optional[Nudge]:
+        """Shared forward path for EVERY signal (RFP §7.C). Given the signal's
+        already-folded base nudge (from compute_skill_score_nudge / compute_event
+        _nudge), builds the feature vector WITH the signal_type one-hot, OVERRIDES
+        the magnitude with the learned net (once trained; else keeps the Phase-A
+        formula magnitude = cold-start fallback), and records the pre-nudge emot
         snapshot so the dream boundary can attribute the resulting drift.
 
-        Returns the Nudge to emit, or None (warming up / on-baseline / no events
-        — same honest no-movement cases as Phase A)."""
-        base_nudge = compute_skill_score_nudge(
-            successes, failures, self.state_path, cfg=self.cfg)
+        🔒 Single-consumer contract: all observe_* calls run on the ONE synthesis
+        drain thread, so the per-signal EMA baseline file (written inside the
+        compute_* helper) needs no extra lock; `self._lock` still guards the net
+        weights + pending buffer (shared with the dream-thread trainer)."""
         if base_nudge is None:
             return None
 
         emot_state = self._read_emot_state()
-        features = build_features(base_nudge, emot_state)
+        features = build_features(base_nudge, emot_state, signal_type=signal_type)
 
         nudge = base_nudge
         if self.cfg.net_enabled:
@@ -538,6 +657,25 @@ class AffectiveNudgeRuntime:
             if len(self._pending) > self._max_pending:
                 self._pending = self._pending[-self._max_pending:]
         return nudge
+
+    def observe_drain(self, successes: int, failures: int,
+                      ts: float) -> Optional[Nudge]:
+        """Phase-A/B skill_score forward at a drain tick. Returns the Nudge to
+        emit, or None (warming up / on-baseline / no events)."""
+        base_nudge = compute_skill_score_nudge(
+            successes, failures, self.state_path, cfg=self.cfg)
+        return self._observe("skill_score", base_nudge, ts)
+
+    def observe_signal(self, signal_type: str, signed_delta: float, ts: float,
+                       *, intrinsic_positive: bool = False) -> Optional[Nudge]:
+        """Phase-C event-signal forward (sol_receipt / maker_bond / x_engagement /
+        chain_reuse). `signed_delta` = the raw state-delta on its natural scale;
+        `intrinsic_positive` forces a + valence for can't-be-negative signals
+        (engagement / reuse / maker_bond). Returns the Nudge or None."""
+        base_nudge = compute_event_nudge(
+            signed_delta, self.state_path, signal_type=signal_type, cfg=self.cfg,
+            intrinsic_positive=intrinsic_positive)
+        return self._observe(signal_type, base_nudge, ts)
 
     # ── dream-boundary path (train) ────────────────────────────────────────────
     def train_on_dream(self) -> dict:

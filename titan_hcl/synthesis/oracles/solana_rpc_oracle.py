@@ -122,6 +122,59 @@ class SolanaRpcOracle:
     def can_handle(self, domain: str) -> bool:
         return domain in SUPPORTED_DOMAINS
 
+    # ── affective grounding helper (RFP_affective_grounding_loop §7.C) ───
+    def latest_funding_feepayer(self, wallet_pubkey: str) -> Optional[str]:
+        """Best-effort: the fee-payer pubkey of the most recent transaction
+        touching `wallet_pubkey`. Used by the Affective Grounding Loop to tag a
+        positive balance delta as Maker-originated (`maker_bond` signal) when the
+        funding tx's fee-payer == the Maker pubkey.
+
+        ONE getSignaturesForAddress(limit=1) + ONE getTransaction(jsonParsed);
+        returns the fee-payer (the first signer account) pubkey string, or None on
+        any RPC/parse failure or when no RPC is configured. Never raises — the
+        caller treats None as "could not attribute" (no maker_bond this event).
+        It is invoked only on a real +balance delta (rare), so the un-gated extra
+        RPC pair is naturally bounded by funding frequency, not per-tick."""
+        if not self._urls or not wallet_pubkey:
+            return None
+        try:
+            sig_resp = self._rpc_post({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [str(wallet_pubkey), {"limit": 1}],
+            })
+            result = (sig_resp or {}).get("result") or []
+            if not result:
+                return None
+            sig = result[0].get("signature")
+            if not sig:
+                return None
+            tx_resp = self._rpc_post({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTransaction",
+                "params": [sig, {"encoding": "jsonParsed",
+                                 "maxSupportedTransactionVersion": 0}],
+            })
+            tx = (tx_resp or {}).get("result") or {}
+            account_keys = (
+                ((tx.get("transaction") or {}).get("message") or {})
+                .get("accountKeys") or [])
+            # Fee-payer = the first signer account. jsonParsed → list of dicts
+            # with {pubkey, signer, writable, source}; legacy → list of str
+            # (index 0 is the fee-payer).
+            for ak in account_keys:
+                if isinstance(ak, dict):
+                    if ak.get("signer"):
+                        return str(ak.get("pubkey") or "") or None
+                elif isinstance(ak, str):
+                    return str(ak) or None
+            return None
+        except Exception:
+            logger.debug(
+                "[solana_rpc_oracle] latest_funding_feepayer failed",
+                exc_info=True)
+            return None
+
     # ── verify entry point ──────────────────────────────────────────────
 
     def verify(self, claim: OracleClaim) -> OracleVerdict:
