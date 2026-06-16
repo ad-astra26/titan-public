@@ -63,8 +63,23 @@ def _probe_loop(worker_name: str, interval_s: float, top_n: int) -> None:
         try:
             objs = gc.get_objects()
             counts = Counter()
+            mod_names = Counter()        # module.__name__ → count (dup = re-loaded)
             for o in objs:
-                counts[type(o).__name__] += 1
+                tn = type(o).__name__
+                counts[tn] += 1
+                if tn == "module":
+                    try:
+                        mod_names[getattr(o, "__name__", "?")] += 1
+                    except Exception:
+                        pass
+            # Duplicate module objects (same __name__, >1 instance) = modules
+            # re-imported fresh (bypassing sys.modules cache) → the import-leak
+            # source. The top dup names point straight at the culprit library.
+            dup_mods = {k: v for k, v in mod_names.most_common(25) if v > 1}
+            # Garbage-vs-leak: gc.collect() returns the count of unreachable
+            # cyclic objects it freed. High + RSS-correlated = collectable cyclic
+            # garbage (gc can't keep up under load), NOT a referenced leak.
+            collected = gc.collect()
             rec = {
                 "ts": time.time(),
                 "worker": worker_name,
@@ -72,9 +87,11 @@ def _probe_loop(worker_name: str, interval_s: float, top_n: int) -> None:
                 "rss_mb": round(_rss_mb(), 1),
                 "total_objects": len(objs),
                 "gc_tracked": sum(counts.values()),
+                "gc_collected": collected,
+                "dup_modules": dup_mods,
                 "top": dict(counts.most_common(top_n)),
             }
-            del objs, counts
+            del objs, counts, mod_names
             with open(out_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
         except Exception:
