@@ -107,8 +107,17 @@ HEARTBEAT_TIMEOUT = 90.0        # seconds before declaring a module dead (mainne
 DEFAULT_RSS_LIMIT_MB = 1500     # per-module RSS limit (MB)
 RESTART_BACKOFF_BASE = 2.0      # exponential backoff base (seconds)
 MAX_RESTARTS_IN_WINDOW = 5      # max restarts allowed in the sliding window
-RESTART_WINDOW_SECONDS = 600.0  # 10-minute sliding window for restart tracking
+# RFP_supervision_lifecycle §7.A (2026-06-16): 600s→60s. The OTP-standard
+# intensity window (SUPERVISION_INTENSITY_WINDOW_S in _phase_c_constants.py). A
+# 600s window accumulated transient cold-boot/resource flaps spread over minutes
+# into a false crash-loop → DISABLE (synthesis incident 2026-06-15). 60s still
+# catches a genuine tight crash-loop while letting spread-out transients age out.
+RESTART_WINDOW_SECONDS = 60.0   # OTP-standard sliding window for restart tracking
 SUSTAINED_UPTIME_RESET = 300.0  # 5 minutes of uptime before restart count resets
+# RFP_supervision_lifecycle §7.A — a transient RESOURCE fault (rss_*) during a
+# module's boot window is not a crash loop; don't count it toward escalation
+# (the kill→respawn costs the whole system more than letting it finish booting).
+BOOT_GRACE_SECONDS = 45.0       # boot window during which rss faults are uncounted
 REENABLE_COOLDOWN_S = 600.0    # 10 minutes before auto-re-enabling a disabled module
 # CPU-aware heartbeat (added 2026-04-21) — when heartbeat times out, sample
 # /proc/<pid>/stat CPU time. If CPU grew ≥ MIN_CPU_DELTA_FOR_ALIVE since last
@@ -274,6 +283,8 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         self._max_restarts_in_window = int(cfg.get("max_restarts_in_window", MAX_RESTARTS_IN_WINDOW))
         self._restart_window_seconds = float(cfg.get("restart_window", RESTART_WINDOW_SECONDS))
         self._sustained_uptime_reset = float(cfg.get("sustained_uptime_reset", SUSTAINED_UPTIME_RESET))
+        # RFP_supervision_lifecycle §7.A — boot-grace window for transient rss faults.
+        self._boot_grace_seconds = float(cfg.get("boot_grace_seconds", BOOT_GRACE_SECONDS))
         # Phase 9 Chunk 9L (RFP §3F.2.6) — staggered boot to eliminate
         # cold-boot CPU contention. ~40 autostart modules booting in parallel
         # on a 4-core VPS oversubscribed CPU 5-6×, causing cascade
@@ -1051,6 +1062,40 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                         }))
                     info.blocked_dependency = None
                     info.blocked_since = 0.0
+
+            # RFP_supervision_lifecycle §7.A — BOOT-GRACE for transient resource
+            # faults. A rss_* spike inside a module's boot window is the load
+            # phase (FAISS/Kuzu/DuckDB into heap), not a crash loop — let it
+            # finish booting rather than kill→respawn (respawn costs the whole
+            # system more; Phase B adds the cgroup throttle for the box-starved
+            # case). Genuine errors + heartbeat_timeout + post-boot rss faults
+            # are NOT exempted (a truly hung boot is caught by heartbeat_timeout,
+            # which fires after boot-grace). Resource fault classified from the
+            # `reason` string (e.g. "rss_713mb").
+            _in_boot_grace = (
+                info.start_time > 0.0
+                and (now - info.start_time) < self._boot_grace_seconds)
+            if _in_boot_grace and reason.startswith("rss"):
+                logger.info(
+                    "[Guardian] Module '%s' resource fault '%s' during boot-grace "
+                    "(%.0fs/%.0fs uptime) — not counted toward escalation, letting "
+                    "it finish booting", name, reason,
+                    now - info.start_time, self._boot_grace_seconds)
+                return False
+
+            # RFP_supervision_lifecycle §7.A — SUSTAINED-UPTIME reset (was wired
+            # to config at __init__ but never APPLIED). A module that has run
+            # continuously for >_sustained_uptime_reset since its last restart has
+            # proven stable; clear its restart history so old transient flaps
+            # don't accumulate toward a false crash-loop escalation.
+            if (info.last_restart > 0.0
+                    and (now - info.last_restart) > self._sustained_uptime_reset
+                    and info.restart_timestamps):
+                logger.info(
+                    "[Guardian] Module '%s' stable for %.0fs (>%.0fs) — resetting "
+                    "restart history (%d cleared)", name, now - info.last_restart,
+                    self._sustained_uptime_reset, len(info.restart_timestamps))
+                info.restart_timestamps.clear()
 
             # Sliding window: count restarts in the last _restart_window_seconds
             # Prune old timestamps
