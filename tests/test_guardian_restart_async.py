@@ -153,26 +153,21 @@ def test_concurrent_restart_async_for_different_modules():
 
 
 def test_monitor_tick_does_not_call_restart_synchronously():
-    """Inspect monitor_tick source — it must NOT call self.restart()
-    synchronously (which would block the tick on SAVE_NOW), but instead emit a
-    restart REQUEST asynchronously. Post Phase-11 split (§11.I.1) monitor_tick
-    lives on Supervisor and publishes MODULE_RESTART_REQUEST via
-    `publish_module_restart_request` rather than calling restart() inline."""
+    """Inspect monitor_tick source — should call self.restart_async, not
+    self.restart, for the heartbeat-timeout + crash-restart paths."""
     import inspect
-    from titan_hcl.supervisor import Supervisor
+    from titan_hcl import guardian_hcl as g_mod
 
-    src = inspect.getsource(Supervisor.monitor_tick)
-    # No SYNCHRONOUS restart inside the tick (the original starvation bug).
-    assert "self.restart(" not in src, \
-        "monitor_tick must NOT call self.restart() synchronously (Option B)"
-    # The fault paths emit an async restart REQUEST instead.
-    assert "publish_module_restart_request" in src, \
-        "monitor_tick fault paths must emit an async restart-request"
-    # RSS-overrun + heartbeat-timeout faults are detected here and routed to
-    # the async request path (reason strings carried on the request).
-    assert 'f"rss_' in src, "RSS-overrun fault must be detected in monitor_tick"
-    assert "heartbeat_timeout" in src, \
-        "heartbeat-timeout fault must be detected in monitor_tick"
+    src = inspect.getsource(g_mod.Guardian.monitor_tick)
+    # heartbeat-timeout path uses async
+    assert "self.restart_async(name, reason=reason)" in src, \
+        "heartbeat-timeout path must use restart_async (Option B)"
+    # crash-restart path uses async
+    assert 'restart_async(name, reason=f"died_exitcode_' in src, \
+        "crashed-process path must use restart_async (Option B)"
+    # rss-overrun path uses async
+    assert 'restart_async(name, reason=f"rss_' in src, \
+        "RSS-overrun path must use restart_async (Option B)"
 
 
 def test_bus_peer_died_handler_uses_restart_async():
