@@ -2187,6 +2187,7 @@ def create_pre_hook(plugin):
                 return _get_cached_coordinator(plugin)
 
             _v5 = await asyncio.to_thread(_fetch_coordinator)
+            _ph_stage("v5_coordinator")   # RFP hot-path opt §1.2 — pinpoint sub-cost
 
             # (pre-chat neuromod snapshot for felt-at-lived-time + CGN social reward is
             # now captured from SHM before this block via _capture_pre_chat_felt — the
@@ -2347,30 +2348,43 @@ def create_pre_hook(plugin):
             # ζ.1: gated on felt_state (own language is identity/expression).
             try:
               if "felt_state" in active_features:
-                import sqlite3 as _sl
-                import asyncio as _ol_asyncio
-                def _read_own_lang():
-                    from titan_hcl.utils.db import safe_connect as _sc
-                    db = _sc("data/inner_memory.db")
-                    try:
-                        comp = db.execute(
-                            "SELECT sentence, level, confidence FROM composition_history "
-                            "WHERE confidence > 0.4 AND sentence NOT LIKE '%___%' "
-                            "ORDER BY id DESC LIMIT 3"
-                        ).fetchall()
-                        vocab = db.execute("SELECT COUNT(*) FROM vocabulary").fetchone()[0]
-                        return comp, vocab
-                    finally:
-                        db.close()
-                _comp_rows, _vocab_n = await _ol_asyncio.to_thread(_read_own_lang)
-                if _comp_rows:
-                    _clines = ["### My Own Words (compositions I created in my emerging language)"]
-                    for _cs, _cl, _cc in _comp_rows:
-                        _clines.append(f'- "{_cs}" (L{_cl})')
-                    _clines.append(f"My vocabulary: {_vocab_n} words.")
-                    own_language_context = "\n".join(_clines) + "\n\n"
+                # RFP_synthesis_agno_hot_path_optimization §1.2 P1 — cache the
+                # slow-changing own-language read (vocab grows over hours;
+                # compositions accrue slowly). 90s TTL. This read hit
+                # data/inner_memory.db on EVERY felt-state turn and was a prime
+                # source of the enrichment tail-stall under DB-lock contention
+                # (correlated with synthesis export:spine). Cache even empty so
+                # no-composition turns don't re-hit.
+                own_language_context = _pre_hook_cache_get("enrich:own_language")
+                if own_language_context is None:
+                    own_language_context = ""
+                    import sqlite3 as _sl
+                    import asyncio as _ol_asyncio
+                    def _read_own_lang():
+                        from titan_hcl.utils.db import safe_connect as _sc
+                        db = _sc("data/inner_memory.db")
+                        try:
+                            comp = db.execute(
+                                "SELECT sentence, level, confidence FROM composition_history "
+                                "WHERE confidence > 0.4 AND sentence NOT LIKE '%___%' "
+                                "ORDER BY id DESC LIMIT 3"
+                            ).fetchall()
+                            vocab = db.execute("SELECT COUNT(*) FROM vocabulary").fetchone()[0]
+                            return comp, vocab
+                        finally:
+                            db.close()
+                    _comp_rows, _vocab_n = await _ol_asyncio.to_thread(_read_own_lang)
+                    if _comp_rows:
+                        _clines = ["### My Own Words (compositions I created in my emerging language)"]
+                        for _cs, _cl, _cc in _comp_rows:
+                            _clines.append(f'- "{_cs}" (L{_cl})')
+                        _clines.append(f"My vocabulary: {_vocab_n} words.")
+                        own_language_context = "\n".join(_clines) + "\n\n"
+                    _pre_hook_cache_set_with_ttl(
+                        "enrich:own_language", own_language_context, ttl_s=90.0)
             except Exception as e:
                 logger.debug("[pre_hook] language enrichment skipped: %s", e)
+            _ph_stage("v5_identity_lang")   # RFP hot-path opt §1.2 — pinpoint sub-cost
 
             # [18] MSL Identity — "I AM" grounding, concept confidences
             # ζ.1: gated on felt_state (identity is part of felt experience).
@@ -2652,7 +2666,20 @@ def create_pre_hook(plugin):
                         pass
                     return en_lines
 
-                _en_lines = await _en_asyncio.to_thread(_read_experience_sources)
+                # RFP_synthesis_agno_hot_path_optimization §1.2 P1 — 90s cache of
+                # the 3-DB experience read (episodic_memory + inner_memory ×2 —
+                # "biggest sqlite cost outside VCB", hour-windowed so ~stable
+                # within 90s). The CGN_KNOWLEDGE_USAGE emission below STILL fires
+                # every turn from the (cached) topics — behavior preserved
+                # (INV-OPT-1); only the DB reads are skipped on a hit.
+                _en_cached = _pre_hook_cache_get("enrich:experience_sources")
+                if _en_cached is not None:
+                    _en_lines, _en_knowledge_topics = _en_cached[0], list(_en_cached[1])
+                else:
+                    _en_lines = await _en_asyncio.to_thread(_read_experience_sources)
+                    _pre_hook_cache_set_with_ttl(
+                        "enrich:experience_sources",
+                        (_en_lines, list(_en_knowledge_topics)), ttl_s=90.0)
                 if _en_lines:
                     experience_narrative_context = (
                         "### My Recent Experience (what happened to me)\n"
@@ -2685,6 +2712,7 @@ def create_pre_hook(plugin):
                             _en_usage_err)
             except Exception as _en_err:
                 logger.debug("[pre_hook] experience narrative skipped: %s", _en_err)
+            _ph_stage("v5_experience")   # RFP hot-path opt §1.2 — pinpoint sub-cost
 
             # [23] Grounded narration — Titan's felt-state composition for LLM refinement
             # ζ.1: gated on felt_state (composition IS felt expression).

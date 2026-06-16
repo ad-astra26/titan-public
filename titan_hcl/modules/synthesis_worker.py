@@ -1240,6 +1240,16 @@ def _export_loop(store: "ActivationStore",
     the rest have their own internal locks / are independent."""
     stop_event.wait(min(interval_s, 12.0))   # settle + offset from the recompute pass
     pass_count = 0
+    # RFP_synthesis_agno_hot_path_optimization P2a — throttle the spine export.
+    # Its full-history json.dump is CPU-bound (~9s, telemetry T3 2026-06-16) and
+    # HOLDS THE GIL → starves the recompute/heartbeat thread even from this
+    # separate export thread (the historical ~34s/pass flap mode). The spine
+    # snapshot is an eventually-consistent cross-process READ cache, so a longer
+    # cadence is safe. Export at most every _spine_min_interval_s (4 export
+    # cycles, ≥240s floor); the other exports keep the ~interval_s cadence.
+    # P2b (follow-on) will dirty-gate (engram write-counter) + incrementalize.
+    _spine_min_interval_s = max(interval_s * 4.0, 240.0)
+    _spine_last_export = 0.0   # monotonic ts of the last spine export (0 = force first)
     while not stop_event.is_set():
         t0 = time.monotonic()
         timings: dict[str, int] = {}
@@ -1271,7 +1281,13 @@ def _export_loop(store: "ActivationStore",
             nonlocal bundles
             bundles = bundle_store.export_snapshot(bundle_snapshot_path) or 0
         _timed("bundle", _bundle)                                  # own internal lock
-        _timed("spine", lambda: spine_exporter_holder["fn"]())     # Engram spine → JSON
+        # P2a throttle — spine export only every _spine_min_interval_s (the 9s
+        # GIL-held json.dump is the heartbeat-starvation risk; skip it on the
+        # other passes). First pass (_spine_last_export==0) always exports.
+        _now_spine = time.monotonic()
+        if _now_spine - _spine_last_export >= _spine_min_interval_s:
+            _timed("spine", lambda: spine_exporter_holder["fn"]())  # Engram spine → JSON
+            _spine_last_export = _now_spine
         _timed("fork_activation", lambda: fork_activation_updater_holder["fn"]())
         _timed("fork", lambda: fork_exporter_holder["fn"]())
         _timed("oracle", lambda: oracle_exporter_holder["fn"]())
