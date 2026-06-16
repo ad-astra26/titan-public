@@ -617,7 +617,7 @@ max_restarts_in_window = 5
 # Sliding window size for restart tracking (seconds)
 # Influences: how quickly restart count "forgets"
 # Affects: recovery from transient vs persistent failures
-restart_window = 60.0    # RFP_supervision_lifecycle §7.A — OTP-standard window (was 600); spread flaps age out
+restart_window = 600.0
 
 # Sustained uptime before restart count resets (seconds)
 # Influences: when a module is considered "stable"

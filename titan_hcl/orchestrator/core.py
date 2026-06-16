@@ -107,26 +107,9 @@ HEARTBEAT_TIMEOUT = 90.0        # seconds before declaring a module dead (mainne
 DEFAULT_RSS_LIMIT_MB = 1500     # per-module RSS limit (MB)
 RESTART_BACKOFF_BASE = 2.0      # exponential backoff base (seconds)
 MAX_RESTARTS_IN_WINDOW = 5      # max restarts allowed in the sliding window
-# RFP_supervision_lifecycle §7.A (2026-06-16): 600s→60s. The OTP-standard
-# intensity window (SUPERVISION_INTENSITY_WINDOW_S in _phase_c_constants.py). A
-# 600s window accumulated transient cold-boot/resource flaps spread over minutes
-# into a false crash-loop → DISABLE (synthesis incident 2026-06-15). 60s still
-# catches a genuine tight crash-loop while letting spread-out transients age out.
-RESTART_WINDOW_SECONDS = 60.0   # OTP-standard sliding window for restart tracking
+RESTART_WINDOW_SECONDS = 600.0  # 10-minute sliding window for restart tracking
 SUSTAINED_UPTIME_RESET = 300.0  # 5 minutes of uptime before restart count resets
-# RFP_supervision_lifecycle §7.A — a transient RESOURCE fault (rss_*) during a
-# module's boot+settle window is not a crash loop; don't count it toward
-# escalation (the kill→respawn costs the whole system more than letting it
-# finish booting). 180s: T1 live (2026-06-16) showed synthesis's spine-load
-# RssAnon spike (714MB > its 700 limit) persisting to ~101s after start before
-# settling back under (settled ~440-570 [V]); 45s was far too short → the
-# guardian killed it mid-settle → flap → disable. 180s rides the observed
-# spike out with margin (the heaviest module's boot+settle).
-BOOT_GRACE_SECONDS = 180.0      # boot+settle window during which rss faults are uncounted
-# RFP_supervision_lifecycle §7.B — only modules at/above this rss_limit are
-# "heavy" enough to starve the box on boot; lighter ones are never throttled.
-BOOT_THROTTLE_HEAVY_MIN_RSS_MB = 400.0
-REENABLE_COOLDOWN_S = 180.0    # RFP_supervision_lifecycle §7.C — 3min (was 600) auto-re-enable cooldown
+REENABLE_COOLDOWN_S = 600.0    # 10 minutes before auto-re-enabling a disabled module
 # CPU-aware heartbeat (added 2026-04-21) — when heartbeat times out, sample
 # /proc/<pid>/stat CPU time. If CPU grew ≥ MIN_CPU_DELTA_FOR_ALIVE since last
 # sample, the module is alive-but-CPU-starved (not deadlocked). Defer restart
@@ -291,13 +274,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         self._max_restarts_in_window = int(cfg.get("max_restarts_in_window", MAX_RESTARTS_IN_WINDOW))
         self._restart_window_seconds = float(cfg.get("restart_window", RESTART_WINDOW_SECONDS))
         self._sustained_uptime_reset = float(cfg.get("sustained_uptime_reset", SUSTAINED_UPTIME_RESET))
-        # RFP_supervision_lifecycle §7.A — boot-grace window for transient rss faults.
-        self._boot_grace_seconds = float(cfg.get("boot_grace_seconds", BOOT_GRACE_SECONDS))
-        # RFP_supervision_lifecycle §7.B — predictive boot back-pressure. Enabled
-        # by default (fail-open + cgroup-gated: without Delegate=yes it degrades to
-        # predictive-defer = Phase A behavior, so default-on is safe).
-        self._boot_throttle_enabled = bool(cfg.get("boot_throttle_enabled", True))
-        self._boot_throttle_cgroup = bool(cfg.get("boot_throttle_cgroup", True))
         # Phase 9 Chunk 9L (RFP §3F.2.6) — staggered boot to eliminate
         # cold-boot CPU contention. ~40 autostart modules booting in parallel
         # on a 4-core VPS oversubscribed CPU 5-6×, causing cascade
@@ -644,40 +620,11 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 info.start_time = time.time()
                 info.last_heartbeat = time.time()
                 logger.info("[Guardian] Started module '%s' (pid=%d)", name, proc.pid)
-                # RFP_supervision_lifecycle §7.B — predictive boot back-pressure.
-                self._maybe_boot_throttle(name, info, proc.pid)
                 return True
             except Exception as e:
                 logger.error("[Guardian] Failed to start module '%s': %s", name, e)
                 info.state = ModuleState.CRASHED
                 return False
-
-    def _maybe_boot_throttle(self, name: str, info: "ModuleInfo", pid: int) -> None:
-        """RFP_supervision_lifecycle §7.B — at spawn, predict whether this (heavy)
-        module can boot without starving the box; if not, throttle it via cgroup
-        memory.high (graceful paging) — or predictive-defer when cgroup delegation
-        is unavailable — instead of letting it spike → OOM-flap → DISABLE. The
-        throttle decision + mechanism is cascaded to the journal as a single
-        greppable `MODULE_BOOT_THROTTLED` line. FAIL-OPEN: never breaks a boot."""
-        if not self._boot_throttle_enabled:
-            return
-        rss_limit = float(getattr(info.spec, "rss_limit_mb", 0.0) or 0.0)
-        if rss_limit < BOOT_THROTTLE_HEAVY_MIN_RSS_MB:
-            return  # light module — cannot starve the box on its own
-        try:
-            from titan_hcl.orchestrator.boot_throttle import evaluate_and_throttle
-            d = evaluate_and_throttle(
-                pid, name, rss_limit, current_rss_mb=0.0,
-                cgroup_enabled=self._boot_throttle_cgroup)
-            if d.throttled:
-                logger.warning(
-                    "[Guardian] MODULE_BOOT_THROTTLED module=%s mechanism=%s "
-                    "rss_limit=%.0fMB mem_avail=%.0fMB swap_used=%.0fMB load=%.2f "
-                    "memory_high=%.0fMB — booting under back-pressure (NOT killed)",
-                    name, d.mechanism, rss_limit, d.box.mem_available_mb,
-                    d.box.swap_used_mb, d.box.load1, d.high_mb)
-        except Exception as e:  # noqa: BLE001 — throttle must NEVER break a boot
-            logger.debug("[Guardian] boot-throttle eval for '%s' failed: %s", name, e)
 
     def _cleanup_module(self, name: str) -> None:
         """Clean up a module's state, force-killing any surviving process and its children."""
@@ -1105,40 +1052,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                     info.blocked_dependency = None
                     info.blocked_since = 0.0
 
-            # RFP_supervision_lifecycle §7.A — BOOT-GRACE for transient resource
-            # faults. A rss_* spike inside a module's boot window is the load
-            # phase (FAISS/Kuzu/DuckDB into heap), not a crash loop — let it
-            # finish booting rather than kill→respawn (respawn costs the whole
-            # system more; Phase B adds the cgroup throttle for the box-starved
-            # case). Genuine errors + heartbeat_timeout + post-boot rss faults
-            # are NOT exempted (a truly hung boot is caught by heartbeat_timeout,
-            # which fires after boot-grace). Resource fault classified from the
-            # `reason` string (e.g. "rss_713mb").
-            _in_boot_grace = (
-                info.start_time > 0.0
-                and (now - info.start_time) < self._boot_grace_seconds)
-            if _in_boot_grace and reason.startswith("rss"):
-                logger.info(
-                    "[Guardian] Module '%s' resource fault '%s' during boot-grace "
-                    "(%.0fs/%.0fs uptime) — not counted toward escalation, letting "
-                    "it finish booting", name, reason,
-                    now - info.start_time, self._boot_grace_seconds)
-                return False
-
-            # RFP_supervision_lifecycle §7.A — SUSTAINED-UPTIME reset (was wired
-            # to config at __init__ but never APPLIED). A module that has run
-            # continuously for >_sustained_uptime_reset since its last restart has
-            # proven stable; clear its restart history so old transient flaps
-            # don't accumulate toward a false crash-loop escalation.
-            if (info.last_restart > 0.0
-                    and (now - info.last_restart) > self._sustained_uptime_reset
-                    and info.restart_timestamps):
-                logger.info(
-                    "[Guardian] Module '%s' stable for %.0fs (>%.0fs) — resetting "
-                    "restart history (%d cleared)", name, now - info.last_restart,
-                    self._sustained_uptime_reset, len(info.restart_timestamps))
-                info.restart_timestamps.clear()
-
             # Sliding window: count restarts in the last _restart_window_seconds
             # Prune old timestamps
             while info.restart_timestamps and (now - info.restart_timestamps[0]) > self._restart_window_seconds:
@@ -1386,20 +1299,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 name, REENABLE_COOLDOWN_S)
 
     def enable(self, name: str) -> bool:
-        """Re-enable a DISABLED module: reset counters + initiate a NON-BLOCKING start.
-
-        RFP_supervision_lifecycle §7.C — the reset (clear DISABLED + counters) is
-        done synchronously under the lock, then `start()` is submitted to the
-        restart executor and this returns IMMEDIATELY ("initiated"). Previously
-        enable() called `self.start(name)` inline, which blocks up to
-        SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S on dep-activation — that was
-        the 60s enable-RPC-timeout that forced full restarts to recover a
-        DISABLED module (synthesis incident 2026-06-15). Both callers benefit:
-        the chat-bridge enable RPC (returns fast, no timeout) AND the supervisor
-        auto-re-enable in monitor_tick (no longer stalls the monitor loop).
-        start()'s own state-guard dedups a double-submit; the supervisor
-        monitor_tick confirms the module reaches healthy. Keystone: §7.B lets the
-        module actually boot once enable initiates it."""
+        """Re-enable a disabled module, reset restart counters, and start it. Thread-safe via _module_lock."""
         with self._module_lock:
             info = self._modules.get(name)
             if not info:
@@ -1408,21 +1308,11 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             if info.state != ModuleState.DISABLED:
                 logger.info("[Guardian] Module '%s' is not disabled (state=%s)", name, info.state)
                 return True  # already enabled
-            logger.info(
-                "[Guardian] Re-enabling module '%s' — resetting counters, "
-                "initiating non-blocking start", name)
+            logger.info("[Guardian] Re-enabling module '%s' — resetting restart counters", name)
             info.state = ModuleState.STOPPED
             info.restart_count = 0
             info.restart_timestamps.clear()
-            info.disabled_at = 0.0  # no longer disabled — clears the reenable-eta
-        # Outside the lock: initiate start in the background so neither the enable
-        # RPC nor the monitor loop blocks on dep-activation.
-        try:
-            self._restart_executor.submit(self.start, name)
-        except Exception as e:  # noqa: BLE001 — executor shut down during teardown
-            logger.warning("[Guardian] enable('%s') start-submit failed: %s", name, e)
-            return False
-        return True
+            return self.start(name)
 
     def _compute_boot_order(self, names: list[str]) -> list[str]:
         """Phase 9 Chunk 9L — order autostart modules: dependency-correct
@@ -2172,10 +2062,8 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             # 1Hz cadence. Use Event.wait so shutdown is responsive.
             self._module_ready_publisher_stop.wait(1.0)
 
-    def stop_all(self, reason: str = "shutdown") -> int:
-        """Gracefully stop all running modules. Returns the count stopped
-        (RFP_supervision_lifecycle §7.D — fed into the KERNEL_SHUTDOWN_COMPLETE
-        marker so a restart can confirm a clean, complete drain)."""
+    def stop_all(self, reason: str = "shutdown") -> None:
+        """Gracefully stop all running modules."""
         self._stop_requested = True
         # Stop the continuous probe poller (Phase 11 §11.I.7 / RFP 11D).
         try:
@@ -2197,12 +2085,9 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             self._restart_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:  # noqa: BLE001
             pass
-        stopped = 0
         for name, info in self._modules.items():
             if info.state in (ModuleState.RUNNING, ModuleState.STARTING, ModuleState.UNHEALTHY):
                 self.stop(name, reason=reason)
-                stopped += 1
-        return stopped
 
     def fast_kill(self, name: str) -> bool:
         """Fast SIGTERM-then-SIGKILL on a module — NO SAVE_NOW dance.
@@ -2510,13 +2395,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 # Microkernel v2 Phase B.2.1 — adoption sentinel + timestamp.
                 "adopted": info.adopted,
                 "adopt_ts": info.adopt_ts if info.adopted else 0.0,
-                # RFP_supervision_lifecycle §7.C — seconds until the supervisor
-                # auto-re-enables this DISABLED module ("re-enabling in Ns"
-                # observable); None when not disabled.
-                "reenable_eta_s": (
-                    round(max(0.0, REENABLE_COOLDOWN_S - (time.time() - info.disabled_at)), 1)
-                    if info.state == ModuleState.DISABLED and info.disabled_at > 0
-                    else None),
             }
         return result
 
