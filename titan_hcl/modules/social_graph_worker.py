@@ -287,6 +287,12 @@ def social_graph_worker_main(recv_queue, send_queue, name: str,
             "so guardian respawns")
         sys.exit(1)
 
+    # RFP_supervision_lifecycle §7.D / Phase D.1 — register a bus-INDEPENDENT
+    # WAL checkpoint that runs on ANY shutdown (SIGTERM/control-group/PDEATHSIG),
+    # not only on a bus MODULE_SHUTDOWN. _checkpoint_wal is idempotent (G16).
+    from titan_hcl.core.worker_shutdown import register_shutdown_save
+    register_shutdown_save(name, lambda: _checkpoint_wal(social_graph))
+
     # === MODULE-SPECIFIC: SHM publisher init ===
     state_publisher = None
     try:

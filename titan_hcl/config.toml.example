@@ -138,6 +138,12 @@ fixed_priority_fee = 1000             # μ₌, only used if strategy="fixed"
 mode = ""
 local_dir = "data/backups"
 local_rolling_days = 30
+# ZK-compressed audit trail (SPEC §B4) — fire a Light-Protocol
+# `append_epoch_snapshot` compressed account on each HEAD backup event, in
+# addition to the commit_state Merkle root. Per-Titan switch; default OFF.
+# Status (switch + last tx + parse-back verify) is surfaced on the health
+# ZK_COMPRESSION readout. See PLAN_zk_vault_proof_completion.md.
+zk_compressed_audit_enabled = false
 soul_local_rolling_days = 90
 local_snapshot_always = true
 tarball_validation_enabled = true

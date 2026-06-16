@@ -2249,9 +2249,14 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             self._module_ready_publisher_stop.wait(1.0)
 
     def stop_all(self, reason: str = "shutdown") -> int:
-        """Gracefully stop all running modules. Returns the count stopped
-        (RFP_supervision_lifecycle §7.D — fed into the KERNEL_SHUTDOWN_COMPLETE
-        marker so a restart can confirm a clean, complete drain)."""
+        """Gracefully stop all running modules. Returns the count stopped.
+
+        RFP_supervision_lifecycle §7.D / SPEC §18.4: this runs under the Rust
+        kernel's ordered drain (the kernel SIGTERMs titan_hcl, keeps the bus
+        broker alive through this drain, then stops it). Each module's stop()
+        does its bus SAVE_NOW handshake here; workers ALSO self-save
+        bus-independently on their own SIGTERM (worker_shutdown). Clean-vs-forced
+        shutdown is read from systemd `Result` (§11.B), NOT a marker."""
         self._stop_requested = True
         # Stop the continuous probe poller (Phase 11 §11.I.7 / RFP 11D).
         try:
@@ -2918,13 +2923,21 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
     # PR_SET_PDEATHSIG asks the kernel to deliver SIGTERM the moment our
     # parent dies — survives parent SIGKILL because the kernel is the
     # messenger. Combined with a getppid()-poll watcher as backup defense.
-    # Worker entry_fns install their own SIGTERM handlers afterward, which
-    # catch this signal and perform graceful shutdown (flush WAL, etc.).
     from titan_hcl.core.worker_lifecycle import install_full_protection
     _wl = install_full_protection()
+    # RFP_supervision_lifecycle §7.D / Phase D.1 — install the FLOOR
+    # SIGTERM→KeyboardInterrupt handler so EVERY spawned worker unwinds its
+    # blocking recv loop on SIGTERM (control-group, PDEATHSIG, or orchestrator)
+    # and reaches the wrapper's finally → run_shutdown_saves(), instead of dying
+    # mid-loop with no checkpoint. (Previously the titan_hcl/modules/* workers
+    # had NO SIGTERM handler — the old "workers install their own" comment here
+    # was stale for them; only the persistence layer did. A worker that installs
+    # a richer handler later, e.g. persistence_entry.py, overrides this floor.)
+    from titan_hcl.core.worker_shutdown import install_worker_sigterm_handler
+    _sig_ok = install_worker_sigterm_handler()
     logger.info(
-        "Module '%s' lifecycle protection: pdeathsig=%s watcher=%s",
-        name, _wl["pdeathsig_installed"], _wl["watcher_started"],
+        "Module '%s' lifecycle protection: pdeathsig=%s watcher=%s sigterm_floor=%s",
+        name, _wl["pdeathsig_installed"], _wl["watcher_started"], _sig_ok,
     )
 
     # Phase B.2.1 — bus bootstrap + swap-handler bootstrap. setup_worker_bus
@@ -3004,6 +3017,18 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
         logger.error("Module '%s' crashed: %s", name, e, exc_info=True)
         raise
     finally:
+        # RFP_supervision_lifecycle §7.D / Phase D.1 — run every registered
+        # bus-INDEPENDENT save FIRST (before bus_client.stop()), on EVERY exit
+        # path. Idempotent + run-once guarded; a no-op for workers that hold no
+        # critical state. This is what makes graceful shutdown survive a
+        # dead/slow bus without data loss (SPEC §11.B G16 / §18.4).
+        try:
+            from titan_hcl.core.worker_shutdown import run_shutdown_saves
+            _n_saved = run_shutdown_saves()
+            if _n_saved:
+                logger.info("Module '%s' bus-independent shutdown saves: %d", name, _n_saved)
+        except Exception:  # noqa: BLE001 — never let save-teardown mask the exit
+            logger.warning("Module '%s' run_shutdown_saves error", name, exc_info=True)
         if bus_client is not None:
             try:
                 bus_client.stop()

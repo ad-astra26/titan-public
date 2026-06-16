@@ -2066,6 +2066,49 @@ def _get_vault_status_cached() -> dict | None:
     return _vault_status_cache["data"]
 
 
+def _zk_compression_status(plugin, sdk_available: bool) -> str:
+    """Real ZK-compression status for the health readout — reads the per-Titan
+    audit-state file written by the backup event's `append_epoch_snapshot`
+    (PLAN_zk_vault_proof_completion). Replaces the dead `meditation._photon`
+    probe (PhotonClient was never instantiated → always "STUB"). States:
+      ACTIVE  — a Light compressed account has been written (last_tx present)
+      ARMED   — switch on, no write yet
+      CAPABLE — program deployed, switch off / no write
+      ABSENT  — SDK unavailable
+    Detail (switch + last_tx + verify) rides `ZK_COMPRESSION_DETAIL`."""
+    try:
+        from titan_hcl.core.state_registry import resolve_titan_id
+        from titan_hcl.logic.zk_vault_state import read_zk_audit_state
+        titan_id = resolve_titan_id(getattr(plugin, "titan_id", None))
+        zk = read_zk_audit_state(titan_id) or {}
+    except Exception:  # noqa: BLE001
+        zk = {}
+    if zk.get("last_tx"):
+        return "ACTIVE"
+    if zk.get("continuous_enabled"):
+        return "ARMED"
+    return "CAPABLE" if sdk_available else "ABSENT"
+
+
+def _zk_compression_detail(plugin) -> dict:
+    """Switch + last-tx + parse-back verify detail for the ZK-compression gate."""
+    try:
+        from titan_hcl.core.state_registry import resolve_titan_id
+        from titan_hcl.logic.zk_vault_state import read_zk_audit_state
+        titan_id = resolve_titan_id(getattr(plugin, "titan_id", None))
+        zk = read_zk_audit_state(titan_id) or {}
+    except Exception:  # noqa: BLE001
+        zk = {}
+    return {
+        "continuous_enabled": bool(zk.get("continuous_enabled", False)),
+        "last_tx": zk.get("last_tx"),
+        "last_verified": zk.get("last_verified"),
+        "last_memory_count": zk.get("last_memory_count"),
+        "last_state_root": zk.get("last_state_root"),
+        "last_error": zk.get("last_error"),
+    }
+
+
 def _build_health_snapshot_sync(plugin, kernel_proxy=None) -> dict:
     """Synchronous builder — extracted body of /health handler.
 
@@ -2145,11 +2188,8 @@ def _build_health_snapshot_sync(plugin, kernel_proxy=None) -> dict:
         "MAKER_AUTH": "ACTIVE" if maker_pubkey else "DEGRADED",
     }
     if not is_v3:
-        solana_capabilities["ZK_COMPRESSION"] = (
-            "ACTIVE" if (getattr(getattr(plugin, "meditation", None), "_photon", None) is not None)
-            else "STUB" if sdk_available
-            else "ABSENT"
-        )
+        solana_capabilities["ZK_COMPRESSION"] = _zk_compression_status(plugin, sdk_available)
+        solana_capabilities["ZK_COMPRESSION_DETAIL"] = _zk_compression_detail(plugin)
 
     if is_v3:
         # Phase C C-S7 Component 2 (2026-05-05): same kernel_rpc proxy
@@ -2523,11 +2563,8 @@ async def _legacy_health_inline(request: Request):
             "MAKER_AUTH": "ACTIVE" if maker_pubkey else "DEGRADED",
         }
         if not is_v3:
-            solana_capabilities["ZK_COMPRESSION"] = (
-                "ACTIVE" if (getattr(getattr(plugin, "meditation", None), "_photon", None) is not None)
-                else "STUB" if sdk_available
-                else "ABSENT"
-            )
+            solana_capabilities["ZK_COMPRESSION"] = _zk_compression_status(plugin, sdk_available)
+            solana_capabilities["ZK_COMPRESSION_DETAIL"] = _zk_compression_detail(plugin)
 
         # Subsystem health — V3 uses Guardian module states
         if is_v3:

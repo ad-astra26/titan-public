@@ -1666,6 +1666,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
         kuzu_checkpoint_holder["fn"] = _kuzu_checkpoint_tick
 
+        # RFP_supervision_lifecycle §7.D / Phase D.1 — bus-INDEPENDENT
+        # UNCONDITIONAL Kuzu spine checkpoint on any shutdown (SIGTERM/
+        # control-group/PDEATHSIG). synthesis is full-restart-only, so without
+        # this a control-group SIGTERM left a dirty WAL that replayed +420 MB on
+        # next open (the OOM-loop). checkpoint() is idempotent + G21 sole-writer.
+        from titan_hcl.core.worker_shutdown import register_shutdown_save
+        register_shutdown_save(
+            name,
+            lambda: kuzu_graph_obj.checkpoint() if kuzu_graph_obj is not None else None,
+        )
+
     # Phase 2 D-P2-1 EngineRecall — contract-driven recall coordinator.
     # Lazy-open a read-only sqlite handle on data/timechain/index.db so
     # the RuleEvaluator's FORK_READ + CROSS_REF ops have a substrate.

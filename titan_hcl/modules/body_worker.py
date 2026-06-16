@@ -205,6 +205,16 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     if _saved_fn is not None:
         focus_nudges = _saved_fn
 
+    # RFP_supervision_lifecycle §7.D / Phase D.1 — bus-INDEPENDENT save of the
+    # Spirit-learned FILTER_DOWN weights + focus nudges on any shutdown
+    # (SIGTERM/control-group/PDEATHSIG). The lambda is late-binding, so it reads
+    # the CURRENT severity_multipliers/focus_nudges at shutdown (both are
+    # body_worker_main locals reassigned in the loop). _save_body_state is
+    # idempotent (atomic file write).
+    from titan_hcl.core.worker_shutdown import register_shutdown_save
+    register_shutdown_save(
+        name, lambda: _save_body_state(config, severity_multipliers, focus_nudges))
+
     # ── S7: §L1 fast-path setup (flag-gated) ──────────────────────
     # When microkernel.shm_body_fast_enabled is true, start per-sense
     # refresh threads + 7.83 Hz shm writer thread. Tick layer reads

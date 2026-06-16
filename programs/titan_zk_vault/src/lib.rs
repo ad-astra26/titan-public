@@ -54,6 +54,23 @@ impl CompressedProofInput {
     }
 }
 
+/// Resolve an optional client-supplied proof into a Light `ValidityProof`.
+///
+/// `compress_memory_batch` / `append_epoch_snapshot` create **output-only,
+/// addressless** compressed accounts (no input account, `new_init(.., None, ..)`).
+/// The Light system program FORBIDS a proof in that case — passing `Some(..)`
+/// (even an all-zero proof) is rejected with `ProofIsSome` (6018). So the proof
+/// MUST be `None` for the current output-only flow; `Some` is reserved for a
+/// future input-consuming / address-creating instruction.
+fn resolve_validity_proof(
+    proof: Option<CompressedProofInput>,
+) -> light_sdk::instruction::ValidityProof {
+    match proof {
+        Some(p) => p.to_validity_proof(),
+        None => light_sdk::instruction::ValidityProof(None),
+    }
+}
+
 /// Titan ZK-Vault — On-Chain Memory Anchor
 ///
 /// V2.1: Added ZK-compressed batch receipts and epoch snapshots via Light Protocol.
@@ -124,7 +141,7 @@ pub mod titan_zk_vault {
     /// memories on-chain via Light Protocol compressed accounts.
     pub fn compress_memory_batch<'info>(
         ctx: Context<'_, '_, '_, 'info, CompressMemoryBatch<'info>>,
-        proof: CompressedProofInput,
+        proof: Option<CompressedProofInput>,
         batch_root: [u8; 32],
         node_count: u16,
         epoch_id: u64,
@@ -158,7 +175,7 @@ pub mod titan_zk_vault {
         account.batch_root = batch_root;
         account.node_count = node_count;
 
-        let cpi = LightSystemProgramCpi::new_cpi(crate::LIGHT_CPI_SIGNER, proof.to_validity_proof())
+        let cpi = LightSystemProgramCpi::new_cpi(crate::LIGHT_CPI_SIGNER, resolve_validity_proof(proof))
             .with_light_account(account)
             .map_err(|_| TitanError::CompressedAccountError)?;
         cpi.invoke(light_cpi_accounts)
@@ -178,7 +195,7 @@ pub mod titan_zk_vault {
     /// Append-only — each Greater Epoch creates a new compressed account.
     pub fn append_epoch_snapshot<'info>(
         ctx: Context<'_, '_, '_, 'info, AppendEpochSnapshot<'info>>,
-        proof: CompressedProofInput,
+        proof: Option<CompressedProofInput>,
         state_root: [u8; 32],
         memory_count: u64,
         sovereignty_score: u16,
@@ -214,7 +231,7 @@ pub mod titan_zk_vault {
         account.shadow_url_hash = shadow_url_hash;
         account.timestamp = timestamp;
 
-        let cpi = LightSystemProgramCpi::new_cpi(crate::LIGHT_CPI_SIGNER, proof.to_validity_proof())
+        let cpi = LightSystemProgramCpi::new_cpi(crate::LIGHT_CPI_SIGNER, resolve_validity_proof(proof))
             .with_light_account(account)
             .map_err(|_| TitanError::CompressedAccountError)?;
         cpi.invoke(light_cpi_accounts)
