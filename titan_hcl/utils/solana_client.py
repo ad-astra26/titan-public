@@ -70,99 +70,6 @@ VAULT_PROGRAM_ID = "52an8WjtfxpkCqZZ1AYFkaDTGb4RyNFFD9VQRVdxcpJw"
 # PDA seed for Titan vault accounts — MUST match b"titan_vault" in lib.rs
 VAULT_PDA_SEED = b"titan_vault"
 
-# ---------------------------------------------------------------------------
-# Light Protocol — v1 CPI system accounts (for compress_memory_batch /
-# append_epoch_snapshot ZK-compressed writes)
-# ---------------------------------------------------------------------------
-# These are network-agnostic (identical devnet + mainnet-beta) and pinned in
-# the light-sdk 0.23 / light-compressed-account 0.11 crate constants. VERIFIED
-# 2026-06-15 against the vendored crate `constants.rs` + on-chain PDA derivation
-# (see titan-docs/PLAN_zk_vault_proof_completion.md + memory/solana_zk_compression.md).
-# NOTE: the account-compression AUTHORITY below (HwXnGK3t…) is the 0.23-SDK
-# value — it deliberately DIFFERS from the zkcompression.com docs page (HZH7qS…),
-# which is for a different deployment context and would mismatch the v1 CPI.
-LIGHT_SYSTEM_PROGRAM_ID = "SySTEM1eSU2p4BGQfQpimFEWWSC1XDFeun3Nqzz3rT7"
-LIGHT_ACCOUNT_COMPRESSION_PROGRAM_ID = "compr6CUsB5m2jS4Y3831ztGSTnDpnKJTKS95d64XVq"
-LIGHT_ACCOUNT_COMPRESSION_AUTHORITY = "HwXnGK3tPkkVY6P439H2p68AxpeuWXd5PcrAxFpbmfbA"
-LIGHT_REGISTERED_PROGRAM_PDA = "35hkDgaAKwMCaxRz2ocSZ6NaUrtKkyNqU6c4RV3tYJRh"
-LIGHT_NOOP_PROGRAM_ID = "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV"
-# Public V1 (concurrent / ZK) state tree + its nullifier queue. Documented
-# defaults; public trees CAN rotate, so callers may override at runtime. The
-# output-only create path only needs the state tree (nullifier queue is for
-# spending/nullifying inputs, which these instructions never do).
-LIGHT_V1_STATE_TREE = "smt2rJAFdyJJupwMKAqTNAJwvjhmiZ4JYGZmbVRw1Ho"
-LIGHT_V1_NULLIFIER_QUEUE = "nfq2hgS7NYemXsFaFUCe3EMXSDSfnZnAe27jC6aPP1X"
-# CPI-signer PDA seed — MUST match derive_light_cpi_signer!(..) in lib.rs.
-LIGHT_CPI_AUTHORITY_SEED = b"cpi_authority"
-
-
-def derive_light_cpi_authority(program_id_str: str = None) -> Optional["Pubkey"]:
-    """Derive the program's Light CPI-authority PDA = PDA([b"cpi_authority"], program_id).
-
-    This is the per-program signer Light expects at remaining_accounts[1]; it is
-    NOT a network constant — it is derived from the vault program ID.
-    """
-    if not _SOLANA_AVAILABLE:
-        return None
-    try:
-        program_id = Pubkey.from_string(program_id_str or VAULT_PROGRAM_ID)
-        pda, _bump = Pubkey.find_program_address([LIGHT_CPI_AUTHORITY_SEED], program_id)
-        return pda
-    except Exception as e:  # noqa: BLE001
-        logger.error("[SolanaClient] Failed to derive Light CPI authority: %s", e)
-        return None
-
-
-def build_light_v1_remaining_accounts(
-    program_id_str: str = None,
-    state_tree_str: str = None,
-) -> Optional[list]:
-    """Build the Light Protocol v1 CPI `remaining_accounts` for an OUTPUT-ONLY,
-    addressless compressed-account create (compress_memory_batch /
-    append_epoch_snapshot).
-
-    Order is fixed by light-sdk 0.23 `cpi::v1::CpiAccounts` (8 system accounts +
-    1 output state-tree). The signer/fee-payer (authority) is passed as a NAMED
-    account by the instruction builder — it is NOT included here. `output_tree_index`
-    in the instruction data must select the state tree's slot within the tree
-    sub-slice (index 0 → the single state tree at position 8).
-
-    Returns the list of AccountMeta, or None if the SDK is unavailable / a pubkey
-    is malformed.
-    """
-    if not _SOLANA_AVAILABLE:
-        return None
-    try:
-        cpi_authority = derive_light_cpi_authority(program_id_str)
-        if cpi_authority is None:
-            return None
-        invoking_program = Pubkey.from_string(program_id_str or VAULT_PROGRAM_ID)
-        state_tree = Pubkey.from_string(state_tree_str or LIGHT_V1_STATE_TREE)
-
-        def ro(pubkey_str):
-            return AccountMeta(
-                pubkey=Pubkey.from_string(pubkey_str),
-                is_signer=False, is_writable=False,
-            )
-
-        return [
-            ro(LIGHT_SYSTEM_PROGRAM_ID),                       # 0
-            AccountMeta(pubkey=cpi_authority,                  # 1
-                        is_signer=False, is_writable=False),
-            ro(LIGHT_REGISTERED_PROGRAM_PDA),                  # 2
-            ro(LIGHT_NOOP_PROGRAM_ID),                         # 3
-            ro(LIGHT_ACCOUNT_COMPRESSION_AUTHORITY),           # 4
-            ro(LIGHT_ACCOUNT_COMPRESSION_PROGRAM_ID),          # 5
-            AccountMeta(pubkey=invoking_program,               # 6
-                        is_signer=False, is_writable=False),
-            ro(SYSTEM_PROGRAM_ID),                             # 7
-            AccountMeta(pubkey=state_tree,                     # 8 (output_tree_index=0)
-                        is_signer=False, is_writable=True),
-        ]
-    except Exception as e:  # noqa: BLE001
-        logger.error("[SolanaClient] Failed to build Light v1 remaining accounts: %s", e)
-        return None
-
 # Anchor instruction discriminators (from IDL — SHA256("global:<instruction_name>")[:8])
 _VAULT_IX_INITIALIZE = bytes([48, 191, 163, 44, 71, 129, 63, 164])
 _VAULT_IX_COMMIT_STATE = bytes([201, 80, 148, 145, 9, 196, 225, 56])
@@ -710,35 +617,26 @@ def build_compress_memory_batch_instruction(
     proof_bytes: bytes = None,
     merkle_context: dict = None,
     program_id_str: str = None,
-    state_tree_str: str = None,
 ) -> Optional["Instruction"]:
     """
-    Build the complete compress_memory_batch instruction (ZK-compressed write).
+    Build the compress_memory_batch instruction with ZK proof context.
 
-    Creates an OUTPUT-ONLY, addressless Light compressed account, so NO validity
-    proof is required (the on-chain Light system program rejects a proof when
-    there is nothing to prove — `ProofIsSome`/6018). `proof_bytes` therefore
-    defaults to None → Borsh `Option::None`, which the program maps to
-    `ValidityProof(None)`. The Light v1 system `remaining_accounts` are appended
-    here (8 system accounts + 1 output state tree), so the caller can send the
-    returned instruction directly.
+    This builds only the instruction data portion. The full remaining accounts
+    (Light Protocol system accounts + tree accounts) must be appended by the
+    caller based on the Photon validity proof response.
 
     Args:
-        authority_pubkey: The Titan's wallet Pubkey (named signer / fee payer).
+        authority_pubkey: The Titan's wallet Pubkey.
         batch_root: 32-byte Merkle root of memory hashes.
         node_count: Number of memories in the batch.
         epoch_id: Meditation cycle number.
         sovereignty_score: Basis points (0-10000).
-        proof_bytes: 128-byte Groth16 proof (a:32 + b:64 + c:32). None (default)
-            for the output-only path — see above.
-        merkle_context: Reserved (Photon tree context); unused for output-only.
+        proof_bytes: 128-byte Groth16 proof (a:32 + b:64 + c:32). None for empty proof.
+        merkle_context: Tree addresses and indices from Photon (unused in data, used by caller for accounts).
         program_id_str: Override vault program ID.
-        state_tree_str: Override the Light V1 state tree (defaults to the
-            documented public tree).
 
     Returns:
-        Complete Instruction (with Light remaining accounts), or None if SDK
-        unavailable / accounts could not be built.
+        Instruction object (without remaining accounts), or None if SDK unavailable.
     """
     if not _SOLANA_AVAILABLE or authority_pubkey is None:
         return None
@@ -776,22 +674,15 @@ def build_compress_memory_batch_instruction(
             + struct.pack("<H", node_count)
             + struct.pack("<Q", epoch_id)
             + struct.pack("<H", sovereignty_score)
-            + bytes([0])  # output_tree_index = 0 → the state tree at tree-slot 0
+            + bytes([0])  # output_tree_index — set by caller or default 0
         )
-
-        remaining = build_light_v1_remaining_accounts(program_id_str, state_tree_str)
-        if remaining is None:
-            logger.error("[SolanaClient] compress_memory_batch: Light remaining accounts unavailable")
-            return None
-
-        accounts = [
-            AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=authority_pubkey, is_signer=True, is_writable=True),
-        ] + remaining
 
         return Instruction(
             program_id=program_id,
-            accounts=accounts,
+            accounts=[
+                AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=authority_pubkey, is_signer=True, is_writable=True),
+            ],
             data=data,
         )
     except Exception as e:
@@ -808,30 +699,22 @@ def build_append_epoch_snapshot_instruction(
     proof_bytes: bytes = None,
     merkle_context: dict = None,
     program_id_str: str = None,
-    state_tree_str: str = None,
 ) -> Optional["Instruction"]:
     """
-    Build the complete append_epoch_snapshot instruction (ZK-compressed write).
-
-    Like compress_memory_batch this creates an OUTPUT-ONLY, addressless Light
-    compressed account → NO validity proof required (`proof_bytes=None` →
-    `ValidityProof(None)`), and the Light v1 system `remaining_accounts` are
-    appended here so the instruction can be sent directly.
+    Build the append_epoch_snapshot instruction with ZK proof context.
 
     Args:
-        authority_pubkey: The Titan's wallet Pubkey (named signer / fee payer).
+        authority_pubkey: The Titan's wallet Pubkey.
         state_root: 32-byte full cognitive state root.
         memory_count: Total memories at this point.
         sovereignty_score: Basis points (0-10000).
         shadow_url_hash: 32-byte SHA-256 hash of Shadow Drive archive.
-        proof_bytes: 128-byte Groth16 proof. None (default) for the output-only path.
-        merkle_context: Reserved (Photon tree context); unused for output-only.
+        proof_bytes: 128-byte Groth16 proof. None for empty proof.
+        merkle_context: Tree addresses and indices from Photon.
         program_id_str: Override vault program ID.
-        state_tree_str: Override the Light V1 state tree.
 
     Returns:
-        Complete Instruction (with Light remaining accounts), or None if SDK
-        unavailable / accounts could not be built.
+        Instruction object (without remaining accounts), or None if SDK unavailable.
     """
     if not _SOLANA_AVAILABLE or authority_pubkey is None:
         return None
@@ -868,22 +751,15 @@ def build_append_epoch_snapshot_instruction(
             + struct.pack("<Q", memory_count)
             + struct.pack("<H", sovereignty_score)
             + shadow_url_hash
-            + bytes([0])  # output_tree_index = 0 → the state tree at tree-slot 0
+            + bytes([0])
         )
-
-        remaining = build_light_v1_remaining_accounts(program_id_str, state_tree_str)
-        if remaining is None:
-            logger.error("[SolanaClient] append_epoch_snapshot: Light remaining accounts unavailable")
-            return None
-
-        accounts = [
-            AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=authority_pubkey, is_signer=True, is_writable=True),
-        ] + remaining
 
         return Instruction(
             program_id=program_id,
-            accounts=accounts,
+            accounts=[
+                AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=False),
+                AccountMeta(pubkey=authority_pubkey, is_signer=True, is_writable=True),
+            ],
             data=data,
         )
     except Exception as e:

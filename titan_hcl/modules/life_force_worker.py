@@ -370,12 +370,6 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
         sys.exit(1)
     _try_load_persisted(engine)
 
-    # RFP_supervision_lifecycle §7.D / Phase D.1 — bus-INDEPENDENT save of the
-    # metabolic engine state on any shutdown (SIGTERM/control-group/PDEATHSIG),
-    # not only the bus SAVE_NOW path. _save_persisted is idempotent (G16).
-    from titan_hcl.core.worker_shutdown import register_shutdown_save
-    register_shutdown_save(name, lambda: _save_persisted(engine))
-
     # === MODULE-SPECIFIC: SHM publisher init ===
     state_publisher = None
     try:

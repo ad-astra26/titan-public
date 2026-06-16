@@ -29,9 +29,7 @@ use tracing::{info, warn};
 use titan_bus::BusBroker;
 use titan_cgn::create_cgn_live_weights;
 use titan_clocks::{run_circadian_loop, run_pi_heartbeat_loop, EpochTickPublisher};
-use titan_core::constants::{
-    BUS_API_HTTP_PORT_DEFAULT, KERNEL_PYTHON_DRAIN_GRACE_S, KERNEL_SHUTDOWN_GRACE_S, SPEC_VERSION,
-};
+use titan_core::constants::{BUS_API_HTTP_PORT_DEFAULT, KERNEL_SHUTDOWN_GRACE_S, SPEC_VERSION};
 use titan_state::{Slot, SlotRegistry};
 
 use crate::broker_publisher::BrokerEpochPublisher;
@@ -441,13 +439,10 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
     )
     .map_err(|e| KernelError::Supervisor(format!("{e:?}")))?;
 
-    // Legacy SpawnedChildren registry. NOTE: in production it stays EMPTY —
-    // every child (substrate + the 3 Python peers) is spawned through
-    // KernelChildSupervisor's `spawn_and_watch_*`, whose Child handles live
-    // inside the watch tasks, NOT here. So `children.sigterm_all()` is a no-op
-    // and the real shutdown SIGTERM goes through `kernel_supervisor
-    // .sigterm_children()` (SPEC §18.4 / RFP_supervision_lifecycle §7.D). This
-    // empty registry is retained only to future-proof a direct-spawn path.
+    // Legacy SpawnedChildren for the existing sigterm_all path. The new
+    // KernelChildSupervisor owns the actual respawn logic; SpawnedChildren
+    // remains for shutdown SIGTERM dispatch (the existing sigterm_all
+    // implementation operates on Option<Child> slots).
     let children = SpawnedChildren::new();
 
     let mut substrate_watch_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -503,12 +498,8 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
     // Phase 11.x (Maker 2026-05-28): SUPERVISED via KernelChildSupervisor
     // (was fire-and-forget direct spawn → zombied on death). The supervisor
     // now watches + respawns all 3 Python peers via their own spawn fns, so
-    // `kill -9 titan_hcl|titan_hcl_api` self-recovers (INV-PROC-5). Graceful
-    // shutdown SIGTERMs these peers explicitly via
-    // `kernel_supervisor.sigterm_children()` at SHUTDOWN_BEGIN (SPEC §18.4 /
-    // RFP_supervision_lifecycle §7.D) — NOT via PDEATHSIG, which only fires on
-    // kernel exit and would arrive after the broker is already gone. (PDEATHSIG
-    // remains the backstop for an UNGRACEFUL kernel death.)
+    // `kill -9 titan_hcl|titan_hcl_api` self-recovers (INV-PROC-5). Shutdown
+    // is via PDEATHSIG (§11.C.1) like substrate/guardian, not children.sigterm.
     if options.spawn_titan_hcl {
         info!(
             event = "BOOT_B9b_SPAWN_TITAN_HCL",
@@ -600,23 +591,8 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
     kernel_supervisor.mark_shutdown_active();
     shutdown.notify_waiters();
 
-    // SPEC §18.4 / RFP_supervision_lifecycle §7.D (Phase D.2) — explicitly
-    // SIGTERM every supervised child (substrate, guardian_hcl, titan_hcl,
-    // titan_hcl_api) NOW, while the bus broker is still alive. The legacy
-    // `children.sigterm_all()` is a no-op (the Phase-11 peers are owned by
-    // KernelChildSupervisor's watch tasks, never registered into the empty
-    // SpawnedChildren registry), so the real signal goes through the
-    // supervisor's pid bookkeeping. Under `KillMode=mixed` this is the ONLY
-    // thing that starts the children draining — systemd signals just the kernel
-    // ($MAINPID), and PDEATHSIG fires only on kernel exit (too late: the broker
-    // would already be gone). `mark_shutdown_active()` (above) ensures these
-    // exits are classified clean (no respawn).
-    children.sigterm_all().await; // retained: no-op today, future-proofs the registry path
-    kernel_supervisor.sigterm_children().await;
-
-    // Phase 1 — fast L0/L1 drain: the kernel-internal loops resolve on
-    // shutdown.notify_waiters(); substrate (L1) + guardian_hcl exit quickly.
-    // Bounded by KERNEL_SHUTDOWN_GRACE_S.
+    // Send SIGTERM to children, give them DAEMON_SHUTDOWN_GRACE_S to exit
+    children.sigterm_all().await;
     let _ = tokio::time::timeout(Duration::from_secs_f64(KERNEL_SHUTDOWN_GRACE_S), async {
         let _ = circadian_handle.await;
         let _ = pi_handle.await;
@@ -628,30 +604,15 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
         if let Some(h) = python_watch_handle {
             let _ = h.await;
         }
+        if let Some(h) = titan_hcl_watch_handle {
+            let _ = h.await;
+        }
+        if let Some(h) = titan_hcl_api_watch_handle {
+            let _ = h.await;
+        }
         // B9.d api reload subscriber exits on shutdown.notified().
         let _ = api_reload_subscriber_handle.await;
     })
-    .await;
-
-    // Phase 2 — Python L2/L3 drain: keep the broker ALIVE until titan_hcl
-    // (orchestrator) + titan_hcl_api exit. titan_hcl drains its ~40 modules
-    // SEQUENTIALLY, each running a bus SAVE_NOW→SAVE_DONE handshake over THIS
-    // broker, so the broker must outlive the drain — that ordering is the whole
-    // §18.4 fix. Bounded by KERNEL_PYTHON_DRAIN_GRACE_S (< systemd
-    // TimeoutStopSec, the outer SIGKILL backstop); resolves early the instant
-    // both peers exit. Phase D.1's bus-independent self-save is the belt to
-    // this suspenders: even if the bound is hit, no worker loses data.
-    let _ = tokio::time::timeout(
-        Duration::from_secs_f64(KERNEL_PYTHON_DRAIN_GRACE_S),
-        async {
-            if let Some(h) = titan_hcl_watch_handle {
-                let _ = h.await;
-            }
-            if let Some(h) = titan_hcl_api_watch_handle {
-                let _ = h.await;
-            }
-        },
-    )
     .await;
 
     // Stop broker

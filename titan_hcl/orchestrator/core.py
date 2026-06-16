@@ -126,6 +126,19 @@ BOOT_GRACE_SECONDS = 180.0      # boot+settle window during which rss faults are
 # RFP_supervision_lifecycle §7.B — only modules at/above this rss_limit are
 # "heavy" enough to starve the box on boot; lighter ones are never throttled.
 BOOT_THROTTLE_HEAVY_MIN_RSS_MB = 400.0
+# RFP_supervision_lifecycle §7.B/§7.D — MEM/CPU-AWARE BOOT-WAVE PACING. The
+# per-module boot_throttle above only defers individual HEAVY modules; the boot
+# STORM is the CUMULATIVE pressure of the whole ~40-module wave on a contended
+# box (e.g. a shared box already running the other Titan) → swap-thrash → modules
+# die mid-boot (shm_pid_dead) → re-boot → 32× churn (T3 2026-06-16). The pacing
+# below adapts the boot CONCURRENCY + STAGGER to live box headroom: a CALM box
+# boots exactly as fast as today; a CONTENDED box throttles the wave so it doesn't
+# over-subscribe. HARD-BOUNDED so a boot can NEVER drag (cap floor + stagger
+# ceiling) — a slow-but-smooth boot, never a 10-minute one.
+BOOT_PACING_MEM_FLOOR_MB = 768.0   # MemAvailable below this → throttle the wave
+BOOT_PACING_LOAD_FACTOR = 1.5      # load1 > cores×this → throttle the wave
+BOOT_PACING_CAP_FLOOR = 2          # never drop in-flight below this (keeps progress)
+BOOT_PACING_STAGGER_MAX_S = 4.0    # hard ceiling on the adaptive stagger
 REENABLE_COOLDOWN_S = 180.0    # RFP_supervision_lifecycle §7.C — 3min (was 600) auto-re-enable cooldown
 # CPU-aware heartbeat (added 2026-04-21) — when heartbeat times out, sample
 # /proc/<pid>/stat CPU time. If CPU grew ≥ MIN_CPU_DELTA_FOR_ALIVE since last
@@ -298,6 +311,12 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         # predictive-defer = Phase A behavior, so default-on is safe).
         self._boot_throttle_enabled = bool(cfg.get("boot_throttle_enabled", True))
         self._boot_throttle_cgroup = bool(cfg.get("boot_throttle_cgroup", True))
+        # RFP_supervision_lifecycle §7.B/§7.F (INV-SUP-1/2/8) — a RESOURCE
+        # condition (RssAnon over rss_limit) must THROTTLE/recheck, NEVER drive a
+        # kill→respawn cascade; only genuine critical faults (dead pid, hung
+        # heartbeat, FATAL ModuleError) restart. Default-ON (the smart behavior);
+        # `=false` kill-switch restores the legacy rss→restart for emergency revert.
+        self._rss_over_throttles = bool(cfg.get("rss_over_limit_throttles_not_restarts", True))
         # Phase 9 Chunk 9L (RFP §3F.2.6) — staggered boot to eliminate
         # cold-boot CPU contention. ~40 autostart modules booting in parallel
         # on a 4-core VPS oversubscribed CPU 5-6×, causing cascade
@@ -1678,6 +1697,55 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 time.sleep(0.1)
         return len(ready)
 
+    def _adaptive_boot_pacing(
+        self, base_cap: int, base_stagger: float,
+        _state: Optional[list] = None,
+    ) -> "tuple[int, float]":
+        """Mem/CPU-aware boot-wave pacing (RFP_supervision_lifecycle §7.B/§7.D).
+
+        Returns the (concurrency_cap, stagger_s) for the NEXT spawn, adapted to
+        LIVE box headroom:
+          • CALM box → (base_cap, base_stagger) — today's fast boot, untouched.
+          • CONTENDED box (MemAvailable < floor and/or load1 > cores×factor —
+            e.g. the OTHER Titan running on a shared box) → fewer in-flight +
+            a longer stagger so the ~40-module wave can't over-subscribe the box
+            → no swap-thrash → no shm_pid_dead death-storm.
+
+        HARD-BOUNDED so a boot can NEVER drag: cap never below
+        BOOT_PACING_CAP_FLOOR (≥2 keeps forward progress), stagger never above
+        BOOT_PACING_STAGGER_MAX_S. Worst case is a slow-but-smooth boot — and
+        because it PREVENTS the 32× re-boot storm, total boot time is typically
+        similar-or-better, just without the churn. FAIL-OPEN: any read error →
+        base values (behaves exactly as today)."""
+        try:
+            from titan_hcl.orchestrator.boot_throttle import read_box_pressure
+            box = read_box_pressure()
+            cores = os.cpu_count() or 4
+            mem_tight = 0.0 < box.mem_available_mb < BOOT_PACING_MEM_FLOOR_MB
+            load_high = box.load1 > cores * BOOT_PACING_LOAD_FACTOR
+            if mem_tight or load_high:
+                severe = mem_tight and load_high
+                cap = (BOOT_PACING_CAP_FLOOR if severe
+                       else max(BOOT_PACING_CAP_FLOOR, base_cap // 2))
+                eff_stagger = min(base_stagger * (2.5 if severe else 1.7),
+                                  BOOT_PACING_STAGGER_MAX_S)
+                if _state is not None and not _state[0]:
+                    _state[0] = True
+                    logger.info(
+                        "[Guardian] boot-wave pacing ENGAGED — cap %d→%d, "
+                        "stagger %.1f→%.1fs (MemAvailable=%.0fMB load1=%.2f "
+                        "cores=%d) — smooth boot under box pressure (RFP §7.B)",
+                        base_cap, cap, base_stagger, eff_stagger,
+                        box.mem_available_mb, box.load1, cores)
+                return cap, eff_stagger
+            if _state is not None and _state[0]:
+                _state[0] = False
+                logger.info("[Guardian] boot-wave pacing RELEASED — box headroom "
+                            "recovered, resuming full-speed boot")
+        except Exception:  # noqa: BLE001 — fail-open: pacing never breaks a boot
+            pass
+        return base_cap, base_stagger
+
     def _spawn_capped(
         self, order: list[str], stagger: float, ready_timeout: float,
     ) -> int:
@@ -1695,7 +1763,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         no /dev/shm) → uncapped (the gate is a no-op there).
         """
         bank = self._ensure_module_state_reader_bank()
-        cap = self._boot_concurrency_cap
+        base_cap = self._boot_concurrency_cap
 
         def _running(n: str) -> bool:
             if bank is None:
@@ -1707,7 +1775,15 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 return False
 
         spawned: list[str] = []
+        _pacing_state = [False]   # transition-logging latch for the pacer
         for name in order:
+            # RFP §7.B/§7.D — mem/CPU-aware boot-wave pacing: recomputed PER spawn
+            # so it tracks the box as the wave (and the other Titan) loads it.
+            # Calm box → (base_cap, stagger); contended box → fewer in-flight +
+            # longer (bounded) stagger so the wave can't over-subscribe → no
+            # shm_pid_dead death-storm. Bounded → never a runaway-slow boot.
+            cap, eff_stagger = self._adaptive_boot_pacing(
+                base_cap, stagger, _pacing_state)
             # Gate: bound in-flight (spawned, not yet running) to `cap`. Bounded
             # by ready_timeout so a stuck module can't stall the whole boot.
             if cap > 0 and bank is not None:
@@ -1715,8 +1791,8 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 while (time.time() < gate_deadline
                        and sum(1 for n in spawned if not _running(n)) >= cap):
                     time.sleep(0.3)
-            if spawned and stagger > 0:
-                time.sleep(stagger)
+            if spawned and eff_stagger > 0:
+                time.sleep(eff_stagger)
             self.start(name, activate_deps=False)  # poller drives readiness
             spawned.append(name)
         return self._wait_for_wave_running(order, ready_timeout)
@@ -2173,14 +2249,9 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             self._module_ready_publisher_stop.wait(1.0)
 
     def stop_all(self, reason: str = "shutdown") -> int:
-        """Gracefully stop all running modules. Returns the count stopped.
-
-        RFP_supervision_lifecycle §7.D / SPEC §18.4: this runs under the Rust
-        kernel's ordered drain (the kernel SIGTERMs titan_hcl, keeps the bus
-        broker alive through this drain, then stops it). Each module's stop()
-        does its bus SAVE_NOW handshake here; workers ALSO self-save
-        bus-independently on their own SIGTERM (worker_shutdown). Clean-vs-forced
-        shutdown is read from systemd `Result` (§11.B), NOT a marker."""
+        """Gracefully stop all running modules. Returns the count stopped
+        (RFP_supervision_lifecycle §7.D — fed into the KERNEL_SHUTDOWN_COMPLETE
+        marker so a restart can confirm a clean, complete drain)."""
         self._stop_requested = True
         # Stop the continuous probe poller (Phase 11 §11.I.7 / RFP 11D).
         try:
@@ -2430,12 +2501,39 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
 
     @staticmethod
     def _get_rss_mb(pid: int) -> float:
-        """Read RSS from /proc/{pid}/status (Linux only)."""
+        """Read REAL resident memory from /proc/{pid}/status — RssAnon, NOT VmRSS.
+
+        RFP_supervision_lifecycle §7.B / the proper false-OOM fix (2026-06-16).
+        The supervisor's rss_limit guard (supervisor/core.py:343) compares this
+        to `rss_limit_mb`. It MUST measure private anonymous pages (the memory
+        that actually counts toward OOM pressure), NOT VmRSS — VmRSS over-counts
+        the RECLAIMABLE file-backed mmap'd pages that the DB-heavy + embedder
+        workers map (FAISS/Kuzu/DuckDB/ONNX page-cache, ~100-300 MB). That delta
+        drove a VmRSS false-OOM restart cascade: synthesis (VmRSS 706 vs 700 cap,
+        real RssAnon 498) and agno (VmRSS 880 vs 1000, real RssAnon 815), T1
+        mainnet 2026-06-15/16 — verified live via worker telemetry. The
+        bus_socket._enrich_heartbeat fix (79aa5a68) corrected the REPORTED value;
+        this fixes the one the supervisor actually ENFORCES. A genuine leak still
+        trips (RssAnon grows with real allocation). Fall back to VmRSS only if
+        RssAnon is absent (pre-4.5 kernels).
+        """
         try:
+            _anon: Optional[float] = None
+            _vmrss: Optional[float] = None
             with open(f"/proc/{pid}/status") as f:
                 for line in f:
-                    if line.startswith("VmRSS:"):
-                        return int(line.split()[1]) / 1024.0  # kB → MB
+                    if line.startswith("RssAnon:"):
+                        _anon = int(line.split()[1]) / 1024.0  # kB → MB
+                        if _vmrss is not None:
+                            break
+                    elif line.startswith("VmRSS:"):
+                        _vmrss = int(line.split()[1]) / 1024.0
+                        if _anon is not None:
+                            break
+            if _anon is not None:
+                return _anon
+            if _vmrss is not None:
+                return _vmrss
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             pass
         return 0.0
@@ -2820,21 +2918,13 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
     # PR_SET_PDEATHSIG asks the kernel to deliver SIGTERM the moment our
     # parent dies — survives parent SIGKILL because the kernel is the
     # messenger. Combined with a getppid()-poll watcher as backup defense.
+    # Worker entry_fns install their own SIGTERM handlers afterward, which
+    # catch this signal and perform graceful shutdown (flush WAL, etc.).
     from titan_hcl.core.worker_lifecycle import install_full_protection
     _wl = install_full_protection()
-    # RFP_supervision_lifecycle §7.D / Phase D.1 — install the FLOOR
-    # SIGTERM→KeyboardInterrupt handler so EVERY spawned worker unwinds its
-    # blocking recv loop on SIGTERM (control-group, PDEATHSIG, or orchestrator)
-    # and reaches the wrapper's finally → run_shutdown_saves(), instead of dying
-    # mid-loop with no checkpoint. (Previously the titan_hcl/modules/* workers
-    # had NO SIGTERM handler — the old "workers install their own" comment here
-    # was stale for them; only the persistence layer did. A worker that installs
-    # a richer handler later, e.g. persistence_entry.py, overrides this floor.)
-    from titan_hcl.core.worker_shutdown import install_worker_sigterm_handler
-    _sig_ok = install_worker_sigterm_handler()
     logger.info(
-        "Module '%s' lifecycle protection: pdeathsig=%s watcher=%s sigterm_floor=%s",
-        name, _wl["pdeathsig_installed"], _wl["watcher_started"], _sig_ok,
+        "Module '%s' lifecycle protection: pdeathsig=%s watcher=%s",
+        name, _wl["pdeathsig_installed"], _wl["watcher_started"],
     )
 
     # Phase B.2.1 — bus bootstrap + swap-handler bootstrap. setup_worker_bus
@@ -2914,18 +3004,6 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
         logger.error("Module '%s' crashed: %s", name, e, exc_info=True)
         raise
     finally:
-        # RFP_supervision_lifecycle §7.D / Phase D.1 — run every registered
-        # bus-INDEPENDENT save FIRST (before bus_client.stop()), on EVERY exit
-        # path. Idempotent + run-once guarded; a no-op for workers that hold no
-        # critical state. This is what makes graceful shutdown survive a
-        # dead/slow bus without data loss (SPEC §11.B G16 / §18.4).
-        try:
-            from titan_hcl.core.worker_shutdown import run_shutdown_saves
-            _n_saved = run_shutdown_saves()
-            if _n_saved:
-                logger.info("Module '%s' bus-independent shutdown saves: %d", name, _n_saved)
-        except Exception:  # noqa: BLE001 — never let save-teardown mask the exit
-            logger.warning("Module '%s' run_shutdown_saves error", name, exc_info=True)
         if bus_client is not None:
             try:
                 bus_client.stop()

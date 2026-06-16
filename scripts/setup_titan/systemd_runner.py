@@ -157,18 +157,7 @@ ExecStart={bin_dir}/titan-kernel-rs --titan-id {titan_id} --data-dir {root}/data
 ExecStop=/bin/kill -TERM $MAINPID
 ExecStopPost={cleanup}
 
-# SPEC §18.4 / RFP_supervision_lifecycle §7.D (Phase D.2) — ORDERED graceful
-# shutdown. KillMode=mixed sends the initial SIGTERM ONLY to the kernel
-# ($MAINPID); the kernel then drives the SPEC §18.4 cascade (SIGTERM children →
-# children drain over the LIVE bus → kernel snapshots → stops the broker →
-# exits). With the default KillMode=control-group, systemd SIGTERMs the whole
-# cgroup at once, racing the kernel and tearing the bus down before the Python
-# drain finishes → hang → SIGKILL. TimeoutStopSec must exceed the kernel's
-# KERNEL_PYTHON_DRAIN_GRACE_S (60s) so the orchestrated 40-module drain
-# completes before systemd's SIGKILL backstop.
-KillMode=mixed
-KillSignal=SIGTERM
-TimeoutStopSec=90
+TimeoutStopSec=30
 Restart=on-failure
 # Give the bus broker room to bind its socket before daemons redial on a restart
 # (longer than the 5s default to damp the cold-boot connect race on min-tier).

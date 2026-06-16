@@ -460,15 +460,6 @@ def neuromod_worker_main(
         logger.error("[NeuromodWorker] NeuromodulatorSystem init failed: %s — exiting", e)
         return
 
-    # RFP_supervision_lifecycle §7.D / Phase D.1 — bus-INDEPENDENT save of the
-    # neuromodulator learned state on any shutdown (SIGTERM/control-group/
-    # PDEATHSIG). Guarded: not every system build exposes _save_state.
-    from titan_hcl.core.worker_shutdown import register_shutdown_save
-    register_shutdown_save(
-        name,
-        lambda: neuromod_system._save_state() if hasattr(neuromod_system, "_save_state") else None,
-    )
-
     # Lazy slot writer — None if flag-off or shm setup fails.
     flag_on = bool(
         (full_config.get("microkernel") or {}).get("shm_neuromod_enabled", False))

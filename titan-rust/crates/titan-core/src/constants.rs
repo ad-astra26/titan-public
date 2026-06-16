@@ -3,17 +3,17 @@
 //! DO NOT EDIT BY HAND. Edit the TOML, then run:
 //!     python scripts/generate_phase_c_constants.py
 //!
-//! SPEC version: 1.11.5
-//! Source SHA-256: e7d91d67329f6c0f61091ebd1956d8e61118c27381260bef1334cef068f57334
+//! SPEC version: 1.11.4
+//! Source SHA-256: 38b16cdbece1cc82d241b808248c7cf2f16e301276d19faf340fa8fcfd3d86af
 //!
 //! Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 //! `arch_map phase-c verify`.
 #![allow(dead_code)]
 
 // ── SPEC version metadata ──────────────────────────────────────────────
-pub const SPEC_VERSION: &str = "1.11.5";
+pub const SPEC_VERSION: &str = "1.11.4";
 pub const SPEC_SOURCE_SHA256: &str =
-    "e7d91d67329f6c0f61091ebd1956d8e61118c27381260bef1334cef068f57334";
+    "38b16cdbece1cc82d241b808248c7cf2f16e301276d19faf340fa8fcfd3d86af";
 
 // ── KERNEL ────────────────────────────────────────────────────────────────
 // titan-kernel-rs internals (boot, snapshot, signal handling, persistence)
@@ -22,8 +22,6 @@ pub const SPEC_SOURCE_SHA256: &str =
 pub const KERNEL_BOOT_TIMEOUT_S: f64 = 30.0;
 /// Kernel SIGTERM→SIGKILL grace window
 pub const KERNEL_SHUTDOWN_GRACE_S: f64 = 10.0;
-/// Window the kernel keeps the bus broker ALIVE while the Python L2/L3 peers (titan_hcl orchestrator + titan_hcl_api) drain their 40-module save sequence on shutdown. Longer than KERNEL_SHUTDOWN_GRACE_S (which bounds the fast L0/L1 children) because the orchestrated drain is sequential; bounded BELOW the systemd TimeoutStopSec SIGKILL backstop. Ordering: TimeoutStopSec > KERNEL_PYTHON_DRAIN_GRACE_S > KERNEL_SHUTDOWN_GRACE_S.
-pub const KERNEL_PYTHON_DRAIN_GRACE_S: f64 = 60.0;
 /// L0 persistence atomic-snapshot cadence
 pub const KERNEL_SNAPSHOT_INTERVAL_S: f64 = 1.0;
 /// Circadian clock tick cadence (1 Hz logical) per SPEC §10.H

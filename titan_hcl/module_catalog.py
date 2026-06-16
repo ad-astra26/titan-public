@@ -1243,10 +1243,15 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # llama-cpp-python. The ~317 MB fastembed model + its unbounded ONNX CPU
         # arena (the real root cause of the T1 rss_3522mb spike — the arena never
         # returns memory to the OS) are GONE; llama.cpp bge-small is flat ~197 MB.
-        # The 700 cap is now a comfortable ceiling (262 baseline + ~197 ≈ 459 MB),
-        # NOT a leak accommodation. Re-grounded against the migration P6 RSS soak
-        # (real resident measurement) before any further change — kept at 700 as a
-        # safe ceiling meanwhile (llama.cpp is flat, so headroom carries no risk).
+        # The 700 cap is sized against REAL RESIDENT (~459 MB → RssAnon ~498 MB
+        # live), which is comfortable. As of 2026-06-16 the guardian ENFORCES
+        # RssAnon, not VmRSS (orchestrator/core.py `_get_rss_mb`), so the
+        # reclaimable FAISS/Kuzu/DuckDB mmap page-cache (~207 MB on T1's large
+        # dataset) no longer inflates the enforced figure. The 2026-06-16 interim
+        # 1500 VmRSS band-aid is REVERTED — 700 is correct against real memory;
+        # a genuine RssAnon breach now THROTTLES, never respawns (INV-SUP-2).
+        # (Earlier VmRSS false-OOM restart loop that prompted the band-aid: T1
+        # mainnet 2026-06-15/16, verified RssAnon=498 vs VmRSS=706 via telemetry.)
         rss_limit_mb=700,
         autostart=True,
         lazy=False,

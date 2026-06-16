@@ -376,12 +376,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         iql_config=iql_config)
     # _load_state() called in __init__
 
-    # RFP_supervision_lifecycle §7.D / Phase D.1 — bus-INDEPENDENT save of the
-    # CGN's learned IQL state on any shutdown (SIGTERM/control-group/PDEATHSIG).
-    # _save_state is idempotent + atomic (also called periodically in-loop).
-    from titan_hcl.core.worker_shutdown import register_shutdown_save
-    register_shutdown_save(name, lambda: cgn._save_state())
-
     # ── Pre-register "reasoning" consumer for ARC (runs as standalone script) ──
     if "reasoning" not in cgn._consumers:
         cgn.register_consumer(CGNConsumerConfig(
