@@ -4718,6 +4718,33 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                 _set_pi = getattr(msl, "set_pi_value", None)
                 if callable(_set_pi):
                     _set_pi(pi_monitor.heartbeat_ratio)
+            # Break E (RFP_synthesis_reuse_and_routing_revival) — RESTORE the MSL
+            # buffer feed. The D8-3 spirit→cognitive migration restored msl.tick()
+            # but DROPPED the collect_snapshot() that pushes a sensor frame into the
+            # temporal buffer (it has no live caller — confirmed) → the buffer never
+            # reached is_ready() → tick() returned None every epoch → _last_output
+            # stayed None → the 20-D distilled_context block read zeros fleet-wide
+            # (outer_msl_context_state slot never published; live-diagnosed on T2:
+            # "_last_output is None — buffer not ready"). Feed the live modalities in
+            # scope each epoch so the buffer fills and tick() yields a REAL, varying
+            # context. Absent modalities (visual/audio/pattern — no such sensors)
+            # default neutral inside collect_snapshot. MUST run BEFORE tick().
+            _collect = getattr(msl, "collect_snapshot", None)
+            if callable(_collect):
+                try:
+                    _nm_fn = state_refs.get("_neuromod_reader")
+                    _nm_levels = _nm_fn() if callable(_nm_fn) else None
+                    _dev_age_msl = (float(getattr(pi_monitor, "developmental_age",
+                                                  0.0) or 0.0)
+                                    if pi_monitor is not None else 0.0)
+                    _collect(
+                        inner_body=state_refs.get("_inner_body_state"),
+                        outer_body=state_refs.get("_outer_body_state"),
+                        neuromod_levels=_nm_levels,
+                        developmental_age=_dev_age_msl,
+                    )
+                except Exception as _msl_cs_err:
+                    _log_driver_err("msl.collect_snapshot", _msl_cs_err)
             _msl_tick_fn = getattr(msl, "tick", None)
             if callable(_msl_tick_fn):
                 _msl_output = _msl_tick_fn()

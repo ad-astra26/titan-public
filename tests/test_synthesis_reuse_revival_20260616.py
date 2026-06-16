@@ -180,3 +180,39 @@ def test_idle_synthetic_pass_recovers_collapsed_policy():
 
     assert policy.exploit_action(tool_feats.to_vector()) == tool_idx
     assert policy.exploit_action(skill_feats.to_vector()) == skill_idx
+
+
+# ── Break E — MSL buffer feed → tick → real distilled_context ─────────────────
+
+def test_msl_collect_snapshot_feeds_buffer_then_tick_produces_context():
+    """The fix restores the collect_snapshot() feed dropped in the D8-3 migration.
+    Without a feed the buffer never readies and tick() returns None (the live
+    bug). With it, the buffer fills and tick() yields a 20-D distilled_context."""
+    from titan_hcl.logic.msl import MultisensorySynthesisLayer
+    msl = MultisensorySynthesisLayer()
+
+    # before any feed, tick is starved (the exact live failure)
+    assert msl.tick() is None
+    assert getattr(msl, "_last_output", None) is None
+
+    # feed varying frames (mirrors the restored cognitive_worker call)
+    rng = np.random.default_rng(3)
+    last_ctx = None
+    contexts = []
+    for _ in range(8):
+        msl.collect_snapshot(
+            inner_body=rng.uniform(0, 1, 5).tolist(),
+            outer_body=rng.uniform(0, 1, 5).tolist(),
+            neuromod_levels={"dopamine": float(rng.uniform(0, 1)),
+                             "serotonin": float(rng.uniform(0, 1))},
+            developmental_age=1.0)
+        out = msl.tick()
+        if out is not None:
+            ctx = out.get("distilled_context")
+            assert ctx is not None and len(ctx) == 20
+            contexts.append(tuple(round(x, 4) for x in ctx))
+            last_ctx = ctx
+
+    assert last_ctx is not None, "buffer never readied — feed did not work"
+    # real feed ⇒ the context VARIES across frames (not a constant/dead vector)
+    assert len(set(contexts)) > 1, "distilled_context is constant — feed is dead"
