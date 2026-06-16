@@ -817,6 +817,15 @@ class TitanKernel:
             self.disk_health.stop()
         except Exception as e:
             logger.warning("[TitanKernel] disk_health.stop error: %s", e)
+        # RFP_supervision_lifecycle §7.D — graceful drain. stop_all() runs each
+        # module's save_first stop (WORKER_SHUTDOWN_GRACE_S per SPEC §18.4); it
+        # returns the stopped count. NOTE: clean-shutdown CONFIRMATION for the
+        # restart gate is NOT a marker written here — the systemd-supervised
+        # process is the RUST kernel (titan-kernel-rs), so this Python path is not
+        # the SIGTERM handler. The canonical clean-vs-forced signal is systemd's
+        # exit Result/ExecMainStatus per SPEC §11.B (0/143=clean, 137=SIGKILL),
+        # which the manage script checks post-stop (titan_common.sh
+        # _verify_graceful_shutdown). See RFP §7.D.
         try:
             self.guardian.stop_all(reason=reason)
         except Exception as e:
