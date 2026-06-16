@@ -45,6 +45,8 @@ import titan_hcl.bus as bus
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -643,6 +645,7 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
     return True
 
 
+@with_error_envelope(module_name="soul_diary", subsystem="entry", severity=_phase11_sev.FATAL)
 def soul_diary_worker_main(recv_queue, send_queue, name: str,
                            config: dict) -> None:
     """Main loop for the soul-diary worker subprocess (§1.0 P1)."""

@@ -64,6 +64,7 @@ from titan_hcl.bus import (
     BUS_WORKER_ADOPT_REQUEST,
     DivineBus,
     MODULE_CRASHED,
+    MODULE_CRITICAL_DOWN,
     MODULE_HEARTBEAT,
     MODULE_PROBE_REQUEST,
     MODULE_RELOAD_ACK,
@@ -1298,6 +1299,66 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 "[Orchestrator] disabled-slot write for '%s' failed: %s",
                 name, e)
 
+    def _emit_module_critical_down(
+        self, name: str, *, error_code: str, severity: str,
+        count: int, reason: str,
+    ) -> None:
+        """Publish the RFP §7.F MODULE_CRITICAL_DOWN CRITICAL line + render the
+        greppable kernel-journal tag. Emitted whenever a module is DISABLED and
+        will NOT auto-recover on its own (escalation HALT/TERMINATE, or the
+        taxonomy FATAL-ModuleError gate). One known tag to grep — the operator
+        sees what died + why without scanning 1000 lines (§7.F.1.b)."""
+        logger.critical(
+            "[ERR] MODULE_CRITICAL_DOWN{module=%s,error_code=%s,severity=%s,"
+            "count=%d,reason=%s}",
+            name, error_code, severity, count, reason)
+        try:
+            # dst="all": this is an observer/operator signal (observatory renders
+            # it, operators grep it) — broadcast like MODULE_ERROR, not targeted.
+            self.bus.publish(make_msg(MODULE_CRITICAL_DOWN, "guardian", "all", {
+                "module": name, "error_code": error_code, "severity": severity,
+                "count": count, "reason": reason, "ts": time.time(),
+            }))
+        except Exception as e:  # noqa: BLE001 — never let the CRITICAL emit crash the gate
+            logger.debug("[Orchestrator] MODULE_CRITICAL_DOWN emit for '%s' failed: %s", name, e)
+
+    def disable(
+        self, name: str, reason: str, *,
+        error_code: str = "UNKNOWN", severity: str = "FATAL", count: int = 0,
+    ) -> bool:
+        """Disable a module from outside the restart-window escalation path —
+        the RFP §7.F taxonomy DISABLE gate (repeated FATAL / unrecoverable
+        ModuleError). Mirrors the escalation HALT branch's terminal steps
+        (stop → DISABLED → terminal-slot write → MODULE_CRASHED) and additionally
+        emits MODULE_CRITICAL_DOWN. The auto-re-enable cooldown (§7.C) applies
+        via `disabled_at`, so this is recoverable, not permanent. RLock-guarded
+        (re-entrant — safe if a caller already holds it)."""
+        with self._module_lock:
+            info = self._modules.get(name)
+            if not info:
+                logger.error("[Guardian] Cannot disable unknown module '%s'", name)
+                return False
+            if info.state == ModuleState.DISABLED:
+                return True  # already disabled — idempotent
+            now = time.time()
+            logger.critical(
+                "[Guardian] Taxonomy DISABLE for '%s' [%s] — reason=%s "
+                "error_code=%s severity=%s count=%d (auto-re-enable in %.0fs)",
+                name, info.spec.layer, reason, error_code, severity, count,
+                REENABLE_COOLDOWN_S)
+            self.stop(name, reason=f"taxonomy_disable:{reason}")
+            info.state = ModuleState.DISABLED
+            info.disabled_at = now
+            self._write_disabled_to_slot(name)
+            self.bus.publish(make_msg(MODULE_CRASHED, "guardian", "core", {
+                "module": name, "reason": f"taxonomy_disable:{reason}",
+                "error_code": error_code, "severity": severity,
+            }))
+        # CRITICAL_DOWN outside the lock (bus publish must never hold the lifecycle lock).
+        self._emit_module_critical_down(
+            name, error_code=error_code, severity=severity, count=count, reason=reason)
+        return True
+
     def _handle_escalation(
         self, name: str, info: "ModuleInfo", reason: str, now: float,
     ) -> None:
@@ -1388,6 +1449,9 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 "window_seconds": self._restart_window_seconds,
                 "escalation_id": escalation_id,
             }))
+            self._emit_module_critical_down(
+                name, error_code=common_reason.value, severity="FATAL",
+                count=len(info.restart_timestamps), reason="escalation_terminate")
         else:  # HALT
             self.stop(name, reason="escalation_halt")
             info.state = ModuleState.DISABLED
@@ -1399,6 +1463,9 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 "window_seconds": self._restart_window_seconds,
                 "escalation_id": escalation_id,
             }))
+            self._emit_module_critical_down(
+                name, error_code=common_reason.value, severity="FATAL",
+                count=len(info.restart_timestamps), reason="escalation_halt")
             logger.warning(
                 "[Guardian] Halt policy — '%s' disabled; Maker must "
                 "intervene (auto-re-enable in %.0fs)",

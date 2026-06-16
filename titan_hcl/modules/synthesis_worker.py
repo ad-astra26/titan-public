@@ -1408,6 +1408,7 @@ def _export_loop(store: "ActivationStore",
         stop_event.wait(max(interval_s - slept, 0.1))
 
 
+@with_error_envelope(module_name="synthesis", subsystem="entry", severity=_phase11_sev.FATAL)
 def synthesis_worker_main(recv_queue, send_queue, name: str,
                           config: dict) -> None:
     """L2 module entry — Guardian supervised.

@@ -93,6 +93,31 @@ class ModuleErrorCode(str, enum.Enum):
     STORAGE_DEGRADED = "STORAGE_DEGRADED"
 
 
+# ── Recoverability classification (RFP_supervision_lifecycle §7.F) ────────────
+# The Severity docstring above specifies the guardian selector:
+#   FATAL + recoverable   error_code → restart (retry may help)
+#   FATAL + unrecoverable error_code → DISABLE immediately (restart is futile)
+# This set makes that selector EXECUTABLE. An error_code is "unrecoverable" when
+# respawning the SAME code from disk cannot plausibly fix it — the fault is in the
+# module's contract/config/boot, not a transient runtime condition. Conservative
+# by design (false-"recoverable" just means the crash-loop path disables it a few
+# restarts later via §7.A; false-"unrecoverable" would disable a module that a
+# restart could have saved). A FATAL code NOT in this set still disables on the
+# *repeated* path (N FATAL in window) per the guardian gate — the crash-loop case.
+UNRECOVERABLE_CODES: frozenset[str] = frozenset({
+    ModuleErrorCode.BOOT_TIMEOUT.value,        # can't finish boot → restart re-loops the same boot
+})
+
+
+def is_unrecoverable(error_code: str) -> bool:
+    """True iff a FATAL error with this code should DISABLE immediately rather
+    than restart. Accepts a raw string or a ModuleErrorCode value. Unknown codes
+    are treated as RECOVERABLE (fail-open to the restart path; the repeated-FATAL
+    crash-loop gate still disables a genuinely-broken module)."""
+    code = error_code.value if isinstance(error_code, ModuleErrorCode) else str(error_code)
+    return code in UNRECOVERABLE_CODES
+
+
 def _truncate(s: str, limit: int) -> str:
     """Truncate to `limit` chars, replacing the tail with ' …[truncated]' if cut."""
     if len(s) <= limit:

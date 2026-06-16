@@ -624,6 +624,18 @@ restart_window = 60.0    # RFP_supervision_lifecycle §7.A — OTP-standard wind
 # Affects: restart budget replenishment
 sustained_uptime_reset = 300.0
 
+# RFP_supervision_lifecycle §7.F — structured-error taxonomy USE (DEFAULT-ON
+# kill-switches; flip to false only for emergency revert).
+# (b) Journal cascade: render every MODULE_ERROR to the kernel journal as the
+#     greppable tag [ERR][module][code][severity] — grep ONE tag, not 1000 lines.
+module_error_journal_render = true
+# (c) DISABLE gate: a FATAL ModuleError with an UNRECOVERABLE error_code disables
+#     immediately; a FATAL with a recoverable code disables after
+#     fatal_module_error_disable_threshold occurrences in the restart_window.
+#     Resource conditions are NOT ModuleErrors (§7.B THROTTLE) → never disable here.
+taxonomy_fatal_disable_gate = true
+fatal_module_error_disable_threshold = 3
+
 # Phase 9 Chunk 9L (RFP §3F.2.6) — staggered boot to eliminate cold-boot
 # CPU contention. ~40 autostart modules booting in parallel on a 4-core VPS
 # oversubscribed CPU 5-6×, causing cascade heartbeat-timeouts (audit

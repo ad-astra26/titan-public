@@ -239,6 +239,7 @@ def run() -> int:
         from titan_hcl.bus import (
             MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN, MODULE_CRASHED,
             MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
+            MODULE_ERROR,
         )
         from scripts._titan_bus_client_helpers import (
             build_bus_and_client, start_inbound_dispatcher,
@@ -249,6 +250,11 @@ def run() -> int:
             broadcast_topics=[
                 MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN, MODULE_CRASHED,
                 MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
+                # RFP_supervision_lifecycle §7.F — forward MODULE_ERROR so the
+                # Supervisor's taxonomy consumer (its own "guardian_module_errors"
+                # in-process subscriber) renders the greppable journal cascade +
+                # runs the FATAL-ModuleError DISABLE gate.
+                MODULE_ERROR,
             ],
             reply_only=False,
         )

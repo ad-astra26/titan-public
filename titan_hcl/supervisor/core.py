@@ -41,14 +41,18 @@ What lives WHERE post-Phase-11 §11.I.1 split:
 from __future__ import annotations
 
 import logging
+import queue as _queue
 import time
+from collections import deque
 from typing import TYPE_CHECKING, Optional
 
 from titan_hcl.bus import (
     DivineBus,
+    MODULE_ERROR,
     MODULE_RESTART_REQUEST,
     make_msg,
 )
+from titan_hcl.errors import Severity, is_unrecoverable
 
 if TYPE_CHECKING:
     from titan_hcl.orchestrator import Orchestrator
@@ -77,6 +81,21 @@ _RSS_SUSTAINED_OVER_CYCLES: int = 30
 # headroom, and stays under the orchestrator's max_restarts window (600s) so
 # a genuine crash-loop still escalates → DISABLED.
 _RESTART_REQUEST_COOLDOWN_S: float = 90.0
+
+# RFP_supervision_lifecycle §7.F — taxonomy-driven DISABLE gate.
+# A module that emits this many FATAL ModuleErrors (recoverable error_code)
+# within the restart window is a genuine crash-loop the §7.A path would also
+# catch via repeated restarts — but the taxonomy gate disables it FAST, with a
+# typed reason, and a single greppable MODULE_CRITICAL_DOWN line. A FATAL with
+# an UNRECOVERABLE error_code (errors.is_unrecoverable) disables on the FIRST
+# occurrence — restart is futile. Resource conditions are NOT ModuleErrors
+# (§7.B THROTTLE) and never reach this gate. The window mirrors the orchestrator
+# restart window so the two gates agree on "what's a crash-loop".
+_FATAL_MODULE_ERROR_DISABLE_THRESHOLD: int = 3
+# Max ModuleError messages drained per monitor_tick — backstop against a flood
+# (the bus already rate-limits to 100/s per (module,code); this bounds journal
+# render + processing cost on a 1 Hz tick to a known ceiling).
+_MODULE_ERROR_DRAIN_CAP_PER_TICK: int = 200
 
 
 def _load_constants() -> None:
@@ -125,6 +144,35 @@ class Supervisor:
         # the backstop for the pid-write race.
         self._restart_requested_at: dict[str, float] = {}
 
+        # ── RFP §7.F — structured-error taxonomy consumer ────────────────────
+        # Flags ship DEFAULT-ON (feedback_all_flags_default_on); the `=false`
+        # form is a kill-switch only.
+        self._module_error_journal_render = bool(
+            self._config.get("module_error_journal_render", True))
+        self._taxonomy_disable_gate = bool(
+            self._config.get("taxonomy_fatal_disable_gate", True))
+        self._fatal_disable_threshold = int(
+            self._config.get("fatal_module_error_disable_threshold",
+                             _FATAL_MODULE_ERROR_DISABLE_THRESHOLD))
+        # Per-module rolling timestamps of FATAL ModuleErrors (window = the
+        # orchestrator restart_window). deque so old entries age out cheaply.
+        self._fatal_error_ts: dict[str, deque] = {}
+        # Dedicated MODULE_ERROR queue — SEPARATE from the orchestrator's
+        # "guardian" liveness queue (D-SPEC-151: keeping flooding broadcasts off
+        # that queue protects MODULE_HEARTBEAT). The Rust broker forwards
+        # MODULE_ERROR to this process because guardian_hcl.py declares it in
+        # build_bus_and_client(broadcast_topics=[...]); the in-process dispatcher
+        # routes it here by the types= filter.
+        self._module_error_queue = None
+        if self._module_error_journal_render or self._taxonomy_disable_gate:
+            try:
+                self._module_error_queue = bus.subscribe(
+                    "guardian_module_errors", types=[MODULE_ERROR])
+            except Exception as e:  # noqa: BLE001 — never crash supervision boot
+                logger.warning(
+                    "[Supervisor] MODULE_ERROR subscription failed: %s — "
+                    "taxonomy journal/disable gate inactive this boot", e)
+
     # ── D5 restart-trigger emission ──────────────────────────────────────────
 
     def publish_module_restart_request(
@@ -151,6 +199,82 @@ class Supervisor:
             "[Supervisor] published MODULE_RESTART_REQUEST(name=%s, reason=%s)",
             name, reason,
         )
+
+    # ── RFP §7.F — structured-error taxonomy consumer ────────────────────────
+
+    def _process_module_errors(self) -> None:
+        """Drain the dedicated MODULE_ERROR queue (RFP §7.F).
+
+          (b) JOURNAL CASCADE — render EVERY ModuleError to the kernel journal as
+              a STABLE greppable tag `[ERR][<module>][<code>][<severity>] <msg>`
+              so an operator greps ONE tag instead of scanning 1000 lines.
+          (c) DISABLE GATE — a FATAL ModuleError with an UNRECOVERABLE error_code
+              disables the module on the FIRST occurrence (restart is futile); a
+              FATAL with a recoverable code disables once it crosses
+              `_fatal_disable_threshold` within the orchestrator restart window
+              (the crash-loop case). A resource condition is NOT a ModuleError
+              (it is a §7.B THROTTLE) so it can never reach this gate — DISABLE is
+              taxonomy-driven, never rss-fault-driven (INV-SUP-1/8).
+
+        This is ADDITIVE to the §7.A restart-window escalation (the infra-fault
+        backstop for crashes that emit no ModuleError, e.g. an external SIGKILL or
+        a native SEGV) — both gates coexist.
+        """
+        q = self._module_error_queue
+        if q is None:
+            return
+        window = float(getattr(self.orchestrator, "_restart_window_seconds", 60.0))
+        drained = 0
+        while drained < _MODULE_ERROR_DRAIN_CAP_PER_TICK:
+            try:
+                msg = q.get_nowait()
+            except _queue.Empty:
+                break
+            except Exception:  # noqa: BLE001 — a bad msg must never break the tick
+                break
+            drained += 1
+            payload = msg.get("payload") if isinstance(msg, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            module = str(payload.get("module_name") or payload.get("module") or "unknown")
+            code = str(payload.get("error_code") or "UNKNOWN")
+            severity = str(payload.get("severity") or "ERROR")
+            summary = str(payload.get("message") or "")
+
+            # (b) greppable journal tag — one stable shape per ModuleError.
+            if self._module_error_journal_render:
+                logger.error("[ERR][%s][%s][%s] %s", module, code, severity, summary)
+
+            # (c) DISABLE gate — FATAL only.
+            if not self._taxonomy_disable_gate or severity != Severity.FATAL.value:
+                continue
+            now = time.time()
+            buf = self._fatal_error_ts.get(module)
+            if buf is None:
+                buf = deque()
+                self._fatal_error_ts[module] = buf
+            buf.append(now)
+            while buf and (now - buf[0]) > window:
+                buf.popleft()
+
+            unrecoverable = is_unrecoverable(code)
+            if unrecoverable or len(buf) >= self._fatal_disable_threshold:
+                reason = ("unrecoverable_fatal_module_error" if unrecoverable
+                          else "repeated_fatal_module_error")
+                logger.critical(
+                    "[Supervisor] DISABLE gate fired for '%s' — %s "
+                    "(error_code=%s, fatal_count=%d/%d in %.0fs window)",
+                    module, reason, code, len(buf),
+                    self._fatal_disable_threshold, window)
+                try:
+                    self.orchestrator.disable(
+                        module, reason, error_code=code,
+                        severity=severity, count=len(buf))
+                except Exception as e:  # noqa: BLE001 — disable failure must not break the tick
+                    logger.error(
+                        "[Supervisor] disable('%s') failed: %s", module, e,
+                        exc_info=True)
+                buf.clear()  # reset so auto-re-enable (§7.C) gets a clean window
 
     # ── Supervisory loop (Phase 11 §11.I.1, monitor_tick) ────────────────────
 
@@ -191,6 +315,11 @@ class Supervisor:
         # 11E.b.2 splits BUS_PEER_DIED + MODULE_HEARTBEAT to a supervisor-side
         # subscriber + emits state via bus to the orchestrator.
         orch._process_guardian_messages()
+
+        # RFP §7.F — drain the dedicated MODULE_ERROR queue: render greppable
+        # journal tags + run the taxonomy DISABLE gate. Separate queue from the
+        # liveness drain above, so a ModuleError flood never crowds heartbeats.
+        self._process_module_errors()
 
         now = time.time()
         # SPEC §11.I.2 (D-SPEC-141) — the per-module SHM slot

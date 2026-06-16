@@ -220,6 +220,14 @@ MODULE_ERROR = "MODULE_ERROR"
 # to 10/s when sustained rate exceeds 100/s (per RFP §3H.3); this event signals
 # the flood-state to observers so they can render degraded-mode UX.
 MODULE_ERROR_FLOOD = "MODULE_ERROR_FLOOD"
+# RFP_supervision_lifecycle §7.F (taxonomy-driven DISABLE gate) — CRITICAL line
+# emitted by the guardian when a module is disabled because it crossed the
+# FATAL-ModuleError threshold (or hit an unrecoverable error_code). Payload:
+# {module, error_code, severity, count, reason}. Rendered to the kernel journal
+# as MODULE_CRITICAL_DOWN{...} so an operator greps ONE tag to see what died and
+# why (vs. scanning 1000 lines). Distinct from MODULE_CRASHED (lifecycle event):
+# this is the human-facing "this module is DOWN and will not auto-recover" signal.
+MODULE_CRITICAL_DOWN = "MODULE_CRITICAL_DOWN"
 # Probe contract per §11.I.2/§11.I.3 — bus-RPC, not state propagation.
 # titan_hcl polls per-module SHM slots at 1Hz; on state=BOOTED it dispatches
 # MODULE_PROBE_REQUEST(name, probe_id) to the worker (P0, dst=worker). Worker
