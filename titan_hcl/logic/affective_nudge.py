@@ -405,26 +405,6 @@ def read_engagement_delta(db_path: str,
         return fallback
 
 
-def read_reuse_total(db_path: str) -> Optional[int]:
-    """Return `SUM(times_reused)` over `inner_memory.db::meta_wisdom` (the
-    chain_reuse running total), or None on a missing db / error. The caller diffs
-    successive totals into a per-tick reuse delta. Read-only, soft."""
-    import sqlite3
-    if not db_path or not os.path.exists(db_path):
-        return None
-    try:
-        con = sqlite3.connect(db_path, timeout=2.0)
-        try:
-            row = con.execute(
-                "SELECT COALESCE(SUM(times_reused), 0) FROM meta_wisdom").fetchone()
-            return int((row or [0])[0] or 0)
-        finally:
-            con.close()
-    except Exception as e:
-        logger.debug("[affective_nudge] read_reuse_total failed: %s", e)
-        return None
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE B — the emergent AffectiveNudgeNet (D2)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -651,7 +631,28 @@ class AffectiveNudgeRuntime:
         self._max_pending = int(max_pending)
         self._lock = threading.Lock()
         self._pending: List[_PendingNudge] = []
+        self._chat_reuse_pending = 0   # §7.C chain_reuse: outer competence-reuse
         self.net = AffectiveNudgeNet.load_npz(net_path, hidden=cfg.net_hidden)
+
+    # ── chain_reuse (outer competence-reuse) accumulator ──────────────────────
+    def note_chat_reuse(self, n: int = 1) -> None:
+        """Record `n` outer competence-reuse events — each agno `skill_delegate`
+        decision (a learned skill matched → reuse, no re-run). Called from the
+        synthesis dispatch loop's TURN_REASONING_RECORD handler (chat-active,
+        unlike the sparse inner meta_wisdom reuse). Thread-safe; the drain loop
+        drains the accumulated count, keeping all observe_* on the ONE drain
+        thread (single-consumer EMA-file contract)."""
+        if n <= 0:
+            return
+        with self._lock:
+            self._chat_reuse_pending += int(n)
+
+    def drain_chat_reuse(self) -> int:
+        """Return + reset the accumulated outer-reuse count (drain-loop consumer)."""
+        with self._lock:
+            c = self._chat_reuse_pending
+            self._chat_reuse_pending = 0
+        return int(c)
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _read_emot_state(self) -> Optional[dict]:

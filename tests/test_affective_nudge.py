@@ -604,7 +604,7 @@ def test_skill_score_path_byte_identical_after_refactor(tmp_path):
 # ── §7.C Tier 2: cross-process source readers (events_teacher / inner_memory) ──
 
 from titan_hcl.logic.affective_nudge import (   # noqa: E402
-    read_engagement_delta, read_reuse_total,
+    read_engagement_delta,
 )
 
 
@@ -646,18 +646,19 @@ def test_read_engagement_delta_missing_db_soft(tmp_path):
     assert read_engagement_delta(str(tmp_path / "nope.db"), None) == (0, 0.0)
 
 
-def test_read_reuse_total_sums_and_missing(tmp_path):
-    import sqlite3
-    p = str(tmp_path / "inner_memory.db")
-    c = sqlite3.connect(p)
-    c.execute("CREATE TABLE meta_wisdom (id INTEGER PRIMARY KEY, "
-              "times_reused INTEGER DEFAULT 0)")
-    c.execute("INSERT INTO meta_wisdom (times_reused) VALUES (3)")
-    c.execute("INSERT INTO meta_wisdom (times_reused) VALUES (5)")
-    c.commit(); c.close()
-    assert read_reuse_total(p) == 8
-    # empty table → 0 (COALESCE), missing db → None
-    assert read_reuse_total(str(tmp_path / "nope.db")) is None
+def test_chat_reuse_counter_drains(tmp_path):
+    # chain_reuse (repointed to outer agno reuse): note_chat_reuse accumulates
+    # skill_delegate turns; the drain loop drains the count (+resets) → one
+    # chain_reuse event per drain tick. Thread-safe single-consumer.
+    rt = _runtime(tmp_path, "reuse")
+    assert rt.drain_chat_reuse() == 0          # nothing yet
+    rt.note_chat_reuse()                        # one skill_delegate turn
+    rt.note_chat_reuse(2)                        # two more (n arg)
+    assert rt.drain_chat_reuse() == 3           # accumulated
+    assert rt.drain_chat_reuse() == 0           # reset after drain
+    rt.note_chat_reuse(0)                        # no-op (guard)
+    rt.note_chat_reuse(-5)                       # no-op (guard)
+    assert rt.drain_chat_reuse() == 0
 
 
 def test_tier2_signals_event_nudge_path(tmp_path):

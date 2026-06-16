@@ -740,10 +740,12 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
     Affective Grounding Loop §7.C (2026-06-16): this same tick ALSO runs the four
     broadened EVENT taps on EVERY iteration — NOT gated on a skill-score drain,
     since these signals flow independently of the dream-gated skill-score source:
-    sol_receipt + maker_bond (balance-SHM delta + feePayer lookup) and x_engagement
-    + chain_reuse (read-only sqlite polls of `data_dir`'s events_teacher.db /
-    inner_memory.db). `solana_oracle` (reused SolanaRpcOracle) + `maker_pubkey` are
-    the maker_bond feePayer attribution; all optional/soft (never affect the spine).
+    sol_receipt + maker_bond (balance-SHM delta + feePayer lookup), x_engagement
+    (read-only poll of `data_dir`'s events_teacher.db), and chain_reuse (drains the
+    runtime's outer-competence-reuse counter, fed by the TURN_REASONING_RECORD
+    handler on each agno `skill_delegate` turn — chat-active). `solana_oracle`
+    (reused SolanaRpcOracle) + `maker_pubkey` are the maker_bond feePayer
+    attribution; all optional/soft (never affect the spine).
 
     NO cpu_load backoff (removed 2026-06-10): the drain is LIGHTWEIGHT — bounded to
     DEFAULT_DRAIN_LIMIT upserts/tick, on this dedicated daemon thread, off the
@@ -790,7 +792,6 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
     _last_balance: Optional[float] = None       # §7.C sol_receipt: last balance_sol
     _SOL_DELTA_EPS = 1e-7                        # skip sub-100-lamport float noise
     _last_engagement_ts: Optional[float] = None  # §7.C x_engagement: snapshot cursor
-    _last_reuse_total: Optional[int] = None      # §7.C chain_reuse: SUM(times_reused)
     while not stop_event.is_set():
         try:
             summary = skill_store.drain_score_events()
@@ -835,7 +836,7 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                     and send_queue is not None and shm_bank is not None):
                 try:
                     from titan_hcl.logic.affective_nudge import (
-                        SIGNAL_MODULATOR, read_engagement_delta, read_reuse_total)
+                        SIGNAL_MODULATOR, read_engagement_delta)
                     _ns = shm_bank.read_network_state()
                     _bal = (float(_ns["balance_sol"])
                             if isinstance(_ns, dict)
@@ -882,23 +883,22 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                                     intrinsic_positive=True),
                                 SIGNAL_MODULATOR["x_engagement"])
 
-                    # chain_reuse — SUM(times_reused) delta (inner_memory.db, read-
-                    # only). First tick sets the baseline (no fire); a reuse is an
-                    # intrinsically-positive competence-confirmation event.
-                    if data_dir:
-                        _reuse_total = read_reuse_total(
-                            os.path.join(data_dir, "inner_memory.db"))
-                        if _reuse_total is not None:
-                            if (_last_reuse_total is not None
-                                    and _reuse_total > _last_reuse_total):
-                                _emit_affective_nudge(
-                                    "chain_reuse",
-                                    affective_runtime.observe_signal(
-                                        "chain_reuse",
-                                        _reuse_total - _last_reuse_total,
-                                        time.time(), intrinsic_positive=True),
-                                    SIGNAL_MODULATOR["chain_reuse"])
-                            _last_reuse_total = _reuse_total
+                    # chain_reuse — OUTER competence-reuse: each agno `skill_delegate`
+                    # decision (a learned skill matched → reuse, no re-run) is noted
+                    # by the TURN_REASONING_RECORD handler into the runtime; drained
+                    # here. This is CHAT-ACTIVE (fires whenever Titan reuses a learned
+                    # skill on a turn) — repointed 2026-06-16 from the inner
+                    # meta_wisdom.times_reused, which only moves on autonomous
+                    # MetaReasoningEngine ticks (~hourly) → too sparse to be a felt
+                    # signal. Intrinsically-positive competence-confirmation event.
+                    _reuse_n = affective_runtime.drain_chat_reuse()
+                    if _reuse_n > 0:
+                        _emit_affective_nudge(
+                            "chain_reuse",
+                            affective_runtime.observe_signal(
+                                "chain_reuse", _reuse_n, time.time(),
+                                intrinsic_positive=True),
+                            SIGNAL_MODULATOR["chain_reuse"])
                 except Exception as e:
                     logger.debug(
                         "[synthesis_worker] affective event-tap tick failed: %s", e)
@@ -2737,8 +2737,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # the reused SolanaRpcOracle (hoisted; None if oracle-init failed → the
         # tap soft-skips maker_bond while sol_receipt still fires).
         _maker_pubkey_str = str((config or {}).get("maker_pubkey", "") or "")
-        # §7.C x_engagement/chain_reuse poll the sibling sqlite stores under the
-        # same data dir as synthesis.duckdb (events_teacher.db + inner_memory.db).
+        # §7.C x_engagement polls the sibling events_teacher.db under the same
+        # data dir as synthesis.duckdb (chain_reuse is event-driven, not polled).
         _affective_data_dir = os.path.dirname(db_path)
         _skill_drain_thread = threading.Thread(
             target=_skill_score_drain_loop,
@@ -3913,6 +3913,15 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                 if _act_idx is not None else "")
                     except Exception:
                         _act = ""
+                    # Affective Grounding Loop §7.C — chain_reuse: a `skill_delegate`
+                    # turn is an OUTER competence-reuse (a learned skill matched →
+                    # reuse, no re-run). Note it on the runtime; the drain loop folds
+                    # the accumulated count into a chain_reuse nudge (chat-active).
+                    if _act == "skill_delegate" and _affective_runtime is not None:
+                        try:
+                            _affective_runtime.note_chat_reuse()
+                        except Exception:
+                            pass
                     if _rid and reasoning_store is not None:
                         reasoning_store.record_turn(
                             reasoning_id=_rid,
