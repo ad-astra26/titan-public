@@ -298,6 +298,12 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         # predictive-defer = Phase A behavior, so default-on is safe).
         self._boot_throttle_enabled = bool(cfg.get("boot_throttle_enabled", True))
         self._boot_throttle_cgroup = bool(cfg.get("boot_throttle_cgroup", True))
+        # RFP_supervision_lifecycle §7.B/§7.F (INV-SUP-1/2/8) — a RESOURCE
+        # condition (RssAnon over rss_limit) must THROTTLE/recheck, NEVER drive a
+        # kill→respawn cascade; only genuine critical faults (dead pid, hung
+        # heartbeat, FATAL ModuleError) restart. Default-ON (the smart behavior);
+        # `=false` kill-switch restores the legacy rss→restart for emergency revert.
+        self._rss_over_throttles = bool(cfg.get("rss_over_limit_throttles_not_restarts", True))
         # Phase 9 Chunk 9L (RFP §3F.2.6) — staggered boot to eliminate
         # cold-boot CPU contention. ~40 autostart modules booting in parallel
         # on a 4-core VPS oversubscribed CPU 5-6×, causing cascade
