@@ -383,12 +383,19 @@ class NeuromodulatorSystem:
 
         Safety:
         - GABA is ALWAYS excluded (hard gate — bliss-lock prevention)
-        - Developmental gate: no nudge before age 0.1 (system must stabilize first)
         - Max delta clamped to [-max_delta, +max_delta] per modulator per call
         - Autoreceptor/homeostatic/allostatic layers are NOT modified
+
+        NOTE (2026-06-16, Maker-directed): the old developmental-age gate
+        (`if developmental_age < 0.1: return`) is REMOVED. It read the maturity
+        from `read_pi_heartbeat()` — which does NOT carry `developmental_age` (only
+        phase/pulse_count/age_seconds/seq) → it was ALWAYS 0.0 → it silently
+        suppressed EVERY external nudge fleet-wide, including the entire Affective
+        Grounding Loop (A+B+C), so events never moved emot. Runaway is regulated by
+        the native metabolic→sleep→neuromod-reset homeostat (INV-AFF-NO-BACKSTOP) +
+        the per-call clamp, not this gate. `developmental_age` is kept as an accepted
+        (now-unused) kwarg for caller back-compat.
         """
-        if developmental_age < 0.1:
-            return
         if not nudge_map:
             return
 
