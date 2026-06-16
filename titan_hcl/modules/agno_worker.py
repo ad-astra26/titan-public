@@ -1525,6 +1525,8 @@ def agno_worker_main(recv_queue, send_queue, name: str,
 
         from titan_hcl.synthesis.bridge_recall import BridgeRecall
         from titan_hcl.synthesis.recall_reader import build_recall_reader
+        from titan_hcl.synthesis.snapshot_procedural_reader import (
+            SnapshotProceduralReader)
         from titan_hcl.synthesis.spine_snapshot_reader import SnapshotSpineReader
         from titan_hcl.synthesis.synthesis_vector_index import FaissReader
         from titan_hcl.synthesis.tx_index_builder import TxContentDeref
@@ -1536,12 +1538,21 @@ def agno_worker_main(recv_queue, send_queue, name: str,
         # Without it kuzu_reader=None, so BOTH concept + self recall silently fell
         # back in chat. Self-recall = the "chat resolves from the SELF node" goal.
         _snapshot_spine_reader = SnapshotSpineReader(_data_dir_ag)
+        # Break F (RFP_synthesis_reuse_and_routing_revival) — the agno-side
+        # procedural reader. WITHOUT it engine_recall(granularity="procedural")
+        # returned None unconditionally (procedural=none in the boot log) → the
+        # match_procedural_skill tool always answered "no match" AND the OML
+        # skill_utility/skill_matched features never lit → skill_delegate=0
+        # fleet-wide. Snapshot+faiss-backed, canonical scoring (G18-pure, no lock).
+        _snapshot_procedural_reader = SnapshotProceduralReader(
+            _data_dir_ag, _agno_embedder)
         worker_plugin.engine_recall = build_recall_reader(
             data_dir=_data_dir_ag,
             bridge_recall=BridgeRecall(),
             embedder=_agno_embedder,
             faiss_reader=_faiss_reader,
             kuzu_reader=_snapshot_spine_reader,
+            procedural_reader=_snapshot_procedural_reader,
         )
         worker_plugin.synthesis_tx_deref = TxContentDeref(data_dir=_data_dir_ag)
         if not hasattr(worker_plugin, "_last_surfaced_items"):

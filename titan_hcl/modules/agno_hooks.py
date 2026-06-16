@@ -265,6 +265,14 @@ def _oml_decide_debug_capture(policy, vec, action, prompt_text, cm_score, cm_act
         pass
 
 
+# Break A (RFP_synthesis_reuse_and_routing_revival) — the delegate-gate relevance
+# floor for lighting the OML skill features in the PreHook (titan_params.toml
+# [synthesis.skill] match_floor; INV-Syn-20). A procedural match below this is not
+# delegatable, so neither skill_utility nor skill_matched is set (skill lane stays
+# dormant for that turn) — keeping grounded_route + the OML ladder consistent.
+_SKILL_DELEGATE_MATCH_FLOOR: float = 0.65
+
+
 def _outer_policy_decide(plugin, readout, requires_tool, prompt_text, prompt_vec=None):
     """Read the SHM-published `OuterMetaPolicy`, build the feature vector from
     locally-available signals, and EXPLOIT (argmax) → `(MODE, features_list,
@@ -338,6 +346,11 @@ def _outer_policy_decide(plugin, readout, requires_tool, prompt_text, prompt_vec
     feats = OuterFeatures(
         recall_top_cosine=float(getattr(readout, "recall_score", 0.0) or 0.0),
         skill_utility=float(getattr(readout, "skill_utility", 0.0) or 0.0),
+        # Break A — was never wired (default False) so feature idx 4 read 0 on
+        # 344/344 live decides → the structural ladder's skill_delegate trigger
+        # (skill_matched ∧ skill_util≥floor) never fired. Now lit by the PreHook
+        # procedural match.
+        skill_matched=bool(getattr(readout, "skill_matched", False)),
         engram_ground=float(getattr(readout, "engram_ground", 0.0) or 0.0),
         requires_tool=bool(requires_tool),
         has_code_signal=_has_code,
@@ -1768,10 +1781,43 @@ def create_pre_hook(plugin):
                     logger.info("[PreHook] DK.4 concept covers ask: '%s' "
                                 "(ground=%.2f) → strong substrate signal",
                                 _dk4_name[:48], _dk4_ground)
+                # Break A (RFP_synthesis_reuse_and_routing_revival) — the skill-reuse
+                # lane was left "dormant" (skill_utility hardcoded None) so the
+                # grounded_route skill lane + the OML skill_utility/skill_matched
+                # features (idx 3/4) never lit → skill_delegate=0 fleet-wide. Run the
+                # cross-process procedural match (engine_recall granularity, served by
+                # the snapshot reader wired in Break F) and set BOTH features together
+                # ONLY when a delegate-gated skill matches (match_score ≥ match_floor,
+                # INV-Syn-20) — keeping grounded_route + the OML structural ladder
+                # consistent. Soft-fail = dormant (parity with the prior behavior).
+                _skill_util = None
+                _skill_matched = False
+                try:
+                    _sk_rc = getattr(plugin, "engine_recall", None)
+                    if _sk_rc is not None and prompt_text:
+                        _sk_res = await asyncio.to_thread(
+                            lambda: _sk_rc.recall(
+                                prompt_text, granularity="procedural", k=1))
+                        if _sk_res:
+                            _sk_top = _sk_res[0]
+                            _sk_match = float(getattr(_sk_top, "score", 0.0) or 0.0)
+                            if _sk_match >= _SKILL_DELEGATE_MATCH_FLOOR:
+                                _skill_util = float(
+                                    getattr(_sk_top, "importance", 0.0) or 0.0)
+                                _skill_matched = True
+                                logger.info(
+                                    "[PreHook] procedural skill matched: '%s' "
+                                    "(match=%.2f util=%.2f) → skill lane live",
+                                    str(getattr(_sk_top, "summary", ""))[:48],
+                                    _sk_match, _skill_util)
+                except Exception as _sk_err:
+                    logger.debug("[PreHook] procedural skill match skipped: %s",
+                                 _sk_err)
                 _readout = GroundedReadout(
                     recall_score=_recall_input,
                     engram_ground=_dk4_ground,  # DK.4 — curated concept substrate
-                    skill_utility=None,        # B1 (skill-lane dormant until then)
+                    skill_utility=_skill_util,   # Break A — live procedural match
+                    skill_matched=_skill_matched,
                     requires_tool=_requires_tool,
                     is_informational=is_informational_query(prompt_text),
                     can_afford_research=_can_afford_research(plugin),  # §7.0b.2 part 4

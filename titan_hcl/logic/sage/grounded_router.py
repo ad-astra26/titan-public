@@ -71,6 +71,12 @@ class GroundedReadout:
     recall_score: float = 0.0
     engram_ground: float = 0.0
     skill_utility: Optional[float] = None
+    # Break A (RFP_synthesis_reuse_and_routing_revival) — {0,1} a delegate-gated
+    # procedural skill matched the prompt (match_score ≥ match_floor, INV-Syn-20).
+    # Feeds the OML `skill_matched` feature (idx 4) the structural ladder reads;
+    # was never populated → skill_delegate unreachable. Set together with
+    # skill_utility by the PreHook procedural lookup.
+    skill_matched: bool = False
     requires_tool: bool = False
     is_informational: bool = False
     can_afford_research: bool = True

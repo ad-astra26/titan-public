@@ -5405,10 +5405,34 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
     # (msl.py:2256) — does NOT touch MSLStatePublisher / msl_state.bin or any
     # inner behavior; publish failures never break the tick. G21 single-writer.
     _msl_for_ctx = state_refs.get("msl")
-    if _msl_for_ctx is not None:
+    # Break E (RFP_synthesis_reuse_and_routing_revival) — the outer_msl_context_state
+    # slot was ABSENT from /dev/shm/<id>/ (V+C) → read_msl_context() returned None →
+    # the 20-D MSL block (the LARGEST OML input) read all-zeros on 344/344 live
+    # decides. The publish code (added 2026-06-11) IS deployed, so the write is being
+    # skipped at runtime. Diagnose the exact skip-reason ONCE per cause (msl-None /
+    # last_output-None / no-distilled_context / write-error) so the live boot log
+    # tells us where to fix — do NOT silently swallow it.
+    def _msl_ctx_diag(reason: str) -> None:
+        _seen = state_refs.setdefault("_msl_ctx_diag_seen", set())
+        if reason not in _seen:
+            _seen.add(reason)
+            logger.warning(
+                "[CognitiveWorker] MSL context[20] slot NOT published — %s "
+                "(agno DECIDE reads zeros for the 20-D MSL block until fixed)",
+                reason)
+    if _msl_for_ctx is None:
+        _msl_ctx_diag("state_refs['msl'] is None")
+    else:
         try:
             _lo = getattr(_msl_for_ctx, "_last_output", None)
+            if _lo is None:
+                _msl_ctx_diag("msl._last_output is None (tick returned early — "
+                              "buffer not ready / tick not run this epoch)")
+            elif not isinstance(_lo, dict):
+                _msl_ctx_diag(f"msl._last_output is {type(_lo).__name__}, not dict")
             _ctx = _lo.get("distilled_context") if isinstance(_lo, dict) else None
+            if _lo is not None and isinstance(_lo, dict) and _ctx is None:
+                _msl_ctx_diag("_last_output lacks 'distilled_context' key")
             if _ctx is not None:
                 from titan_hcl.synthesis.outer_meta_policy import (
                     OUTER_MSL_CONTEXT_STATE_SPEC, msl_context_to_fixed)
@@ -5426,9 +5450,10 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                         "DECIDE path, O(1) read; G18/G20 single-writer)")
                 _ctx_writer.write(msl_context_to_fixed(_ctx))
         except Exception as _msl_ctx_err:
+            _msl_ctx_diag(f"publish raised: {_msl_ctx_err!r}")
             logger.debug(
                 "[CognitiveWorker] msl_context publish soft-fail: %s",
-                _msl_ctx_err)
+                _msl_ctx_err, exc_info=True)
     # D-SPEC-85 v1.25.0 — consciousness_age slot publish (lifetime
     # self-observation tick counter from consciousness.db). G21
     # single-writer = cognitive_worker; surfaces Titan's "main age" to

@@ -1127,11 +1127,16 @@ class ProceduralSkillStore:
                 "COALESCE(MAX(CASE WHEN c.polarity='positive' THEN c.time_cost END), 0.0) AS best_tc, "
                 "COALESCE(SUM(c.success_count), 0) AS succ, "
                 "COALESCE(SUM(c.failure_count), 0) AS fail, "
-                "COUNT(c.task_shape) AS n_cells "
+                "COUNT(c.task_shape) AS n_cells, "
+                # Break F (RFP_synthesis_reuse_and_routing_revival) — the FAISS row
+                # id so the cross-process SnapshotProceduralReader (agno side) can
+                # join skills_vectors.faiss hits back to skill rows.
+                "s.embedding_id "
                 "FROM procedural_skills s "
                 "LEFT JOIN skill_cells c ON c.skill_id = s.skill_id "
                 "GROUP BY s.skill_id, s.oracle_id, s.goal_class, s.name, "
-                "s.nl_description, s.promoted, s.verified_at, s.created_at "
+                "s.nl_description, s.promoted, s.verified_at, s.created_at, "
+                "s.embedding_id "
                 "ORDER BY best_tc DESC, s.created_at DESC"
             ).fetchall()
             counters = (
@@ -1150,6 +1155,8 @@ class ProceduralSkillStore:
                 "success_count": int(r[8] or 0),
                 "failure_count": int(r[9] or 0),
                 "task_shapes": int(r[10] or 0),
+                # Break F — FAISS row id for the agno-side snapshot reader (-1 = unembedded).
+                "embedding_id": int(r[11]) if r[11] is not None else -1,
             }
             for r in rows
         ]

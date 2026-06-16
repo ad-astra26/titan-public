@@ -3304,10 +3304,14 @@ miner_max_seq_len          = 8      # sliding-window upper bound
 llm_judge_per_pass_cap     = 200    # INV-Syn-21 per-dream-pass scoring cap
 llm_judge_timeout_s        = 30.0   # INV-Syn-21 per-TX LLM timeout
 soft_retire_floor          = -0.5   # below → META_SKILL_SOFT_RETIRED log; row stays per Q4
-# Per-Titan cascade flag (T3 canary=true, T2/T1=false until soak confirms).
-# Override via ~/.titan/microkernel_<id>.toml [synthesis.skill]. When false,
-# match_procedural_skill always returns null (dry-run).
-delegate_live              = false  # default OFF for safety; flip per-Titan
+# Per-Titan cascade flag. Override via ~/.titan/microkernel_<id>.toml
+# [synthesis.skill]. When false, match_procedural_skill always returns null
+# (dry-run). DEFAULTS ON fleet-wide (feedback_all_flags_default_on): a forgotten
+# OFF flag silently disabled the entire skill-reuse delegate path — the agno tool
+# returned "no match" unconditionally regardless of a real match. The gate stays
+# as a `=false` kill-switch; the live match is delegate-gated by INV-Syn-20
+# (utility_floor + match_floor + verified_at) so flipping ON is safe.
+delegate_live              = true   # ON (kill-switch only); RFP_synthesis_reuse_and_routing_revival §B
 
 [synthesis.consolidation]
 # RFP_synthesis_spine_reads_real_data §7.D — dream-boundary concept synthesis.

@@ -106,6 +106,12 @@ _DEFAULTS = {
     #   signal) route `direct` where grounded sends them `research`. Same boundary ⇒ the
     #   seed + idle pass agree with the symbolic router on "does he actually know?".
     "explore_skill_floor": 0.3,        # skill_utility ≥ this + matched ⇒ reuse (→ skill_delegate)
+    # Break D (RFP_synthesis_reuse_and_routing_revival) — anti-collapse. Each idle
+    # tick re-teaches the balanced SYNTHETIC lane set (the cold-start lanes) this
+    # many passes, UNCONDITIONALLY, so feature-discrimination is maintained against
+    # the dense quality-judge `direct` stream on a restored (never-re-seeded) policy.
+    # 0 disables (pure real-context teaching — the old, collapse-preserving behavior).
+    "structural_synthetic_passes": 3,
     "explore_research_chi_floor": 0.4, # chi ≥ this ⇒ research affordable; else honest IDK
     "explore_request_enabled": False,  # active idle problem-gen (LLM-judge layer; Phase 2 consumer)
     "macro_min_wins": 5,               # verified wins of one (goal_class,action) → distil
@@ -1064,15 +1070,37 @@ def _structural_explore(cfg, store, policy, shm_writer, life, name) -> None:
     LIVE turns (unknown outcomes, per-action-baseline `learn`); idle consolidates
     toward the verifiable oracle, live verdicts refine BEYOND it. This is what
     closes G5/GB8."""
-    contexts = store.distinct_recent_contexts(int(cfg["explore_structural_batch"]))
-    if not contexts:
-        return
     affordable = _research_affordable(life, cfg)
     adv = float(cfg["explore_structural_advantage"])
     know_thr = float(cfg["explore_know_threshold"])
     skill_floor = float(cfg["explore_skill_floor"])
     taught = 0
-    for features, _goal_class in contexts:
+
+    # Break D (RFP_synthesis_reuse_and_routing_revival) — anti-collapse maintenance.
+    # The real-context teaching below keys on `distinct_recent_contexts`, which on a
+    # collapsed Titan are ALL direct-shaped (high recall; skill/tool/MSL features 0)
+    # → structural_target returns `direct` for every one → the idle pass REINFORCES
+    # the collapse instead of breaking it (verified live: T1 routed 344/344 direct).
+    # The balanced SYNTHETIC lanes (the SAME set the cold-start seed uses) re-teach
+    # feature-discrimination EVERY tick regardless of live-traffic bias, so the dense
+    # quality-judge `direct` stream cannot monopolize a restored policy (which never
+    # re-runs the cold-start seed). Runs UNCONDITIONALLY (most important when there
+    # are no/biased recent contexts). Off the live path (INV-OML-9); cross-entropy
+    # toward the verifiable structural target (the proven-robust rule, NOT Boltzmann).
+    _syn_passes = int(cfg.get("structural_synthetic_passes", 3))
+    if _syn_passes > 0:
+        _rng = np.random.default_rng(0)   # deterministic balanced anchors
+        for _ in range(_syn_passes):
+            for _label, _overrides, _affordable in _COLD_START_LANES:
+                _vec = _synth_feature_vec(_rng, _overrides)
+                _target = structural_target_action(
+                    _vec, affordable=_affordable,
+                    know_threshold=know_thr, skill_floor=skill_floor)
+                policy.train_step(_vec, _target, advantage=adv)
+                taught += 1
+
+    contexts = store.distinct_recent_contexts(int(cfg["explore_structural_batch"]))
+    for features, _goal_class in (contexts or []):
         if len(features) != OUTER_POLICY_INPUT_DIM:
             continue
         vec = np.asarray(features, dtype=np.float32)
@@ -1084,7 +1112,9 @@ def _structural_explore(cfg, store, policy, shm_writer, life, name) -> None:
         store.save_policy_flat(policy.to_flat().tolist(),
                                policy.total_updates, policy.reward_baseline)
         _publish_weights(shm_writer, policy)
-        store.log_explore("structural", "", f"n={taught} affordable={affordable}")
+        store.log_explore(
+            "structural", "",
+            f"n={taught} synthetic_passes={_syn_passes} affordable={affordable}")
 
 
 def _maybe_distill_macro(goal_class, action, store, cfg, send_queue, name) -> None:
