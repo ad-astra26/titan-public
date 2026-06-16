@@ -251,7 +251,7 @@ class _FakePhoton:
     def __init__(self, existing=None):
         self.existing = existing
 
-    async def get_compressed_account(self, address_b58):
+    async def fetch_compressed_account(self, address_b58):
         return self.existing
 
     async def get_new_address_proof(self, address_b58, tree_b58):
@@ -276,8 +276,11 @@ def test_emit_sovereign_state_genesis_creates(tmp_path, monkeypatch):
     assert res["op"] == "create"
     assert res["tx"] == net._sig
     assert len(net.sent) == 1
-    sent_ix = net.sent[0][0][0]
-    assert bytes(sent_ix.data)[:8] == sc._VAULT_IX_CREATE_SOVEREIGN_STATE
+    ixs = net.sent[0][0]
+    # CU-limit ix is prepended (addressed create + on-chain verify > 200k CU)
+    assert len(ixs) == 2
+    assert bytes(ixs[0].data)[0] == 2, "SetComputeUnitLimit discriminator"
+    assert bytes(ixs[1].data)[:8] == sc._VAULT_IX_CREATE_SOVEREIGN_STATE
     assert net.sent[0][1] == "HIGH"
 
 
@@ -305,8 +308,9 @@ def test_emit_sovereign_state_update_consumes_existing(tmp_path, monkeypatch):
     )
     assert res["op"] == "update"
     assert res["tx"] == net._sig
-    sent_ix = net.sent[0][0][0]
-    assert bytes(sent_ix.data)[:8] == sc._VAULT_IX_UPDATE_SOVEREIGN_STATE
+    ixs = net.sent[0][0]
+    assert len(ixs) == 2 and bytes(ixs[0].data)[0] == 2  # CU-limit prepended
+    assert bytes(ixs[1].data)[:8] == sc._VAULT_IX_UPDATE_SOVEREIGN_STATE
 
 
 def test_emit_sovereign_state_requires_photon(tmp_path, monkeypatch):

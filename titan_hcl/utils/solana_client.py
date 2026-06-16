@@ -323,6 +323,23 @@ def build_compute_budget_instruction(
         return None
 
 
+def build_compute_unit_limit_instruction(units: int) -> Optional["Instruction"]:
+    """Build a ComputeBudget **SetComputeUnitLimit** instruction (raises the
+    200k-CU default cap). Required for the ZK-Vault SovereignState create/update —
+    the addressed create + on-chain Groth16 verify + InsertIntoQueues exceeds 200k
+    (devnet-measured: 200k default failed mid-InsertIntoQueues). Discriminator
+    byte 2 + u32 LE units (max 1,400,000)."""
+    if not _SOLANA_AVAILABLE:
+        return None
+    try:
+        program_id = Pubkey.from_string(COMPUTE_BUDGET_PROGRAM_ID)
+        data = bytes([2]) + int(units).to_bytes(4, byteorder="little")
+        return Instruction(program_id=program_id, accounts=[], data=data)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[SolanaClient] Failed to build compute unit limit instruction: %s", e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Vault Program — PDA Derivation & Instruction Builders
 # ---------------------------------------------------------------------------

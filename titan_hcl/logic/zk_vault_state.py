@@ -287,7 +287,7 @@ async def verify_sovereign_state(photon, address_bytes: bytes,
         from titan_hcl.utils.solana_client import decode_sovereign_state
         import base64
         address_b58 = b58encode(address_bytes).decode()
-        acct = await photon.get_compressed_account(address_b58)
+        acct = await photon.fetch_compressed_account(address_b58)
         if not acct:
             return out
         raw = acct.get("data", {})
@@ -378,6 +378,7 @@ async def emit_sovereign_state(network, *, state_root_hex: str, sovereignty_bp: 
             is_available, derive_light_v1_address,
             build_create_sovereign_state_instruction,
             build_update_sovereign_state_instruction,
+            build_compute_unit_limit_instruction,
             decode_sovereign_state, LIGHT_V1_ADDRESS_TREE,
         )
         if not is_available():
@@ -412,7 +413,7 @@ async def emit_sovereign_state(network, *, state_root_hex: str, sovereignty_bp: 
             return result
         address_b58 = b58encode(address).decode()
 
-        existing = await photon.get_compressed_account(address_b58)
+        existing = await photon.fetch_compressed_account(address_b58)
 
         if not existing:
             # ── GENESIS: addressed create with a non-inclusion proof ──
@@ -424,7 +425,8 @@ async def emit_sovereign_state(network, *, state_root_hex: str, sovereignty_bp: 
                 write_sovereign_state_status(titan_id, enabled=True, last_op="create",
                                              last_error="noninclusion_proof_unavailable")
                 return result
-            addr_root_index = int(_first(proof_val, "addressRootIndex", "address_root_index",
+            addr_root_index = int(_first(proof_val, "rootIndices", "addressRootIndices",
+                                         "addressRootIndex", "address_root_index",
                                          "rootIndex", "root_index", default=0) or 0)
             ix = build_create_sovereign_state_instruction(
                 network.pubkey, proof_bytes=proof_128,
@@ -456,7 +458,7 @@ async def emit_sovereign_state(network, *, state_root_hex: str, sovereignty_bp: 
                 write_sovereign_state_status(titan_id, enabled=True, last_op="update",
                                              last_error="inclusion_proof_unavailable")
                 return result
-            root_index = int(_first(proof_val, "rootIndex", "root_index", default=0) or 0)
+            root_index = int(_first(proof_val, "rootIndices", "rootIndex", "root_index", default=0) or 0)
             leaf_index = int(existing.get("leafIndex", existing.get("leaf_index", 0)) or 0)
             ix = build_update_sovereign_state_instruction(
                 network.pubkey, proof_bytes=proof_128, old_state=old_state,
@@ -473,7 +475,11 @@ async def emit_sovereign_state(network, *, state_root_hex: str, sovereignty_bp: 
                                          last_error=result["error"])
             return result
 
-        sig = await network.send_sovereign_transaction([ix], priority="HIGH")
+        # Addressed create + on-chain Groth16 verify + InsertIntoQueues exceeds the
+        # 200k-CU default → raise the limit (devnet-measured 2026-06-16).
+        cu_ix = build_compute_unit_limit_instruction(500_000)
+        ixs = [cu_ix, ix] if cu_ix is not None else [ix]
+        sig = await network.send_sovereign_transaction(ixs, priority="HIGH")
         if not sig:
             result["error"] = "tx_send_failed"
             write_sovereign_state_status(titan_id, enabled=True, last_op=result["op"],
