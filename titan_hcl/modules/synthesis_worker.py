@@ -723,7 +723,8 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                             affective_state_path: Optional[str] = None,
                             affective_runtime: Any = None,
                             solana_oracle: Any = None,
-                            maker_pubkey: str = "") -> None:
+                            maker_pubkey: str = "",
+                            data_dir: str = "") -> None:
     """Daemon thread — drain the `skill_score_events` queue into `skill_cells`
     off the hot path (EEL Pillar B1). Its OWN cadence (like `_tx_index_loop`) so
     a drain never delays the recompute watermark publish. All writes route through
@@ -736,11 +737,13 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
     flag-gated OFF by default. `send_queue`/`shm_bank`/`affective_*` are None when
     the loop runs without the affective tap (e.g. unit scenarios) → spine unchanged.
 
-    Affective Grounding Loop §7.C (2026-06-16): this same tick ALSO runs the
-    broadened EVENT taps (sol_receipt + maker_bond) on EVERY iteration — NOT gated
-    on a skill-score drain, since SOL movement flows independently of the
-    dream-gated skill-score source. `solana_oracle` (reused SolanaRpcOracle) +
-    `maker_pubkey` are the maker_bond feePayer attribution; both optional/soft.
+    Affective Grounding Loop §7.C (2026-06-16): this same tick ALSO runs the four
+    broadened EVENT taps on EVERY iteration — NOT gated on a skill-score drain,
+    since these signals flow independently of the dream-gated skill-score source:
+    sol_receipt + maker_bond (balance-SHM delta + feePayer lookup) and x_engagement
+    + chain_reuse (read-only sqlite polls of `data_dir`'s events_teacher.db /
+    inner_memory.db). `solana_oracle` (reused SolanaRpcOracle) + `maker_pubkey` are
+    the maker_bond feePayer attribution; all optional/soft (never affect the spine).
 
     NO cpu_load backoff (removed 2026-06-10): the drain is LIGHTWEIGHT — bounded to
     DEFAULT_DRAIN_LIMIT upserts/tick, on this dedicated daemon thread, off the
@@ -784,8 +787,10 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
             nudge.target, "net" if _net_steps >= 1 else "formula",
             nudge.rate, nudge.mu_before, nudge.n, dev_age)
 
-    _last_balance: Optional[float] = None   # §7.C sol_receipt: last seen balance_sol
-    _SOL_DELTA_EPS = 1e-7                    # skip sub-100-lamport float noise
+    _last_balance: Optional[float] = None       # §7.C sol_receipt: last balance_sol
+    _SOL_DELTA_EPS = 1e-7                        # skip sub-100-lamport float noise
+    _last_engagement_ts: Optional[float] = None  # §7.C x_engagement: snapshot cursor
+    _last_reuse_total: Optional[int] = None      # §7.C chain_reuse: SUM(times_reused)
     while not stop_event.is_set():
         try:
             summary = skill_store.drain_score_events()
@@ -819,16 +824,18 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                         logger.debug(
                             "[synthesis_worker] affective nudge tick failed: %s", e)
 
-            # Affective Grounding Loop §7.C — broadened EVENT taps (sol_receipt +
-            # maker_bond), run EVERY tick (NOT gated on a skill-score drain — SOL
-            # movement flows independently of the dream-gated skill-score source,
-            # which is why the channel was organically inert fleet-wide). Off-hot-
-            # path, flag-gated, soft-fail (never affects skill formation).
+            # Affective Grounding Loop §7.C — four broadened EVENT taps
+            # (sol_receipt + maker_bond + x_engagement + chain_reuse), run EVERY
+            # tick (NOT gated on a skill-score drain — these signals flow
+            # independently of the dream-gated skill-score source, which is why the
+            # channel was organically inert fleet-wide). Off-hot-path, flag-gated,
+            # soft-fail (never affects skill formation).
             if (affective_runtime is not None
                     and getattr(affective_runtime.cfg, "enabled", False)
                     and send_queue is not None and shm_bank is not None):
                 try:
-                    from titan_hcl.logic.affective_nudge import SIGNAL_MODULATOR
+                    from titan_hcl.logic.affective_nudge import (
+                        SIGNAL_MODULATOR, read_engagement_delta, read_reuse_total)
                     _ns = shm_bank.read_network_state()
                     _bal = (float(_ns["balance_sol"])
                             if isinstance(_ns, dict)
@@ -859,6 +866,39 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                                                 intrinsic_positive=True),
                                             SIGNAL_MODULATOR["maker_bond"])
                         _last_balance = _bal
+
+                    # x_engagement — aggregate engagement delta since last tick
+                    # (events_teacher.db, read-only; cursor established on the first
+                    # tick so no historical flood). Social attention↑ = + event.
+                    if data_dir:
+                        _eng_delta, _last_engagement_ts = read_engagement_delta(
+                            os.path.join(data_dir, "events_teacher.db"),
+                            _last_engagement_ts)
+                        if _eng_delta > 0:
+                            _emit_affective_nudge(
+                                "x_engagement",
+                                affective_runtime.observe_signal(
+                                    "x_engagement", _eng_delta, time.time(),
+                                    intrinsic_positive=True),
+                                SIGNAL_MODULATOR["x_engagement"])
+
+                    # chain_reuse — SUM(times_reused) delta (inner_memory.db, read-
+                    # only). First tick sets the baseline (no fire); a reuse is an
+                    # intrinsically-positive competence-confirmation event.
+                    if data_dir:
+                        _reuse_total = read_reuse_total(
+                            os.path.join(data_dir, "inner_memory.db"))
+                        if _reuse_total is not None:
+                            if (_last_reuse_total is not None
+                                    and _reuse_total > _last_reuse_total):
+                                _emit_affective_nudge(
+                                    "chain_reuse",
+                                    affective_runtime.observe_signal(
+                                        "chain_reuse",
+                                        _reuse_total - _last_reuse_total,
+                                        time.time(), intrinsic_positive=True),
+                                    SIGNAL_MODULATOR["chain_reuse"])
+                            _last_reuse_total = _reuse_total
                 except Exception as e:
                     logger.debug(
                         "[synthesis_worker] affective event-tap tick failed: %s", e)
@@ -2697,13 +2737,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # the reused SolanaRpcOracle (hoisted; None if oracle-init failed → the
         # tap soft-skips maker_bond while sol_receipt still fires).
         _maker_pubkey_str = str((config or {}).get("maker_pubkey", "") or "")
+        # §7.C x_engagement/chain_reuse poll the sibling sqlite stores under the
+        # same data dir as synthesis.duckdb (events_teacher.db + inner_memory.db).
+        _affective_data_dir = os.path.dirname(db_path)
         _skill_drain_thread = threading.Thread(
             target=_skill_score_drain_loop,
             args=(procedural_skill_store, stop_event, interval_s, name),
             kwargs={"send_queue": send_queue, "shm_bank": _shm_bank,
                     "affective_runtime": _affective_runtime,
                     "solana_oracle": solana_oracle,
-                    "maker_pubkey": _maker_pubkey_str},
+                    "maker_pubkey": _maker_pubkey_str,
+                    "data_dir": _affective_data_dir},
             daemon=True, name=f"synthesis-skill-drain-{name}")
         _skill_drain_thread.start()
         _aff_on = (_affective_runtime is not None

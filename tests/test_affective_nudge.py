@@ -445,3 +445,229 @@ def test_runtime_per_titan_net_divergence(tmp_path):
     probe = build_features(
         Nudge(0.05, 1.0, 5.0, 1, 0.9, 0.5, 6), {"V_blended": 0.3, "dominant_idx": 0})
     assert a.net.forward(probe) != b.net.forward(probe)     # diverged
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §7.C — broadened signals: signal_type one-hot + compute_event_nudge + the
+# generalized runtime observe_signal path. (sol_receipt + maker_bond = Tier 1.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from titan_hcl.logic.affective_nudge import (   # noqa: E402
+    SIGNAL_TYPES, SIGNAL_INDEX, N_SIGNAL_TYPES, SIGNAL_MODULATOR,
+    compute_event_nudge, _BASE_FEATURE_DIM,
+)
+
+
+def test_feature_dim_grows_by_signal_count():
+    assert FEATURE_DIM == _BASE_FEATURE_DIM + N_SIGNAL_TYPES
+    assert N_SIGNAL_TYPES == len(SIGNAL_TYPES)
+    # stable positional order — skill_score MUST stay index 0 (saved-net columns).
+    assert SIGNAL_INDEX["skill_score"] == 0
+
+
+def test_build_features_signal_one_hot_per_type():
+    n = Nudge(magnitude=0.05, target=1.0, surprise=5.0, valence=1,
+              rate=0.9, mu_before=0.5, n=4)
+    for st in SIGNAL_TYPES:
+        f = build_features(n, {"V_blended": 0.2, "dominant_idx": 1}, signal_type=st)
+        assert f.shape == (FEATURE_DIM,)
+        # exactly one signal one-hot, at the right index, in the [12:] block.
+        assert f[_BASE_FEATURE_DIM:].sum() == 1.0
+        assert f[_BASE_FEATURE_DIM + SIGNAL_INDEX[st]] == 1.0
+        # the base block is untouched by the signal one-hot.
+        assert f[4:12].sum() == 1.0          # dominant one-hot still there
+
+
+def test_build_features_unknown_signal_no_one_hot():
+    n = Nudge(0.05, 1.0, 5.0, 1, 0.9, 0.5, 4)
+    f = build_features(n, None, signal_type="not_a_signal")
+    assert f[_BASE_FEATURE_DIM:].sum() == 0.0   # no signal claimed (robust)
+
+
+def test_all_signals_map_to_DA_phase_c_v1():
+    # Maker-decided: all Phase C signals → DA in v1 (multi-modulator = C.2).
+    assert set(SIGNAL_MODULATOR.values()) == {"DA"}
+    assert SIGNAL_MODULATOR["sol_receipt"] == "DA"
+    assert SIGNAL_MODULATOR["maker_bond"] == "DA"
+
+
+def test_event_nudge_zero_delta_none(tmp_path):
+    assert compute_event_nudge(0.0, _path(tmp_path), signal_type="sol_receipt",
+                               cfg=CFG) is None
+
+
+def test_event_nudge_first_obs_seeds_then_emits(tmp_path):
+    p = _path(tmp_path)
+    # first ever → seed only (no prior → no definable surprise)
+    assert compute_event_nudge(0.05, p, signal_type="sol_receipt", cfg=CFG) is None
+    # warm past min_samples
+    compute_event_nudge(0.05, p, signal_type="sol_receipt", cfg=CFG)
+    n = compute_event_nudge(0.5, p, signal_type="sol_receipt", cfg=CFG)  # bigger receipt
+    assert n is not None and n.magnitude > 0.0
+
+
+def test_sol_receipt_symmetric_valence(tmp_path):
+    # A receipt (+Δ) → +valence (pull DA up); a spend (−Δ) → −valence.
+    p_pos = _path(tmp_path, "pos.json")
+    for _ in range(2):
+        compute_event_nudge(0.01, p_pos, signal_type="sol_receipt", cfg=CFG)
+    up = compute_event_nudge(0.5, p_pos, signal_type="sol_receipt", cfg=CFG)
+    assert up is not None and up.valence == 1 and up.target == 1.0
+
+    p_neg = _path(tmp_path, "neg.json")
+    for _ in range(2):
+        compute_event_nudge(-0.01, p_neg, signal_type="sol_receipt", cfg=CFG)
+    down = compute_event_nudge(-0.5, p_neg, signal_type="sol_receipt", cfg=CFG)
+    assert down is not None and down.valence == -1 and down.target == 0.0
+
+
+def test_maker_bond_intrinsic_positive(tmp_path):
+    # maker_bond forces + valence even though the magnitude EMA is direction-blind.
+    p = _path(tmp_path)
+    for _ in range(2):
+        compute_event_nudge(0.01, p, signal_type="maker_bond", cfg=CFG,
+                            intrinsic_positive=True)
+    n = compute_event_nudge(0.5, p, signal_type="maker_bond", cfg=CFG,
+                            intrinsic_positive=True)
+    assert n is not None and n.valence == 1
+
+
+def test_event_signal_habituation_per_signal(tmp_path):
+    # Warm the baseline at a SMALL magnitude, then fire a LARGE receipt repeatedly:
+    # the first deviates strongly (big nudge), and as μ catches up to the large
+    # magnitude the nudge shrinks → habituation emerges per-signal (no hardcoded
+    # decay). A constant-from-cold stream never deviates (μ seeds to it), so the
+    # deviation must come from a baseline shift — exactly the EMA mechanic.
+    p = _path(tmp_path)
+    for _ in range(2):
+        compute_event_nudge(0.001, p, signal_type="sol_receipt", cfg=CFG)  # small
+    mags = []
+    for _ in range(30):
+        n = compute_event_nudge(0.5, p, signal_type="sol_receipt", cfg=CFG)  # big
+        if n is not None:
+            mags.append(n.magnitude)
+    assert mags, "expected at least one nudge before habituation"
+    assert mags[-1] < mags[0]             # shrinks as μ catches up to the big size
+
+
+def test_event_signals_keep_independent_baselines(tmp_path):
+    # sol_receipt and maker_bond share ONE state file but separate _SignalBaseline
+    # keys → folding one does not move the other's surprise.
+    p = _path(tmp_path)
+    for _ in range(3):
+        compute_event_nudge(0.2, p, signal_type="sol_receipt", cfg=CFG)
+    # maker_bond still cold here → first real obs seeds, emits None
+    assert compute_event_nudge(0.2, p, signal_type="maker_bond", cfg=CFG,
+                               intrinsic_positive=True) is None
+    import json
+    state = json.loads(open(p).read())
+    assert "sol_receipt" in state and "maker_bond" in state
+    assert state["sol_receipt"]["n"] >= 3 and state["maker_bond"]["n"] == 1
+
+
+def test_runtime_observe_signal_records_pending_with_one_hot(tmp_path):
+    emot = _emot(0.1)
+    rt = AffectiveNudgeRuntime(CFGB, str(tmp_path / "s.json"),
+                               str(tmp_path / "n.npz"), emot_state_reader=emot)
+    for _ in range(2):
+        rt.observe_signal("sol_receipt", 0.01, ts=0.0)     # warm
+    got = rt.observe_signal("sol_receipt", 0.6, ts=1.0)    # real event
+    assert got is not None and got.magnitude > 0.0
+    assert len(rt._pending) >= 1
+    # the pending features carry the sol_receipt one-hot
+    feat = rt._pending[-1].features
+    assert feat[_BASE_FEATURE_DIM + SIGNAL_INDEX["sol_receipt"]] == 1.0
+
+
+def test_net_load_dim_guard_discards_incompatible(tmp_path):
+    # A pre-Phase-C 12-D net on disk must be discarded (fresh 17-D net), not crash.
+    p = str(tmp_path / "old.npz")
+    old = AffectiveNudgeNet(hidden=16, in_dim=12)   # legacy dim
+    old.train_step(np.ones((2, 12)), np.zeros(2), lr=0.05)
+    old.save_npz(p)
+    fresh = AffectiveNudgeNet.load_npz(p, hidden=16)
+    assert fresh.in_dim == FEATURE_DIM               # rebuilt at the new dim
+    assert fresh.is_trained is False                 # discarded the stale weights
+
+
+def test_skill_score_path_byte_identical_after_refactor(tmp_path):
+    # The §7.C refactor must not change skill_score behaviour: a known scenario
+    # yields the same valence/target/sign as the documented Phase-A contract.
+    p = _path(tmp_path)
+    for _ in range(2):
+        compute_skill_score_nudge(1, 1, p, cfg=CFG)     # baseline rate 0.5
+    up = compute_skill_score_nudge(10, 0, p, cfg=CFG)   # rate 1.0 > μ
+    assert up is not None and up.valence == 1 and up.target == 1.0
+    assert up.rate == pytest.approx(1.0)
+
+
+# ── §7.C Tier 2: cross-process source readers (events_teacher / inner_memory) ──
+
+from titan_hcl.logic.affective_nudge import (   # noqa: E402
+    read_engagement_delta, read_reuse_total,
+)
+
+
+def _mk_engagement_db(path, rows):
+    import sqlite3
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE engagement_snapshots (id INTEGER PRIMARY KEY, "
+              "tweet_id TEXT, delta_likes INTEGER, delta_replies INTEGER, "
+              "delta_quotes INTEGER, checked_at REAL)")
+    for tid, dl, dr, dq, ts in rows:
+        c.execute("INSERT INTO engagement_snapshots (tweet_id, delta_likes, "
+                  "delta_replies, delta_quotes, checked_at) VALUES (?,?,?,?,?)",
+                  (tid, dl, dr, dq, ts))
+    c.commit(); c.close()
+
+
+def test_read_engagement_delta_establishes_then_sums(tmp_path):
+    p = str(tmp_path / "events_teacher.db")
+    _mk_engagement_db(p, [("t1", 3, 1, 0, 100.0), ("t2", 5, 0, 2, 200.0)])
+    # first call (cursor None) → establish at MAX(checked_at), NO historical flood
+    delta, cur = read_engagement_delta(p, None)
+    assert delta == 0 and cur == 200.0
+    # a new snapshot after the cursor → its aggregate delta, cursor advances
+    import sqlite3
+    c = sqlite3.connect(p)
+    c.execute("INSERT INTO engagement_snapshots (tweet_id, delta_likes, "
+              "delta_replies, delta_quotes, checked_at) VALUES ('t3',4,2,1,300.0)")
+    c.commit(); c.close()
+    delta, cur = read_engagement_delta(p, cur)
+    assert delta == 7 and cur == 300.0
+    # no new snapshots → delta 0, cursor unchanged
+    delta, cur = read_engagement_delta(p, cur)
+    assert delta == 0 and cur == 300.0
+
+
+def test_read_engagement_delta_missing_db_soft(tmp_path):
+    # missing db → soft (0, last_cursor or 0.0); never raises
+    assert read_engagement_delta(str(tmp_path / "nope.db"), 50.0) == (0, 50.0)
+    assert read_engagement_delta(str(tmp_path / "nope.db"), None) == (0, 0.0)
+
+
+def test_read_reuse_total_sums_and_missing(tmp_path):
+    import sqlite3
+    p = str(tmp_path / "inner_memory.db")
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE meta_wisdom (id INTEGER PRIMARY KEY, "
+              "times_reused INTEGER DEFAULT 0)")
+    c.execute("INSERT INTO meta_wisdom (times_reused) VALUES (3)")
+    c.execute("INSERT INTO meta_wisdom (times_reused) VALUES (5)")
+    c.commit(); c.close()
+    assert read_reuse_total(p) == 8
+    # empty table → 0 (COALESCE), missing db → None
+    assert read_reuse_total(str(tmp_path / "nope.db")) is None
+
+
+def test_tier2_signals_event_nudge_path(tmp_path):
+    # x_engagement / chain_reuse use compute_event_nudge with intrinsic_positive →
+    # always + valence, magnitude from the per-signal EMA (same proven path).
+    for sig in ("x_engagement", "chain_reuse"):
+        p = _path(tmp_path, f"{sig}.json")
+        for _ in range(2):
+            compute_event_nudge(2.0, p, signal_type=sig, cfg=CFG,
+                                intrinsic_positive=True)
+        n = compute_event_nudge(20.0, p, signal_type=sig, cfg=CFG,
+                                intrinsic_positive=True)
+        assert n is not None and n.valence == 1 and n.target == 1.0

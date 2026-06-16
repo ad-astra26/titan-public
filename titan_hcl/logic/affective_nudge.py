@@ -363,6 +363,68 @@ def compute_event_nudge(
         valence_override=valence_override)
 
 
+# ── §7.C Tier 2 cross-process source readers (pure, read-only sqlite) ──────────
+def read_engagement_delta(db_path: str,
+                          last_cursor: Optional[float]) -> tuple:
+    """Aggregate engagement delta from `events_teacher.db::engagement_snapshots`
+    (the x_engagement source). Returns `(total_delta:int, new_cursor:float)`.
+
+    `last_cursor` is the highest `checked_at` already counted. When it is None the
+    cursor is *established* at the current MAX(checked_at) with delta 0 (so a fresh
+    boot does NOT replay all historical engagement as one giant event). Otherwise
+    sums `delta_likes+delta_replies+delta_quotes` over snapshots newer than the
+    cursor and advances it. Read-only, soft: returns `(0, last_cursor or 0.0)` on a
+    missing db / locked read / schema miss (never raises into the drain loop)."""
+    import sqlite3
+    fallback = (0, float(last_cursor or 0.0))
+    if not db_path or not os.path.exists(db_path):
+        return fallback
+    try:
+        con = sqlite3.connect(db_path, timeout=2.0)
+        try:
+            if last_cursor is None:
+                row = con.execute(
+                    "SELECT COALESCE(MAX(checked_at), 0) "
+                    "FROM engagement_snapshots").fetchone()
+                return (0, float((row or [0])[0] or 0.0))
+            rows = con.execute(
+                "SELECT delta_likes, delta_replies, delta_quotes, checked_at "
+                "FROM engagement_snapshots WHERE checked_at > ? "
+                "ORDER BY checked_at ASC LIMIT 200", (float(last_cursor),)
+            ).fetchall()
+            total = 0
+            cursor = float(last_cursor)
+            for r in rows:
+                total += int(r[0] or 0) + int(r[1] or 0) + int(r[2] or 0)
+                cursor = max(cursor, float(r[3] or 0.0))
+            return (int(total), cursor)
+        finally:
+            con.close()
+    except Exception as e:
+        logger.debug("[affective_nudge] read_engagement_delta failed: %s", e)
+        return fallback
+
+
+def read_reuse_total(db_path: str) -> Optional[int]:
+    """Return `SUM(times_reused)` over `inner_memory.db::meta_wisdom` (the
+    chain_reuse running total), or None on a missing db / error. The caller diffs
+    successive totals into a per-tick reuse delta. Read-only, soft."""
+    import sqlite3
+    if not db_path or not os.path.exists(db_path):
+        return None
+    try:
+        con = sqlite3.connect(db_path, timeout=2.0)
+        try:
+            row = con.execute(
+                "SELECT COALESCE(SUM(times_reused), 0) FROM meta_wisdom").fetchone()
+            return int((row or [0])[0] or 0)
+        finally:
+            con.close()
+    except Exception as e:
+        logger.debug("[affective_nudge] read_reuse_total failed: %s", e)
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE B — the emergent AffectiveNudgeNet (D2)
 # ─────────────────────────────────────────────────────────────────────────────
