@@ -4,8 +4,8 @@ _phase_c_constants.py — AUTO-GENERATED from titan-docs/specs/SPEC_titan_archit
 DO NOT EDIT BY HAND. Edit the TOML, then run:
     python scripts/generate_phase_c_constants.py
 
-SPEC version: 1.11.4
-Source SHA-256: 38b16cdbece1cc82d241b808248c7cf2f16e301276d19faf340fa8fcfd3d86af
+SPEC version: 1.11.5
+Source SHA-256: e7d91d67329f6c0f61091ebd1956d8e61118c27381260bef1334cef068f57334
 
 Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 `arch_map phase-c verify`.
@@ -14,8 +14,8 @@ from __future__ import annotations
 from typing import Final
 
 # ── SPEC version metadata ──────────────────────────────────────────────
-SPEC_VERSION: Final[str] = "1.11.4"
-SPEC_SOURCE_SHA256: Final[str] = "38b16cdbece1cc82d241b808248c7cf2f16e301276d19faf340fa8fcfd3d86af"
+SPEC_VERSION: Final[str] = "1.11.5"
+SPEC_SOURCE_SHA256: Final[str] = "e7d91d67329f6c0f61091ebd1956d8e61118c27381260bef1334cef068f57334"
 
 
 # ── KERNEL ────────────────────────────────────────────────────────────────
@@ -25,6 +25,8 @@ SPEC_SOURCE_SHA256: Final[str] = "38b16cdbece1cc82d241b808248c7cf2f16e301276d19f
 KERNEL_BOOT_TIMEOUT_S: Final[float] = 30.0
 # Kernel SIGTERM→SIGKILL grace window
 KERNEL_SHUTDOWN_GRACE_S: Final[float] = 10.0
+# Window the kernel keeps the bus broker ALIVE while the Python L2/L3 peers (titan_hcl orchestrator + titan_hcl_api) drain their 40-module save sequence on shutdown. Longer than KERNEL_SHUTDOWN_GRACE_S (which bounds the fast L0/L1 children) because the orchestrated drain is sequential; bounded BELOW the systemd TimeoutStopSec SIGKILL backstop. Ordering: TimeoutStopSec > KERNEL_PYTHON_DRAIN_GRACE_S > KERNEL_SHUTDOWN_GRACE_S.
+KERNEL_PYTHON_DRAIN_GRACE_S: Final[float] = 60.0
 # L0 persistence atomic-snapshot cadence
 KERNEL_SNAPSHOT_INTERVAL_S: Final[float] = 1.0
 # Circadian clock tick cadence (1 Hz logical) per SPEC §10.H
@@ -331,8 +333,10 @@ AGENCY_STATE_MAX_BYTES: Final[int] = 8192
 SOCIAL_PERCEPTION_STATE_SCHEMA_VERSION: Final[int] = 1
 # Max msgpack payload bytes for social_perception_state.bin.
 SOCIAL_PERCEPTION_STATE_MAX_BYTES: Final[int] = 2048
-# RL_STATE (recorder_state.bin) schema/bytes RETIRED with the offline-RL
-# subsystem (RFP_synthesis_decision_authority P1) — recorder_worker is gone.
+# Schema version for recorder_state.bin slot — variable msgpack {programs[], current_program_id, dream_quality, training_loss_ema, transitions, last_train_ts, ts}. Owned by recorder_worker (was rl_worker prior to v1.8.4 §4.N rename, D-SPEC-58). (Session 2.)
+RL_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for recorder_state.bin.
+RL_STATE_MAX_BYTES: Final[int] = 4096
 # Schema version for interface_advisor_state.bin slot — variable msgpack {rates: {msg_type → current_rate_in_window}, limits: dict[msg_type → limit], window_s: float, rate_limit_count: int, schema_version: int, ts: float}. Owned by interface_advisor_worker (G21 single-writer). NEW v1.8.5 §4.H (D-SPEC-59).
 INTERFACE_ADVISOR_STATE_SCHEMA_VERSION: Final[int] = 1
 # Max msgpack payload bytes for interface_advisor_state.bin. NEW v1.8.5 §4.H (D-SPEC-59).

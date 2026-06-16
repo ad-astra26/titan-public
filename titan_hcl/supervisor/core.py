@@ -62,12 +62,6 @@ logger = logging.getLogger(__name__)
 _MIN_CPU_DELTA_FOR_ALIVE: Optional[float] = None
 _MAX_STARVED_CYCLES: Optional[int] = None
 _REENABLE_COOLDOWN_S: Optional[float] = None
-# RFP_supervision_lifecycle §7.B/§7.F — after this many consecutive cycles (≈1 Hz)
-# of RssAnon over rss_limit, a THROTTLE warning escalates to a SUSTAINED line
-# (genuine memory pressure, surfaced for root-cause). It still does NOT respawn —
-# throttle beats respawn (INV-SUP-2); a real leak is a root-cause issue to surface,
-# not flap.
-_RSS_SUSTAINED_OVER_CYCLES: int = 30
 
 # Cascade guard (Phase 11 §11.I.2). Min seconds between successive
 # MODULE_RESTART_REQUESTs for the SAME module. Must comfortably exceed a
@@ -343,41 +337,11 @@ class Supervisor:
                         info.restart_timestamps.clear()
 
             # ── RSS budget (live RUNNING only) ──
-            # INV-SUP-1/2/8 (RFP §7.B/§7.F): a RESOURCE condition THROTTLES and
-            # is surfaced — it NEVER drives a kill→respawn. `rss` is RssAnon (real
-            # private memory) post the #1 enforcement fix, so an over-limit here
-            # is genuine pressure, not VmRSS mmap inflation. Respawning a worker
-            # over its real limit just loses its state and reboots into the same
-            # pressure (and feeds the load→restart→load cascade) — throttle +
-            # surface for root-cause instead. Only genuine critical faults (dead
-            # pid / hung heartbeat above; FATAL ModuleError) restart. The legacy
-            # rss→restart is behind a kill-switch (`rss_over_limit_throttles_
-            # not_restarts=false`) for emergency revert only.
             if fault_reason is None and sstate == "running" and spid > 0:
-                rss = orch._get_rss_mb(spid)   # RssAnon (real memory)
+                rss = orch._get_rss_mb(spid)
                 info.rss_mb = rss
                 if rss > info.spec.rss_limit_mb:
-                    if getattr(orch, "_rss_over_throttles", True):
-                        info.consecutive_rss_over_cycles += 1
-                        _n = info.consecutive_rss_over_cycles
-                        _sustained = _n >= _RSS_SUSTAINED_OVER_CYCLES
-                        if _n == 1 or _n % _RSS_SUSTAINED_OVER_CYCLES == 0:
-                            logger.warning(
-                                "[Supervisor] Module '%s' RssAnon %.0fMB over "
-                                "rss_limit %dMB for %d cycle(s) — THROTTLE, not "
-                                "restart (resource conditions never drive "
-                                "lifecycle; INV-SUP-1/2). %s",
-                                name, rss, info.spec.rss_limit_mb, _n,
-                                "SUSTAINED — genuine memory pressure, surfacing "
-                                "for root-cause (still no respawn)" if _sustained
-                                else "rechecking — letting it settle")
-                        # (§7.B future: apply a cgroup memory.high soft-limit here
-                        #  once Delegate=yes / leaf-cgroup layout is in place.)
-                    else:
-                        # kill-switch: legacy resource-fault→restart behavior.
-                        fault_reason = f"rss_{rss:.0f}mb"
-                else:
-                    info.consecutive_rss_over_cycles = 0   # under-limit / recovered
+                    fault_reason = f"rss_{rss:.0f}mb"
 
             if fault_reason is None:
                 continue

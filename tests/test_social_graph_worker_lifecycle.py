@@ -201,9 +201,12 @@ def test_corrupt_db_boot_recovery_from_backup(temp_data_dir):
 
 def test_plugin_py_registers_social_graph_modulespec():
     """plugin.py:_register_modules MUST register social_graph ModuleSpec."""
+    # ModuleSpec registration was refactored out of plugin.py into the central
+    # module_catalog.py — read it there (the entry_fn + name + flags all live
+    # in titan_hcl/module_catalog.py now).
     plugin_py = (
         Path(__file__).resolve().parents[1]
-        / "titan_hcl" / "core" / "plugin.py"
+        / "titan_hcl" / "module_catalog.py"
     ).read_text()
     assert 'name="social_graph"' in plugin_py, (
         "plugin.py does not register social_graph ModuleSpec — "
@@ -215,9 +218,12 @@ def test_plugin_py_registers_social_graph_modulespec():
 def test_module_spec_critical_data_writer_flag():
     """social_graph ModuleSpec must have critical_data_writer=True
     (G16 requirement — graceful SIGTERM grace + WAL checkpoint)."""
+    # ModuleSpec registration was refactored out of plugin.py into the central
+    # module_catalog.py — read it there (the entry_fn + name + flags all live
+    # in titan_hcl/module_catalog.py now).
     plugin_py = (
         Path(__file__).resolve().parents[1]
-        / "titan_hcl" / "core" / "plugin.py"
+        / "titan_hcl" / "module_catalog.py"
     ).read_text()
     # Find the social_graph ModuleSpec block + verify
     # critical_data_writer=True appears in it
@@ -231,9 +237,12 @@ def test_module_spec_critical_data_writer_flag():
 def test_module_spec_autostart_no_flag_gate():
     """social_graph_worker has no flag-gate (always-on per PLAN §6
     'hard cutover' migration)."""
+    # ModuleSpec registration was refactored out of plugin.py into the central
+    # module_catalog.py — read it there (the entry_fn + name + flags all live
+    # in titan_hcl/module_catalog.py now).
     plugin_py = (
         Path(__file__).resolve().parents[1]
-        / "titan_hcl" / "core" / "plugin.py"
+        / "titan_hcl" / "module_catalog.py"
     ).read_text()
     idx = plugin_py.find('name="social_graph"')
     block = plugin_py[idx:idx + 1500]

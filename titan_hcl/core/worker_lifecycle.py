@@ -13,9 +13,11 @@ they're OOM-killed themselves, often taking sibling Titans down with them.
 This module installs two complementary defenses in every worker subprocess:
 
 1. **PR_SET_PDEATHSIG** — Linux kernel-level: when our parent dies (any
-   reason, including SIGKILL), the kernel sends us SIGTERM. Our existing
-   per-worker SIGTERM handlers then perform graceful shutdown (flush WAL,
-   release locks, exit). Survives parent SIGKILL because the kernel is
+   reason, including SIGKILL), the kernel sends us SIGTERM. The worker's
+   SIGTERM handler (the floor handler installed by `_module_wrapper` via
+   `worker_shutdown.install_worker_sigterm_handler()`, or a richer per-worker
+   one such as persistence_entry.py's) then performs graceful shutdown (flush
+   WAL, release locks, exit). Survives parent SIGKILL because the kernel is
    the messenger, not Python.
 
 2. **Parent watcher thread** — backup polling defense. Every `interval`
@@ -24,11 +26,14 @@ This module installs two complementary defenses in every worker subprocess:
    or stripped (e.g., across exec() boundaries) and provides a defense on
    non-Linux platforms (no-op there since prctl is Linux-only).
 
-Both defenses route through SIGTERM, so workers' existing graceful
-shutdown handlers (e.g., persistence_entry.py:62, body_worker, etc.)
-continue to work unchanged. No worker code needs to know about this
-module — Guardian's `_module_wrapper` calls `install_full_protection()`
-at child-process start, before invoking `entry_fn`.
+Both defenses route through SIGTERM. The SIGTERM disposition itself is owned
+by `worker_shutdown` (RFP_supervision_lifecycle §7.D / Phase D.1): Guardian's
+`_module_wrapper` calls `install_full_protection()` (this module) AND
+`install_worker_sigterm_handler()` (worker_shutdown) at child-process start,
+before invoking `entry_fn`. The floor handler converts SIGTERM →
+KeyboardInterrupt so the worker unwinds its recv loop and runs its registered
+bus-independent saves; a worker that installs its own richer SIGTERM handler
+afterward (e.g. persistence_entry.py's asyncio stop_event) overrides the floor.
 
 Phase B.2.1 extension (2026-04-27 mid-day):
 - `clear_parent_death_signal()` / `reset_parent_death_signal()` — workers
