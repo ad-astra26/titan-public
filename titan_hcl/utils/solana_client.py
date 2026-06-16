@@ -660,6 +660,26 @@ LIGHT_COMPRESSION_PROGRAM_ID = "compr6CUsB5m2jS4Y3831ztGSTnDpnKJTKS95d64XVq"
 # Anchor discriminators for ZK compression instructions (from IDL build)
 _VAULT_IX_COMPRESS_MEMORY_BATCH = bytes([105, 76, 210, 140, 189, 129, 57, 135])
 _VAULT_IX_APPEND_EPOCH_SNAPSHOT = bytes([213, 217, 65, 120, 202, 70, 5, 131])
+# E2 — the running canonical sovereign-state account (SNARK-per-write).
+# anchor global discriminators = sha256("global:<name>")[:8] (pattern verified
+# vs _VAULT_IX_APPEND_EPOCH_SNAPSHOT). See RFP_zk_vault_snark_per_write.md §7.
+_VAULT_IX_CREATE_SOVEREIGN_STATE = bytes([223, 34, 252, 254, 61, 152, 166, 36])
+_VAULT_IX_UPDATE_SOVEREIGN_STATE = bytes([86, 247, 246, 161, 125, 6, 201, 176])
+
+# Light v1 ADDRESS tree + queue (canonical public infra; the actual tree used is
+# taken from the live Photon proof per write — these are fallback/derivation
+# reference only). v1 address tree per light-sdk address.rs:66 doc example.
+# 🚩 [I]-VERIFY-ON-DEVNET: these two are from a crate DOC EXAMPLE, NOT traced
+# live. The derived address is bound to the address-tree pubkey, so a wrong tree
+# = wrong address = genesis create FAILS. Trace the real canonical v1 address
+# tree/queue against the live devnet Photon indexer BEFORE the genesis tx (and
+# before ANY mainnet spend). The crate's v2 example uses a DIFFERENT tree
+# (amt2kaJA…) with the same queue — version ambiguity is real. (RFP §7.B live-[I].)
+LIGHT_V1_ADDRESS_TREE = "amt1Ayt45jfbdw5YSo7iz6WZxUmnZsQTYXy82hVwyC2"
+LIGHT_V1_ADDRESS_QUEUE = "aq1S9z4reTSQAdgWHGD2zDaS39sjGrAxbR31vxJ2F4F"
+# SovereignState canonical address seed prefix — MUST match lib.rs
+# create_sovereign_state derive_address seeds.
+_SOVEREIGN_STATE_SEED = b"sovereign_state"
 
 
 def compute_batch_root(memory_hashes: List[bytes]) -> bytes:
@@ -888,6 +908,306 @@ def build_append_epoch_snapshot_instruction(
         )
     except Exception as e:
         logger.error("[SolanaClient] Failed to build append_epoch_snapshot: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# E2 — SovereignState (the running canonical SNARK-per-write account)
+# RFP_zk_vault_snark_per_write.md §7.A/§7.B. Addressed compressed account:
+#   genesis = create_sovereign_state (non-inclusion proof + address tree/queue)
+#   each subsequent write = update_sovereign_state (new_mut, inclusion proof)
+# ---------------------------------------------------------------------------
+
+def derive_light_v1_address(
+    authority_pubkey,
+    address_tree_str: str = None,
+    program_id_str: str = None,
+) -> Optional[bytes]:
+    """Compute the Titan's canonical SovereignState compressed-account address —
+    the SAME 32-byte address the program derives on-chain via light-sdk v1
+    `derive_address([b"sovereign_state", authority], address_tree, program_id)`
+    (Keccak-based, NOT Poseidon; `light-sdk-types-0.23/address.rs:38-55`).
+
+    Needed CLIENT-side only to request the genesis non-inclusion proof from
+    Photon (`getValidityProof` new-address). Validated byte-exact against the
+    crate test vectors in `tests/test_zk_vault_sovereign_state.py`.
+
+    Returns the 32-byte address, or None if the SDK is unavailable / inputs bad.
+    """
+    if not _SOLANA_AVAILABLE or authority_pubkey is None:
+        return None
+    try:
+        from titan_hcl.utils._keccak import keccak256
+        program_id = Pubkey.from_string(program_id_str or VAULT_PROGRAM_ID)
+        address_tree = Pubkey.from_string(address_tree_str or LIGHT_V1_ADDRESS_TREE)
+        prog_b = bytes(program_id)
+        auth_b = bytes(authority_pubkey)
+        tree_b = bytes(address_tree)
+        # address_seed = keccak(program_id ‖ seed ‖ authority)[0:=0]  (legacy variant, no bump)
+        seed = bytearray(keccak256(prog_b + _SOVEREIGN_STATE_SEED + auth_b))
+        seed[0] = 0
+        # address = keccak(address_tree ‖ address_seed ‖ 0xFF)[0:=0]  (const_array variant w/ bump)
+        addr = bytearray(keccak256(tree_b + bytes(seed) + bytes([0xFF])))
+        addr[0] = 0
+        return bytes(addr)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[SolanaClient] derive_light_v1_address failed: %s", e)
+        return None
+
+
+def _light_v1_system_accounts(program_id_str: str = None) -> Optional[list]:
+    """The 8 canonical Light v1 system accounts (get_light_system_account_metas
+    order) — the shared prefix of every v1 CPI remaining-accounts list. Packed
+    (tree/queue/address) accounts are appended by the caller at offset 8."""
+    if not _SOLANA_AVAILABLE:
+        return None
+    cpi_authority = derive_light_cpi_authority(program_id_str)
+    if cpi_authority is None:
+        return None
+    invoking_program = Pubkey.from_string(program_id_str or VAULT_PROGRAM_ID)
+
+    def ro(pubkey_str):
+        return AccountMeta(pubkey=Pubkey.from_string(pubkey_str),
+                           is_signer=False, is_writable=False)
+
+    return [
+        ro(LIGHT_SYSTEM_PROGRAM_ID),                  # 0
+        AccountMeta(pubkey=cpi_authority, is_signer=False, is_writable=False),  # 1
+        ro(LIGHT_REGISTERED_PROGRAM_PDA),             # 2
+        ro(LIGHT_NOOP_PROGRAM_ID),                    # 3
+        ro(LIGHT_ACCOUNT_COMPRESSION_AUTHORITY),      # 4
+        ro(LIGHT_ACCOUNT_COMPRESSION_PROGRAM_ID),     # 5
+        AccountMeta(pubkey=invoking_program, is_signer=False, is_writable=False),  # 6
+        ro(SYSTEM_PROGRAM_ID),                        # 7
+    ]
+
+
+def _writable(pubkey_str):
+    return AccountMeta(pubkey=Pubkey.from_string(pubkey_str),
+                       is_signer=False, is_writable=True)
+
+
+def build_create_sovereign_state_instruction(
+    authority_pubkey,
+    *,
+    proof_bytes: bytes,
+    address_merkle_tree_index: int,
+    address_queue_index: int,
+    address_root_index: int,
+    state_root: bytes,
+    epoch_number: int,
+    memory_count: int,
+    sovereignty_score: int,
+    shadow_url_hash: bytes,
+    output_tree_index: int = 0,
+    output_state_tree_str: str = None,
+    address_tree_str: str = None,
+    address_queue_str: str = None,
+    program_id_str: str = None,
+) -> Optional["Instruction"]:
+    """GENESIS: addressed create with a REQUIRED non-inclusion proof (INV-ZKW-3).
+
+    Instruction data: disc + Some(128B proof) + PackedAddressTreeInfo
+    {addr_mt_index:u8, addr_q_index:u8, root_index:u16} + output_tree_index:u8
+    + state_root[32] + epoch_number:u64 + memory_count:u64 + sovereignty:u16
+    + shadow_url_hash[32].
+    Accounts: [vault_pda, authority] + 8 system + [output_state_tree(8),
+    address_tree(9), address_queue(10)] (§7.B CREATE ordering).
+    """
+    if not _SOLANA_AVAILABLE or authority_pubkey is None:
+        return None
+    if not proof_bytes or len(proof_bytes) != 128:
+        logger.error("[SolanaClient] create_sovereign_state requires a 128-byte proof")
+        return None
+    if len(state_root) != 32 or len(shadow_url_hash) != 32:
+        logger.error("[SolanaClient] state_root and shadow_url_hash must be 32 bytes each.")
+        return None
+    try:
+        program_id = Pubkey.from_string(program_id_str or VAULT_PROGRAM_ID)
+        pda_result = derive_vault_pda(authority_pubkey, program_id_str)
+        if pda_result is None:
+            return None
+        vault_pda, _ = pda_result
+
+        data = (
+            _VAULT_IX_CREATE_SOVEREIGN_STATE
+            + bytes([1]) + proof_bytes                       # Option::Some(proof)
+            + bytes([address_merkle_tree_index & 0xFF])      # PackedAddressTreeInfo.address_merkle_tree_pubkey_index
+            + bytes([address_queue_index & 0xFF])            # .address_queue_pubkey_index
+            + struct.pack("<H", address_root_index)          # .root_index
+            + bytes([output_tree_index & 0xFF])
+            + state_root
+            + struct.pack("<Q", epoch_number)
+            + struct.pack("<Q", memory_count)
+            + struct.pack("<H", sovereignty_score)
+            + shadow_url_hash
+        )
+
+        system = _light_v1_system_accounts(program_id_str)
+        if system is None:
+            logger.error("[SolanaClient] create_sovereign_state: system accounts unavailable")
+            return None
+        packed = [
+            _writable(output_state_tree_str or LIGHT_V1_STATE_TREE),     # packed idx 0 → remaining[8]
+            _writable(address_tree_str or LIGHT_V1_ADDRESS_TREE),        # packed idx 1 → remaining[9]
+            _writable(address_queue_str or LIGHT_V1_ADDRESS_QUEUE),      # packed idx 2 → remaining[10]
+        ]
+        accounts = [
+            AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=authority_pubkey, is_signer=True, is_writable=True),
+        ] + system + packed
+
+        return Instruction(program_id=program_id, accounts=accounts, data=data)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[SolanaClient] Failed to build create_sovereign_state: %s", e)
+        return None
+
+
+def build_update_sovereign_state_instruction(
+    authority_pubkey,
+    *,
+    proof_bytes: bytes,
+    old_state: dict,
+    address: bytes,
+    leaf_index: int,
+    root_index: int,
+    prove_by_index: bool = False,
+    merkle_tree_index: int = 0,
+    queue_index: int = 1,
+    output_state_tree_index: int = 0,
+    state_root: bytes,
+    epoch_number: int,
+    memory_count: int,
+    sovereignty_score: int,
+    shadow_url_hash: bytes,
+    state_tree_str: str = None,
+    nullifier_queue_str: str = None,
+    program_id_str: str = None,
+) -> Optional["Instruction"]:
+    """UPDATE: new_mut consume+recreate with a REQUIRED inclusion proof (INV-ZKW-2).
+
+    Instruction data: disc + Some(128B proof) + CompressedAccountMeta
+    {tree_info(root_index:u16, prove_by_index:bool, mt_index:u8, q_index:u8,
+    leaf_index:u32), address[32], output_state_tree_index:u8} + old_state
+    (SovereignState borsh, 122B — the program re-hashes it to prove the input)
+    + new state_root[32] + epoch_number:u64 + memory_count:u64 + sovereignty:u16
+    + shadow_url_hash[32].
+    Accounts: [vault_pda, authority] + 8 system + [state_tree(8),
+    nullifier_queue(9)] (§7.B UPDATE ordering).
+    """
+    if not _SOLANA_AVAILABLE or authority_pubkey is None:
+        return None
+    if not proof_bytes or len(proof_bytes) != 128:
+        logger.error("[SolanaClient] update_sovereign_state requires a 128-byte proof")
+        return None
+    if len(state_root) != 32 or len(shadow_url_hash) != 32 or len(address) != 32:
+        logger.error("[SolanaClient] state_root/shadow_url_hash/address must be 32 bytes each.")
+        return None
+    try:
+        program_id = Pubkey.from_string(program_id_str or VAULT_PROGRAM_ID)
+        pda_result = derive_vault_pda(authority_pubkey, program_id_str)
+        if pda_result is None:
+            return None
+        vault_pda, _ = pda_result
+
+        old_blob = _serialize_sovereign_state(old_state)
+        if old_blob is None:
+            return None
+
+        # CompressedAccountMeta.tree_info = PackedStateTreeInfo (field order!)
+        tree_info = (
+            struct.pack("<H", root_index)                # root_index: u16
+            + bytes([1 if prove_by_index else 0])        # prove_by_index: bool
+            + bytes([merkle_tree_index & 0xFF])          # merkle_tree_pubkey_index: u8
+            + bytes([queue_index & 0xFF])                # queue_pubkey_index: u8
+            + struct.pack("<I", leaf_index)              # leaf_index: u32
+        )
+        account_meta = tree_info + address + bytes([output_state_tree_index & 0xFF])
+
+        data = (
+            _VAULT_IX_UPDATE_SOVEREIGN_STATE
+            + bytes([1]) + proof_bytes                   # Option::Some(proof)
+            + account_meta
+            + old_blob                                   # old_state: SovereignState (122B)
+            + state_root
+            + struct.pack("<Q", epoch_number)
+            + struct.pack("<Q", memory_count)
+            + struct.pack("<H", sovereignty_score)
+            + shadow_url_hash
+        )
+
+        system = _light_v1_system_accounts(program_id_str)
+        if system is None:
+            logger.error("[SolanaClient] update_sovereign_state: system accounts unavailable")
+            return None
+        packed = [
+            _writable(state_tree_str or LIGHT_V1_STATE_TREE),          # packed idx 0 → remaining[8]
+            _writable(nullifier_queue_str or LIGHT_V1_NULLIFIER_QUEUE),  # packed idx 1 → remaining[9]
+        ]
+        accounts = [
+            AccountMeta(pubkey=vault_pda, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=authority_pubkey, is_signer=True, is_writable=True),
+        ] + system + packed
+
+        return Instruction(program_id=program_id, accounts=accounts, data=data)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[SolanaClient] Failed to build update_sovereign_state: %s", e)
+        return None
+
+
+def _serialize_sovereign_state(s: dict) -> Optional[bytes]:
+    """Borsh-serialize a SovereignState (122B) from a decoded dict (hex strings
+    for the 32-byte fields). Field order MUST match lib.rs `SovereignState`."""
+    try:
+        authority = bytes.fromhex(s["authority"]) if isinstance(s["authority"], str) else bytes(s["authority"])
+        state_root = bytes.fromhex(s["state_root"]) if isinstance(s["state_root"], str) else bytes(s["state_root"])
+        shadow = bytes.fromhex(s["shadow_url_hash"]) if isinstance(s["shadow_url_hash"], str) else bytes(s["shadow_url_hash"])
+        if len(authority) != 32 or len(state_root) != 32 or len(shadow) != 32:
+            logger.error("[SolanaClient] _serialize_sovereign_state: 32-byte field wrong length")
+            return None
+        return (
+            authority
+            + struct.pack("<Q", int(s["epoch_number"]))
+            + state_root
+            + struct.pack("<Q", int(s["memory_count"]))
+            + struct.pack("<H", int(s["sovereignty_score"]))
+            + shadow
+            + struct.pack("<q", int(s["timestamp"]))
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error("[SolanaClient] _serialize_sovereign_state failed: %s", e)
+        return None
+
+
+def decode_sovereign_state(data: bytes) -> Optional[dict]:
+    """Decode raw SovereignState data from a Photon response (same 122-byte
+    Borsh layout as CompressedEpochSnapshot; distinguished on-chain by its own
+    LightDiscriminator). Robust to an 8-byte discriminator prefix is handled by
+    the caller trying both offsets."""
+    if not data or len(data) < 122:
+        return None
+    try:
+        offset = 0
+        authority = data[offset:offset + 32]; offset += 32
+        epoch_number = struct.unpack_from("<Q", data, offset)[0]; offset += 8
+        state_root = data[offset:offset + 32]; offset += 32
+        memory_count = struct.unpack_from("<Q", data, offset)[0]; offset += 8
+        sovereignty_score = struct.unpack_from("<H", data, offset)[0]; offset += 2
+        shadow_url_hash = data[offset:offset + 32]; offset += 32
+        timestamp = struct.unpack_from("<q", data, offset)[0]
+        return {
+            "type": "SovereignState",
+            "authority": authority.hex(),
+            "epoch_number": epoch_number,
+            "state_root": state_root.hex(),
+            "memory_count": memory_count,
+            "sovereignty_score": sovereignty_score,
+            "sovereignty_percent": round(sovereignty_score / 100, 2),
+            "shadow_url_hash": shadow_url_hash.hex(),
+            "timestamp": timestamp,
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.error("[SolanaClient] Failed to decode SovereignState: %s", e)
         return None
 
 

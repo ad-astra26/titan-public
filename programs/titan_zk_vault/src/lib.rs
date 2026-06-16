@@ -5,11 +5,15 @@ extern crate light_hasher;
 
 use light_sdk::{
     account::LightAccount,
+    address::v1::derive_address,
     cpi::{
         v1::{CpiAccounts, LightSystemProgramCpi},
         InvokeLightSystemProgram, LightCpiInstruction,
     },
     derive_light_cpi_signer,
+    instruction::{
+        account_meta::CompressedAccountMeta, PackedAddressTreeInfo, PackedAddressTreeInfoExt,
+    },
     CpiSigner, LightDiscriminator, LightHasher,
 };
 
@@ -60,8 +64,10 @@ impl CompressedProofInput {
 /// addressless** compressed accounts (no input account, `new_init(.., None, ..)`).
 /// The Light system program FORBIDS a proof in that case — passing `Some(..)`
 /// (even an all-zero proof) is rejected with `ProofIsSome` (6018). So the proof
-/// MUST be `None` for the current output-only flow; `Some` is reserved for a
-/// future input-consuming / address-creating instruction.
+/// MUST be `None` for the output-only flow (`compress_memory_batch` /
+/// `append_epoch_snapshot`); `Some(realProof)` is used by the input-consuming /
+/// address-creating instructions `create_sovereign_state` (non-inclusion) and
+/// `update_sovereign_state` (inclusion).
 fn resolve_validity_proof(
     proof: Option<CompressedProofInput>,
 ) -> light_sdk::instruction::ValidityProof {
@@ -244,6 +250,143 @@ pub mod titan_zk_vault {
         );
         Ok(())
     }
+
+    /// Creates the Titan's single canonical sovereign-state compressed account (GENESIS).
+    ///
+    /// Addressed create: derives a deterministic Light address from the authority,
+    /// registers it with a **non-inclusion validity proof** (the address must not
+    /// already exist), and writes the first `SovereignState`. Fires once per Titan;
+    /// every subsequent canonical write is `update_sovereign_state`. (E2, INV-ZKW-3.)
+    pub fn create_sovereign_state<'info>(
+        ctx: Context<'_, '_, '_, 'info, CreateSovereignState<'info>>,
+        proof: Option<CompressedProofInput>,
+        address_tree_info: PackedAddressTreeInfo,
+        output_tree_index: u8,
+        state_root: [u8; 32],
+        epoch_number: u64,
+        memory_count: u64,
+        sovereignty_score: u16,
+        shadow_url_hash: [u8; 32],
+    ) -> Result<()> {
+        let vault = &ctx.accounts.vault_state;
+        require!(
+            vault.authority == ctx.accounts.authority.key(),
+            TitanError::UnauthorizedAuthority
+        );
+        // INV-ZKW-3: the addressed create carries a real non-inclusion proof.
+        require!(proof.is_some(), TitanError::ProofRequired);
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.authority.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+
+        // Deterministic canonical address: one stable Light address per Titan.
+        let (address, address_seed) = derive_address(
+            &[b"sovereign_state", ctx.accounts.authority.key().as_ref()],
+            &address_tree_info
+                .get_tree_pubkey(&light_cpi_accounts)
+                .map_err(|_| TitanError::CompressedAccountError)?,
+            &crate::ID,
+        );
+        let new_address_params = address_tree_info.into_new_address_params_packed(address_seed);
+
+        let timestamp = Clock::get()?.unix_timestamp;
+
+        let mut account = LightAccount::<SovereignState>::new_init(
+            &crate::ID,
+            Some(address),
+            output_tree_index,
+        );
+        account.authority = ctx.accounts.authority.key().to_bytes();
+        account.epoch_number = epoch_number;
+        account.state_root = state_root;
+        account.memory_count = memory_count;
+        account.sovereignty_score = sovereignty_score;
+        account.shadow_url_hash = shadow_url_hash;
+        account.timestamp = timestamp;
+
+        let cpi =
+            LightSystemProgramCpi::new_cpi(crate::LIGHT_CPI_SIGNER, resolve_validity_proof(proof))
+                .with_light_account(account)
+                .map_err(|_| TitanError::CompressedAccountError)?
+                .with_new_addresses(&[new_address_params]);
+        cpi.invoke(light_cpi_accounts)
+            .map_err(|_| TitanError::LightCpiInvokeError)?;
+
+        msg!(
+            "Titan ZK-Vault: SovereignState created | epoch={} | memories={}",
+            epoch_number,
+            memory_count,
+        );
+        Ok(())
+    }
+
+    /// Updates the Titan's canonical sovereign-state account (CONSUME + RECREATE).
+    ///
+    /// `new_mut` nullifies the prior leaf and writes a new one; the Light system
+    /// program verifies a Groth16 **inclusion** proof on-chain before accepting it.
+    /// Every canonical sovereign-state write after genesis carries a real SNARK
+    /// (INV-ZKW-2). `old_state` MUST equal the current on-chain account data — the
+    /// program recomputes the input leaf hash from it.
+    pub fn update_sovereign_state<'info>(
+        ctx: Context<'_, '_, '_, 'info, UpdateSovereignState<'info>>,
+        proof: Option<CompressedProofInput>,
+        account_meta: CompressedAccountMeta,
+        old_state: SovereignState,
+        state_root: [u8; 32],
+        epoch_number: u64,
+        memory_count: u64,
+        sovereignty_score: u16,
+        shadow_url_hash: [u8; 32],
+    ) -> Result<()> {
+        let vault = &ctx.accounts.vault_state;
+        require!(
+            vault.authority == ctx.accounts.authority.key(),
+            TitanError::UnauthorizedAuthority
+        );
+        // INV-ZKW-2: every update carries a real inclusion proof.
+        require!(proof.is_some(), TitanError::ProofRequired);
+
+        let light_cpi_accounts = CpiAccounts::new(
+            ctx.accounts.authority.as_ref(),
+            ctx.remaining_accounts,
+            crate::LIGHT_CPI_SIGNER,
+        );
+
+        let timestamp = Clock::get()?.unix_timestamp;
+
+        // 3rd arg = the OLD account DATA (the program re-hashes it to prove the input).
+        let mut account = LightAccount::<SovereignState>::new_mut(
+            &crate::ID,
+            &account_meta,
+            old_state,
+        )
+        .map_err(|_| TitanError::CompressedAccountError)?;
+
+        // authority is immutable identity — left as carried in old_state.
+        account.epoch_number = epoch_number;
+        account.state_root = state_root;
+        account.memory_count = memory_count;
+        account.sovereignty_score = sovereignty_score;
+        account.shadow_url_hash = shadow_url_hash;
+        account.timestamp = timestamp;
+
+        let cpi =
+            LightSystemProgramCpi::new_cpi(crate::LIGHT_CPI_SIGNER, resolve_validity_proof(proof))
+                .with_light_account(account)
+                .map_err(|_| TitanError::CompressedAccountError)?;
+        cpi.invoke(light_cpi_accounts)
+            .map_err(|_| TitanError::LightCpiInvokeError)?;
+
+        msg!(
+            "Titan ZK-Vault: SovereignState updated | epoch={} | memories={}",
+            epoch_number,
+            memory_count,
+        );
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +469,34 @@ pub struct AppendEpochSnapshot<'info> {
     pub authority: Signer<'info>,
 }
 
+/// Context for create_sovereign_state — reads vault PDA to verify authority.
+#[derive(Accounts)]
+pub struct CreateSovereignState<'info> {
+    #[account(
+        seeds = [b"titan_vault", authority.key().as_ref()],
+        bump = vault_state.bump,
+        has_one = authority,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+}
+
+/// Context for update_sovereign_state — reads vault PDA to verify authority.
+#[derive(Accounts)]
+pub struct UpdateSovereignState<'info> {
+    #[account(
+        seeds = [b"titan_vault", authority.key().as_ref()],
+        bump = vault_state.bump,
+        has_one = authority,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+}
+
 // ---------------------------------------------------------------------------
 // State — Uncompressed (traditional PDA)
 // ---------------------------------------------------------------------------
@@ -389,6 +560,31 @@ pub struct CompressedEpochSnapshot {
     pub timestamp: i64,             // 8 bytes
 }
 
+/// The Titan's single canonical sovereign-state compressed account (E2).
+///
+/// ADDRESSED — one stable, deterministic Light address per Titan
+/// (`derive_address([b"sovereign_state", authority], …)`), reusable as the
+/// on-chain anchor for future Titan artifacts. MUTABLE — each daily backup
+/// event consume+recreates it via `new_mut`, carrying a real Groth16 proof
+/// (INV-ZKW-2). Decode-distinct discriminator from the append-only
+/// `CompressedEpochSnapshot` audit trail (INV-ZKW-1).
+#[derive(
+    Clone, Debug, Default, LightDiscriminator, LightHasher,
+    AnchorSerialize, AnchorDeserialize,
+)]
+pub struct SovereignState {
+    #[hash]
+    pub authority: [u8; 32],        // 32 bytes — Titan's wallet (immutable identity)
+    pub epoch_number: u64,          // 8 bytes — Greater Epoch sequence
+    #[hash]
+    pub state_root: [u8; 32],       // 32 bytes — == backup event_merkle_root (INV-ZKW-4)
+    pub memory_count: u64,          // 8 bytes — total memories at this point
+    pub sovereignty_score: u16,     // 2 bytes — basis points
+    #[hash]
+    pub shadow_url_hash: [u8; 32],  // 32 bytes — Arweave archive hash
+    pub timestamp: i64,             // 8 bytes
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -401,4 +597,6 @@ pub enum TitanError {
     CompressedAccountError,
     #[msg("Light system program CPI invocation failed")]
     LightCpiInvokeError,
+    #[msg("A validity proof is required for this instruction")]
+    ProofRequired,
 }

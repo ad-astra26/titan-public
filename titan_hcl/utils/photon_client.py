@@ -149,6 +149,32 @@ class PhotonClient:
             return result["value"]
         return None
 
+    async def get_new_address_proof(
+        self, address_b58: str, address_tree_b58: str
+    ) -> Optional[dict]:
+        """Fetch a NON-INCLUSION validity proof for a NEW compressed-account
+        address (the ZK-Vault SovereignState GENESIS create, INV-ZKW-3) — proves
+        the address does NOT yet exist in the address tree.
+
+        Photon `getValidityProof` with the `newAddressesWithTrees` param. The
+        response carries the Groth16 `compressedProof` + the address-tree root
+        index used. ⚠ The exact request/response field names are Photon-version
+        dependent — VERIFY against the live devnet indexer before the genesis tx
+        (RFP §7.B live-[I]); both common spellings are attempted.
+
+        Returns the `value` dict (proof + addressRootIndex/treeInfos), or None.
+        """
+        params = {
+            "hashes": [],
+            "newAddressesWithTrees": [
+                {"address": address_b58, "tree": address_tree_b58}
+            ],
+        }
+        result = await self._rpc_call("getValidityProof", params)
+        if result and "value" in result:
+            return result["value"]
+        return None
+
     async def prove_memory_existence(self, memory_hash_hex: str) -> Optional[dict]:
         """
         Proof-of-Knowledge primitive.
