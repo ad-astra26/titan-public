@@ -2167,8 +2167,10 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             # 1Hz cadence. Use Event.wait so shutdown is responsive.
             self._module_ready_publisher_stop.wait(1.0)
 
-    def stop_all(self, reason: str = "shutdown") -> None:
-        """Gracefully stop all running modules."""
+    def stop_all(self, reason: str = "shutdown") -> int:
+        """Gracefully stop all running modules. Returns the count stopped
+        (RFP_supervision_lifecycle §7.D — fed into the KERNEL_SHUTDOWN_COMPLETE
+        marker so a restart can confirm a clean, complete drain)."""
         self._stop_requested = True
         # Stop the continuous probe poller (Phase 11 §11.I.7 / RFP 11D).
         try:
@@ -2190,9 +2192,12 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             self._restart_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:  # noqa: BLE001
             pass
+        stopped = 0
         for name, info in self._modules.items():
             if info.state in (ModuleState.RUNNING, ModuleState.STARTING, ModuleState.UNHEALTHY):
                 self.stop(name, reason=reason)
+                stopped += 1
+        return stopped
 
     def fast_kill(self, name: str) -> bool:
         """Fast SIGTERM-then-SIGKILL on a module — NO SAVE_NOW dance.
