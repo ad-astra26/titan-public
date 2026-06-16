@@ -263,7 +263,6 @@ pub mod titan_zk_vault {
         address_tree_info: PackedAddressTreeInfo,
         output_tree_index: u8,
         state_root: [u8; 32],
-        epoch_number: u64,
         memory_count: u64,
         sovereignty_score: u16,
         shadow_url_hash: [u8; 32],
@@ -275,6 +274,9 @@ pub mod titan_zk_vault {
         );
         // INV-ZKW-3: the addressed create carries a real non-inclusion proof.
         require!(proof.is_some(), TitanError::ProofRequired);
+        // epoch_number from the vault commit counter (monotonic; mirrors E1, no
+        // client-invented value).
+        let epoch_number = vault.commit_count;
 
         let light_cpi_accounts = CpiAccounts::new(
             ctx.accounts.authority.as_ref(),
@@ -336,7 +338,6 @@ pub mod titan_zk_vault {
         account_meta: CompressedAccountMeta,
         old_state: SovereignState,
         state_root: [u8; 32],
-        epoch_number: u64,
         memory_count: u64,
         sovereignty_score: u16,
         shadow_url_hash: [u8; 32],
@@ -348,6 +349,8 @@ pub mod titan_zk_vault {
         );
         // INV-ZKW-2: every update carries a real inclusion proof.
         require!(proof.is_some(), TitanError::ProofRequired);
+        // epoch_number advances with the vault commit counter (monotonic).
+        let epoch_number = vault.commit_count;
 
         let light_cpi_accounts = CpiAccounts::new(
             ctx.accounts.authority.as_ref(),

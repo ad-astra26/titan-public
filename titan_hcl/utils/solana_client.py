@@ -995,7 +995,6 @@ def build_create_sovereign_state_instruction(
     address_queue_index: int,
     address_root_index: int,
     state_root: bytes,
-    epoch_number: int,
     memory_count: int,
     sovereignty_score: int,
     shadow_url_hash: bytes,
@@ -1009,8 +1008,8 @@ def build_create_sovereign_state_instruction(
 
     Instruction data: disc + Some(128B proof) + PackedAddressTreeInfo
     {addr_mt_index:u8, addr_q_index:u8, root_index:u16} + output_tree_index:u8
-    + state_root[32] + epoch_number:u64 + memory_count:u64 + sovereignty:u16
-    + shadow_url_hash[32].
+    + state_root[32] + memory_count:u64 + sovereignty:u16 + shadow_url_hash[32].
+    (epoch_number is read on-chain from vault.commit_count — not a client arg.)
     Accounts: [vault_pda, authority] + 8 system + [output_state_tree(8),
     address_tree(9), address_queue(10)] (§7.B CREATE ordering).
     """
@@ -1037,7 +1036,6 @@ def build_create_sovereign_state_instruction(
             + struct.pack("<H", address_root_index)          # .root_index
             + bytes([output_tree_index & 0xFF])
             + state_root
-            + struct.pack("<Q", epoch_number)
             + struct.pack("<Q", memory_count)
             + struct.pack("<H", sovereignty_score)
             + shadow_url_hash
@@ -1076,7 +1074,6 @@ def build_update_sovereign_state_instruction(
     queue_index: int = 1,
     output_state_tree_index: int = 0,
     state_root: bytes,
-    epoch_number: int,
     memory_count: int,
     sovereignty_score: int,
     shadow_url_hash: bytes,
@@ -1090,8 +1087,8 @@ def build_update_sovereign_state_instruction(
     {tree_info(root_index:u16, prove_by_index:bool, mt_index:u8, q_index:u8,
     leaf_index:u32), address[32], output_state_tree_index:u8} + old_state
     (SovereignState borsh, 122B — the program re-hashes it to prove the input)
-    + new state_root[32] + epoch_number:u64 + memory_count:u64 + sovereignty:u16
-    + shadow_url_hash[32].
+    + new state_root[32] + memory_count:u64 + sovereignty:u16 + shadow_url_hash[32].
+    (epoch_number is read on-chain from vault.commit_count — not a client arg.)
     Accounts: [vault_pda, authority] + 8 system + [state_tree(8),
     nullifier_queue(9)] (§7.B UPDATE ordering).
     """
@@ -1130,7 +1127,6 @@ def build_update_sovereign_state_instruction(
             + account_meta
             + old_blob                                   # old_state: SovereignState (122B)
             + state_root
-            + struct.pack("<Q", epoch_number)
             + struct.pack("<Q", memory_count)
             + struct.pack("<H", sovereignty_score)
             + shadow_url_hash

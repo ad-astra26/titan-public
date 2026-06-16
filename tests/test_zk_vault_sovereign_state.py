@@ -100,7 +100,6 @@ def test_build_create_sovereign_state_layout_and_accounts():
         address_queue_index=2,
         address_root_index=1187,
         state_root=b"\x11" * 32,
-        epoch_number=109,
         memory_count=219450,
         sovereignty_score=2823,
         shadow_url_hash=b"\x22" * 32,
@@ -109,7 +108,8 @@ def test_build_create_sovereign_state_layout_and_accounts():
     )
     assert ix is not None
     # data: 8 disc + 1 Some + 128 proof + 4 PackedAddressTreeInfo + 1 out_idx
-    #       + 32 state_root + 8 epoch + 8 mem + 2 sov + 32 shadow = 224
+    #       + 32 state_root + 8 mem + 2 sov + 32 shadow = 216
+    # (epoch_number is read on-chain from vault.commit_count — NOT in the data)
     d = bytes(ix.data)
     assert d[:8] == sc._VAULT_IX_CREATE_SOVEREIGN_STATE
     assert d[8] == 1, "Option::Some tag"
@@ -120,11 +120,10 @@ def test_build_create_sovereign_state_layout_and_accounts():
     assert d[off + 4] == 0, "output_tree_index"
     off += 5
     assert d[off:off + 32] == b"\x11" * 32
-    assert struct.unpack_from("<Q", d, off + 32)[0] == 109
-    assert struct.unpack_from("<Q", d, off + 40)[0] == 219450
-    assert struct.unpack_from("<H", d, off + 48)[0] == 2823
-    assert d[off + 50:off + 82] == b"\x22" * 32
-    assert len(d) == 224
+    assert struct.unpack_from("<Q", d, off + 32)[0] == 219450
+    assert struct.unpack_from("<H", d, off + 40)[0] == 2823
+    assert d[off + 42:off + 74] == b"\x22" * 32
+    assert len(d) == 216
     # accounts: [vault, authority] + 8 system + [out_tree, addr_tree, addr_queue]
     accts = ix.accounts
     assert len(accts) == 13
@@ -142,7 +141,7 @@ def test_create_rejects_bad_proof():
     ix = sc.build_create_sovereign_state_instruction(
         auth, proof_bytes=b"\x00" * 64,  # wrong length
         address_merkle_tree_index=1, address_queue_index=2, address_root_index=0,
-        state_root=b"\x11" * 32, epoch_number=1, memory_count=1,
+        state_root=b"\x11" * 32, memory_count=1,
         sovereignty_score=1, shadow_url_hash=b"\x22" * 32, program_id_str=PROGRAM_ID)
     assert ix is None
 
@@ -176,7 +175,6 @@ def test_build_update_sovereign_state_layout_and_accounts():
         queue_index=1,
         output_state_tree_index=0,
         state_root=b"\x44" * 32,
-        epoch_number=109,
         memory_count=219450,
         sovereignty_score=2823,
         shadow_url_hash=b"\x55" * 32,
@@ -202,12 +200,11 @@ def test_build_update_sovereign_state_layout_and_accounts():
     assert old_blob == sc._serialize_sovereign_state(_sample_old_state())
     off += 122
     assert d[off:off + 32] == b"\x44" * 32                  # new state_root
-    assert struct.unpack_from("<Q", d, off + 32)[0] == 109
-    assert struct.unpack_from("<Q", d, off + 40)[0] == 219450
-    assert struct.unpack_from("<H", d, off + 48)[0] == 2823
-    assert d[off + 50:off + 82] == b"\x55" * 32
-    # total = 8 + 129 + 42 + 122 + 82 = 383
-    assert len(d) == 383
+    assert struct.unpack_from("<Q", d, off + 32)[0] == 219450  # memory_count
+    assert struct.unpack_from("<H", d, off + 40)[0] == 2823    # sovereignty
+    assert d[off + 42:off + 74] == b"\x55" * 32                # shadow_url_hash
+    # total = 8 + 129 + 42 + 122 + 74 = 375 (epoch_number read on-chain, not in data)
+    assert len(d) == 375
     # accounts: [vault, authority] + 8 system + [state_tree, nullifier_queue]
     accts = ix.accounts
     assert len(accts) == 12
@@ -217,6 +214,113 @@ def test_build_update_sovereign_state_layout_and_accounts():
 
 
 # ── SovereignState serialize ↔ decode roundtrip ─────────────────────────────
+
+# ── emit_sovereign_state orchestration (selector: genesis vs update) ─────────
+
+import asyncio
+import base64
+
+
+class _FakeNetwork:
+    def __init__(self, pubkey, sig="5KQ" + "z" * 85, program_id=PROGRAM_ID):
+        from solders.pubkey import Pubkey
+        self.pubkey = Pubkey.from_string(pubkey)
+        self._vault_program_id = program_id
+        self._sig = sig
+        self.sent = []
+
+    async def send_sovereign_transaction(self, ixs, priority="MEDIUM"):
+        self.sent.append((ixs, priority))
+        return self._sig
+
+
+def _fake_proof_value(root_index=7):
+    return {
+        "compressedProof": {
+            "a": base64.b64encode(b"\x01" * 32).decode(),
+            "b": base64.b64encode(b"\x02" * 64).decode(),
+            "c": base64.b64encode(b"\x03" * 32).decode(),
+        },
+        "rootIndex": root_index,
+        "addressRootIndex": root_index,
+    }
+
+
+class _FakePhoton:
+    """Genesis when `existing is None`; update when it returns an account dict."""
+    def __init__(self, existing=None):
+        self.existing = existing
+
+    async def get_compressed_account(self, address_b58):
+        return self.existing
+
+    async def get_new_address_proof(self, address_b58, tree_b58):
+        return _fake_proof_value()
+
+    async def get_validity_proof(self, hashes):
+        return _fake_proof_value()
+
+
+def test_emit_sovereign_state_genesis_creates(tmp_path, monkeypatch):
+    from titan_hcl.logic import zk_vault_state as zk
+    monkeypatch.chdir(tmp_path)
+    net = _FakeNetwork(AUTH)
+    photon = _FakePhoton(existing=None)  # no account → GENESIS
+    res = asyncio.new_event_loop().run_until_complete(
+        zk.emit_sovereign_state(
+            net, state_root_hex=bytes(range(32)).hex(), sovereignty_bp=2823,
+            arweave_url="https://arweave.net/TX", archive_hash="abc",
+            titan_id="T2", memory_count=208128, photon=photon,
+        )
+    )
+    assert res["op"] == "create"
+    assert res["tx"] == net._sig
+    assert len(net.sent) == 1
+    sent_ix = net.sent[0][0][0]
+    assert bytes(sent_ix.data)[:8] == sc._VAULT_IX_CREATE_SOVEREIGN_STATE
+    assert net.sent[0][1] == "HIGH"
+
+
+def test_emit_sovereign_state_update_consumes_existing(tmp_path, monkeypatch):
+    from titan_hcl.logic import zk_vault_state as zk
+    monkeypatch.chdir(tmp_path)
+    net = _FakeNetwork(AUTH)
+    old = {
+        "authority": "aa" * 32, "epoch_number": 5, "state_root": "bb" * 32,
+        "memory_count": 1000, "sovereignty_score": 2000,
+        "shadow_url_hash": "cc" * 32, "timestamp": 1700000000,
+    }
+    existing = {
+        "data": {"data": base64.b64encode(sc._serialize_sovereign_state(old)).decode()},
+        "hash": "HzznVxith6L5pp5w8Aht5oV2vXpQ8Qd1qbWYHGAytestHASH",
+        "leafIndex": 412,
+    }
+    photon = _FakePhoton(existing=existing)  # account exists → UPDATE
+    res = asyncio.new_event_loop().run_until_complete(
+        zk.emit_sovereign_state(
+            net, state_root_hex=bytes(range(32, 64)).hex(), sovereignty_bp=2900,
+            arweave_url="https://arweave.net/TX2", archive_hash="def",
+            titan_id="T2", memory_count=208200, photon=photon,
+        )
+    )
+    assert res["op"] == "update"
+    assert res["tx"] == net._sig
+    sent_ix = net.sent[0][0][0]
+    assert bytes(sent_ix.data)[:8] == sc._VAULT_IX_UPDATE_SOVEREIGN_STATE
+
+
+def test_emit_sovereign_state_requires_photon(tmp_path, monkeypatch):
+    from titan_hcl.logic import zk_vault_state as zk
+    monkeypatch.chdir(tmp_path)
+    res = asyncio.new_event_loop().run_until_complete(
+        zk.emit_sovereign_state(
+            _FakeNetwork(AUTH), state_root_hex=bytes(range(32)).hex(),
+            sovereignty_bp=1, arweave_url="", archive_hash="", titan_id="T2",
+            memory_count=1, photon=None,
+        )
+    )
+    assert res["error"] == "no_photon" and res["tx"] is None
+
 
 def test_sovereign_state_roundtrip():
     s = _sample_old_state()

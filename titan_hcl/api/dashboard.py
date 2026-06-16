@@ -2091,21 +2091,36 @@ def _zk_compression_status(plugin, sdk_available: bool) -> str:
 
 
 def _zk_compression_detail(plugin) -> dict:
-    """Switch + last-tx + parse-back verify detail for the ZK-compression gate."""
+    """Switch + last-tx + parse-back verify detail for the ZK-compression gate.
+
+    Carries BOTH planes: E1 (append-only audit trail) + E2 (the running
+    SovereignState account — `snark_per_write`, RFP_zk_vault_snark_per_write §1.2
+    step 8). `snark_per_write` is True once a proof-carrying create/update tx has
+    been written."""
     try:
         from titan_hcl.core.state_registry import resolve_titan_id
-        from titan_hcl.logic.zk_vault_state import read_zk_audit_state
+        from titan_hcl.logic.zk_vault_state import (
+            read_zk_audit_state, read_sovereign_state_status,
+        )
         titan_id = resolve_titan_id(getattr(plugin, "titan_id", None))
         zk = read_zk_audit_state(titan_id) or {}
+        sov = read_sovereign_state_status(titan_id) or {}
     except Exception:  # noqa: BLE001
-        zk = {}
+        zk, sov = {}, {}
     return {
+        # E1 append-only audit trail
         "continuous_enabled": bool(zk.get("continuous_enabled", False)),
         "last_tx": zk.get("last_tx"),
         "last_verified": zk.get("last_verified"),
         "last_memory_count": zk.get("last_memory_count"),
         "last_state_root": zk.get("last_state_root"),
         "last_error": zk.get("last_error"),
+        # E2 running SovereignState (SNARK-per-write)
+        "snark_per_write": bool(sov.get("last_update_tx")),
+        "last_update_tx": sov.get("last_update_tx"),
+        "last_update_op": sov.get("last_op"),
+        "last_proof_verified": sov.get("last_proof_verified"),
+        "last_sovereign_error": sov.get("last_error"),
     }
 
 

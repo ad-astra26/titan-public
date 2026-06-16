@@ -1344,6 +1344,24 @@ class RebirthBackup:
                         program_id_str=vault_program_id,
                         photon=getattr(self, "_photon", None),
                     )
+                    # E2 (option A): alongside the E1 append-trail, write the
+                    # running canonical SovereignState (SNARK-per-write). Selector
+                    # (create-vs-update) lives inside emit_sovereign_state. Needs
+                    # Photon (proofs) — no-ops cleanly if it's absent.
+                    photon = getattr(self, "_photon", None)
+                    if photon is not None:
+                        from titan_hcl.logic.zk_vault_state import emit_sovereign_state
+                        await emit_sovereign_state(
+                            self.network,
+                            state_root_hex=event_merkle_root,
+                            sovereignty_bp=sovereignty_bp,
+                            arweave_url=arweave_url,
+                            archive_hash=head_comp.get("arc", "") or "",
+                            titan_id=self._titan_id,
+                            memory_count=mem_count,
+                            program_id_str=vault_program_id,
+                            photon=photon,
+                        )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "[Backup] ZK-compressed audit snapshot failed "
