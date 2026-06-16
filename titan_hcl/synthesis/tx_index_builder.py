@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # whole chain. JSON, atomic tmp+rename.
 WATERMARK_NAME = "synthesis_tx_index_watermark.json"
 
-# Embed BATCH_SIZE texts per fastembed call (one call >> N single calls,
+# Embed BATCH_SIZE texts per embedder call (one call >> N single calls,
 # especially on a small/contended box). Persist + advance the watermark every
 # SAVE_EVERY indexed so an interruption mid-backfill keeps progress.
 BATCH_SIZE = 256
@@ -249,7 +249,7 @@ class TxIndexBuilder:
             return stats
 
         # Accumulate (tx_hash, text) and flush to the store in batches — ONE
-        # fastembed call per batch is dramatically faster + lighter than per-text
+        # embedder call per batch is dramatically faster + lighter than per-text
         # (critical on a small/contended box). Periodic save + watermark advance
         # so an interruption keeps progress (the index saves only on flush).
         batch: list[tuple[str, str]] = []

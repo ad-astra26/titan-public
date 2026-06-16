@@ -1343,25 +1343,30 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             # _OVG_READY stays False — probe will fail-fast rather than
             # claim a half-ready worker can serve.
 
-    # ── Phase 13 §3J.1/§3J.2 — eager-warm the text embedder (fastembed) ──
+    # ── Phase 13 §3J.1/§3J.2 — eager-warm the text embedder (llama.cpp) ──
     # Same anti-pattern correction as the OVG warm above (D-SPEC-138): the
     # reasoning-tier gatekeeper `state_tensor` embed (PreHook) calls
     # `worker_plugin.recorder.action_embedder.encode(...)` → get_text_embedder().
-    # Warming it here keeps the fastembed cold load (~3.5s settled, far worse
+    # Warming it here keeps the embedder cold load (~3.5s settled, far worse
     # under boot contention) OFF the first reasoning chat's critical path, and
     # the fail-loud self_test ensures the zero-vector regression (§3J.1) can
-    # never return silently. fastembed is ONNX — adds NO torch to agno.
+    # never return silently. The runtime is now `llama-cpp-python` (2026-06-01
+    # §3J.1 migration, via utils.text_embedder.get_text_embedder → LlamaCppEncoder):
+    # same bge-small-en-v1.5 model + identical vectors, flat ~197 MB, torch-free.
+    # (Was fastembed/ONNX, replaced because onnxruntime's CPU arena never returns
+    # memory to the OS — the rss_3522mb leak. This comment was stale until
+    # 2026-06-16.)
     try:
         from titan_hcl.utils.text_embedder import self_test as _emb_self_test
         _emb_t0 = time.time()
         if _emb_self_test():
             logger.info(
-                "[AgnoWorker] text embedder warmed in %.0fms (fastembed eager "
+                "[AgnoWorker] text embedder warmed in %.0fms (llama.cpp eager "
                 "init at boot — Phase 13 §3J.1)", (time.time() - _emb_t0) * 1000)
         else:
             logger.error(
                 "[AgnoWorker] text embedder SELF-TEST FAILED at boot — "
-                "embeddings degraded; CHECK fastembed install (§3J.1)")
+                "embeddings degraded; CHECK llama-cpp-python install (§3J.1)")
     except Exception as _emb_err:  # noqa: BLE001
         logger.warning(
             "[AgnoWorker] embedder eager-warm failed (lazy retry on first "

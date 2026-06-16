@@ -2652,7 +2652,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             from titan_hcl.synthesis.skill_store import ProceduralSkillStore
 
             # Operator-closure Phase A: reuse the ONE shared embedder (no second
-            # fastembed model — RSS discipline). Same BAAI/bge-small-en-v1.5 path.
+            # llama.cpp embedder — RSS discipline). Same BAAI/bge-small-en-v1.5 path.
             procedural_skill_store = ProceduralSkillStore(
                 duckdb_conn=store._conn,
                 writer=db_writer,                  # single-writer-thread (Option C)

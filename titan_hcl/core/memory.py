@@ -136,10 +136,10 @@ class TieredMemoryGraph:
         self._node_store: Dict = {}
         self._next_id = 1
 
-        # Lightweight mempool embedding index (fastembed, in-memory)
+        # Lightweight mempool embedding index (llama.cpp, in-memory)
         # NOTE: Must be initialized BEFORE _load_node_store (which calls _index_mempool_node)
         self._mempool_embeddings: Dict[int, np.ndarray] = {}
-        self._embedding_model = None  # Lazy-loaded fastembed model
+        self._embedding_model = None  # Lazy-loaded llama.cpp embedder
         self._embedding_dim = 384  # BAAI/bge-small-en-v1.5
 
         # --- Direct Memory Backend (replaces Cognee) ---
@@ -268,7 +268,7 @@ class TieredMemoryGraph:
         return True
 
     # -------------------------------------------------------------------------
-    # Mempool Embedding Index (lightweight, in-memory, fastembed)
+    # Mempool Embedding Index (lightweight, in-memory, llama.cpp)
     # -------------------------------------------------------------------------
     def _ensure_embedding_model(self):
         """Lazy-bind the fleet-standard llama.cpp embedder singleton for mempool
@@ -611,7 +611,7 @@ class TieredMemoryGraph:
                 self._apply_decay(node)
                 results.append(node)
 
-        # 2. Mempool semantic search (pre-meditation recall via fastembed)
+        # 2. Mempool semantic search (pre-meditation recall via llama.cpp)
         mempool_hits = self._mempool_semantic_search(prompt, top_k=5, vec=_qvec)
         seen_ids = {r["id"] for r in results}
         for node in mempool_hits:

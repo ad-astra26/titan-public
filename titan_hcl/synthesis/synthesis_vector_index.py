@@ -10,7 +10,7 @@ Two roles, one shard convention:
 
   * **SynthesisVectorStore** — the SOLE WRITER (synthesis_worker; G21 / the
     INV-Syn-3 sole-writer family). On seal of a meaningful TX it embeds the TX
-    content (the same fastembed BAAI/bge-small-en-v1.5 path the rest of the
+    content (the same llama.cpp BAAI/bge-small-en-v1.5 path the rest of the
     engine uses) and appends `(tx_hash → vector)` to the per-fork shard. It
     also serves as an in-process `faiss_reader` for synthesis_worker's own
     EngineRecall (so the SEARCH op finally returns hits inside the worker).
@@ -290,7 +290,7 @@ class SynthesisVectorStore:
         self._writer = resolve_writer(writer)
         self._data_dir = str(data_dir)
         self._embedder = embedder
-        # Optional `(list[str]) -> list[vec]` batch embedder. fastembed is far
+        # Optional `(list[str]) -> list[vec]` batch embedder. llama.cpp is far
         # faster (and far lighter on a small box) embedding a list in one call
         # than N single-item calls — `add_texts` uses this when present.
         self._batch_embedder = batch_embedder
@@ -337,7 +337,7 @@ class SynthesisVectorStore:
     def add_texts(self, fork: str, items: list) -> int:
         """Batch-embed + bind `items` (a list of `(tx_hash, text)`) into the
         fork's shard. Skips tx_hashes already present (idempotent). Returns the
-        number actually added. Uses the batch embedder in ONE fastembed call
+        number actually added. Uses the batch embedder in ONE embedder call
         (much faster + lighter than per-text on a small box); falls back to
         per-text `add_text` when no batch embedder is configured. Does NOT save
         — caller batches saves."""

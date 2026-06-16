@@ -116,7 +116,7 @@ class _EmbedIndex:
             return
         self._init_attempted = True
         try:
-            # Phase 13 §3J.1 — fastembed (ONNX, 384-d) replaces the broken
+            # Phase 13 §3J.1 — llama.cpp (bge-small, 384-d) replaces the broken
             # sentence_transformers import (torch/torchvision ABI mismatch →
             # silent zeros). Same 384-d, so ST_EMBED_DIM downstream is unchanged.
             from titan_hcl.utils.text_embedder import get_text_embedder
@@ -124,7 +124,7 @@ class _EmbedIndex:
             self._model = get_text_embedder()
             self._np = _np
             self._available = True
-            logger.info("[TeacherMemory] Embedding model loaded: fastembed "
+            logger.info("[TeacherMemory] Embedding model loaded: llama.cpp "
                         "(BAAI/bge-small-en-v1.5, dim=%d)", ST_EMBED_DIM)
         except Exception as e:
             logger.warning(
