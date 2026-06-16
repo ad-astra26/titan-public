@@ -817,37 +817,10 @@ class TitanKernel:
             self.disk_health.stop()
         except Exception as e:
             logger.warning("[TitanKernel] disk_health.stop error: %s", e)
-        stopped = 0
         try:
-            stopped = self.guardian.stop_all(reason=reason) or 0
+            self.guardian.stop_all(reason=reason)
         except Exception as e:
             logger.warning("[TitanKernel] guardian.stop_all error: %s", e)
-        # RFP_supervision_lifecycle §7.D — definitive graceful-shutdown completion
-        # marker. After stop_all has drained every module (save_first), emit a
-        # journal line + write a marker file so a restart can confirm the stop was
-        # CLEAN (all modules saved, NOT SIGKILLed mid-save) and gate the next
-        # start on memory reclaim — eliminating the cold-boot-on-residual-memory
-        # cascade that disabled modules on fast coupled restarts (2026-06-15).
-        try:
-            from titan_hcl.orchestrator.boot_throttle import read_box_pressure
-            _mem_avail = read_box_pressure().mem_available_mb
-        except Exception:  # noqa: BLE001
-            _mem_avail = -1.0
-        logger.info(
-            "[TitanKernel] KERNEL_SHUTDOWN_COMPLETE modules_stopped=%d reason=%s "
-            "mem_available_mb=%.0f — all modules drained + state saved",
-            stopped, reason, _mem_avail)
-        try:
-            import json as _json
-            import time as _time
-            from pathlib import Path as _Path
-            _marker = _Path("data/kernel_shutdown_complete.marker")
-            _marker.parent.mkdir(parents=True, exist_ok=True)
-            _marker.write_text(_json.dumps({
-                "ts": _time.time(), "modules_stopped": stopped,
-                "reason": reason, "mem_available_mb": _mem_avail}))
-        except Exception as e:  # noqa: BLE001 — marker is best-effort observability
-            logger.debug("[TitanKernel] shutdown marker write failed: %s", e)
 
     # ------------------------------------------------------------------
     # Private L0 loops (event-loop tasks)
