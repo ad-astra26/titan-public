@@ -200,3 +200,41 @@ def test_unrecoverable_set_is_conservative():
 
 def test_unknown_error_code_is_recoverable():
     assert is_unrecoverable("SOME_NEW_UNREGISTERED_CODE") is False
+
+
+# ── integration: the REAL in-process bus path (not a hand-fed queue) ─────────
+
+def test_real_bus_path_publish_to_disable_e2e():
+    """Integration — the REAL path a worker actually uses:
+    publish_module_error(bus, err) → DivineBus dst='all' broadcast → the
+    Supervisor's OWN `guardian_module_errors` subscription (filter=MODULE_ERROR)
+    → _process_module_errors drains it → render + DISABLE + MODULE_CRITICAL_DOWN
+    traverses the bus to an independent observer. The unit tests above feed the
+    queue directly; THIS proves the subscription + routing are wired correctly.
+    (The only piece not covered in-process is the Rust-broker SOCKET forward
+    declared in guardian_hcl.build_bus_and_client — that needs a live box.)"""
+    from titan_hcl.bus import publish_module_error
+    bus, g = _guardian_with()
+    sup = _supervisor(bus, g, fatal_module_error_disable_threshold=1)
+    assert sup._module_error_queue is not None, "Supervisor must hold a real MODULE_ERROR subscription"
+    crit_q = bus.subscribe("test_obs_e2e", types=[MODULE_CRITICAL_DOWN])
+
+    err = ModuleError(
+        module_name="m", subsystem="entry",
+        error_code=ModuleErrorCode.BOOT_TIMEOUT.value,  # unrecoverable → first-occurrence disable
+        severity=Severity.FATAL, message="boot exceeded grace",
+    )
+    assert publish_module_error(bus, err) is True, "the real publish helper must send"
+
+    sup._process_module_errors()  # drains from the supervisor's OWN subscription
+
+    assert g._modules["m"].state == ModuleState.DISABLED, \
+        "a FATAL unrecoverable error published over the real bus must disable the module"
+    got = []
+    while True:
+        try:
+            got.append(crit_q.get_nowait())
+        except Exception:
+            break
+    assert any(m["payload"]["module"] == "m" and m["payload"]["error_code"] == "BOOT_TIMEOUT"
+               for m in got), "MODULE_CRITICAL_DOWN must traverse the bus to an independent observer"
