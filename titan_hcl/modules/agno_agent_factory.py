@@ -390,7 +390,14 @@ def create_agent(plugin: Any, agent_config: Optional[dict] = None):
         post_hooks=[post_hook],
         db=db,
         additional_context=skill_context or None,
-        add_history_to_context=True,
+        # RFP_agno_memory_bypass §1b (D-SPEC-158) — agno's per-run history LOAD is
+        # the dominant retainer of the ~30MB/turn leak (it reloads the last N runs,
+        # each carrying Titan's large V5-enriched prompt, into context every arun()).
+        # Titan owns its own recent-conversation context (agno_hooks recent-turns
+        # store, injected in the PreHook), so agno's native history is redundant.
+        # Default OFF (bypass ON — Maker flag rule); `agno_history_bypass=false`
+        # kill-switch restores agno's native history.
+        add_history_to_context=(not bool(merged_cfg.get("agno_history_bypass", True))),
         num_history_runs=int(merged_cfg.get("history_runs", 5)),
         add_datetime_to_context=True,
         markdown=True,

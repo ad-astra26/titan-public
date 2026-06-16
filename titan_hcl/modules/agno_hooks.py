@@ -108,6 +108,59 @@ def _pre_hook_cache_set_with_ttl(key: str, value, *, ttl_s: float) -> None:
     than the default 30s — e.g. directives change rarely, 5 min TTL)."""
     _pre_hook_cache[key] = (value, _time_for_cache.time() + ttl_s)
 
+
+# ── Titan-owned recent-conversation store (RFP_agno_memory_bypass §1b, D-SPEC-158) ──
+# Replaces agno's `add_history_to_context` (the dominant retainer of the ~30MB/turn
+# leak — Stage-0 verified). We own the format → future control + lets us eventually
+# drop agno's db entirely. BOUNDED + leak-free: last N (user,assistant) TEXT pairs
+# per session (never the V5-enriched context — that's what made agno's copies huge),
+# LRU-capped sessions. In-memory (recent context is ephemeral; Titan's semantic
+# recall/`query_user_memories` persists across restarts — durability is a follow-on).
+from collections import OrderedDict as _OrderedDict_rt, deque as _deque_rt
+_RECENT_TURNS_MAX = 5          # ≈ the old num_history_runs
+_RECENT_TURNS_SESSIONS = 256   # LRU cap on tracked sessions (bounds total footprint)
+_RECENT_TURNS_TEXT_CAP = 600   # per-message char cap (continuity, not full transcript)
+_recent_turns: "_OrderedDict_rt[str, _deque_rt]" = _OrderedDict_rt()
+
+
+def _recent_turns_key(user_id: str, session_id: str) -> str:
+    return f"{user_id or 'anon'}:{session_id or 'default'}"
+
+
+def record_recent_turn(user_id: str, session_id: str,
+                       user_text: str, assistant_text: str) -> None:
+    """PostHook: append this turn's (user, assistant) text to the session ring."""
+    try:
+        k = _recent_turns_key(user_id, session_id)
+        dq = _recent_turns.get(k)
+        if dq is None:
+            dq = _deque_rt(maxlen=_RECENT_TURNS_MAX)
+            _recent_turns[k] = dq
+        _recent_turns.move_to_end(k)
+        dq.append((str(user_text or "")[:_RECENT_TURNS_TEXT_CAP],
+                   str(assistant_text or "")[:_RECENT_TURNS_TEXT_CAP]))
+        while len(_recent_turns) > _RECENT_TURNS_SESSIONS:
+            _recent_turns.popitem(last=False)
+    except Exception:  # noqa: BLE001 — never break the PostHook
+        logger.debug("[PostHook] record_recent_turn failed", exc_info=True)
+
+
+def get_recent_turns_context(user_id: str, session_id: str) -> str:
+    """PreHook: the literal recent-conversation block to prepend (TEXT only)."""
+    try:
+        dq = _recent_turns.get(_recent_turns_key(user_id, session_id))
+        if not dq:
+            return ""
+        lines = ["### Recent conversation (most recent last)"]
+        for u, a in dq:
+            if u:
+                lines.append(f"User: {u}")
+            if a:
+                lines.append(f"Titan: {a}")
+        return "\n".join(lines) + "\n\n"
+    except Exception:  # noqa: BLE001
+        return ""
+
 # ── Interface Module singletons (Step 5) ────────────────────────────
 # Created once at import time, reused across all hook invocations.
 # Thread-safe for single-writer (one conversation flow at a time).
@@ -2987,9 +3040,15 @@ def create_pre_hook(plugin):
             plugin._last_perceptual_field = None
 
         _ph_stage("after_reflex_arc")
+        # RFP_agno_memory_bypass §1b — literal recent-conversation continuity that
+        # used to come from agno's `add_history_to_context` (now off; it was the
+        # ~30MB/turn retainer). TEXT only, from Titan's own bounded store (small).
+        recent_turns_context = get_recent_turns_context(
+            user_id, getattr(plugin, '_current_session_id', None) or "default")
         # Inject context into agent's additional_context
         # V5: inner state sections + V6: MSL/CGN/social/reasoning enrichment
-        injected = (perceptual_field_text + interface_coloring + consciousness_context +
+        injected = (recent_turns_context +
+                    perceptual_field_text + interface_coloring + consciousness_context +
                     maker_context + voice_context + social_context + user_memory_context +
                     grounded_context + directive_context + status_context +
                     neuromod_context + embodied_context + temporal_context +
@@ -3200,6 +3259,14 @@ def create_post_hook(plugin):
 
         # 0. Identify user for social tracking
         user_id = getattr(plugin, '_current_user_id', None) or "anonymous"
+
+        # RFP_agno_memory_bypass §1b (D-SPEC-158) — record this turn into Titan's
+        # own bounded recent-conversation store; the PreHook injects it next turn
+        # (replaces agno's add_history_to_context, the ~30MB/turn retainer). TEXT
+        # only, leak-free; never breaks the PostHook.
+        record_recent_turn(
+            user_id, getattr(plugin, '_current_session_id', None) or "default",
+            user_prompt, response_text)
 
         # ── RFP §7.B (C1′) — non-verifiable turn record ──────────────────────
         # The PreHook (B.1) stashed a decision + minted a reasoning_id for a
