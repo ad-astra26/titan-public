@@ -394,6 +394,18 @@ class OuterCompositeReader:
         return None
 
 
+def _symlog(x):
+    """symlog(x) = sign(x)·ln(1+|x|) — DreamerV3 scale-stable transform (INV-ML-1).
+    Compresses magnitude while staying ~linear near 0; the IQL value/Q heads
+    learn in symlog space so the value is scale-stable without normalization."""
+    return np.sign(x) * np.log1p(np.abs(x))
+
+
+def _symexp(y):
+    """symexp = inverse of symlog: sign(y)·(exp(|y|)−1)."""
+    return np.sign(y) * np.expm1(np.abs(y))
+
+
 def _clip01(v: float) -> float:
     if v != v:  # NaN guard
         return 0.0
@@ -505,6 +517,11 @@ class OuterMetaPolicy:
         # + their own update counter. Training-only; never published to SHM.
         self._iql_inited: bool = False
         self.total_iql_updates: int = 0
+        # Scale-free competence signal source (SOAR ① / INV-ML-3): fraction of the
+        # last train_iql batch with advantage Q(s,a)−V(s) > 0 (the policy's edge
+        # over its own value baseline). MasteryLevel blends this — it cannot be
+        # fooled by reward-scale inflation. 0.0 until the first IQL pass.
+        self._last_adv_pos_rate: float = 0.0
         self._vw1 = self._vb1 = self._vw2 = self._vb2 = None
         self._qw1 = self._qb1 = self._qw2 = self._qb2 = None
         self._qtw1 = self._qtb1 = self._qtw2 = self._qtb2 = None
@@ -828,7 +845,7 @@ class OuterMetaPolicy:
                     if ns is None else np.asarray(ns, dtype=np.float32))
 
         bs = min(batch_size, n)
-        tot_v = tot_q = tot_p = 0.0
+        tot_v = tot_q = tot_p = tot_adv_pos = 0.0
         for _ in range(int(steps)):
             idx = np.random.choice(n, bs, replace=False)
             batch = [transitions[i] for i in idx]
@@ -858,10 +875,13 @@ class OuterMetaPolicy:
             self._vw2 -= lr * dvw2; self._vb2 -= lr * dvb2
 
             # 2. Q update — Bellman backup with V(s') (never max_a Q → no OOD).
-            v_next, _ = self._mlp2_forward(S2, self._vw1, self._vb1,
-                                           self._vw2, self._vb2)
-            v_next = v_next.reshape(B) * NT
-            q_backup = R + gamma * v_next                                      # [B]
+            # symlog-space heads (INV-ML-1): the V/Q nets emit symlog-space values,
+            # so the Bellman arithmetic is done in REAL space (symexp the bootstrap)
+            # then re-symlog'd as the regression target.
+            v_next_sym, _ = self._mlp2_forward(S2, self._vw1, self._vb1,
+                                               self._vw2, self._vb2)
+            v_next_real = _symexp(v_next_sym.reshape(B)) * NT                  # 0 at terminal
+            q_backup = _symlog(R + gamma * v_next_real)                       # symlog-space target
             q_all, q_cache = self._mlp2_forward(S, self._qw1, self._qb1,
                                                 self._qw2, self._qb2)          # [B,A]
             q_sa = q_all[rows, A]
@@ -880,6 +900,7 @@ class OuterMetaPolicy:
             v_pred2, _ = self._mlp2_forward(S, self._vw1, self._vb1,
                                             self._vw2, self._vb2)
             adv = q_all2[rows, A] - v_pred2.reshape(B)                         # [B]
+            tot_adv_pos += float(np.mean(adv > 0.0))                           # competence signal
             weight = np.minimum(np.exp(beta * adv), adv_clip).astype(np.float32)
             # π forward (batched) — own cache; does NOT touch self._cache (REINFORCE path).
             z1 = S @ self.w1 + self.b1; h1 = np.maximum(0.0, z1)
@@ -919,13 +940,31 @@ class OuterMetaPolicy:
             tot_v += v_loss; tot_q += q_loss; tot_p += policy_loss
 
         s = max(1, int(steps))
+        self._last_adv_pos_rate = float(tot_adv_pos / s)
         return {"v_loss": tot_v / s, "q_loss": tot_q / s,
                 "policy_loss": tot_p / s, "transitions": n,
-                "iql_updates": self.total_iql_updates}
+                "iql_updates": self.total_iql_updates,
+                "adv_pos_rate": self._last_adv_pos_rate}
+
+    def advantage_positive_rate(self) -> float:
+        """Scale-free competence signal (SOAR ① / INV-ML-3): the last IQL pass's
+        fraction of samples with advantage > 0. MasteryLevel blends this to GATE
+        the level ratchet (a V̄ rise alone never advances the level)."""
+        return float(self._last_adv_pos_rate)
+
+    def value_symlog(self, x) -> float:
+        """V(s) in SYMLOG space — the canonical value the MasteryLevel grade
+        ladder bins (INV-ML-1; GRADE_SUPPORT is in symlog space). Alias of the
+        raw V-head output (the head learns in symlog space)."""
+        return self.value(x)
+
+    def value_real(self, x) -> float:
+        """V(s) in REAL space (symexp of the symlog-space head) — for telemetry."""
+        return float(_symexp(self.value(x)))
 
     def value(self, x) -> float:
-        """V(s) — the learned expectile state-value (P3 MasteryLevel reads this).
-        0.0 if IQL not yet initialised."""
+        """V(s) — the learned (symlog-space) expectile state-value (MasteryLevel
+        reads this). 0.0 if IQL not yet initialised."""
         if not self._iql_inited:
             return 0.0
         out, _ = self._mlp2_forward(
