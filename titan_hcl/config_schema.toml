@@ -382,6 +382,8 @@
 "stealth_sage.twitterapi_search_depth" = {type="int", constraint=">=0", reload="hot", owner=["agency_worker", "social_worker"], sensitive=false}
 "stealth_sage.webshare_rotating_url" = {type="str", constraint="", reload="restart_required", owner=["agency_worker", "social_worker"], sensitive=false}
 "synthesis.decision_authority.enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+# secrets-only key (lives in ~/.titan/secrets.toml, no config/params placeholder) — declared manually; the generator only sees params+config.
+"synthesis.user_id_hash_salt" = {type="str", constraint="", reload="restart_required", owner=["synthesis"], sensitive=true}
 "synthesis.decision_authority.gibberish_probe_every" = {type="int", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.baseline_alpha" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
