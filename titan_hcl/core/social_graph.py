@@ -122,7 +122,7 @@ class SocialGraph:
                 from titan_hcl.persistence.writer_client import (
                     get_client,
                 )
-                cfg = IMWConfig.from_titan_config_section("persistence_social_graph")
+                cfg = IMWConfig.from_titan_config_section("persistence.social_graph")
                 if cfg.enabled and cfg.mode != "disabled":
                     if cfg.db_path:
                         try:

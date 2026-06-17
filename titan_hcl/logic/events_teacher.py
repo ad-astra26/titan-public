@@ -201,7 +201,7 @@ class EventsTeacherDB:
                 from titan_hcl.persistence.writer_client import (
                     get_client,
                 )
-                cfg = IMWConfig.from_titan_config_section("persistence_events_teacher")
+                cfg = IMWConfig.from_titan_config_section("persistence.events_teacher")
                 if cfg.enabled and cfg.mode != "disabled":
                     if cfg.db_path:
                         try:

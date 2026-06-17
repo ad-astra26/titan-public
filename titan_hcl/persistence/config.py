@@ -126,12 +126,15 @@ class IMWConfig:
 
     @classmethod
     def from_titan_config_section(cls, section_name: str = "persistence") -> "IMWConfig":
-        """Generic loader: load any [persistence_*] section from config.toml.
+        """Generic loader: load a [persistence] subtable from config.toml.
 
         Added 2026-04-21 to support multiple writer instances (rFP_observatory_
-        writer_service Phase 0). For example:
-          - section_name="persistence"            → IMW (inner_memory.db)
-          - section_name="persistence_observatory" → ObservatoryWriter
+        writer_service Phase 0). ``section_name`` is a dotted path resolved
+        against the merged config (RFP_config_as_shm_state §7-Phase-B(6) Tier-1
+        rename consolidated the per-writer DB sections under [persistence.<sub>]):
+          - section_name="persistence"               → IMW (inner_memory.db)
+          - section_name="persistence.observatory"   → ObservatoryWriter
+          - section_name="persistence.social_graph"  → SocialGraphWriter
 
         The parse is mtime-cached (``_load_config_toml_cached``) — this loader
         is called per-route in worker hot paths, so re-parsing config.toml on
@@ -141,7 +144,10 @@ class IMWConfig:
         if not cfg_path.exists():
             return cls.from_dict(None)
         full = _load_config_toml_cached(cfg_path)
-        return cls.from_dict(full.get(section_name))
+        node = full
+        for _part in section_name.split("."):
+            node = (node or {}).get(_part, {})
+        return cls.from_dict(node or None)
 
     def is_table_canonical(self, table: str) -> bool:
         return table in self.tables_canonical

@@ -226,7 +226,7 @@ class ObservatoryDB:
                 from titan_hcl.persistence.writer_client import (
                     InnerMemoryWriterClient,
                 )
-                cfg = IMWConfig.from_titan_config_section("persistence_observatory")
+                cfg = IMWConfig.from_titan_config_section("persistence.observatory")
                 # Path-isolation safety — only checked when caller passed an
                 # explicit db_path. The check uses realpath to handle
                 # absolute-vs-relative + symlinks; tested against the

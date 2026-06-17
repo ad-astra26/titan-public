@@ -330,7 +330,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # Scoped per rFP_observatory_writer_service (drafted 2026-04-21);
     # microkernel-v2-aligned (L3 DB ownership). Default OFF — Maker flips
     # `enabled=true` in [persistence_observatory] when ready for Phase 1.
-    _obs_persistence_cfg = config.get("persistence_observatory", {})
+    _obs_persistence_cfg = config.get("persistence", {}).get("observatory", {})
     _obs_writer_enabled = bool(_obs_persistence_cfg.get("enabled", False))
     # Per-instance defaults — namespaced so the two writers don't collide
     # on socket/WAL/journal/metrics paths. Maker can override any of these
@@ -376,12 +376,15 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # for multi-process-contention DBs (social_graph + events_teacher +
     # consciousness). Same imw_main entry, per-DB config sections.
     # ─────────────────────────────────────────────────────────────────
-    for _w_name, _w_section, _w_default_db in (
-        ("social_graph_writer", "persistence_social_graph", "social_graph.db"),
-        ("events_teacher_writer", "persistence_events_teacher", "events_teacher.db"),
-        ("consciousness_writer", "persistence_consciousness", "consciousness.db"),
+    # RFP_config_as_shm_state §7-Phase-B(6) Tier-1 rename: the per-writer DB
+    # sections were consolidated under [persistence.<sub>] (5 top-level sections
+    # → 1 slot). Read the subtable off the single `persistence` section.
+    for _w_name, _w_subkey, _w_default_db in (
+        ("social_graph_writer", "social_graph", "social_graph.db"),
+        ("events_teacher_writer", "events_teacher", "events_teacher.db"),
+        ("consciousness_writer", "consciousness", "consciousness.db"),
     ):
-        _w_cfg_section = config.get(_w_section, {})
+        _w_cfg_section = config.get("persistence", {}).get(_w_subkey, {})
         _w_enabled = bool(_w_cfg_section.get("enabled", False))
         _w_sock_default = f"data/run/{_w_name}.sock"
         _w_wal_default = f"data/run/{_w_name}.wal"
