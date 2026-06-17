@@ -157,6 +157,24 @@ _DEFAULTS = {
     "judge_reward_weight": 1.0,        # LLM turn-judge (metered tier)
     "user_reward_weight": 1.0,         # ordinary user rating (reward-only nudge)
     "maker_reward_weight": 2.0,        # Maker rating — more authority over his own Titan
+    # ── Canonical-IQL routing learner (RFP_emergent_mastery_curriculum P2) ──
+    # FULL IQL (learned Q + expectile-V + AWR + Bellman-with-V(s') + Polyak),
+    # mirroring CGN-IQL by hand in numpy on OuterMetaPolicy (INV-MC-6). The
+    # foundation that gives V(s) for the emergent MasteryLevel (P3). DEFAULT ON
+    # (all-flags-default-on); flag-off ⇒ byte-identical legacy REINFORCE path.
+    # When on: _handle_reward only BUFFERS (record_reward_tuple); learning is the
+    # offline train_iql pass in the idle _explore_tick (pure-offline, like CGN
+    # consolidate). next_state from per-goal_class trajectory links.
+    "oml_iql_enabled": True,
+    "iql_tau": 0.7,                    # expectile asymmetry (optimistic V)
+    "iql_beta": 3.0,                   # AWR temperature
+    "iql_gamma": 0.99,                 # Bellman discount (full IQL — uses V(s'))
+    "iql_polyak": 0.005,              # Q-target EMA rate
+    "iql_adv_clip": 100.0,            # AWR weight cap
+    "iql_lr": 0.003,                  # SGD step for the V/Q/π updates
+    "iql_steps": 20,                  # gradient steps per idle consolidation pass
+    "iql_batch_size": 32,             # transitions per step
+    "iql_replay_window": 2000,        # most-recent reward_tuples drawn for trajectory linking
 }
 # Reward-source authority rank (Phase B corrective-delta): a higher-rank source
 # may correct a lower-rank applied reward; same-or-lower is ignored (no double-train).
@@ -180,6 +198,13 @@ class _SelfLearningStore:
             "CREATE TABLE IF NOT EXISTS policy_state ("
             " id INTEGER PRIMARY KEY, weights_json VARCHAR,"
             " total_updates INTEGER, reward_baseline DOUBLE, ts DOUBLE)")
+        # IQL nets (V/Q/Q-target) durable artifact — SEPARATE from policy_state
+        # (which carries the π SHM flat). Keeps the agno-read SHM slot
+        # byte-identical (P2 §7.P2 step 5). Worker-only; G21 single-writer.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS policy_iql_state ("
+            " id INTEGER PRIMARY KEY, iql_json VARCHAR,"
+            " total_iql_updates BIGINT, ts DOUBLE)")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS pending_decisions ("
             " parent_tool_call_tx VARCHAR PRIMARY KEY, features_json VARCHAR,"
@@ -248,6 +273,45 @@ class _SelfLearningStore:
                  time.time()])
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] save_policy_flat soft-fail: %s", e)
+
+    # -- IQL nets persistence (P2 — worker-only, separate from the π SHM flat) --
+    def save_iql_flat(self, iql_flat_list, total_iql_updates) -> None:
+        try:
+            self._conn.execute(
+                "INSERT INTO policy_iql_state (id, iql_json, total_iql_updates, ts) "
+                "VALUES (0,?,?,?) ON CONFLICT (id) DO UPDATE "
+                "SET iql_json=excluded.iql_json, "
+                "total_iql_updates=excluded.total_iql_updates, ts=excluded.ts",
+                [json.dumps(iql_flat_list), int(total_iql_updates), time.time()])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] save_iql_flat soft-fail: %s", e)
+
+    def load_iql_flat(self):
+        try:
+            row = self._conn.execute(
+                "SELECT iql_json FROM policy_iql_state WHERE id=0").fetchone()
+            if not row or not row[0]:
+                return None
+            return json.loads(row[0])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] load_iql_flat soft-fail: %s", e)
+            return None
+
+    def iql_transitions(self, n: int):
+        """Most-recent reward tuples WITH goal_class + ts, oldest→newest, for
+        per-goal_class trajectory linking (P2 full-IQL next_state). Returns
+        [(features, action, reward, goal_class, ts), …]."""
+        try:
+            rows = self._conn.execute(
+                "SELECT features_json, action, reward, goal_class, ts FROM ("
+                "  SELECT features_json, action, reward, goal_class, ts, id"
+                "  FROM reward_tuples ORDER BY id DESC LIMIT ?"
+                ") ORDER BY ts ASC, id ASC", [int(n)]).fetchall()
+            return [(json.loads(r[0]), int(r[1]), float(r[2]),
+                     str(r[3] or ""), float(r[4] or 0.0)) for r in rows]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] iql_transitions soft-fail: %s", e)
+            return []
 
     # -- pending decisions (the async-join stash) -----------------------
     def stash_decision(self, *, tx, features, action, goal_class, turn_id) -> None:
@@ -679,6 +743,28 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
             logger.warning("[self_learning] cold-start seed failed (continuing "
                            "unseeded): %s", e)
 
+    # P2 — restore the IQL nets (V/Q/Q-target), separate from the π flat. A
+    # cold-start (fresh / pathological / restore-fail) gets a FRESH init: the old
+    # V/Q encode collapsed-era value, same reasoning as clearing reward tuples.
+    if bool(cfg.get("oml_iql_enabled", True)):
+        try:
+            import numpy as _np
+            _iql_loaded = store.load_iql_flat() if not _cold_start else None
+            if _iql_loaded is not None and policy.iql_from_flat(
+                    _np.asarray(_iql_loaded, dtype=_np.float32)):
+                logger.info("[self_learning] IQL nets restored (iql_updates=%d)",
+                            policy.total_iql_updates)
+            else:
+                policy.init_iql()
+                logger.info("[self_learning] IQL nets fresh-init (cold-start=%s)",
+                            _cold_start)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[self_learning] IQL init/restore failed (fresh): %s", e)
+            try:
+                policy.init_iql()
+            except Exception:  # noqa: BLE001
+                pass
+
     # SHM weight publisher (single writer — INV-OML-8 / G21).
     _shm_writer = None
     try:
@@ -888,18 +974,41 @@ def _handle_reward(payload, store, policy, shm_writer, cfg, send_queue, name) ->
         else:
             return False                             # same-or-lower authority → ignore
         store.mark_rewarded(tx, effective, src)
-    policy.learn(features, action, train_reward,
-                 baseline_alpha=float(cfg["baseline_alpha"]))
-    store.save_policy_flat(policy.to_flat().tolist(),
-                           policy.total_updates, policy.reward_baseline)
-    _publish_weights(shm_writer, policy)
+    # P2 (RFP_emergent_mastery_curriculum) — FULL-IQL pure-offline path. When on,
+    # the per-turn REINFORCE update is SKIPPED: the turn only BUFFERS the sample;
+    # the V/Q/π learning is the offline train_iql pass in the idle _explore_tick
+    # (mirrors CGN consolidate). The π SHM flat is unchanged here, so no republish.
+    # Flag-off ⇒ byte-identical legacy REINFORCE+publish path (INV-MC-7).
+    _iql_on = bool(cfg.get("oml_iql_enabled", True))
+    _sample_reward = train_reward
+    if _iql_on:
+        # The async-correction branch set record_tuple=False to avoid a REINFORCE
+        # double-train; under IQL we DO want the corrected sample, labelled with
+        # the ABSOLUTE corrected reward (`effective`), not the REINFORCE delta.
+        if not record_tuple:
+            _sample_reward = effective
+            record_tuple = True
+    else:
+        policy.learn(features, action, train_reward,
+                     baseline_alpha=float(cfg["baseline_alpha"]))
+        store.save_policy_flat(policy.to_flat().tolist(),
+                               policy.total_updates, policy.reward_baseline)
+        _publish_weights(shm_writer, policy)
     if record_tuple:
-        store.record_reward_tuple(features=features, action=action,
-                                  reward=train_reward, goal_class=goal_class)
-    logger.info("[self_learning] trained: action=%s reward=%+.2f src=%s goal=%s "
-                "updates=%d baseline=%.3f", action_index_to_name(action),
-                train_reward, source or "direct", goal_class or "-",
-                policy.total_updates, policy.reward_baseline)
+        store.record_reward_tuple(
+            features=features, action=action,
+            reward=(_sample_reward if _iql_on else train_reward),
+            goal_class=goal_class)
+    if _iql_on:
+        logger.info("[self_learning] buffered (IQL): action=%s reward=%+.2f src=%s "
+                    "goal=%s (offline train in explore tick)",
+                    action_index_to_name(action), _sample_reward,
+                    source or "direct", goal_class or "-")
+    else:
+        logger.info("[self_learning] trained: action=%s reward=%+.2f src=%s goal=%s "
+                    "updates=%d baseline=%.3f", action_index_to_name(action),
+                    train_reward, source or "direct", goal_class or "-",
+                    policy.total_updates, policy.reward_baseline)
     # Macro distillation (S1) — a (goal_class, action) with enough verified wins.
     # Phase-C piece 6: when the deliberative explore-tick path is enabled it is
     # the SOLE macro source (it would otherwise be pre-empted by this reactive
@@ -1192,6 +1301,34 @@ def _outer_deliberate(cfg, store, send_queue, name, outer_reason, outer_meta) ->
                     composed_from=composed_children, version=version)
 
 
+def _build_routing_transitions(rows):
+    """Per-goal_class trajectory linking for the full-IQL routing learner (P2),
+    mirroring cgn._build_trajectory_links (concept_id ≙ goal_class). `rows` =
+    [(features, action, reward, goal_class, ts), …] already global-sorted by ts
+    ASC. Returns transition dicts {state, action, reward, next_state, terminal};
+    next_state = the SAME goal_class's next state in time, tail terminal
+    (V(s')=0). This is what makes it FULL IQL (V(s') participates), not bandit."""
+    from collections import defaultdict
+    valid = []
+    groups = defaultdict(list)
+    for feats, action, reward, gc, _ts in rows:
+        if len(feats) != OUTER_POLICY_INPUT_DIM:
+            continue
+        valid.append((feats, int(action), float(reward)))
+        groups[gc].append(len(valid) - 1)
+    out = []
+    for _gc, idxs in groups.items():
+        for j, ix in enumerate(idxs):
+            feats, action, reward = valid[ix]
+            if j + 1 < len(idxs):
+                out.append({"state": feats, "action": action, "reward": reward,
+                            "next_state": valid[idxs[j + 1]][0], "terminal": False})
+            else:
+                out.append({"state": feats, "action": action, "reward": reward,
+                            "next_state": None, "terminal": True})
+    return out
+
+
 def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
                   outer_reason=None, outer_meta=None) -> None:
     """Idle EXPLORE (L3) — metabolically gated (INV-OML-9). Passes:
@@ -1211,23 +1348,50 @@ def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
                 return
         except Exception:  # noqa: BLE001
             return  # can't confirm metabolic headroom → conservatively skip
-    # (1) balanced experience-replay.
-    _batch_n = int(cfg["explore_replay_batch"])
-    if cfg.get("explore_balanced", True):
-        batch = store.balanced_reward_tuples(_batch_n)
+    # (1) experience-replay learning.
+    if bool(cfg.get("oml_iql_enabled", True)):
+        # FULL-IQL consolidation (P2) — REPLACES the REINFORCE replay. Build
+        # per-goal_class trajectories (next_state/terminal) from the recent
+        # reward tuples and run ONE offline train_iql pass; persist the π flat
+        # (SHM) + the separate IQL nets. This is the sole policy-learning pass
+        # under IQL (the per-turn _handle_reward only buffers).
+        rows = store.iql_transitions(int(cfg.get("iql_replay_window", 2000)))
+        transitions = _build_routing_transitions(rows)
+        if len(transitions) >= 2:
+            stats = policy.train_iql(
+                transitions,
+                tau=float(cfg["iql_tau"]), beta=float(cfg["iql_beta"]),
+                gamma=float(cfg["iql_gamma"]), polyak=float(cfg["iql_polyak"]),
+                adv_clip=float(cfg["iql_adv_clip"]), lr=float(cfg["iql_lr"]),
+                steps=int(cfg["iql_steps"]), batch_size=int(cfg["iql_batch_size"]))
+            store.save_policy_flat(policy.to_flat().tolist(),
+                                   policy.total_updates, policy.reward_baseline)
+            store.save_iql_flat(policy.iql_to_flat().tolist(),
+                                policy.total_iql_updates)
+            _publish_weights(shm_writer, policy)
+            store.log_explore(
+                "iql", "",
+                f"trans={stats.get('transitions')} v={stats.get('v_loss', 0.0):.4f} "
+                f"q={stats.get('q_loss', 0.0):.4f} p={stats.get('policy_loss', 0.0):.4f} "
+                f"iql_updates={stats.get('iql_updates')}")
     else:
-        batch = store.recent_reward_tuples(_batch_n)
-    replayed = 0
-    for features, action, reward in batch:
-        if len(features) != OUTER_POLICY_INPUT_DIM:
-            continue
-        policy.learn(features, action, reward, baseline_alpha=float(cfg["baseline_alpha"]))
-        replayed += 1
-    if replayed:
-        store.save_policy_flat(policy.to_flat().tolist(),
-                               policy.total_updates, policy.reward_baseline)
-        _publish_weights(shm_writer, policy)
-        store.log_explore("replay", "", f"batch={replayed}balanced={cfg.get('explore_balanced', True)}")
+        # Legacy REINFORCE balanced experience-replay (flag-off; INV-MC-7).
+        _batch_n = int(cfg["explore_replay_batch"])
+        if cfg.get("explore_balanced", True):
+            batch = store.balanced_reward_tuples(_batch_n)
+        else:
+            batch = store.recent_reward_tuples(_batch_n)
+        replayed = 0
+        for features, action, reward in batch:
+            if len(features) != OUTER_POLICY_INPUT_DIM:
+                continue
+            policy.learn(features, action, reward, baseline_alpha=float(cfg["baseline_alpha"]))
+            replayed += 1
+        if replayed:
+            store.save_policy_flat(policy.to_flat().tolist(),
+                                   policy.total_updates, policy.reward_baseline)
+            _publish_weights(shm_writer, policy)
+            store.log_explore("replay", "", f"batch={replayed}balanced={cfg.get('explore_balanced', True)}")
     # (2) active structural exploration — the G5/GB8 closer (deadlock fix step 2).
     if cfg.get("explore_structural", True):
         _structural_explore(cfg, store, policy, shm_writer, life, name)

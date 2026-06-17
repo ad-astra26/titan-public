@@ -40,6 +40,13 @@ def _feat(**kw):
     return OuterFeatures(**kw).to_vector().tolist()
 
 
+# Flag-off cfg: with IQL on (the default, P2) _handle_reward BUFFERS instead of
+# training per-turn, so these legacy per-turn-REINFORCE-training contract tests
+# run with oml_iql_enabled=False — they double as the INV-MC-7 flag-off parity
+# guard (the legacy path must stay byte-identical).
+_LEGACY = {"synthesis": {"self_learning": {"oml_iql_enabled": False}}}
+
+
 def test_decision_stash_then_reward_join_trains(tmp_path):
     store = _store(tmp_path)
     policy = OuterMetaPolicy(lr=0.05)
@@ -53,7 +60,7 @@ def test_decision_stash_then_reward_join_trains(tmp_path):
 
     trained = _handle_reward(
         {"parent_tool_call_tx": "tx_abc", "reward": 1.0}, store, policy,
-        None, _cfg({}), _Q(), "self_learning")
+        None, _cfg(_LEGACY), _Q(), "self_learning")
 
     assert trained is True
     assert policy.total_updates == updates_before + 1
@@ -77,13 +84,33 @@ def test_direct_reward_trains_without_stash(tmp_path):
     trained = _handle_reward(
         {"features": feats, "action": tool, "reward": 1.0,
          "goal_class": "combinatorics"},
-        store, policy, None, _cfg({}), _Q(), "self_learning")
+        store, policy, None, _cfg(_LEGACY), _Q(), "self_learning")
     assert trained is True
     assert policy.total_updates == updates_before + 1
     # recorded as a reward tuple (drives macro distillation)
     assert len(store.recent_reward_tuples(10)) == 1
     # no pending-decision stash was needed
     assert store.pop_decision("anything") is None
+
+
+def test_iql_default_buffers_join_without_per_turn_train(tmp_path):
+    # P2 default (oml_iql_enabled=True): the join still resolves + marks the
+    # decision rewarded + records the reward tuple, but does NOT train per-turn
+    # (no REINFORCE update; learning is the offline explore-tick train_iql pass).
+    store = _store(tmp_path)
+    policy = OuterMetaPolicy(lr=0.05)
+    tool = OUTER_ACTIONS.index("tool")
+    feats = _feat(has_code_signal=True)
+    store.stash_decision(tx="tx_iql", features=feats, action=tool,
+                         goal_class="combinatorics", turn_id="t1")
+    updates_before = policy.total_updates
+    trained = _handle_reward(
+        {"parent_tool_call_tx": "tx_iql", "reward": 1.0}, store, policy,
+        None, _cfg({}), _Q(), "self_learning")  # default cfg → IQL on
+    assert trained is True
+    assert policy.total_updates == updates_before          # buffered, not trained
+    assert len(store.recent_reward_tuples(10)) == 1        # the sample was buffered
+    assert store.peek_decision("tx_iql")[4] == "llm_judge"  # still marked rewarded
 
 
 def test_direct_reward_distills_macro(tmp_path):
@@ -126,7 +153,7 @@ def test_negative_reward_trains(tmp_path):
                          goal_class="compute", turn_id="t2")
     trained = _handle_reward(
         {"parent_tool_call_tx": "tx_neg", "reward": -1.0}, store, policy,
-        None, _cfg({}), _Q(), "self_learning")
+        None, _cfg(_LEGACY), _Q(), "self_learning")
     assert trained is True
     assert policy.reward_baseline < 0.0  # EMA tracked the −1
 
@@ -159,12 +186,12 @@ def test_corrective_delta_user_after_judge(tmp_path):
     store.stash_decision(tx="tx", features=_feat(), action=direct,
                          goal_class="philosophy", turn_id="t")
     _handle_reward({"parent_tool_call_tx": "tx", "reward": 1.0, "source": "llm_judge"},
-                   store, policy, None, _cfg({}), _Q(), "self_learning")
+                   store, policy, None, _cfg(_LEGACY), _Q(), "self_learning")
     upd_after_judge = policy.total_updates
     assert store.peek_decision("tx")[4] == "llm_judge"
     trained = _handle_reward(
         {"parent_tool_call_tx": "tx", "reward": -1.0, "source": "user"},
-        store, policy, None, _cfg({}), _Q(), "self_learning")
+        store, policy, None, _cfg(_LEGACY), _Q(), "self_learning")
     assert trained is True
     assert policy.total_updates == upd_after_judge + 1   # the correction retrained
     peeked = store.peek_decision("tx")
