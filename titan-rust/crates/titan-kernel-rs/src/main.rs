@@ -17,6 +17,8 @@
 pub mod api_reload_subscriber;
 pub mod broker_publisher;
 pub mod cli;
+pub mod config_daemon;
+pub mod config_schema;
 pub mod exit;
 pub mod fastbus_publisher;
 pub mod identity_load;

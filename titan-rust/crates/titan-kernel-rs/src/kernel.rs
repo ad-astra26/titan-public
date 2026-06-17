@@ -24,7 +24,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use titan_bus::BusBroker;
 use titan_cgn::create_cgn_live_weights;
@@ -279,6 +279,59 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
         "B3 created kernel-owned shm slots + cgn_live_weights"
     );
 
+    // B3.5 (RFP_config_as_shm_state §7.A): config-as-SHM-state seed. Runs BEFORE
+    // the B8 python spawn so per-section config slots are live when workers start
+    // (Phase B repoints worker reads to them). NON-FATAL in Phase A: no worker
+    // reads these slots yet, so an incomplete schema must NOT break boot — it logs
+    // a loud [ERR] and continues. Default-on; kill-switch TITAN_KERNEL_CONFIG_DAEMON=0.
+    let config_daemon_enabled = std::env::var("TITAN_KERNEL_CONFIG_DAEMON")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    let config_slots = if config_daemon_enabled {
+        let schema_path = cli
+            .config
+            .parent()
+            .map(|p| p.join("config_schema.toml"))
+            .unwrap_or_else(|| PathBuf::from("config_schema.toml"));
+        match crate::config_schema::ConfigSchema::load(&schema_path) {
+            Ok(schema) => {
+                let schema = Arc::new(schema);
+                match crate::config_daemon::ConfigSlotSet::seed(
+                    &shm_dir,
+                    &cli.config,
+                    &schema,
+                    false,
+                ) {
+                    Ok(set) => {
+                        info!(
+                            event = "CONFIG_DAEMON_SEEDED",
+                            sections = set.section_count(),
+                            schema_keys = schema.len(),
+                            "B3.5 config-as-SHM-state slots seeded"
+                        );
+                        Some((set, schema))
+                    }
+                    Err(e) => {
+                        error!(event = "CONFIG_DAEMON_SEED_FAIL", err = %e,
+                            "B3.5 config seed failed — config daemon disabled this boot");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(event = "CONFIG_DAEMON_NO_SCHEMA", path = ?schema_path, err = %e,
+                    "B3.5 config_schema.toml not loadable — config daemon disabled");
+                None
+            }
+        }
+    } else {
+        info!(
+            event = "CONFIG_DAEMON_DISABLED",
+            "B3.5 config daemon disabled via env"
+        );
+        None
+    };
+
     info!(event = "BOOT_B4_BUS_BIND", path = ?bus_socket, "B4 bus broker bind");
     let mut broker = BusBroker::new(titan_id, authkey.to_vec());
     broker
@@ -363,6 +416,28 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
         let shutdown = shutdown.clone();
         tokio::spawn(async move { run_snapshot_loop(path, state, shutdown).await })
     };
+
+    // B6.5 (RFP_config_as_shm_state §7.A): config-daemon watch loop. Spawned here
+    // (still BEFORE the B8 python spawn) so the slots stay live + re-applied on
+    // file change. `None` ⇒ daemon disabled/seed-failed this boot (already logged).
+    let config_watch_handle = config_slots.map(|(set, schema)| {
+        let broker = broker.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            crate::config_daemon::run_config_watch_loop(
+                set,
+                schema,
+                shutdown,
+                move |topic, payload| {
+                    let broker = broker.clone();
+                    async move {
+                        broker.publish_local(topic, "config_daemon", payload).await;
+                    }
+                },
+            )
+            .await
+        })
+    });
 
     // B7.5 (C-S3 chunk C3-6): kernel-side fastbus producer attach.
     // Must happen BEFORE substrate spawn — substrate's first attach in C3-6
@@ -622,6 +697,9 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
         let _ = pi_handle.await;
         let _ = snapshot_handle.await;
         let _ = fastbus_handle.await;
+        if let Some(h) = config_watch_handle {
+            let _ = h.await;
+        }
         if let Some(h) = substrate_watch_handle {
             let _ = h.await;
         }
