@@ -51,6 +51,7 @@ from titan_hcl.modules._heartbeat_grace import (
 from titan_hcl.synthesis.outer_meta_policy import (
     MSL_CONTEXT_DIM,
     NUM_OUTER_ACTIONS,
+    OUTER_ACTIONS,
     OUTER_META_POLICY_STATE_SPEC,
     OUTER_POLICY_INPUT_DIM,
     OuterMetaPolicy,
@@ -195,6 +196,18 @@ _DEFAULTS = {
     "competence_w_adv": 0.4,          # weight: advantage-positive-rate
     "competence_window": 200,         # recent decisions for success_rate
     "competence_ema_alpha": 0.05,     # competence_rate smoothing
+    # ── P4 — level-driven reward shaping (ARCHITECTURE_mastery_leveling.md §4) ──
+    # As the level rises, the easy `direct` path's POSITIVE reward decays (coasting
+    # pays less → the policy explores harder paths). Applied to the IQL TRAINING
+    # transitions only — the buffered reward_tuples stay RAW so the scale-free
+    # competence signal stays correctness-grounded (INV-ML-3). Floor>0 keeps
+    # `direct` a valid learned action (INV-MC-4). Other actions are never damped.
+    "level_shaping_enabled": True,
+    "direct_damping_floor": 0.3,      # min multiplier on a positive direct reward (INV-MC-4)
+    "direct_damping_slope": 0.07,     # per-level decay (level 10 → 1−0.7 = floor)
+    "direct_ungrounded_recall_threshold": 0.5,  # recall_top_cosine below this = ungrounded
+    "direct_ungrounded_extra_damping": 0.7,     # ungrounded direct damped MORE
+    "direct_graduated_floor": 0.6,    # mastered (chunked) goal_class → ease damping (higher floor)
 }
 # Reward-source authority rank (Phase B corrective-delta): a higher-rank source
 # may correct a lower-rank applied reward; same-or-lower is ignored (no double-train).
@@ -1436,19 +1449,62 @@ def _build_routing_transitions(rows):
     for feats, action, reward, gc, _ts in rows:
         if len(feats) != OUTER_POLICY_INPUT_DIM:
             continue
-        valid.append((feats, int(action), float(reward)))
+        valid.append((feats, int(action), float(reward), str(gc or "")))
         groups[gc].append(len(valid) - 1)
     out = []
     for _gc, idxs in groups.items():
         for j, ix in enumerate(idxs):
-            feats, action, reward = valid[ix]
-            if j + 1 < len(idxs):
-                out.append({"state": feats, "action": action, "reward": reward,
-                            "next_state": valid[idxs[j + 1]][0], "terminal": False})
-            else:
-                out.append({"state": feats, "action": action, "reward": reward,
-                            "next_state": None, "terminal": True})
+            feats, action, reward, gcl = valid[ix]
+            nxt = valid[idxs[j + 1]][0] if j + 1 < len(idxs) else None
+            out.append({"state": feats, "action": action, "reward": reward,
+                        "next_state": nxt, "terminal": nxt is None,
+                        "goal_class": gcl})
     return out
+
+
+# Action index for the easy path (`direct`) — the only action P4 damps.
+_DIRECT_ACTION_IDX = OUTER_ACTIONS.index("direct")
+
+
+def _direct_damping(level: float, *, floor: float, slope: float,
+                    graduated: bool, graduated_floor: float) -> float:
+    """P4 damping multiplier for a POSITIVE `direct` reward — decays as the level
+    rises (coasting pays less), bounded below by `floor` (>0, INV-MC-4). A
+    mastered (chunked/graduated) goal_class eases the damping to `graduated_floor`
+    (coasting on a mastered skill is fine — SOAR ② graduation map)."""
+    d = max(float(floor), 1.0 - float(slope) * float(level))
+    if graduated:
+        d = max(d, float(graduated_floor))
+    return d
+
+
+def _shape_transitions_for_level(transitions, level, cfg, store):
+    """P4 — shape the IQL TRAINING transitions by the current MasteryLevel
+    (ARCHITECTURE_mastery_leveling.md §4). Mutates `reward` in place:
+    a POSITIVE `direct` reward is damped by `_direct_damping(level)`, extra-damped
+    when ungrounded (low recall_top_cosine = state[1]); other actions and negative
+    rewards are untouched (we never ease a penalty). Returns the count shaped."""
+    floor = float(cfg["direct_damping_floor"])
+    slope = float(cfg["direct_damping_slope"])
+    grad_floor = float(cfg["direct_graduated_floor"])
+    recall_thr = float(cfg["direct_ungrounded_recall_threshold"])
+    ungrounded_mul = float(cfg["direct_ungrounded_extra_damping"])
+    shaped = 0
+    for t in transitions:
+        if t["action"] != _DIRECT_ACTION_IDX or t["reward"] <= 0.0:
+            continue  # only POSITIVE direct rewards decay
+        graduated = store.is_graduated(t.get("goal_class", ""))
+        d = _direct_damping(level, floor=floor, slope=slope,
+                            graduated=graduated, graduated_floor=grad_floor)
+        try:
+            recall = float(t["state"][1])  # recall_top_cosine
+        except Exception:  # noqa: BLE001
+            recall = 1.0
+        if recall < recall_thr:
+            d *= ungrounded_mul          # ungrounded direct damped MORE
+        t["reward"] = float(t["reward"]) * d
+        shaped += 1
+    return shaped
 
 
 def _update_mastery_level(cfg, store, policy, transitions, mastery, level_writer):
@@ -1510,6 +1566,14 @@ def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
         # under IQL (the per-turn _handle_reward only buffers).
         rows = store.iql_transitions(int(cfg.get("iql_replay_window", 2000)))
         transitions = _build_routing_transitions(rows)
+        # P4 — level-driven reward shaping on the TRAINING transitions (the level
+        # as of the previous tick; EMA-slow so this is the current curriculum).
+        if (mastery is not None and len(transitions) >= 2
+                and bool(cfg.get("level_shaping_enabled", True))):
+            _level_now = float(mastery.readout().get("level", 0.0))
+            _ns = _shape_transitions_for_level(transitions, _level_now, cfg, store)
+            if _ns:
+                store.log_explore("shape", "", f"level={_level_now:.2f} direct_damped={_ns}")
         if len(transitions) >= 2:
             stats = policy.train_iql(
                 transitions,
