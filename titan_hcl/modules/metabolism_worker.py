@@ -84,6 +84,7 @@ MODULE_NAME = "metabolism"
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -249,7 +250,7 @@ def _init_metabolism(config: dict, titan_id: str):
 
     Returns MetabolismController or None on init failure.
     """
-    growth_cfg = (config.get("growth_metrics", {}) or {})
+    growth_cfg = (get_params("growth_metrics") or {})
 
     # ── Soul + Network (kernel handles needed by MetabolismController) ──
     #
@@ -264,7 +265,7 @@ def _init_metabolism(config: dict, titan_id: str):
 
     try:
         from titan_hcl.core.network import HybridNetworkClient as Network
-        network_cfg = (config.get("network", {}) or {})
+        network_cfg = (get_params("network") or {})
         # HybridNetworkClient.__init__(self, mood_engine=None, config=None) —
         # it takes NO `soul` kwarg, and `config` is the 2nd param. The prior
         # call `Network(network_cfg, soul=soul)` bound network_cfg to
@@ -414,7 +415,7 @@ def metabolism_worker_main(recv_queue, send_queue, name: str,
 
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
     )
     boot_ts = time.time()

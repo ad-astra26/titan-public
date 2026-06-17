@@ -104,7 +104,7 @@ def reflex_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     full_config = config or {}
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (full_config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
     )
 

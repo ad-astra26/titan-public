@@ -119,6 +119,7 @@ from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
 from titan_hcl.errors import ModuleError, ModuleErrorCode
 from titan_hcl.bus import publish_module_error
+from titan_hcl.params import get_params
 
 # Process-local EngineRecall singleton (PLAN §2D). Constructed during
 # synthesis_worker_main boot; exposed via get_engine_recall() so future
@@ -2070,7 +2071,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # for audit), just produces no spine writes.
         propose_fn = None
         decompose_fn = None  # Bridge §7.1 — Engram→Object decompose (same provider)
-        inference_cfg = (config or {}).get("inference", {}) or {}
+        inference_cfg = get_params("inference") or {}
         try:
             from titan_hcl.inference import get_provider as _get_provider
             api_key = inference_cfg.get("ollama_cloud_api_key", "") or ""
@@ -2144,7 +2145,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
         # Tunables (RFP §7.D / D2-D3): cosine clustering over the sidecar source;
         # wide window so backfilled history participates; min_cluster default 2.
-        consolidation_cfg = (config or {}).get("synthesis", {}).get(
+        consolidation_cfg = get_params("synthesis").get(
             "consolidation", {}) or {}
         _min_cluster = int(consolidation_cfg.get("min_cluster_size", 2))
         _window_hours = float(consolidation_cfg.get("window_hours", 720.0))
@@ -2299,7 +2300,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # of T3 soak runs in dry-run. Production behavior is set by the
     # `phase5.fork_gc_live` config flag (default False; flip after soak).
     fork_gc_live_mode: bool = bool(
-        (config or {}).get("synthesis", {}).get("fork_gc_live", False)
+        get_params("synthesis").get("fork_gc_live", False)
     )
 
     # ── Phase 9 P9.D — skill-outcome sink (late-bound) ──────────────────
@@ -2460,8 +2461,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # Concrete truth oracles
         sandbox_oracle = CodingSandboxOracle()
         solana_oracle = SolanaRpcOracle(
-            rpc_url=(config or {}).get("network", {}).get("premium_rpc_url"),
-            fallback_urls=list((config or {}).get("network", {}).get("public_rpc_urls", [])),
+            rpc_url=get_params("network").get("premium_rpc_url"),
+            fallback_urls=list(get_params("network").get("public_rpc_urls", [])),
         )
         web_api_oracle = WebApiOracle()  # default search_fn + judge_fn
         # x_oracle / x_research need a real SocialXGateway instance — best-
@@ -2642,7 +2643,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     llm_judge: Optional[Any] = None
     procedural_miner: Optional[Any] = None
 
-    skill_cfg = (config or {}).get("synthesis", {}).get("skill", {}) or {}
+    skill_cfg = get_params("synthesis").get("skill", {}) or {}
     _data_dir = os.environ.get("TITAN_DATA_DIR", "data")
     skills_faiss_path = os.path.join(_data_dir, "skills_vectors.faiss")
     skills_snapshot_path = os.path.join(_data_dir, "skills_snapshot.json")
@@ -2818,7 +2819,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # identity from config (X handle, Telegram id, pubkey). High confidence but
         # <1.0 (epistemic honesty). Idempotent: record_fact reinforces on re-boot.
         try:
-            _mr = (config or {}).get("maker_relationship", {}) or {}
+            _mr = get_params("maker_relationship") or {}
             for _seed_cat, _seed_val in (
                 ("x_handle", str(_mr.get("maker_x_handle", "") or "")),
                 ("telegram_id", str(_mr.get("maker_telegram_id", "") or "")),
@@ -2941,8 +2942,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                        if _wiki_provider is not None else None)
         # DK.3/DK.5 tunables — §7.D-knowledge M1/M2/M5; emergent-epoch lifetime +
         # the recall floor DK.4 routes on. `[synthesis.research]` (titan_params).
-        _rcfg = (config or {}).get("synthesis", {}).get("research", {}) or {}
-        _grcfg = (config or {}).get("gatekeeper", {}).get(
+        _rcfg = get_params("synthesis").get("research", {}) or {}
+        _grcfg = get_params("gatekeeper").get(
             "grounded_router", {}) or {}
         _lint_caps = {
             "contradiction_overlap": float(
@@ -3060,7 +3061,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 try:
                     import asyncio as _aio
                     from titan_hcl.inference import get_provider as _get_provider
-                    provider = _get_provider("ollama_cloud", (config or {}).get("inference", {}) or {})
+                    provider = _get_provider("ollama_cloud", get_params("inference") or {})
                     # provider.complete is ASYNC — bridge via asyncio.run (same
                     # class of bug as the miner proposer: calling it synchronously
                     # returned an un-awaited coroutine → judge scored 0 TXs →
@@ -3087,7 +3088,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 ),
                 llm_provider=_llm_judge_call,
                 outer_memory_writer=writer,
-                model_id=(config or {}).get("inference", {}).get("ollama_cloud_model") or "ollama_cloud_deepseek",
+                model_id=get_params("inference").get("ollama_cloud_model") or "ollama_cloud_deepseek",
                 bus_emit=_judge_bus_emit,
                 per_pass_cap=int(skill_cfg.get("llm_judge_per_pass_cap", 200)),
                 timeout_s=float(skill_cfg.get("llm_judge_timeout_s", 30.0)),
@@ -3108,7 +3109,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 try:
                     import asyncio as _aio
                     from titan_hcl.inference import get_provider as _get_provider
-                    provider = _get_provider("ollama_cloud", (config or {}).get("inference", {}) or {})
+                    provider = _get_provider("ollama_cloud", get_params("inference") or {})
                     seq_str = " → ".join(
                         f"{tool}({args_shape})" for tool, args_shape in cluster_meta.get("sequence", [])
                     )
@@ -3197,7 +3198,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # ToolPlugs' sink (built earlier) drives them.
     skill_failure_tracker: Optional[Any] = None
     user_feedback_override: Optional[Any] = None
-    meta_cfg = dict((config or {}).get("synthesis", {}).get("meta", {}) or {})
+    meta_cfg = dict(get_params("synthesis").get("meta", {}) or {})
     if procedural_skill_store is not None:
         try:
             from titan_hcl.synthesis.skill_failure_tracker import SkillFailureTracker
@@ -3266,7 +3267,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # in scope regardless of the metrics-enabled branch.
     _xproc_chi = {"total_chi_spent": 0.0, "total_evaluations": 0,
                   "total_chi_exhausted": 0}
-    metrics_cfg = dict((config or {}).get("synthesis", {}).get("metrics", {}) or {})
+    metrics_cfg = dict(get_params("synthesis").get("metrics", {}) or {})
     if bool(metrics_cfg.get("metrics_snapshot_enabled", True)):
         try:
             from titan_hcl.synthesis.sovereignty_meter import (

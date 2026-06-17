@@ -31,6 +31,7 @@ import os
 from typing import Any, Optional
 
 from titan_hcl.bus import DivineBus
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -239,8 +240,8 @@ class WorkerPlugin:
                     _build_sage_config, _wire_ollama_cloud)
                 from titan_hcl.logic.sage.researcher import StealthSageResearcher
                 _cfg: dict[str, Any] = {}
-                _cfg.update(self._full_config.get("inference", {}) or {})
-                _cfg.update(self._full_config.get("stealth_sage", {}) or {})
+                _cfg.update(get_params("inference") or {})
+                _cfg.update(get_params("stealth_sage") or {})
                 _sage_cfg = _build_sage_config(_cfg)
                 # Research DISTILLATION (turning scraped pages into an answer) goes
                 # through /v4/llm-distill, which StealthSage reads from config["api"]
@@ -250,11 +251,11 @@ class WorkerPlugin:
                 # The internal_key lives in secrets.toml; this worker's _full_config
                 # may not carry the merged secret, so resolve it canonically
                 # (load_titan_config merges secrets) when _full_config lacks it.
-                _api_cfg = dict(self._full_config.get("api", {}) or {})
+                _api_cfg = dict(get_params("api") or {})
                 if not _api_cfg.get("internal_key"):
                     try:
                         from titan_hcl.config_loader import load_titan_config
-                        _merged_api = (load_titan_config().get("api", {}) or {})
+                        _merged_api = (get_params("api") or {})
                         if _merged_api.get("internal_key"):
                             _api_cfg = _merged_api
                     except Exception:

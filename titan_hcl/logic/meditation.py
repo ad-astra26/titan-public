@@ -106,10 +106,10 @@ class MeditationEpoch:
         # the LLM call appears in llm_state.bin centrally. api_base +
         # internal_key are read from config at score-time (lazy lookup).
         self._llm_distill_api_base: str = (
-            f"http://127.0.0.1:{int(config.get('api', {}).get('port', 7777))}"
+            f"http://127.0.0.1:{int(get_params("api").get('port', 7777))}"
         )
         self._llm_distill_internal_key: str = (
-            config.get("api", {}).get("internal_key", "") or "")
+            get_params("api").get("internal_key", "") or "")
 
         # Epoch counter for info banner
         self._epoch_counter = 0
@@ -155,7 +155,7 @@ class MeditationEpoch:
         combined_text = "\n".join(scrubbed_data)
 
         # Apply configurable privacy filter before sending to any cloud API
-        privacy_cfg = self._config.get("privacy", {})
+        privacy_cfg = get_params("privacy")
         combined_text = self._apply_privacy_filter(combined_text, privacy_cfg)
 
         if self.api_key:

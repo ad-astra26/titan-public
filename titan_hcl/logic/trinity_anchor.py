@@ -29,6 +29,7 @@ import os
 import time
 
 from titan_hcl.utils.silent_swallow import swallow_warn
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ def maybe_anchor_trinity(consciousness, config: dict,
 
     # Signal 2: Minimum TimeChain block delta since last anchor
     # ~20K blocks/day → 5000 blocks ≈ 6 hours → ~4 anchors/day naturally
-    _min_tc_delta = config.get("mainnet_budget", {}).get("consciousness_anchor_min_tc_blocks", 5000)
+    _min_tc_delta = get_params("mainnet_budget").get("consciousness_anchor_min_tc_blocks", 5000)
     _last_anchor_tc = _prev_anchor.get("last_anchor_tc_blocks", 0)
     try:
         from titan_hcl.utils.db import safe_connect as _sc_tc

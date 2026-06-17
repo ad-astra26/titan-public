@@ -22,6 +22,7 @@ import logging
 import sqlite3
 from pathlib import Path
 from dataclasses import dataclass, field
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -970,8 +971,8 @@ class EventsTeacher:
     @staticmethod
     def _get_api_key(config: dict) -> str:
         """Get twitterapi.io API key (same fallback chain as gateway)."""
-        sx = config.get("social_x", {})
-        sage = config.get("stealth_sage", {})
+        sx = get_params("social_x")
+        sage = get_params("stealth_sage")
         return sx.get("api_key", sage.get("twitterapi_io_key", ""))
 
     # ── Rate-Adaptive Scheduling ─────────────────────────────────────
@@ -1046,8 +1047,8 @@ class EventsTeacher:
             pass
 
         api_key = self._get_api_key(config)
-        handle = config.get("social_x", {}).get(
-            "user_name", config.get("twitter_social", {}).get("user_name", "your_x_handle"))
+        handle = get_params("social_x").get(
+            "user_name", get_params("twitter_social").get("user_name", "your_x_handle"))
         if not api_key:
             return 0
 
@@ -1258,7 +1259,7 @@ class EventsTeacher:
         twitterapi.io bills per-result on search; tightening these is the
         biggest lever after cron cadence.
         """
-        et_cfg = config.get("events_teacher", {})
+        et_cfg = get_params("events_teacher")
         n_default = int(et_cfg.get("follower_timeline_n_to_check", 1))
         per_count = int(et_cfg.get("follower_timeline_count", 3))
 
@@ -1462,7 +1463,7 @@ class EventsTeacher:
         quality filters: lang:en, -is:retweet. Returns empty string if
         no terms available (caller skips fetch).
         """
-        et_cfg = config.get("events_teacher", {})
+        et_cfg = get_params("events_teacher")
         gn = int(et_cfg.get("dynamic_grounded_top_n", 2))
         rn = int(et_cfg.get("dynamic_recent_top_n", 1))
         use_sent = bool(et_cfg.get("dynamic_sentence_keyword", True))
@@ -1485,7 +1486,7 @@ class EventsTeacher:
     def _compose_wide_query(self, config: dict) -> str:
         """Build wide-net keyword search from Maker-curated [events_teacher]
         wide_topic_keywords (comma-separated)."""
-        et_cfg = config.get("events_teacher", {})
+        et_cfg = get_params("events_teacher")
         raw = et_cfg.get(
             "wide_topic_keywords",
             "#AI,#consciousness,#spiritual,#blockchain,#solana")
@@ -1529,8 +1530,8 @@ class EventsTeacher:
           • Exploration floor — every source is re-probed ≥1× per
                     `explore_cycles` windows so it can recover (never blind).
         """
-        et_cfg = config.get("events_teacher", {})
-        ac_cfg = (config.get("social_x", {}) or {}).get("auto_cycle", {}) or {}
+        et_cfg = get_params("events_teacher")
+        ac_cfg = (get_params("social_x") or {}).get("auto_cycle", {}) or {}
         window_s = float(ac_cfg.get("attribution_window_s", 172800.0))   # 48 h
         gate_threshold = int(ac_cfg.get("gate_threshold", 0))
         explore_cycles = max(1, int(ac_cfg.get("explore_cycles", 3)))
@@ -1708,7 +1709,7 @@ class EventsTeacher:
         api_calls = 1  # one gateway.search_tweets call (may hit cache, still count budget)
         # Maker-tunable: topic_search_count (default 10). twitterapi.io bills
         # per result on search — halving count halves cost on this endpoint.
-        et_cfg = config.get("events_teacher", {})
+        et_cfg = get_params("events_teacher")
         topic_count = (int(count) if count is not None
                        else int(et_cfg.get("topic_search_count", 10)))
         try:
@@ -1785,8 +1786,8 @@ class EventsTeacher:
             return [], 0
 
         api_key = self._get_api_key(config)
-        handle = config.get("social_x", {}).get(
-            "user_name", config.get("twitter_social", {}).get("user_name", "your_x_handle"))
+        handle = get_params("social_x").get(
+            "user_name", get_params("twitter_social").get("user_name", "your_x_handle"))
         if not api_key:
             return [], 0
 
@@ -2184,7 +2185,7 @@ class EventsTeacher:
         # distillation window — X posting stays governed by social_x rate
         # limits. Flip back to false to restore full metabolic governance.
         _ignore_gate = bool(
-            (config.get("events_teacher", {}) or {}).get(
+            (get_params("events_teacher") or {}).get(
                 "ignore_metabolic_gate", False))
         if (not ok) and _ignore_gate:
             logger.info(
@@ -2277,7 +2278,7 @@ class EventsTeacher:
             # downstream batches all items + tags by source so scoring
             # post-gate attributes events to their source. See
             # _record_adaptive_cycle_outcomes() below.
-            et_cfg = config.get("events_teacher", {})
+            et_cfg = get_params("events_teacher")
             adaptive_enabled = bool(et_cfg.get("adaptive_cycle_enabled", True))
             cycle_results: dict = {}
 
@@ -2339,11 +2340,11 @@ class EventsTeacher:
             # owns provider credentials. Kept in the _distill_content signature
             # for back-compat with any other caller. internal_key authenticates
             # the cron→endpoint hop.
-            inference = config.get("inference", {})
+            inference = get_params("inference")
             llm_url = inference.get("ollama_cloud_base_url", "https://ollama.com/v1")
             llm_key = inference.get("ollama_cloud_api_key", "")
             llm_model = "deepseek-v3.1:671b"
-            internal_key = config.get("api", {}).get("internal_key", "")
+            internal_key = get_params("api").get("internal_key", "")
 
             events, latency = self._distill_content(
                 all_items, mode, titan_state, llm_url, llm_key, llm_model,

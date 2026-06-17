@@ -25,6 +25,7 @@ from typing import Optional, Tuple
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -212,11 +213,11 @@ def build_encryption_context_from_config(full_config: dict) -> Optional[dict]:
     on missing/malformed keypair — logs a warning and returns None so the backup
     still proceeds unencrypted, rather than silently dropping a backup.
     """
-    backup_cfg = (full_config or {}).get("backup", {}) or {}
+    backup_cfg = get_params("backup") or {}
     if not backup_cfg.get("encryption_enabled", False):
         return None
     try:
-        net = (full_config or {}).get("network", {}) or {}
+        net = get_params("network") or {}
         kp_path = net.get(
             "wallet_keypair_path", "data/titan_identity_keypair.json")
         if not os.path.exists(kp_path):

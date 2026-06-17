@@ -47,6 +47,7 @@ from titan_hcl.modules._heartbeat_grace import (
 )
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -488,7 +489,7 @@ def _render_art(orchestrator, row: dict, bundle: dict, target_day: str) -> None:
 def _build_chain_provider(config: dict):
     """Construct the data-plane ChainProvider for the Arweave upload from config
     (a seam — monkeypatched in tests). Devnet → local pseudo-tx; mainnet → Irys."""
-    net = (config or {}).get("network", {}) or {}
+    net = get_params("network") or {}
     from titan_hcl.chain.provider import ArweaveChainProvider
     return ArweaveChainProvider(
         keypair_path=net.get("wallet_keypair_path", "") or "",
@@ -500,7 +501,7 @@ def _build_network_client(config: dict):
     """Construct the trust-plane HybridNetworkClient (holds the wallet keypair +
     signs the mint) from config (a seam — monkeypatched in tests)."""
     from titan_hcl.core.network import HybridNetworkClient
-    return HybridNetworkClient(config=(config or {}).get("network", {}) or {})
+    return HybridNetworkClient(config=get_params("network") or {})
 
 
 async def _upload_and_mint(*, config, date, entry_hash, cumulative_hash,
@@ -671,7 +672,7 @@ def soul_diary_worker_main(recv_queue, send_queue, name: str,
         logger.warning("[soul_diary] ModuleStateWriter init failed: %s", _sw_err)
 
     from titan_hcl.core.state_registry import resolve_titan_id
-    titan_id = ((full_config.get("info_banner", {}) or {}).get("titan_id")
+    titan_id = ((get_params("info_banner") or {}).get("titan_id")
                 or resolve_titan_id())
     logger.info("[soul_diary] Booting — titan_id=%s", titan_id)
 
@@ -682,7 +683,7 @@ def soul_diary_worker_main(recv_queue, send_queue, name: str,
     # provider None → authoring soft-fails to the minimal grounded entry.
     provider = None
     try:
-        inference_cfg = full_config.get("inference", {}) or {}
+        inference_cfg = get_params("inference") or {}
         provider_name = _resolve_provider_name(inference_cfg)
         from titan_hcl.inference import get_provider
         provider = get_provider(provider_name, inference_cfg)

@@ -28,6 +28,7 @@ import os
 import time
 from pathlib import Path
 from typing import Optional
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ def _resolve_filter_down_cfg(config: Optional[dict]) -> dict:
     module constants above (which match the toml defaults, so behavior is
     unchanged for callers that pass config=None).
     """
-    section = (config or {}).get("filter_down", {}) if isinstance(config, dict) else {}
+    section = get_params("filter_down") if isinstance(config, dict) else {}
     return {
         "gamma":            float(section.get("gamma", GAMMA)),
         "lr":               float(section.get("learning_rate", LR)),
@@ -524,7 +525,7 @@ class FilterDownV5Engine:
 
     def __init__(self, config: Optional[dict] = None, data_dir: str = "./data"):
         import numpy as np
-        cfg = (config or {}).get("filter_down_v5", {})
+        cfg = get_params("filter_down_v5")
         base = _resolve_filter_down_cfg(config)
 
         # Shared base params — drive training cadence and multiplier clipping

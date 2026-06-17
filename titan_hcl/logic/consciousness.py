@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from titan_hcl.utils.silent_swallow import swallow_warn
+from titan_hcl.params import get_params
 
 
 # ── SPEC §11.H.1.bis — consciousness.db row-vector BLOB f32-LE encoding ──
@@ -691,7 +692,7 @@ class ConsciousnessLoop:
         # element-wise mean is the "distilled qualitative topology" component
         # of TITAN_SELF. Buffer cleared after each epoch emission.
         from collections import deque
-        _ts_cfg = cfg.get("titan_self", {}) if isinstance(cfg, dict) else {}
+        _ts_cfg = get_params("titan_self") if isinstance(cfg, dict) else {}
         _topo_buf_max = int(_ts_cfg.get("topology_buffer_max", 500))
         self._topology_buffer: "deque[list[float]]" = deque(maxlen=_topo_buf_max)
         self._titan_self_weights = {

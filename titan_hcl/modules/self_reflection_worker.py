@@ -138,6 +138,7 @@ _SELF_REFLECTION_WORKER_SUBSCRIBE_TOPICS: list[str] = [
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -234,7 +235,7 @@ def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool,
 def _resolve_data_path(config: dict, key: str, default: str) -> str:
     """Resolve a config-driven path against project root (so the subprocess
     writes to the canonical data/ subtree, not subprocess cwd)."""
-    raw = (config.get("self_reflection", {}) or {}).get(key, default)
+    raw = (get_params("self_reflection") or {}).get(key, default)
     if os.path.isabs(raw):
         return raw
     project_root = os.path.normpath(
@@ -251,7 +252,7 @@ def _init_self_reasoning(config: dict, db_path: str):
             "[SelfReflectionWorker] SelfReasoningEngine import failed: %s",
             e, exc_info=True)
         return None
-    sr_cfg = (config.get("self_reasoning", {}) or {})
+    sr_cfg = (get_params("self_reasoning") or {})
     try:
         sr = SelfReasoningEngine(config=sr_cfg, db_path=db_path)
         logger.info(
@@ -281,9 +282,9 @@ def _init_coding_explorer(config: dict, db_path: str, send_queue):
         return None
     # Backwards-compat shim — prefer [self_reflection.coding_explorer], fall
     # back to [cgn.coding] for keys missing in the new section.
-    ce_cfg_new = (config.get("self_reflection", {}) or {}).get(
+    ce_cfg_new = (get_params("self_reflection") or {}).get(
         "coding_explorer", {}) or {}
-    ce_cfg_old = (config.get("cgn", {}) or {}).get("coding", {}) or {}
+    ce_cfg_old = (get_params("cgn") or {}).get("coding", {}) or {}
     ce_cfg = {**ce_cfg_old, **ce_cfg_new}  # new wins on conflict
     try:
         ce = CodingExplorer(send_queue=send_queue, config=ce_cfg, db_path=db_path)
@@ -460,7 +461,7 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
     # Canonical titan_id resolution.
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
         or "T1"
     )
@@ -488,12 +489,12 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
             _sw_err)
 
     # === BOILERPLATE: two-flag gating ===
-    microkernel_cfg = (config or {}).get("microkernel", {}) or {}
+    microkernel_cfg = get_params("microkernel") or {}
     l0_rust = bool(microkernel_cfg.get("l0_rust_enabled", False))
     worker_enabled = bool(microkernel_cfg.get(
         "self_reflection_worker_enabled", True))
     sr_section_enabled = bool(
-        (config.get("self_reflection", {}) or {}).get("enabled", True))
+        (get_params("self_reflection") or {}).get("enabled", True))
 
     if not l0_rust:
         logger.info(
@@ -593,7 +594,7 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
     }
 
     # Cadences (from [self_reflection] params with defaults).
-    sr_cfg = (config.get("self_reflection", {}) or {})
+    sr_cfg = (get_params("self_reflection") or {})
     publisher_cadence_s = float(sr_cfg.get(
         "publisher_cadence_s", PUBLISHER_DEFAULT_S))
     coding_publisher_cadence_s = float(sr_cfg.get(

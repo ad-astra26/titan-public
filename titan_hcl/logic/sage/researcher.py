@@ -31,6 +31,7 @@ import httpx
 
 from .document_processor import DocumentProcessor
 from .x_researcher import XResearcher
+from titan_hcl.params import get_params
 
 log = logging.getLogger(__name__)
 
@@ -146,7 +147,7 @@ class StealthSageResearcher:
         # Phase 3 Chunk ψ (D-SPEC-88, 2026-05-18) — Venice/OpenRouter direct
         # httpx REPLACED by /v4/llm-distill. Provider abstraction +
         # failover now centralized in llm_worker.
-        api_cfg = config.get("api", {}) or {}
+        api_cfg = get_params("api") or {}
         self._llm_api_base = (
             f"http://127.0.0.1:{int(api_cfg.get('port', 7777))}")
         self._llm_internal_key = api_cfg.get("internal_key", "") or ""

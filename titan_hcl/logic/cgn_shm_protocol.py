@@ -37,6 +37,7 @@ import time
 
 import numpy as np
 from titan_hcl.utils.silent_swallow import swallow_warn
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ def _resolve_cgn_mode(
         return (shm_path, False)
 
     cfg = config or {}
-    enabled = cfg.get("microkernel", {}).get(
+    enabled = get_params("microkernel").get(
         "shm_cgn_format_alignment_enabled", False)
 
     if enabled:

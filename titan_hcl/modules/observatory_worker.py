@@ -97,6 +97,7 @@ DEFAULT_SNAPSHOT_INTERVAL_S = 60
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -355,7 +356,7 @@ def observatory_worker_main(recv_queue, send_queue, name: str,
 
     interval_s = DEFAULT_SNAPSHOT_INTERVAL_S
     try:
-        interval_s = int((config or {}).get("frontend", {}).get(
+        interval_s = int(get_params("frontend").get(
             "trinity_snapshot_interval", DEFAULT_SNAPSHOT_INTERVAL_S))
     except (TypeError, ValueError):
         interval_s = DEFAULT_SNAPSHOT_INTERVAL_S

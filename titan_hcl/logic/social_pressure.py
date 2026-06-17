@@ -14,6 +14,7 @@ import time
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ class XSessionManager:
         try:
             from titan_hcl.config_loader import load_titan_config
             cfg = load_titan_config()
-            session = cfg.get("twitter_social", {}).get("auth_session", "")
+            session = get_params("twitter_social").get("auth_session", "")
             if session:
                 self._cached_session = session
                 self._session_valid, self._session_keys = self._validate_session(session)

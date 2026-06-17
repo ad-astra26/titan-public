@@ -233,7 +233,7 @@ def _build_neural_nervous_system(full_config: dict):
     from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
-    nn_cfg = (full_config.get("neural_nervous_system", {}) or {})
+    nn_cfg = (get_params("neural_nervous_system") or {})
     data_dir = nn_cfg.get("data_dir") or os.path.join(
         project_root, "data", "neural_nervous_system")
     return NeuralNervousSystem(config=nn_cfg, data_dir=data_dir)
@@ -439,7 +439,7 @@ def _publish_impulse_engine_state(
 
 def _ns_state_path(full_config: dict) -> str:
     """Resolve `data/ns_worker_state.json` per data_dir config."""
-    data_dir = (full_config.get("memory_and_storage", {}) or {}).get(
+    data_dir = (get_params("memory_and_storage") or {}).get(
         "data_dir", "./data")
     if not data_dir:
         data_dir = "./data"
@@ -685,6 +685,7 @@ def _handle_action_result(
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -743,7 +744,7 @@ def ns_worker_main(
     # resolve_titan_id() — see hormonal_worker.py for full rationale.
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (full_config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
     )
 
@@ -756,7 +757,7 @@ def ns_worker_main(
         return
 
     flag_on = bool(
-        (full_config.get("microkernel") or {}).get("shm_ns_enabled", False))
+        (get_params("microkernel") or {}).get("shm_ns_enabled", False))
     writer = None
     if flag_on:
         spec = _maybe_get_titanvm_spec()
@@ -771,7 +772,7 @@ def ns_worker_main(
     impulse_state_writer = None
     ns_state_path = _ns_state_path(full_config)
     if flag_on:
-        impulse_engine = _init_impulse_engine(full_config.get("impulse", {}))
+        impulse_engine = _init_impulse_engine(get_params("impulse"))
         intuition_engine = _init_intuition_engine(full_config)
         shm_bank = _build_shm_reader_bank(titan_id)
         impulse_state_writer = _build_impulse_state_writer(titan_id)

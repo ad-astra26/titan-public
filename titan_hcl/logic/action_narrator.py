@@ -16,6 +16,7 @@ import os
 import random
 import re
 from typing import Optional
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,7 @@ class ActionNarrator:
     """Produce simple word descriptions of Titan's action results."""
 
     def __init__(self, word_recipe_dir: str = "data", config: Optional[dict] = None):
-        section = (config or {}).get("action_narrator", {}) if isinstance(config, dict) else {}
+        section = get_params("action_narrator") if isinstance(config, dict) else {}
         self._word_confidence_default = float(section.get("word_confidence_default", 0.5))
         self._min_content_word_length = int(section.get("min_content_word_length", 3))
         self._word_perturbation_strength = float(section.get("word_perturbation_strength", 0.3))

@@ -389,6 +389,7 @@ def _apply_external_nudge_payload(neuromod_system, payload: dict) -> bool:
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -446,7 +447,7 @@ def neuromod_worker_main(
     # resolve_titan_id() — see hormonal_worker.py for full rationale.
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (full_config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
     )
 
@@ -471,7 +472,7 @@ def neuromod_worker_main(
 
     # Lazy slot writer — None if flag-off or shm setup fails.
     flag_on = bool(
-        (full_config.get("microkernel") or {}).get("shm_neuromod_enabled", False))
+        (get_params("microkernel") or {}).get("shm_neuromod_enabled", False))
     writer = None
     inputs_reader = None
     if flag_on:

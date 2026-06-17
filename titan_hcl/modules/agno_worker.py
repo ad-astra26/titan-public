@@ -215,6 +215,7 @@ from titan_hcl._phase_c_constants import (
 )
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
+from titan_hcl.params import get_params
 
 
 def _ground_for_goal_hook(plugin: Any, text: str) -> list[str]:
@@ -1416,7 +1417,7 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             from titan_hcl.bus import SYNTHESIS_BUFFER_COMMAND
 
             _buffers_cfg = (
-                (config or {}).get("synthesis", {}).get("buffers", {}) or {}
+                get_params("synthesis").get("buffers", {}) or {}
             )
             _warm_s = float(_buffers_cfg.get(
                 "hydration_warm_threshold_s",
@@ -1486,7 +1487,7 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     # operator's intent (NOT the getattr default). Dry-run (false) means
     # the tool returns "no match" even when a skill matches.
     try:
-        _skill_cfg = (config or {}).get("synthesis", {}).get("skill", {}) or {}
+        _skill_cfg = get_params("synthesis").get("skill", {}) or {}
         worker_plugin.synthesis_delegate_live = bool(
             _skill_cfg.get("delegate_live", False)
         )

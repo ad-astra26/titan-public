@@ -69,6 +69,7 @@ from titan_hcl.logic.social_x_gateway import (
     PostContext,
     ReplyContext,
 )
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -242,9 +243,9 @@ class PostDispatchOrchestrator:
         tick (cold-boot fields zero/empty).
         """
         # Config blocks (loaded fresh per tick to pick up live config edits).
-        tc = full_config.get("twitter_social", {}) or {}
-        inf = full_config.get("inference", {}) or {}
-        sage = full_config.get("stealth_sage", {}) or {}
+        tc = get_params("twitter_social") or {}
+        inf = get_params("inference") or {}
+        sage = get_params("stealth_sage") or {}
         session = tc.get("auth_session", "")
         proxy = tc.get("webshare_static_url", "")
         api_key = sage.get("twitterapi_io_key", "")
@@ -550,9 +551,9 @@ class PostDispatchOrchestrator:
           - other ActionResult.status on rate-limit/etc (entry kept)
           - None if queue is empty / can't be read
         """
-        inf = full_config.get("inference", {}) or {}
-        tc = full_config.get("twitter_social", {}) or {}
-        sage = full_config.get("stealth_sage", {}) or {}
+        inf = get_params("inference") or {}
+        tc = get_params("twitter_social") or {}
+        sage = get_params("stealth_sage") or {}
         dq_file = _DEFAULT_DELEGATE_QUEUE
         try:
             if not os.path.exists(dq_file):
@@ -827,7 +828,7 @@ class PostDispatchOrchestrator:
                            emotion: str, now: float) -> int:
         """30-min-cooldown mention discovery + reply loop. Mirrors
         spirit_worker:8303-8390. Returns number of replies posted."""
-        replies_cfg = (full_config.get("social_x") or {}).get(
+        replies_cfg = (get_params("social_x") or {}).get(
             "replies") or {}
         base_cooldown = float(replies_cfg.get(
             "mention_check_cooldown_seconds",
@@ -849,9 +850,9 @@ class PostDispatchOrchestrator:
             return 0
         self._last_mention_check_ts = now
 
-        tc = full_config.get("twitter_social", {}) or {}
-        inf = full_config.get("inference", {}) or {}
-        sage = full_config.get("stealth_sage", {}) or {}
+        tc = get_params("twitter_social") or {}
+        inf = get_params("inference") or {}
+        sage = get_params("stealth_sage") or {}
         max_replies = int(replies_cfg.get("max_replies_per_cycle", 3))
         reply_count = 0
         try:
@@ -874,14 +875,14 @@ class PostDispatchOrchestrator:
                     "[PostDispatch] Mention poll empty (streak=%d) — next "
                     "poll backed off toward %.0fs cap",
                     self._mention_empty_streak,
-                    float((full_config.get("social_x") or {}).get(
+                    float((get_params("social_x") or {}).get(
                         "replies", {}).get("mention_backoff_cap_seconds", 7200.0)))
             # Fleet reply partition (RFP_fleet_x_engagement_coordination
             # INV-FX-7): only the Titan that OWNS a mention's author replies to
             # it, so the shared @your_x_handle account never double-replies to one
             # person across T1/T2/T3. Same deterministic author-hash as proactive
             # engagement; zero coordination.
-            _sx_cfg = full_config.get("social_x") or {}
+            _sx_cfg = get_params("social_x") or {}
             _reply_partition_on = bool(
                 _sx_cfg.get("engagement_partition_enabled", True))
             _reply_roster = _sx_cfg.get("engagement_fleet") or ["T1", "T2", "T3"]

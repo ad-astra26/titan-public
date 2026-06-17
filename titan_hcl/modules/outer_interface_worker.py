@@ -84,6 +84,7 @@ MODULE_NAME = "outer_interface_worker"
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -235,7 +236,7 @@ def _init_outer_interface(config: dict, titan_id: str):
             exc_info=True)
         return None
 
-    oi_cfg = (config.get("outer_interface", {}) or {})
+    oi_cfg = (get_params("outer_interface") or {})
     word_recipe_dir = oi_cfg.get("word_recipe_dir", "data")
 
     # Resolve absolute path against project root so the worker subprocess
@@ -247,7 +248,7 @@ def _init_outer_interface(config: dict, titan_id: str):
 
     # kin.dna params (neurochemical reward params for kin resonance — fed
     # through advisor's GABA-governed cooldown surface).
-    dna_params = (config.get("kin", {}) or {}).get("dna", {}) or None
+    dna_params = (get_params("kin") or {}).get("dna", {}) or None
 
     try:
         outer_interface = OuterInterface(
@@ -325,7 +326,7 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
     # canonical /dev/shm/titan_{T1,T2,T3}/ directories).
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
         or "T1"
     )
@@ -359,11 +360,11 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
     #   2. microkernel.outer_interface_worker_enabled — defensive; normally
     #      guardian skips registration when false, but this in-worker check
     #      catches the case where the flag was flipped post-registration.
-    microkernel_cfg = (config or {}).get("microkernel", {}) or {}
+    microkernel_cfg = get_params("microkernel") or {}
     l0_rust = bool(microkernel_cfg.get("l0_rust_enabled", False))
     worker_enabled = bool(microkernel_cfg.get("outer_interface_worker_enabled", True))
     oi_section_enabled = bool(
-        (config.get("outer_interface", {}) or {}).get("enabled", True))
+        (get_params("outer_interface") or {}).get("enabled", True))
 
     if not l0_rust:
         logger.info(
@@ -455,7 +456,7 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
     }
 
     # Cadences (from [outer_interface] params with defaults).
-    oi_cfg = (config.get("outer_interface", {}) or {})
+    oi_cfg = (get_params("outer_interface") or {})
     save_recipes_every_s = float(oi_cfg.get(
         "save_recipes_every_s", SAVE_RECIPES_DEFAULT_S))
     self_exploration_cadence_s = float(oi_cfg.get(
@@ -471,9 +472,9 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
     # save_dynamic_recipes (default 5 min).
     _publisher_stop_event = threading.Event()
     state_refs["_publisher_stop_event"] = _publisher_stop_event
-    kin_signature_cadence_s = float((config.get("outer_interface", {}) or {}).get(
+    kin_signature_cadence_s = float((get_params("outer_interface") or {}).get(
         "kin_signature_cadence_s", PUBLISHER_DEFAULT_S))
-    kin_society_cadence_s = float((config.get("outer_interface", {}) or {}).get(
+    kin_society_cadence_s = float((get_params("outer_interface") or {}).get(
         "kin_society_cadence_s", 10.0))
     _publisher_thread = threading.Thread(
         target=_publisher_loop,

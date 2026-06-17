@@ -66,6 +66,7 @@ from titan_hcl.synthesis.mastery_level import (
 )
 from titan_hcl.synthesis.outer_meta_reasoning import OuterMetaReasoningEngine
 from titan_hcl.synthesis.outer_reasoning import OuterReasoningEngine
+from titan_hcl.params import get_params
 
 logger = logging.getLogger("self_learning")
 
@@ -761,7 +762,7 @@ class _SelfLearningStore:
 
 
 def _cfg(config: dict) -> dict:
-    sub = ((config or {}).get("synthesis", {}) or {}).get("self_learning", {}) or {}
+    sub = (get_params("synthesis") or {}).get("self_learning", {}) or {}
     out = dict(_DEFAULTS)
     out.update({k: v for k, v in sub.items() if k in _DEFAULTS})
     return out
@@ -805,7 +806,7 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
 
     from titan_hcl.core.state_registry import (
         StateRegistryWriter, ensure_shm_root, resolve_titan_id)
-    titan_id = ((full_config.get("info_banner", {}) or {}).get("titan_id")
+    titan_id = ((get_params("info_banner") or {}).get("titan_id")
                 or resolve_titan_id())
     logger.info("[self_learning] Booting — titan_id=%s enabled=%s", titan_id,
                 cfg["enabled"])

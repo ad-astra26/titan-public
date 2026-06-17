@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -542,7 +543,7 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # Phase B (rFP §3.4.1) §B5 — query LRU+TTL cache (G20 closure for chat
     # hot path). Sized per PLAN: 256 entries × 60s TTL. Tunable via config
     # under [memory_and_storage] for soak observability.
-    _cache_cfg = (config or {}).get("memory_and_storage", {}) if config else {}
+    _cache_cfg = get_params("memory_and_storage") if config else {}
     query_cache = QueryCache(
         maxsize=int(_cache_cfg.get("query_cache_maxsize", 256)),
         ttl_s=float(_cache_cfg.get("query_cache_ttl_s", 60.0)),

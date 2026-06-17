@@ -69,6 +69,7 @@ _last_hb_ts: float = 0.0
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -123,14 +124,14 @@ def backup_orchestrator_main(recv_queue, send_queue, name: str, config: dict) ->
 
     # Unwrap config — arrives as the full config dict from v5_core
     full_config = config or {}
-    backup_cfg = full_config.get("backup", {}) or {}
+    backup_cfg = get_params("backup") or {}
     # BUG-BACKUP-WORKER-HARDCODED-TITAN-ID-T1: previous fallback to literal
     # "T1" caused T2/T3 to log themselves as T1 whenever info_banner.titan_id
     # was missing/empty in their config. resolve_titan_id() walks the canonical
     # precedence chain (explicit → data/titan_identity.json → TITAN_ID env →
     # "T1"), matching every other per-Titan resolver in the codebase.
     from titan_hcl.core.state_registry import resolve_titan_id
-    explicit_id = (full_config.get("info_banner", {}) or {}).get("titan_id") or None
+    explicit_id = (get_params("info_banner") or {}).get("titan_id") or None
     titan_id = resolve_titan_id(explicit_id)
 
     # Per-Titan mode (rFP Phase 3). Default: infer from keypair + arweave_enabled +
@@ -142,7 +143,7 @@ def backup_orchestrator_main(recv_queue, send_queue, name: str, config: dict) ->
     # the Arweave cascade, fail at S4 (no funded Irys deposit on devnet wallets),
     # and the TimeChain path exits without saving the local tarball — observed
     # as 2-week local-TimeChain silence on T2/T3 since 2026-04-29.
-    net_cfg = full_config.get("network", {}) or {}
+    net_cfg = get_params("network") or {}
     solana_network = (net_cfg.get("solana_network") or "").strip().lower()
     is_mainnet = solana_network in ("mainnet", "mainnet-beta")
     mode = backup_cfg.get("mode", "").strip().lower()
@@ -150,7 +151,7 @@ def backup_orchestrator_main(recv_queue, send_queue, name: str, config: dict) ->
         kp_exists = bool(net_cfg.get("wallet_keypair_path", "")) and os.path.exists(
             net_cfg.get("wallet_keypair_path", "")
         )
-        budget_enabled = full_config.get("mainnet_budget", {}).get(
+        budget_enabled = get_params("mainnet_budget").get(
             "backup_arweave_enabled", False
         )
         mode = "mainnet_arweave" if (is_mainnet and kp_exists and budget_enabled) else "local_only"
@@ -248,7 +249,7 @@ def backup_orchestrator_main(recv_queue, send_queue, name: str, config: dict) ->
         from titan_hcl.logic.backup import RebirthBackup
         backup = RebirthBackup(
             network_client=backup_network,  # §24.7 in-process ZK-Vault client (mainnet_arweave only)
-            config=full_config.get("memory_and_storage", {}),
+            config=get_params("memory_and_storage"),
             titan_id=titan_id,
             arweave_store=arweave_store,
             full_config=full_config,
@@ -562,7 +563,7 @@ class BackupOrchestrator:
         self.name = name
         self.backup = state["backup"]
         self.titan_id = state.get("titan_id", "T1")
-        oc = (((full_config or {}).get("backup", {}) or {})
+        oc = ((get_params("backup") or {})
               .get("orchestrator", {}) or {})
         self.byte_budget = (
             int(oc.get("byte_budget_mb", _DEF_BYTE_BUDGET_MB)) * 1024 * 1024)
@@ -1099,7 +1100,7 @@ def _run_monthly_archive_consolidation(state: dict) -> None:
     """
     try:
         full_config = state.get("full_config", {}) or {}
-        backup_cfg = (full_config.get("backup", {}) or {})
+        backup_cfg = (get_params("backup") or {})
         loose_days = int(backup_cfg.get("monthly_archive_loose_days", 7))
         retention_months = int(backup_cfg.get(
             "monthly_archive_retention_months", 12))

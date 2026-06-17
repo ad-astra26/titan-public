@@ -19,6 +19,7 @@ Postures:
 import logging
 import time
 from typing import Optional, Sequence
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ class IntuitionEngine:
     """
 
     def __init__(self, config: Optional[dict] = None):
-        section = (config or {}).get("intuition", {}) if isinstance(config, dict) else {}
+        section = get_params("intuition") if isinstance(config, dict) else {}
         self._trust_decay       = float(section.get("trust_decay", TRUST_DECAY))
         self._trust_boost       = float(section.get("trust_boost", TRUST_BOOST))
         self._trust_penalty     = float(section.get("trust_penalty", TRUST_PENALTY))

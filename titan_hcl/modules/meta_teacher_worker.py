@@ -67,6 +67,7 @@ _last_hb_ts: float = 0.0
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -281,7 +282,7 @@ def _load_meta_teacher_llm_ctx(full_config: dict):
     """
     try:
         from titan_hcl.inference import get_model_for_task
-        api_cfg = full_config.get("api", {}) or {}
+        api_cfg = get_params("api") or {}
         internal_key = api_cfg.get("internal_key", "") or ""
         if not internal_key:
             # The worker's spawned `config` may not carry the [api] section
@@ -292,7 +293,7 @@ def _load_meta_teacher_llm_ctx(full_config: dict):
             # (llm_ok=False) — i.e. the teacher "runs" but teaches nothing.
             try:
                 from titan_hcl.config_loader import load_titan_config
-                _canon_api = load_titan_config().get("api", {}) or {}
+                _canon_api = get_params("api") or {}
                 internal_key = _canon_api.get("internal_key", "") or ""
                 if internal_key:
                     api_cfg = _canon_api
@@ -482,7 +483,7 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
             _rb_err)
         binding_store = None
 
-    inference_cfg = config.get("inference", {}) or {}
+    inference_cfg = get_params("inference") or {}
     # Phase 3 Chunk ψ (D-SPEC-88, 2026-05-18) — LLM calls now route through
     # /v4/llm-distill. Old (llm_client, llm_model) replaced by
     # (llm_api_base, llm_internal_key, llm_model).

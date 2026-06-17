@@ -64,6 +64,7 @@ _RECURRENCE_NORM = 3.0
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -187,7 +188,7 @@ def felt_teaching_worker_main(recv_queue, send_queue, name: str,
                        "(SHM slot absent): %s", _sw_err)
 
     from titan_hcl.core.state_registry import resolve_titan_id
-    titan_id = ((full_config.get("info_banner", {}) or {}).get("titan_id")
+    titan_id = ((get_params("info_banner") or {}).get("titan_id")
                 or resolve_titan_id())
     logger.info("[felt_teaching] Booting — titan_id=%s", titan_id)
 
@@ -204,7 +205,7 @@ def felt_teaching_worker_main(recv_queue, send_queue, name: str,
     from titan_hcl.logic.language_teacher import LanguageTeacher
     client = CGNConsumerClient(
         consumer_name="felt_teaching", send_queue=send_queue, module_name=name,
-        titan_id=titan_id, config=full_config.get("cgn") or full_config)
+        titan_id=titan_id, config=get_params("cgn") or full_config)
     teacher = LanguageTeacher()
 
     # Self-register (cgn_worker also pre-registers as a safety net).
@@ -228,7 +229,7 @@ def felt_teaching_worker_main(recv_queue, send_queue, name: str,
     # flows). The perturbation is the teaching gesture; CGN's signal is record_outcome.
     provider = None
     try:
-        inference_cfg = (full_config.get("inference", {}) or {})
+        inference_cfg = (get_params("inference") or {})
         if inference_cfg.get("ollama_cloud_api_key"):
             from titan_hcl.inference import get_provider as _get_provider
             provider = _get_provider("ollama_cloud", inference_cfg)

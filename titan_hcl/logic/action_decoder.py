@@ -12,6 +12,7 @@ import logging
 import math
 import re
 from typing import Optional
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +44,8 @@ class ActionDecoder:
         # convention) the section itself if "max_delta" appears at top level.
         section: dict = {}
         if isinstance(config, dict):
-            if "action_decoder" in config and isinstance(config["action_decoder"], dict):
-                section = config["action_decoder"]
+            if "action_decoder" in config and isinstance(get_params("action_decoder"), dict):
+                section = get_params("action_decoder")
             elif "max_delta" in config or "audio_duration_scale" in config:
                 section = config
 

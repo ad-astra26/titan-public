@@ -186,6 +186,7 @@ def _maybe_get_writer(spec, titan_id: str):
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -249,7 +250,7 @@ def hormonal_worker_main(
     # PARTIAL classifications on T2's outer_spirit + inner_mind blocks.
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (full_config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
     )
 
@@ -273,7 +274,7 @@ def hormonal_worker_main(
 
     # Lazy slot writer — None if flag-off or shm setup fails.
     flag_on = bool(
-        (full_config.get("microkernel") or {}).get("shm_hormonal_enabled", False))
+        (get_params("microkernel") or {}).get("shm_hormonal_enabled", False))
     writer = None
     if flag_on:
         from titan_hcl.core.state_registry import HORMONAL_STATE

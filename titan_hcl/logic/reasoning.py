@@ -21,6 +21,7 @@ import time
 from typing import Optional
 
 import numpy as np
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -1307,7 +1308,7 @@ class ReasoningEngine:
         # Config section [reasoning_rewards] in titan_params.toml.
         # v1 ships ALL code; phase schedule controlled by weights.
         # Phase 1 has weights=0 → telemetry only, no behavior change.
-        _rr = cfg.get("reasoning_rewards") or {}
+        _rr = get_params("reasoning_rewards") or {}
         self._rr_enabled = bool(_rr.get("enabled", True))
         self._rr_publish = bool(_rr.get("publish_enabled", False))
         self._rr_cap = float(_rr.get("intermediate_cap", 0.2))

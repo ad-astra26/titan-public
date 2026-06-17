@@ -26,6 +26,7 @@ from typing import Optional
 from titan_hcl.utils.crypto import hash_file
 from titan_hcl.utils.silent_swallow import swallow_warn
 from titan_hcl.utils.maker_alert import send_maker_alert
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -741,7 +742,7 @@ class RebirthBackup:
             # config.toml inclusion is opt-IN per [backup].backup_config_toml
             # (default FALSE). A public-install user who leaves it off must retain
             # config.toml themselves + supply it alongside Shard-1 at resurrection.
-            _backup_cfg = (self._full_config or {}).get("backup", {}) or {}
+            _backup_cfg = get_params("backup") or {}
             include_config_toml = bool(_backup_cfg.get("backup_config_toml", False))
 
             with tarfile.open(output_path, "w:gz", compresslevel=9) as tar:
@@ -787,13 +788,13 @@ class RebirthBackup:
         init failure (no silent downgrade — an encrypted Titan must NOT ship
         plaintext).
         """
-        backup_cfg = (self._full_config or {}).get("backup", {}) or {}
+        backup_cfg = get_params("backup") or {}
         if not backup_cfg.get("encryption_enabled", False):
             return None
         from titan_hcl.logic.backup_crypto import (
             load_keypair_bytes, derive_master_key, encrypt_component_tarball,
         )
-        net_cfg = (self._full_config or {}).get("network", {}) or {}
+        net_cfg = get_params("network") or {}
         kp_path = net_cfg.get(
             "wallet_keypair_path", "data/titan_identity_keypair.json")
         kp_bytes, titan_pubkey = load_keypair_bytes(kp_path)
@@ -1029,7 +1030,7 @@ class RebirthBackup:
                         decrypt_from_manifest, load_keypair_bytes,
                     )
                     import hashlib as _hashlib
-                    net = (self._full_config or {}).get("network", {}) or {}
+                    net = get_params("network") or {}
                     kp_path = net.get(
                         "wallet_keypair_path", "data/titan_identity_keypair.json")
                     kp_bytes, titan_pubkey = load_keypair_bytes(kp_path)
@@ -1231,12 +1232,12 @@ class RebirthBackup:
             return None
 
         # Mode + Mode-A URL key
-        backup_cfg = (self._full_config or {}).get("backup", {}) or {}
+        backup_cfg = get_params("backup") or {}
         mode = "B" if backup_cfg.get("encryption_enabled", False) else "A"
         url_key = None
         if mode == "A":
             try:
-                net_cfg = (self._full_config or {}).get("network", {}) or {}
+                net_cfg = get_params("network") or {}
                 kp_path = net_cfg.get(
                     "wallet_keypair_path", "data/titan_identity_keypair.json")
                 kp_bytes, _pub = load_keypair_bytes(kp_path)
@@ -1374,7 +1375,7 @@ class RebirthBackup:
         append_epoch_snapshot on the backup event). Default OFF."""
         try:
             return bool(
-                (self._full_config or {}).get("backup", {}).get(
+                get_params("backup").get(
                     "zk_compressed_audit_enabled", False)
             )
         except Exception:  # noqa: BLE001
@@ -1392,7 +1393,7 @@ class RebirthBackup:
         try:
             cfg = self._full_config or {}
             return bool(
-                cfg.get("backup", {}).get("unified_v2_enabled", False)
+                get_params("backup").get("unified_v2_enabled", False)
             )
         except Exception:
             return False
@@ -1499,7 +1500,7 @@ class RebirthBackup:
     def _chained_incrementals_enabled(self) -> bool:
         """Flag gate. Runtime config.toml [backup].chained_incrementals overrides
         the committed default _BACKUP_CHAINED_INCREMENTALS_DEFAULT."""
-        cfg = (self._full_config or {}).get("backup", {}) or {}
+        cfg = get_params("backup") or {}
         return bool(cfg.get("chained_incrementals",
                             _BACKUP_CHAINED_INCREMENTALS_DEFAULT))
 
@@ -1815,7 +1816,7 @@ class RebirthBackup:
             if cache["master"] is None:
                 from titan_hcl.logic.backup_crypto import (
                     load_keypair_bytes, derive_master_key)
-                cfg = (self._full_config or {}).get("backup", {}) or {}
+                cfg = get_params("backup") or {}
                 kp_path = cfg.get("wallet_keypair_path",
                                   "data/titan_identity_keypair.json")
                 kp_bytes, titan_pubkey = load_keypair_bytes(kp_path)
@@ -1864,7 +1865,7 @@ class RebirthBackup:
             if cache["master"] is None:
                 from titan_hcl.logic.backup_crypto import (
                     load_keypair_bytes, derive_master_key)
-                cfg = (self._full_config or {}).get("backup", {}) or {}
+                cfg = get_params("backup") or {}
                 kp_path = cfg.get("wallet_keypair_path",
                                   "data/titan_identity_keypair.json")
                 kp_bytes, titan_pubkey = load_keypair_bytes(kp_path)
@@ -2291,7 +2292,7 @@ class RebirthBackup:
         from titan_hcl.chain import ArweaveChainProvider
         kp = os.path.expanduser("~/.config/solana/id.json")
         net = "mainnet" if self._titan_id == "T1" else "devnet"
-        ncfg = (self._full_config or {}).get("network", {}) or {}
+        ncfg = get_params("network") or {}
         rpc = ncfg.get("premium_rpc_url", "") or ""
         vpid = (getattr(self.network, "_vault_program_id", None)
                 or ncfg.get("vault_program_id"))
@@ -2367,7 +2368,7 @@ class RebirthBackup:
         from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
         from titan_hcl.logic.backup_worker_pipeline import BackupWorker
         try:
-            _budget = (self._full_config or {}).get("mainnet_budget", {}) or {}
+            _budget = get_params("mainnet_budget") or {}
         except Exception:
             _budget = {}
         if not _budget.get("backup_arweave_enabled", False):
@@ -2686,7 +2687,7 @@ class RebirthBackup:
                 # alone for restore.
                 _l5_cleanup_old_local_tarballs(
                     local_dir, retention_days=int(
-                        self._full_config.get("backup", {}).get("local_rolling_days", 30)))
+                        get_params("backup").get("local_rolling_days", 30)))
                 logger.info(
                     "[Backup] L5 BASELINE: %s (%.1f MB, %d files)",
                     output_name, event.tarball_size_bytes / 1024 / 1024,
@@ -2734,7 +2735,7 @@ class RebirthBackup:
             # (we bypass upload_personality_to_arweave entirely), so do it here.
             _l5_cleanup_old_local_tarballs(
                 local_dir, retention_days=int(
-                    self._full_config.get("backup", {}).get("local_rolling_days", 30)))
+                    get_params("backup").get("local_rolling_days", 30)))
             logger.info(
                 "[Backup] L5 INCREMENTAL: %s (%.2f MB, patched=%d skipped=%d removed=%d)",
                 output_name, event.tarball_size_bytes / 1024 / 1024,

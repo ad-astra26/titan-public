@@ -893,6 +893,7 @@ def _send_response(send_queue, src: str, dst: str, payload: dict, rid: str) -> N
 # from this worker module body per SPEC §11.B.4. body_worker self-imports it
 # back for its own internal reflex callsite.
 from titan_hcl.logic.body_helpers import _compute_body_reflex_intuition  # noqa: E402
+from titan_hcl.params import get_params
 
 
 # Heartbeat throttle (Phase E Fix 2): 3s min interval per process.
@@ -1064,7 +1065,7 @@ def _start_fast_path(thresholds: dict, config: dict, stop_event,
         shm_writer_thread = start_shm_writer_thread(
             tick, _BODY_TICK_PERIOD_S, stop_event, "body_shm_writer",
         )
-    elif (config or {}).get("microkernel", {}).get("l0_rust_enabled", False):
+    elif get_params("microkernel").get("l0_rust_enabled", False):
         # Phase C path — Step 7 §4.4 schema migration v1→v2:
         # Publish msgpack source dict (per-sense {value, severity, velocity})
         # to sensor_cache_inner_body.bin instead of pre-computed 5D tensor.

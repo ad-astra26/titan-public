@@ -44,6 +44,7 @@ _STATS_PUBLISH_INTERVAL_S = 60.0
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -68,12 +69,12 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
     full_config = config or {}
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (full_config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
     )
-    data_dir = (full_config.get("memory_and_storage", {}) or {}).get("data_dir", "./data")
+    data_dir = (get_params("memory_and_storage") or {}).get("data_dir", "./data")
     tc_dir = os.path.join(data_dir, "timechain")
-    keypair_path = (full_config.get("network", {}) or {}).get(
+    keypair_path = (get_params("network") or {}).get(
         "wallet_keypair_path", "data/titan_identity_keypair.json")
 
     logger.info("[OutputVerifierWorker] Booting — titan_id=%s, tc_dir=%s",

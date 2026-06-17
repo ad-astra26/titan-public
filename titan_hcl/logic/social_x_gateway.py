@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 from titan_hcl import bus
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -624,10 +625,10 @@ class SocialXGateway:
             logger.warning("[SocialXGateway] Config load failed: %s", e)
             return {"enabled": False}
 
-        sx = full.get("social_x", {})
+        sx = get_params("social_x")
         # Also read credentials from existing sections for backward compat
-        tw = full.get("twitter_social", {})
-        sage = full.get("stealth_sage", {})
+        tw = get_params("twitter_social")
+        sage = get_params("stealth_sage")
 
         return {
             # Master switch
@@ -694,7 +695,7 @@ class SocialXGateway:
             # [voice] section is surfaced so the grounding gate can read
             # dual_mode_enabled / x_grounding_* keys via the same config
             # object every action already loads.
-            "voice": full.get("voice", {}),
+            "voice": get_params("voice"),
         }
 
     # ── Consumer Access Control ─────────────────────────────────────
@@ -1059,7 +1060,7 @@ class SocialXGateway:
         try:
             from titan_hcl.config_loader import load_titan_config
             full_cfg = load_titan_config()
-            tc = full_cfg.get("twitter_social", {})
+            tc = get_params("twitter_social")
 
             user_name = tc.get("user_name", "")
             password = tc.get("password", "")

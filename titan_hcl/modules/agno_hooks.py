@@ -1981,7 +1981,7 @@ def create_pre_hook(plugin):
         # subsequent turns (not the critical path for THIS decision).
         if _p2_on and _router_active:
             try:
-                _da_cfg = ((plugin._full_config.get("synthesis", {}) or {})
+                _da_cfg = ((get_params("synthesis") or {})
                            .get("decision_authority", {}) or {})
                 _gp_every = int(_da_cfg.get("gibberish_probe_every", 25))
                 _gc = int(getattr(plugin, "_p2_gibberish_turn_count", 0)) + 1

@@ -28,6 +28,7 @@ import time
 from titan_hcl import bus
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
+from titan_hcl.params import get_params
 
 logger = logging.getLogger("TimeChainWorker")
 
@@ -188,8 +189,8 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             try:
                 from titan_hcl.config_loader import load_titan_config
                 _cfg_full = load_titan_config()
-                _net = _cfg_full.get("network", {})
-                _api_port = _cfg_full.get("api", {}).get("port", 7777)
+                _net = get_params("network")
+                _api_port = get_params("api").get("port", 7777)
             except Exception as _ce:
                 logger.warning("[TimeChain] Could not load network config: %s", _ce)
             # Load Titan pubkey from keypair (for contract signing)

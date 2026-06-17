@@ -15,6 +15,7 @@ except ModuleNotFoundError:
     import toml as tomllib # Fallback if we somehow got it installed
 
 from .base import AbstractMoodAddon
+from titan_hcl.params import get_params
 
 class MoodRegistry:
     """
@@ -86,8 +87,8 @@ class MoodEngine:
             logging.warning(f"[MoodEngine] Config load failed: {e}. Using defaults.")
             return
 
-        self.base_weight = config.get("mood_engine", {}).get("base_weight", 1.0)
-        active_modules = config.get("addons", {}).get("active", [])
+        self.base_weight = get_params("mood_engine").get("base_weight", 1.0)
+        active_modules = get_params("addons").get("active", [])
 
         # Hot-load the requested addons
         self.registry.hot_load(active_modules)

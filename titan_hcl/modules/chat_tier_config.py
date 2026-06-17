@@ -32,6 +32,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,7 @@ class ChatTierClassifier:
     @classmethod
     def from_config(cls, full_config: dict[str, Any]) -> "ChatTierClassifier":
         """Construct from the full TOML config dict (expects [chat] section)."""
-        chat_cfg = full_config.get("chat", {}) or {}
+        chat_cfg = get_params("chat") or {}
         default_model_class = chat_cfg.get("default_model_class", "heavy")
         default_name = chat_cfg.get("default_tier", "casual")
         log_decisions = bool(chat_cfg.get("classifier_log_decisions", False))

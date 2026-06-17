@@ -60,6 +60,7 @@ _STATS_PUBLISH_INTERVAL_S = 60.0
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -128,10 +129,10 @@ def _register_helpers(registry, full_config: dict) -> int:
 
     try:
         from titan_hcl.logic.agency.helpers.web_search import WebSearchHelper
-        sage_cfg = full_config.get("stealth_sage", {}) or {}
+        sage_cfg = get_params("stealth_sage") or {}
         searxng_host = sage_cfg.get("searxng_host", "http://localhost:8080")
         firecrawl_key = sage_cfg.get("firecrawl_api_key", "")
-        kp_cfg = full_config.get("knowledge_pipeline", {}) or {}
+        kp_cfg = get_params("knowledge_pipeline") or {}
         kp_budgets_mb = kp_cfg.get("budgets", {}) or {}
         kp_budgets_bytes = {
             k: int(v) * 1024 * 1024
@@ -153,7 +154,7 @@ def _register_helpers(registry, full_config: dict) -> int:
 
     try:
         from titan_hcl.logic.agency.helpers.art_generate import ArtGenerateHelper
-        exp_cfg = full_config.get("expressive", {}) or {}
+        exp_cfg = get_params("expressive") or {}
         output_dir = exp_cfg.get("output_path", "./data/studio_exports")
         registry.register(ArtGenerateHelper(output_dir=output_dir))
         n += 1
@@ -162,8 +163,8 @@ def _register_helpers(registry, full_config: dict) -> int:
 
     try:
         from titan_hcl.logic.agency.helpers.audio_generate import AudioGenerateHelper
-        exp_cfg = full_config.get("expressive", {}) or {}
-        audio_cfg = full_config.get("audio", {}) or {}
+        exp_cfg = get_params("expressive") or {}
+        audio_cfg = get_params("audio") or {}
         output_dir = exp_cfg.get("output_path", "./data/studio_exports")
         max_duration = int(audio_cfg.get("max_duration_seconds", 30))
         sample_rate = int(audio_cfg.get("sample_rate", 44100))
@@ -390,17 +391,17 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     full_config = config or {}
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (full_config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
     )
-    inference_cfg = full_config.get("inference", {}) or {}
-    agency_cfg = full_config.get("agency", {}) or {}
+    inference_cfg = get_params("inference") or {}
+    agency_cfg = get_params("agency") or {}
     budget_per_hour = int(agency_cfg.get("llm_budget_per_hour", 10))
     # Phase 3 Chunk χ-bis (D-SPEC-88, 2026-05-18) — api_base + internal_key
     # for /v4/llm-distill round-trip (replaces direct OllamaCloudClient).
-    _api_port = int((full_config.get("api", {}) or {}).get("port", 7777))
+    _api_port = int((get_params("api") or {}).get("port", 7777))
     _api_base = f"http://127.0.0.1:{_api_port}"
-    _internal_key = (full_config.get("api", {}) or {}).get("internal_key", "") or ""
+    _internal_key = (get_params("api") or {}).get("internal_key", "") or ""
 
     logger.info("[AgencyWorker] Booting — titan_id=%s, budget_per_hour=%d",
                 titan_id, budget_per_hour)

@@ -101,7 +101,7 @@ def _discover_plugins(titan_id: str,
     import titan_hcl.health as health_pkg
 
     plugins: list[HealthCheckPlugin] = []
-    canonical_poller = ((config or {}).get("social_x") or {}).get(
+    canonical_poller = (get_params("social_x") or {}).get(
         "canonical_poller_titan_id", "T1")
     is_canonical_poller = (canonical_poller == ""
                            or canonical_poller == titan_id)
@@ -155,7 +155,7 @@ def _discover_plugins(titan_id: str,
             # Special: social_x plugin needs the [social_x] section
             # for api_key/user_name/db_path resolution.
             if cls.name == "social_x":
-                sx = (config or {}).get("social_x") or {}
+                sx = get_params("social_x") or {}
                 for k in ("api_key", "user_name", "db_path"):
                     if k in sx and k not in merged_cfg:
                         merged_cfg[k] = sx[k]
@@ -365,6 +365,7 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace

@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import time
 from typing import Optional
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ class OffhostMirror:
     """Owns the rsync-over-SSH pull + retention cleanup for T2/T3 → T1."""
 
     def __init__(self, config: dict):
-        mirror_cfg = (config or {}).get("backup", {}).get("mirror", {}) or {}
+        mirror_cfg = get_params("backup").get("mirror", {}) or {}
         self.enabled: bool = bool(mirror_cfg.get("enabled", False))
         self.ssh_user: str = mirror_cfg.get("ssh_user", "youruser")
         self.retention_days: int = int(mirror_cfg.get("retention_days", 7))

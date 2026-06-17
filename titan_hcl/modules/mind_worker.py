@@ -1045,6 +1045,7 @@ def _send_response(send_queue, src: str, dst: str, payload: dict, rid: str) -> N
 # from this worker module body per SPEC §11.B.4. mind_worker self-imports it
 # back for its own internal reflex callsite.
 from titan_hcl.logic.mind_helpers import _compute_mind_reflex_intuition  # noqa: E402
+from titan_hcl.params import get_params
 
 
 # Heartbeat throttle (Phase E Fix 2): 3s min interval per process.
@@ -1236,7 +1237,7 @@ def _start_fast_path(mood_engine, social_graph, media_state, data_dir,
         shm_writer_thread = start_shm_writer_thread(
             tick, _MIND_TICK_PERIOD_S, stop_event, "mind_shm_writer",
         )
-    elif (config or {}).get("microkernel", {}).get("l0_rust_enabled", False):
+    elif get_params("microkernel").get("l0_rust_enabled", False):
         # Phase C path — Sprint 6 §4.5 FULL Rust formula port:
         # Publish msgpack source dict of RAW INPUTS only. Rust
         # `project_inner_mind_15d` (titan-inner-mind-rs) decodes the

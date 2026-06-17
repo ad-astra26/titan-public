@@ -105,6 +105,7 @@ from titan_hcl._phase_c_constants import (
 )
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -524,7 +525,7 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
     )
     boot_ts = time.time()
@@ -560,7 +561,7 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     # can DELETE this entire `if not flag_on:` block.
     # legacy_core.py registration is also gated on the flag so this
     # check is defensive (registration normally skips us in the off-mode).
-    flag_on = bool((config or {}).get("microkernel", {}).get("l0_rust_enabled", False))
+    flag_on = bool(get_params("microkernel").get("l0_rust_enabled", False))
     if not flag_on:
         logger.info(
             "[CognitiveWorker] microkernel.l0_rust_enabled=false — "
@@ -1898,7 +1899,7 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
     # ── WalletObserver (DI:/I:/Donation detection) ──
     try:
         from titan_hcl.logic.wallet_observer import WalletObserver
-        _net_cfg = (config or {}).get("network", {}) or {}
+        _net_cfg = get_params("network") or {}
         _titan_pubkey = _net_cfg.get("titan_pubkey", "")
         _maker_pubkey = _net_cfg.get("maker_pubkey", "")
         _rpc_url = _net_cfg.get(
@@ -2040,7 +2041,7 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
             from titan_hcl.core.state_registry import (
                 resolve_titan_id as _resolve_tid_meta)
             _mr_titan_id = (
-                (config.get("info_banner", {}) or {}).get("titan_id")
+                (get_params("info_banner") or {}).get("titan_id")
                 or _resolve_tid_meta())
             _meta_cfg = {
                 **_meta_cfg,
@@ -2136,7 +2137,7 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
             LifeForceInputsPublisher,
         )
         _lf_tid = (
-            (config.get("info_banner", {}) or {}).get("titan_id")
+            (get_params("info_banner") or {}).get("titan_id")
             or _resolve_tid_lf()
         )
         life_force_inputs_publisher = LifeForceInputsPublisher(titan_id=_lf_tid)
@@ -2174,7 +2175,7 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
     try:
         from titan_hcl.core.state_registry import resolve_titan_id as _resolve_tid_a4
         _a4_tid = (
-            (config.get("info_banner", {}) or {}).get("titan_id")
+            (get_params("info_banner") or {}).get("titan_id")
             or _resolve_tid_a4()
         )
         from titan_hcl.logic.reasoning_state_publisher import (
@@ -2358,7 +2359,7 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
     _social_pressure_meter = None
     try:
         from titan_hcl.logic.social_pressure import SocialPressureMeter
-        _sp_cfg = (config or {}).get("social_presence", {}) or {}
+        _sp_cfg = get_params("social_presence") or {}
         _social_pressure_meter = SocialPressureMeter(_sp_cfg)
         logger.info(
             "[CognitiveWorker] SocialPressureMeter booted (cfg keys=%s)",

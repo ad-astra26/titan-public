@@ -540,6 +540,7 @@ def _drive_evaluate_all(
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -620,7 +621,7 @@ def expression_worker_main(recv_queue, send_queue, name: str,
 
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
-        (config.get("info_banner", {}) or {}).get("titan_id")
+        (get_params("info_banner") or {}).get("titan_id")
         or resolve_titan_id()
     )
     boot_ts = time.time()

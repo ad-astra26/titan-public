@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ def _init_neural_nervous_system(config: dict):
         vm_ns = None
         try:
             from titan_hcl.logic.nervous_system import NervousSystem
-            vm_ns = NervousSystem(config=config.get("titan_vm", {}))
+            vm_ns = NervousSystem(config=get_params("titan_vm"))
         except Exception:
             pass
 
@@ -98,7 +99,7 @@ def _init_coordinator(inner_state, spirit_state, observable_engine,
         nervous_system = None
         try:
             from titan_hcl.logic.nervous_system import NervousSystem
-            vm_cfg = (config or {}).get("titan_vm", {})
+            vm_cfg = get_params("titan_vm")
             nervous_system = NervousSystem(config=vm_cfg)
         except Exception as e:
             logger.warning("[SpiritWorker] NervousSystem init failed: %s", e)

@@ -15,6 +15,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Optional
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ def serialize_for_arweave(
     maker_pubkey = ""
     try:
         from titan_hcl.config_loader import load_titan_config
-        maker_pubkey = load_titan_config().get("network", {}).get("maker_pubkey", "") or ""
+        maker_pubkey = get_params("network").get("maker_pubkey", "") or ""
     except Exception:
         pass
 
@@ -147,7 +148,7 @@ def _resolve_maker_pubkey(explicit: Optional[str] = None) -> str:
         return explicit
     try:
         from titan_hcl.config_loader import load_titan_config
-        return load_titan_config().get("network", {}).get("maker_pubkey", "") or ""
+        return get_params("network").get("maker_pubkey", "") or ""
     except Exception:
         return ""
 

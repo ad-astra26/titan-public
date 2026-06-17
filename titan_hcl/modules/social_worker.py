@@ -130,6 +130,7 @@ _SOCIAL_WORKER_SUBSCRIBE_TOPICS = [
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -201,7 +202,7 @@ def social_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # X-posting per Maker D3(b). Skeleton no-ops so guardian doesn't restart-loop.
     # Registration in legacy_core.py is also flag-gated; this check is defensive.
     flag_on = bool(
-        (config or {}).get("microkernel", {}).get("social_worker_enabled", False))
+        get_params("microkernel").get("social_worker_enabled", False))
     if not flag_on:
         logger.info(
             "[SocialWorker] microkernel.social_worker_enabled=false — "
@@ -232,7 +233,7 @@ def social_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     state_refs["boot_ts"] = boot_ts
 
     # === MODULE-SPECIFIC: per-Titan polling-mode determination (chunk 9M) ===
-    social_x_cfg = (config or {}).get("social_x", {}) or {}
+    social_x_cfg = get_params("social_x") or {}
     canonical_poller = social_x_cfg.get("canonical_poller_titan_id", "T1")
     is_canonical_poller = (canonical_poller == "" or canonical_poller == titan_id)
     state_refs["is_canonical_poller"] = is_canonical_poller
@@ -320,8 +321,8 @@ def _init_post_dispatch_orchestrator(state_refs: dict, name: str,
         try:
             from titan_hcl.config_loader import load_titan_config
             _cfg = load_titan_config() or {}
-            _api_port = int(_cfg.get("api", {}).get("port", 7777))
-            _internal_key = _cfg.get("api", {}).get("internal_key", "") or ""
+            _api_port = int(get_params("api").get("port", 7777))
+            _internal_key = get_params("api").get("internal_key", "") or ""
         except Exception:
             pass
         orchestrator = PostDispatchOrchestrator(
@@ -473,7 +474,7 @@ def _main_loop(recv_queue, send_queue, name: str, state_refs: dict,
     # set up front, not per-tick).
     tick_interval = _DEFAULT_POST_DISPATCH_TICK_INTERVAL_S
     try:
-        social_x_cfg = (config or {}).get("social_x", {}) or {}
+        social_x_cfg = get_params("social_x") or {}
         tick_interval = float(social_x_cfg.get(
             "post_dispatch_tick_interval_seconds",
             _DEFAULT_POST_DISPATCH_TICK_INTERVAL_S))
@@ -908,7 +909,7 @@ def _init_social_x_gateway(config: dict, name: str, send_queue) -> dict:
     # Inject OutputVerifier for security gating of X posts/replies
     try:
         from titan_hcl.logic.output_verifier import OutputVerifier
-        wallet_path = (config.get("network", {}) or {}).get(
+        wallet_path = (get_params("network") or {}).get(
             "wallet_keypair_path", "data/titan_identity_keypair.json")
         gateway.set_output_verifier(OutputVerifier(
             titan_id=titan_id, data_dir="data/timechain",
@@ -944,7 +945,7 @@ def _init_social_x_gateway(config: dict, name: str, send_queue) -> dict:
         api_port = 7777
         try:
             from titan_hcl.config_loader import load_titan_config
-            api_port = int(load_titan_config().get("api", {}).get("port", 7777))
+            api_port = int(get_params("api").get("port", 7777))
         except Exception:
             pass
         gate_url = f"http://127.0.0.1:{api_port}/v4/metabolism/evaluate-gate"
@@ -1021,7 +1022,7 @@ def _init_pressure_meter(config: dict):
     keeps running)."""
     try:
         from titan_hcl.logic.social_pressure import SocialPressureMeter
-        sp_cfg = (config or {}).get("social_presence", {}) or {}
+        sp_cfg = get_params("social_presence") or {}
         meter = SocialPressureMeter(sp_cfg)
         logger.info("[SocialWorker] SocialPressureMeter booted "
                     "(threshold=%.1f, urge_restored=%.1f, catalysts_restored=%d)",
@@ -1151,9 +1152,9 @@ def _handle_heal_request(payload: dict, state_refs: dict,
                     from titan_hcl.config_loader import (
                         load_titan_config)
                     full_cfg = load_titan_config(force_reload=True)
-                    sx_cfg = full_cfg.get("social_x") or {}
-                    sage_cfg = full_cfg.get("stealth_sage") or {}
-                    tw_cfg = full_cfg.get("twitter_social") or {}
+                    sx_cfg = get_params("social_x") or {}
+                    sage_cfg = get_params("stealth_sage") or {}
+                    tw_cfg = get_params("twitter_social") or {}
                     api_key = (sx_cfg.get("api_key", "")
                                 or sage_cfg.get("twitterapi_io_key", "")
                                 or "")

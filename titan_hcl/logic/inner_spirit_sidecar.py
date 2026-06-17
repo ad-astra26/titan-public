@@ -43,6 +43,7 @@ import math
 import threading
 import time
 from typing import Optional
+from titan_hcl.params import get_params
 
 
 # ── D-SPEC-101 (rFP Dims Redesign Closure Phase 1) ──────────────────────
@@ -292,7 +293,7 @@ def start_inner_spirit_sensor_refresh(
         should log_critical when None — Rust inner-spirit-rs will starve
         without this writer).
     """
-    if not (config or {}).get("microkernel", {}).get(
+    if not get_params("microkernel").get(
             "l0_rust_enabled", False):
         return None
 

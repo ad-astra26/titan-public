@@ -98,6 +98,7 @@ GALLERY_QUERY_TIMEOUT_S = 2.0  # work-RPC ≤2s per G19
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import get_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -358,7 +359,7 @@ def studio_worker_main(recv_queue, send_queue, name: str,
     # ── StudioCoordinator init (replicates plugin.py:_wire_studio inline) ──
     from titan_hcl.expressive.studio import StudioCoordinator
 
-    expressive_cfg = (config or {}).get("expressive", {}) or {}
+    expressive_cfg = get_params("expressive") or {}
     output_root = Path(expressive_cfg.get("output_path", "./data/studio_exports"))
 
     # Build coordinator — no metabolism proxy yet (would require bus.request_async
