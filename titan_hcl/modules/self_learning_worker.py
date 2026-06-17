@@ -208,6 +208,13 @@ _DEFAULTS = {
     "direct_ungrounded_recall_threshold": 0.5,  # recall_top_cosine below this = ungrounded
     "direct_ungrounded_extra_damping": 0.7,     # ungrounded direct damped MORE
     "direct_graduated_floor": 0.6,    # mastered (chunked) goal_class → ease damping (higher floor)
+    # ── P7 — clean-baseline reset (uncollapse) ──────────────────────────────
+    # One-shot reset trigger: if this sentinel file exists at worker boot, the
+    # collapsed routing policy + IQL nets + level + replay buffer are CLEARED →
+    # a true cold-start relearn on the IQL loop (the acceptance-proof reset). The
+    # worker DELETES the sentinel after consuming it (so it never loops). To reset
+    # a Titan: `touch <reset_sentinel_path>` on its box, then full-restart it.
+    "reset_sentinel_path": "data/.reset_routing_policy",
 }
 # Reward-source authority rank (Phase B corrective-delta): a higher-rank source
 # may correct a lower-rank applied reward; same-or-lower is ignored (no double-train).
@@ -401,6 +408,28 @@ class _SelfLearningStore:
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] frontier_goal_classes soft-fail: %s", e)
             return []
+
+    def reset_policy_artifacts(self) -> dict:
+        """P7 — therapeutic clean-baseline reset (§24.7 precedent). Clears ALL
+        durable routing-policy state so the next boot is a true cold-start on the
+        IQL loop: the π weights (policy_state), the IQL nets (policy_iql_state),
+        the MasteryLevel (mastery_level_state), AND the experience-replay buffer
+        (reward_tuples — the collapsed-era samples would re-collapse a fresh
+        policy). Macros (macro_emitted) are KEPT — they're verified mastered
+        routines, not collapsed scaffolding. Returns the cleared counts. Only the
+        relearnable RL scaffolding is cleared (INV-OML-1); memory/timechain are
+        untouched (directive_memory_preservation)."""
+        counts = {}
+        for tbl in ("policy_state", "policy_iql_state", "mastery_level_state",
+                    "reward_tuples"):
+            try:
+                n = self._conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()
+                self._conn.execute(f"DELETE FROM {tbl}")
+                counts[tbl] = int(n[0]) if n and n[0] else 0
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[self_learning] reset %s soft-fail: %s", tbl, e)
+                counts[tbl] = -1
+        return counts
 
     def save_mastery_state(self, state_dict) -> None:
         try:
@@ -786,6 +815,25 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
     except Exception as e:
         logger.error("[self_learning] store init failed: %s — exiting", e)
         return
+
+    # P7 — one-shot clean-baseline reset (uncollapse). If the sentinel exists,
+    # CLEAR the collapsed policy + IQL nets + level + replay buffer BEFORE loading
+    # → a guaranteed cold-start relearn on the IQL loop. Consume (delete) the
+    # sentinel so it never loops. (§24.7 therapeutic-clear precedent.)
+    try:
+        _reset_sentinel = str(cfg.get("reset_sentinel_path",
+                                      "data/.reset_routing_policy"))
+        if _reset_sentinel and os.path.exists(_reset_sentinel):
+            _cleared = store.reset_policy_artifacts()
+            try:
+                os.remove(_reset_sentinel)
+            except Exception:  # noqa: BLE001
+                pass
+            logger.warning("[self_learning] 🔄 P7 CLEAN-BASELINE RESET (uncollapse) "
+                           "— cleared %s; cold-start relearn on the IQL loop",
+                           _cleared)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[self_learning] reset-sentinel check failed: %s", e)
 
     # Policy — restore from our own store, else fresh (cold-start).
     _wd = float(cfg["weight_decay"])
