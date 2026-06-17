@@ -3076,6 +3076,17 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
             name, e, exc_info=True,
         )
 
+    # RFP_config_as_shm_state §7.B — UNIVERSAL heartbeat config-watch. One daemon
+    # thread per worker that re-applies `hot` config sections a worker derived at
+    # boot when their SHM slot version bumps (per-call get_params readers see live
+    # values without it). No-op until a worker calls params.register_config_reload;
+    # sleeps harmlessly when TITAN_CONFIG_SHM_READ is off. Never crashes boot.
+    try:
+        from titan_hcl import params as _params
+        _params.start_config_watch()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Module '%s' config-watch start failed: %s", name, e)
+
     try:
         entry_fn(recv_queue, send_queue, name, config)
     except KeyboardInterrupt:

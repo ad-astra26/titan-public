@@ -31,6 +31,8 @@ Usage:
 """
 import logging
 import os
+import threading
+import time
 from typing import Callable, Optional
 
 from titan_hcl.config_loader import load_titan_config
@@ -46,6 +48,8 @@ _shm_root = None                 # resolved once
 _reload_callbacks: dict = {}     # section -> list[Callable[[dict], None]]
 _last_versions: dict = {}        # section -> last slot version seen by poll
 _shm_unavailable = False         # set once if the SHM stack can't be imported/resolved
+_watch_thread = None             # the universal config-watch daemon thread (one per process)
+_watch_lock = threading.Lock()
 
 
 def _config_shm_enabled() -> bool:
@@ -174,3 +178,35 @@ def poll_config_reloads() -> list:
         except Exception as e:
             _LOG.debug("params: poll_config_reloads(%s) error: %s", section, e)
     return applied
+
+
+def start_config_watch(interval_s: float = 3.0):
+    """Start the UNIVERSAL heartbeat config-watch daemon thread (idempotent per
+    process). Installed once per worker at the orchestrator's ``_module_wrapper``
+    (RFP_config_as_shm_state §7.B): a daemon thread that, while SHM reads are
+    enabled, calls ``poll_config_reloads`` every ``interval_s`` so a slot version
+    bump fires the worker's registered ``hot`` reload callbacks (the §1.2 "worker
+    reads on heartbeat" model). Per-call ``get_params`` readers already see live
+    values for free — this thread exists ONLY to re-apply values a worker derived
+    once at boot. ``restart_required`` sections are surfaced by the daemon
+    (``CONFIG_RESTART_REQUIRED``) and carry no hot callback, so they are never
+    hot-applied here (INV-CFG-4). The thread is a no-op (cheap version-poll) when
+    no callback is registered, and sleeps harmlessly when the flag is off."""
+    global _watch_thread
+    with _watch_lock:
+        if _watch_thread is not None and _watch_thread.is_alive():
+            return _watch_thread
+
+        def _loop():
+            while True:
+                try:
+                    if _config_shm_enabled():
+                        poll_config_reloads()
+                except Exception:  # never let the watch thread die or crash the worker
+                    pass
+                time.sleep(interval_s)
+
+        t = threading.Thread(target=_loop, name="titan-config-watch", daemon=True)
+        t.start()
+        _watch_thread = t
+        return t
