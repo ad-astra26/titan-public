@@ -193,12 +193,9 @@ stale_focus_multiplier = 1.5
 # geometric blending. Quality accumulates between PULSEs, crystallizes at advance.
 
 [spirit_enrichment]
-# Seconds between STATE_SNAPSHOT bus messages (how often Spirit sees SELF)
-# Influences: enrichment frequency, Spirit's self-observation cadence
-# Affects: quality accumulation rate, bus message volume
-# Ratio: should be ≤ sphere_clock.tick_interval (Spirit observes faster than clocks)
-# Aligned with Spirit Schumann/3 (383ms)
-micro_tick_interval = 0.383
+# micro_tick_interval (Spirit self-observation cadence) → relocated to config.toml
+# (user-tunable cadence knob) in the Phase-0 config-disjointness pass
+# (RFP_config_as_shm_state §7.0, 2026-06-17). Effective value 10.0 lives in config.
 
 # α in geometric blend: spirit[i]^(1-α*alignment) * state[i]^(α*alignment)
 # Influences: how fast Spirit absorbs state reality
@@ -1614,11 +1611,12 @@ shm_write_on_every_outcome = true
 online_consolidation_every = 50
 
 # ── Canonical IQL learner (RFP_cgn_canonical_iql_upgrade) ────────────────
-# Flag-default-false (INV-CGN-IQL-3): legacy advantage-REINFORCE runs until
-# IQL is devnet-soak-green. When true, dream consolidation routes through the
-# 3 canonical IQL losses — expectile-V + Bellman-Q-with-V(s') + AWR policy —
-# multi-step over the per-concept/per-consumer grounding trajectory.
-cgn_iql_enabled = false
+# cgn_iql_enabled (the on/off feature flag) → relocated to config.toml
+# (user-tunable kill-switch) in the Phase-0 config-disjointness pass
+# (RFP_config_as_shm_state §7.0, 2026-06-17). Effective value true lives there.
+# The IQL hyperparameters below stay here (DNA). When the flag is true, dream
+# consolidation routes through the 3 canonical IQL losses — expectile-V +
+# Bellman-Q-with-V(s') + AWR policy — multi-step over the grounding trajectory.
 cgn_iql_tau = 0.7        # expectile asymmetry (>0.5 ⇒ optimistic upper-V)
 cgn_iql_beta = 3.0       # AWR temperature
 cgn_iql_adv_clip = 100.0 # AWR exp-weight clamp (stability)
@@ -3551,8 +3549,9 @@ spawn_reference_worker_enabled = true
 # Default OFF — byte-identical to pre-S7 with flags off (no threads
 # start, sensors called inline, no shm writes). Per-flag independent
 # (body and mind can flip separately).
-shm_body_fast_enabled = true    # FLIPPED 2026-04-26 — Step 2 of S7 cascade on T1 (verified body fast path live + stable)
-shm_mind_fast_enabled = true    # FLIPPED 2026-04-26 — Step 3 of S7 cascade on T1 (completes Schumann-symmetric Trinity)
+# shm_body_fast_enabled / shm_mind_fast_enabled → relocated to config.toml
+# (box-tunable microkernel flags; folded in from the retired per-Titan override)
+# in the Phase-0 config-disjointness pass (RFP_config_as_shm_state §7.0, 2026-06-17).
 
 # ── Phase B.1 — Shadow Core Swap (rFP §347-357) ────────────────────
 # Enables /v4/maker/shadow-swap endpoint + kernel.shadow_swap_orchestrate.
@@ -3578,7 +3577,8 @@ shadow_swap_enabled = true    # FLIPPED 2026-04-26 — B.1 first deploy test on 
 # via _sanitize_dict_keys() — fix verified live in spirit_state.py:101-129.
 # Closes the second of two unaddressed levers from rFP_microkernel_phase_a8 §3.4
 # (eliminates ~20 QueueFeederThread per Titan = ~160 MB VmData reservation).
-bus_ipc_socket_enabled = true  # 2026-05-01 — restored to true after A.S8 (outer trinity symmetric workers) shipped + broker-boundary msgpack fix (commit 0ebd9e7b) verified 0 sustained drops fleet-wide + api ModuleSpec broadcast_topics filter (commit ec58c003). T1 graduated from legacy mode back to socket-broker. spawn_graduated_workers_enabled stays false per BUG-MICROKERNEL-V2-SPAWN-GRADUATED-HEARTBEAT-CRASHLOOP-20260501.
+# bus_ipc_socket_enabled → relocated to config.toml (box-tunable microkernel flag)
+# in the Phase-0 config-disjointness pass (RFP_config_as_shm_state §7.0, 2026-06-17).
 
 # ── Phase B.2.1 — Spawn graduation for import-stable workers ───────────
 # When true, 9 workers boot via multiprocessing.get_context("spawn") so
@@ -3626,7 +3626,8 @@ bus_ipc_socket_enabled = true  # 2026-05-01 — restored to true after A.S8 (out
 # Shadow swap is now operationally green for T1. T2 still has subscriber-
 # registration race from 2026-04-27 19:04 — DEFER T2/T3 until T1 swap is
 # soaked clean for 24h+.
-spawn_graduated_workers_enabled = true  # 2026-05-02 — committed after T1 spawn-mode + Option A+B verified 27/27 RUNNING in 5 min, 0 cascade events, 0 anon purges. Full microkernel v2 (Phase A+B) is now active by default. Phase C C-S7 (Rust L0/L1) activation tracked in PLAN_microkernel_phase_c_s7_activation_prep.md.
+# spawn_graduated_workers_enabled → relocated to config.toml (box-tunable microkernel
+# flag) in the Phase-0 config-disjointness pass (RFP_config_as_shm_state §7.0, 2026-06-17).
 
 # ── Phase A.8.3 — Output Verifier subprocess (rFP_microkernel_phase_a8) ──
 # When true, output_verifier runs as a Guardian-supervised L2 subprocess
