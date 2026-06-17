@@ -101,15 +101,16 @@ def test_schema_covers_all_keys(schema, params_keys, config_keys):
     sch_params = set(schema["params"])
     sch_config = set(schema["config"])
 
-    # Secrets-only keys live in ~/.titan/secrets.toml (no params/config placeholder),
-    # so the generator never sees them — they are declared manually in the schema
-    # (sensitive=true) and are legitimately "orphan" relative to the two TOMLs.
-    secrets_only = {"synthesis.user_id_hash_salt"}
+    # Keys declared in the schema but not present in THIS box's two TOMLs:
+    #  - secrets-only keys live in ~/.titan/secrets.toml (no params/config placeholder)
+    #  - per-box keys present on other boxes' config.toml (e.g. T2/T3's [genesis])
+    # The schema is fleet-wide, so these are legitimately "orphan" relative to one box.
+    fleet_extra = {"synthesis.user_id_hash_salt", "genesis.titan_name"}
 
     missing_p = params_keys - sch_params
     missing_c = config_keys - sch_config
-    orphan_p = sch_params - params_keys - secrets_only
-    orphan_c = sch_config - config_keys - secrets_only
+    orphan_p = sch_params - params_keys - fleet_extra
+    orphan_c = sch_config - config_keys - fleet_extra
 
     assert not missing_p, f"params keys missing a schema entry: {sorted(missing_p)[:20]}"
     assert not missing_c, f"config keys missing a schema entry: {sorted(missing_c)[:20]}"

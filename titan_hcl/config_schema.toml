@@ -124,6 +124,8 @@
 "expressive.ollama_model" = {type="str", constraint="", reload="hot", owner=["expression_worker", "studio"], sensitive=false}
 "expressive.output_path" = {type="str", constraint="", reload="restart_required", owner=["expression_worker", "studio"], sensitive=false}
 "frontend.art_rolling_limit" = {type="int", constraint=">=0", reload="hot", owner=["observatory"], sensitive=false}
+# per-box key present on T2/T3 (config.toml.example [genesis] template section; T1 has none). Declared fleet-wide so the daemon validates clean on all boxes.
+"genesis.titan_name" = {type="str", constraint="", reload="restart_required", owner=["kernel"], sensitive=false}
 "frontend.privy_api_key" = {type="str", constraint="", reload="hot", owner=["observatory"], sensitive=true}
 "frontend.privy_app_id" = {type="str", constraint="", reload="hot", owner=["observatory"], sensitive=false}
 "frontend.public_domain" = {type="str", constraint="", reload="hot", owner=["observatory"], sensitive=false}
