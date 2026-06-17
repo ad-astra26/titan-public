@@ -58,6 +58,11 @@ from titan_hcl.synthesis.outer_meta_policy import (
     action_index_to_name,
     structural_target_action,
 )
+from titan_hcl.synthesis.mastery_level import (
+    MASTERY_LEVEL_STATE_SPEC,
+    MasteryLevel,
+    mastery_readout_to_flat,
+)
 from titan_hcl.synthesis.outer_meta_reasoning import OuterMetaReasoningEngine
 from titan_hcl.synthesis.outer_reasoning import OuterReasoningEngine
 
@@ -175,6 +180,21 @@ _DEFAULTS = {
     "iql_steps": 20,                  # gradient steps per idle consolidation pass
     "iql_batch_size": 32,             # transitions per step
     "iql_replay_window": 2000,        # most-recent reward_tuples drawn for trajectory linking
+    # ── Emergent MasteryLevel (P3, ARCHITECTURE_mastery_leveling.md §2.2/§5) ──
+    # Self-emergent ability level from the IQL value V(s): EMA(symlog-V̄) binned
+    # on a fixed grade ladder, ratcheted only when a SCALE-FREE competence_rate
+    # confirms it (SOAR ① — anti reward-scale-inflation). Computed each idle
+    # _explore_tick after train_iql; published to SHM (G21) for dashboard/P4-P5.
+    "level_n_grades": 10,
+    "level_grade_lo": -5.0,           # symlog-space grade support (r∈[−1,1],γ=0.99)
+    "level_grade_hi": 5.0,
+    "level_ema_alpha": 0.05,          # V̄ smoothing
+    "level_competence_floor_base": 0.55,   # competence gate at grade 0
+    "level_competence_floor_slope": 0.02,  # per-grade floor increment
+    "competence_w_succ": 0.6,         # weight: verified-success-rate
+    "competence_w_adv": 0.4,          # weight: advantage-positive-rate
+    "competence_window": 200,         # recent decisions for success_rate
+    "competence_ema_alpha": 0.05,     # competence_rate smoothing
 }
 # Reward-source authority rank (Phase B corrective-delta): a higher-rank source
 # may correct a lower-rank applied reward; same-or-lower is ignored (no double-train).
@@ -205,6 +225,10 @@ class _SelfLearningStore:
             "CREATE TABLE IF NOT EXISTS policy_iql_state ("
             " id INTEGER PRIMARY KEY, iql_json VARCHAR,"
             " total_iql_updates BIGINT, ts DOUBLE)")
+        # MasteryLevel state (P3) — emergent level ratchet/EMA, worker-only (G21).
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS mastery_level_state ("
+            " id INTEGER PRIMARY KEY, state_json VARCHAR, ts DOUBLE)")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS pending_decisions ("
             " parent_tool_call_tx VARCHAR PRIMARY KEY, features_json VARCHAR,"
@@ -312,6 +336,77 @@ class _SelfLearningStore:
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] iql_transitions soft-fail: %s", e)
             return []
+
+    # -- MasteryLevel signals + persistence (P3) ------------------------
+    def success_rate(self, window: int) -> float:
+        """Scale-free verified-success rate (SOAR ① / INV-ML-3): fraction of the
+        last `window` decisions with reward>0. Dimensionless ∈ [0,1] — cannot be
+        fooled by reward-scale inflation. 0.0 on an empty buffer."""
+        try:
+            row = self._conn.execute(
+                "SELECT AVG(CASE WHEN reward > 0 THEN 1.0 ELSE 0.0 END) FROM ("
+                "  SELECT reward FROM reward_tuples ORDER BY id DESC LIMIT ?)",
+                [int(window)]).fetchone()
+            return float(row[0]) if row and row[0] is not None else 0.0
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] success_rate soft-fail: %s", e)
+            return 0.0
+
+    def chunk_count(self) -> int:
+        """Number of distilled macros = chunked (mastered) routines (SOAR ②).
+        Secondary structural-competence signal (INV-ML-5)."""
+        try:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM macro_emitted").fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] chunk_count soft-fail: %s", e)
+            return 0
+
+    def is_graduated(self, goal_class: str) -> bool:
+        """Has ANY action for this goal_class been chunked? → it's a mastered
+        (graduated) class (the SOAR ② graduation map; P4/P5 read this)."""
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM macro_emitted WHERE goal_class=? LIMIT 1",
+                [str(goal_class or "")]).fetchone()
+            return bool(row)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] is_graduated soft-fail: %s", e)
+            return False
+
+    def frontier_goal_classes(self, limit: int = 16):
+        """Goal_classes SEEN in reward_tuples but NOT yet chunked — the un-mastered
+        frontier P4/P5 steer exploration/teacher toward (SOAR ② graduation)."""
+        try:
+            rows = self._conn.execute(
+                "SELECT DISTINCT r.goal_class FROM reward_tuples r "
+                "WHERE r.goal_class <> '' AND r.goal_class NOT IN "
+                "(SELECT goal_class FROM macro_emitted) LIMIT ?",
+                [int(limit)]).fetchall()
+            return [str(x[0]) for x in rows]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] frontier_goal_classes soft-fail: %s", e)
+            return []
+
+    def save_mastery_state(self, state_dict) -> None:
+        try:
+            self._conn.execute(
+                "INSERT INTO mastery_level_state (id, state_json, ts) "
+                "VALUES (0,?,?) ON CONFLICT (id) DO UPDATE "
+                "SET state_json=excluded.state_json, ts=excluded.ts",
+                [json.dumps(state_dict), time.time()])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] save_mastery_state soft-fail: %s", e)
+
+    def load_mastery_state(self):
+        try:
+            row = self._conn.execute(
+                "SELECT state_json FROM mastery_level_state WHERE id=0").fetchone()
+            return json.loads(row[0]) if row and row[0] else None
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] load_mastery_state soft-fail: %s", e)
+            return None
 
     # -- pending decisions (the async-join stash) -----------------------
     def stash_decision(self, *, tx, features, action, goal_class, turn_id) -> None:
@@ -774,6 +869,32 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
     except Exception as e:  # noqa: BLE001
         logger.warning("[self_learning] SHM writer init failed: %s", e)
 
+    # P3 — MasteryLevel (emergent ability level from V(s)) + its SHM slot.
+    # Only when IQL is on (the level reads the IQL value); else None (no level).
+    _mastery = None
+    _level_writer = None
+    if bool(cfg.get("oml_iql_enabled", True)):
+        try:
+            _mastery = MasteryLevel(
+                n_grades=int(cfg["level_n_grades"]),
+                grade_lo=float(cfg["level_grade_lo"]),
+                grade_hi=float(cfg["level_grade_hi"]),
+                ema_alpha=float(cfg["level_ema_alpha"]),
+                competence_floor_base=float(cfg["level_competence_floor_base"]),
+                competence_floor_slope=float(cfg["level_competence_floor_slope"]),
+                competence_ema_alpha=float(cfg["competence_ema_alpha"]))
+            # A cold-start policy relearns the level too; only restore on a healthy
+            # policy restore (same reasoning as the IQL nets).
+            _ms = store.load_mastery_state() if not _cold_start else None
+            if _ms is not None and _mastery.load_dict(_ms):
+                logger.info("[self_learning] MasteryLevel restored (grade=%d)",
+                            _mastery.readout()["grade"])
+            _level_writer = StateRegistryWriter(
+                MASTERY_LEVEL_STATE_SPEC, ensure_shm_root(titan_id))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[self_learning] MasteryLevel init failed: %s", e)
+            _mastery = None
+
     # Metabolic gate reader (soft — cold default permits, but survival blocks).
     try:
         from titan_hcl.proxies.life_force_proxy import LifeForceShmReader
@@ -851,7 +972,8 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
         if now - last_explore >= float(cfg["explore_interval_s"]):
             try:
                 _explore_tick(cfg, store, policy, _shm_writer, _life, send_queue, name,
-                              _outer_reason, _outer_meta)
+                              _outer_reason, _outer_meta,
+                              mastery=_mastery, level_writer=_level_writer)
             except Exception as e:  # noqa: BLE001
                 logger.debug("[self_learning] explore tick soft-fail: %s", e)
             last_explore = now
@@ -1329,8 +1451,39 @@ def _build_routing_transitions(rows):
     return out
 
 
+def _update_mastery_level(cfg, store, policy, transitions, mastery, level_writer):
+    """P3 — recompute the emergent MasteryLevel after an IQL pass and publish it.
+    V̄ = mean symlog-V over the batch states; competence_rate = the scale-free
+    blend (verified-success-rate + advantage-positive-rate) that GATES the ratchet
+    (SOAR ①); n_chunks = distilled-macro count (SOAR ②). Persist + SHM-publish."""
+    if mastery is None or not transitions:
+        return
+    try:
+        import numpy as _np
+        states = _np.array([t["state"] for t in transitions], dtype=_np.float32)
+        v_sym = float(_np.mean([policy.value_symlog(s) for s in states]))
+        succ = store.success_rate(int(cfg["competence_window"]))
+        adv_pos = policy.advantage_positive_rate()
+        competence = (float(cfg["competence_w_succ"]) * succ
+                      + float(cfg["competence_w_adv"]) * adv_pos)
+        n_chunks = store.chunk_count()
+        readout = mastery.update(v_sym, competence, n_chunks)
+        store.save_mastery_state(mastery.to_dict())
+        if level_writer is not None:
+            level_writer.write(mastery_readout_to_flat(readout))
+        if readout.get("milestones"):
+            store.log_explore(
+                "mastery", "",
+                f"level={readout['level']:.3f} grade={readout['grade']} "
+                f"competence={readout['competence']:.3f} chunks={readout['n_chunks']} "
+                f"milestones={','.join(readout['milestones'])}")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[self_learning] mastery level update soft-fail: %s", e)
+
+
 def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
-                  outer_reason=None, outer_meta=None) -> None:
+                  outer_reason=None, outer_meta=None, *,
+                  mastery=None, level_writer=None) -> None:
     """Idle EXPLORE (L3) — metabolically gated (INV-OML-9). Passes:
     (1) balanced experience-replay (deadlock fix step 1 — minority actions at
     parity); (2) active structural exploration (step 2 — the verifiable structural
@@ -1374,6 +1527,9 @@ def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
                 f"trans={stats.get('transitions')} v={stats.get('v_loss', 0.0):.4f} "
                 f"q={stats.get('q_loss', 0.0):.4f} p={stats.get('policy_loss', 0.0):.4f} "
                 f"iql_updates={stats.get('iql_updates')}")
+            # P3 — recompute + publish the emergent MasteryLevel off this pass.
+            _update_mastery_level(cfg, store, policy, transitions,
+                                  mastery, level_writer)
     else:
         # Legacy REINFORCE balanced experience-replay (flag-off; INV-MC-7).
         _batch_n = int(cfg["explore_replay_batch"])

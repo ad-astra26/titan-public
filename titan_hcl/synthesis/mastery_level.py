@@ -27,6 +27,8 @@ from typing import Optional
 
 import numpy as np
 
+from titan_hcl.core.state_registry import RegistrySpec
+
 # Defaults mirror ARCHITECTURE_mastery_leveling.md §5 (the v1 design point); the
 # worker overrides from config[synthesis][self_learning].
 DEFAULT_N_GRADES = 10
@@ -38,6 +40,48 @@ DEFAULT_COMPETENCE_FLOOR_SLOPE = 0.02
 DEFAULT_COMPETENCE_EMA_ALPHA = 0.05
 
 MASTERY_LEVEL_SCHEMA_VERSION = 1
+
+# ── SHM slot (P3) — fixed float32 readout for dashboard/Observatory/P4-P5 ─────
+# self_learning_worker is the sole writer (G21/INV-OML-8). Layout (8 floats):
+#   [level, grade, ema_v_symlog, competence, n_chunks,
+#    value_milestones, chunk_milestones, updates]
+MASTERY_LEVEL_FLAT_DIM = 8
+MASTERY_LEVEL_STATE_SLOT = "mastery_level_state"
+MASTERY_LEVEL_STATE_SPEC = RegistrySpec(
+    name=MASTERY_LEVEL_STATE_SLOT,
+    dtype=np.dtype("float32"),
+    shape=(MASTERY_LEVEL_FLAT_DIM,),
+    feature_flag="",
+    schema_version=MASTERY_LEVEL_SCHEMA_VERSION,
+    variable_size=False,
+)
+
+
+def mastery_readout_to_flat(readout: dict) -> np.ndarray:
+    """Pack a MasteryLevel.readout() dict into the fixed SHM vector."""
+    return np.array([
+        float(readout.get("level", 0.0)),
+        float(readout.get("grade", 0)),
+        float(readout.get("ema_v_symlog", 0.0)),
+        float(readout.get("competence", 0.0)),
+        float(readout.get("n_chunks", 0)),
+        float(readout.get("value_milestones", 0)),
+        float(readout.get("chunk_milestones", 0)),
+        float(readout.get("updates", 0)),
+    ], dtype=np.float32)
+
+
+def mastery_flat_to_readout(flat) -> dict:
+    """Reconstruct the readout dict from the SHM vector (dashboard side)."""
+    f = np.asarray(flat, dtype=np.float32).ravel()
+    if f.shape[0] < MASTERY_LEVEL_FLAT_DIM:
+        return {}
+    return {
+        "level": float(f[0]), "grade": int(round(f[1])),
+        "ema_v_symlog": float(f[2]), "competence": float(f[3]),
+        "n_chunks": int(round(f[4])), "value_milestones": int(round(f[5])),
+        "chunk_milestones": int(round(f[6])), "updates": int(round(f[7])),
+    }
 
 
 class MasteryLevel:
@@ -178,4 +222,9 @@ class MasteryLevel:
             return False
 
 
-__all__ = ("MasteryLevel", "MASTERY_LEVEL_SCHEMA_VERSION")
+__all__ = (
+    "MasteryLevel", "MASTERY_LEVEL_SCHEMA_VERSION",
+    "MASTERY_LEVEL_STATE_SLOT", "MASTERY_LEVEL_STATE_SPEC",
+    "MASTERY_LEVEL_FLAT_DIM",
+    "mastery_readout_to_flat", "mastery_flat_to_readout",
+)
