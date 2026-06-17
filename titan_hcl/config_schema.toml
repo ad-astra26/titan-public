@@ -384,6 +384,13 @@
 "stealth_sage.twitterapi_search_depth" = {type="int", constraint=">=0", reload="hot", owner=["agency_worker", "social_worker"], sensitive=false}
 "stealth_sage.webshare_rotating_url" = {type="str", constraint="", reload="restart_required", owner=["agency_worker", "social_worker"], sensitive=false}
 "synthesis.decision_authority.enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+# Per-Titan synthesis canary flags — live in per-box config.toml (folded from the
+# retired microkernel_<id>.toml override, RFP §7-Phase-B(6)); NOT in titan_params.toml
+# (so no disjointness conflict). Present only on canary boxes (e.g. T3) → fleet_extra
+# in test_config_schema_phase0. (synthesis.skill.delegate_live stays in [params] — it
+# has a DNA default in titan_params.toml.)
+"synthesis.fork_gc_live" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.recall.augment_chat" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 # secrets-only key (lives in ~/.titan/secrets.toml, no config/params placeholder) — declared manually; the generator only sees params+config.
 "synthesis.user_id_hash_salt" = {type="str", constraint="", reload="restart_required", owner=["synthesis"], sensitive=true}
 "synthesis.decision_authority.gibberish_probe_every" = {type="int", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}

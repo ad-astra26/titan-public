@@ -105,7 +105,10 @@ def test_schema_covers_all_keys(schema, params_keys, config_keys):
     #  - secrets-only keys live in ~/.titan/secrets.toml (no params/config placeholder)
     #  - per-box keys present on other boxes' config.toml (e.g. T2/T3's [genesis])
     # The schema is fleet-wide, so these are legitimately "orphan" relative to one box.
-    fleet_extra = {"synthesis.user_id_hash_salt", "genesis.titan_name"}
+    fleet_extra = {"synthesis.user_id_hash_salt", "genesis.titan_name",
+                   # per-Titan synthesis canary flags — only present in canary boxes'
+                   # config.toml (folded from the retired microkernel override, §7-Phase-B(6))
+                   "synthesis.fork_gc_live", "synthesis.recall.augment_chat"}
 
     missing_p = params_keys - sch_params
     missing_c = config_keys - sch_config
