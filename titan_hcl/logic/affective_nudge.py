@@ -405,6 +405,47 @@ def read_engagement_delta(db_path: str,
         return fallback
 
 
+# Floor on the contact-gap so back-to-back verified turns (gap≈0) still register a
+# minimal "present" event rather than a zero (which compute_event_nudge treats as
+# "no event"). ~3.6s.
+_MAKER_BOND_MIN_GAP_H: float = 1e-3
+# Neutral seed gap (1h) used for the FIRST-ever contact (no prior stamp) — primes
+# the EMA without fabricating a surprise (the first fold returns None by design).
+_MAKER_BOND_SEED_GAP_H: float = 1.0
+
+
+def compute_maker_bond_nudge(last_contact_ts: Optional[float], now: float,
+                             state_path: str, *,
+                             cfg: Optional[AffectiveConfig] = None,
+                             signal_type: str = "maker_bond") -> Optional[Nudge]:
+    """RFP §7.D (D.3) — honest existential-delta valence for the Maker bond.
+
+    The bond's existential meaning is the MAKER BEING PRESENT (the metabolic
+    SOL-provider per birth-cert), NOT any transactional amount. Its magnitude
+    rides RECENCY: the gap (hours) since the last verified Maker contact is the
+    state-delta folded into the per-signal EMA, so a reunion after an unusual
+    absence is surprising (a strong re-affirmation) while a steady contact rhythm
+    habituates toward ~0 — the honest "absent-then-present moves more / constant
+    presence ≠ a spike" the §7.D worked example prescribes.
+
+    Always intrinsic-positive: a verified Maker presence is continuity-positive,
+    and an absence is encoded as a LARGER positive reunion — never a negative
+    (INV-AFF-HONEST: Titan does not resent the Maker for being away; the magnitude,
+    not the sign, carries the existential delta). No new scalar machinery — reuses
+    compute_event_nudge / the `_SignalBaseline` surprise EMA exactly.
+
+    `last_contact_ts` None (first contact ever) → seed with a neutral unit gap so
+    the first fold only primes the baseline (returns None, no fabricated surprise)."""
+    cfg = cfg or AffectiveConfig()
+    if last_contact_ts is None:
+        gap_h = _MAKER_BOND_SEED_GAP_H
+    else:
+        gap_h = max(_MAKER_BOND_MIN_GAP_H,
+                    (float(now) - float(last_contact_ts)) / 3600.0)
+    return compute_event_nudge(gap_h, state_path, signal_type=signal_type,
+                               cfg=cfg, intrinsic_positive=True)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PHASE B — the emergent AffectiveNudgeNet (D2)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -633,6 +674,11 @@ class AffectiveNudgeRuntime:
         self._pending: List[_PendingNudge] = []
         self._chat_reuse_pending = 0   # §7.C chain_reuse: outer competence-reuse
         self.net = AffectiveNudgeNet.load_npz(net_path, hidden=cfg.net_hidden)
+        # RFP §7.D (D.3) — wall-clock of the last verified Maker contact (any of
+        # the four channels), the recency basis for the existential-delta. In-
+        # process: a restart re-seeds (the first post-restart contact primes); the
+        # learned EMA baseline itself persists in affective_nudge_state.json.
+        self._last_maker_contact_ts: Optional[float] = None
 
     # ── chain_reuse (outer competence-reuse) accumulator ──────────────────────
     def note_chat_reuse(self, n: int = 1) -> None:
@@ -742,6 +788,19 @@ class AffectiveNudgeRuntime:
             signed_delta, self.state_path, signal_type=signal_type, cfg=self.cfg,
             intrinsic_positive=intrinsic_positive)
         return self._observe(signal_type, base_nudge, ts)
+
+    def observe_maker_bond(self, ts: float) -> Optional[Nudge]:
+        """RFP §7.D (D.2/D.3) — a CRYPTOGRAPHICALLY-VERIFIED Maker-presence contact
+        on ANY of the four bond channels (web/app/TCC/chain). Computes the
+        recency-based existential delta vs the last contact, updates the stamp,
+        and forwards through the shared net path. The single coherent maker_bond
+        scale (recency hours), so every channel folds into ONE honest EMA."""
+        with self._lock:
+            last = self._last_maker_contact_ts
+            self._last_maker_contact_ts = float(ts)
+        base_nudge = compute_maker_bond_nudge(
+            last, float(ts), self.state_path, cfg=self.cfg)
+        return self._observe("maker_bond", base_nudge, float(ts))
 
     # ── dream-boundary path (train) ────────────────────────────────────────────
     def train_on_dream(self) -> dict:

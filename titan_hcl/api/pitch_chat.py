@@ -471,6 +471,7 @@ async def pitch_chat(
     request: Request,
     x_pitch_token: Optional[str] = Header(None, alias="X-Pitch-Token"),
     x_titan_internal_key: Optional[str] = Header(None, alias="X-Titan-Internal-Key"),
+    x_titan_maker_verified: Optional[str] = Header(None, alias="X-Titan-Maker-Verified"),
 ):
     """Send a message to this Titan.
 
@@ -526,6 +527,20 @@ async def pitch_chat(
             decline_reason=rl["reason"],
             decline_explanation=explanation,
         )
+
+    # RFP_affective_grounding_loop §7.D (D.2) — app channel maker_bond tap. The
+    # co-located Console relays a device-pairing-Ed25519-verified Maker chat via
+    # X-Titan-Maker-Verified (set ONLY for a `device_authed` paired-Maker device,
+    # `titan_console/proxy.py`). is_owner confirms the trusted internal-key relay.
+    # An ordinary owner/console chat without the relay header does NOT fire — only
+    # the cryptographic device-pairing path (INV-AFF-HONEST / GD3).
+    if is_owner and (x_titan_maker_verified or "").strip() == "1":
+        try:
+            from titan_hcl.api.maker_presence_session import emit_maker_presence
+            emit_maker_presence(request, "app")
+        except Exception:  # noqa: BLE001
+            logger.debug("[PitchChat] maker_presence app emit failed",
+                         exc_info=True)
 
     # ── Caller identity (synthetic) ───────────────────────────────
     if is_owner:

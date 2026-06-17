@@ -183,6 +183,28 @@ class ChatBridgeClient:
         finally:
             self._pending.pop(rid, None)
 
+    # ── Fire-and-forget publish (no reply awaited) ─────────────────
+
+    def emit(self, dst: str, msg_type: str, payload: dict) -> bool:
+        """Publish a one-way event from the api process to a worker over the
+        send_queue — no rid, no reply Future (unlike request_async).
+
+        Used by RFP_affective_grounding_loop §7.D (D.2) to fire
+        MAKER_PRESENCE_VERIFIED → synthesis_worker on a cryptographically-verified
+        Maker interaction at the api edge (web `/chat`, app, TCC). Soft: returns
+        False on any send failure — a missed affective tap must never break the
+        request that triggered it."""
+        if self._send_queue is None:
+            return False
+        try:
+            self._send_queue.put_nowait(bus.make_msg(
+                msg_type, "api", dst, payload))
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[ChatBridgeClient] emit %s → %s failed: %s",
+                         msg_type, dst, e)
+            return False
+
     # ── Diagnostics ────────────────────────────────────────────────
 
     def pending_count(self) -> int:

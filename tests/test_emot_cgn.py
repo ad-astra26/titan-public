@@ -68,7 +68,8 @@ def test_signal_mapping_neutral_weight():
 def test_signal_mapping_covers_expected_events():
     expected_events = {"cluster_assignment", "chain_emotion_context",
                        "cluster_recenter", "cluster_emerged",
-                       "graduation_transition", "rollback_fired"}
+                       "graduation_transition", "rollback_fired",
+                       "maker_presence"}   # §7.D D.4 — Maker-presence evidence
     actual_events = {event for (_, event) in EMOT_SIGNAL_TO_PRIMITIVE.keys()}
     assert expected_events == actual_events
 
@@ -91,11 +92,13 @@ def test_emot_primitive_recompute_derived():
 
 # ── Hypotheses (rFP improvement #5 — 8 not 6) ──────────────────────
 
-def test_seed_hypotheses_count_is_8():
-    """rFP improvement: 8 hypotheses to make 50% graduation bar (≥4/8)
-    achievable. Had been 6 in initial rFP draft."""
+def test_seed_hypotheses_count_is_9():
+    """§7.D D.4 added H9 (MAKER_PRESENCE→LOVE). Graduation bar is an ABSOLUTE
+    min_confirmed (default 4), not a fraction, so the extra hypothesis does not
+    raise the bar — it adds one more confirmable coupling."""
     h = _build_seed_hypotheses()
-    assert len(h) == 8
+    assert len(h) == 9
+    assert "H9_maker_presence_love" in h
 
 
 def test_seed_hypotheses_all_start_nascent():
@@ -124,18 +127,19 @@ def test_consumer_construction_shadow_mode_default():
         assert ec._status == "shadow_mode"
 
 
-def test_consumer_construction_8_primitives():
+def test_consumer_construction_9_primitives():
     with tempfile.TemporaryDirectory() as tmp:
         ec = EmotCGNConsumer(save_dir=tmp)
-        assert len(ec._primitives) == 8
+        assert len(ec._primitives) == 9   # §7.D D.4 — +MAKER_PRESENCE
         for p in EMOT_PRIMITIVES:
             assert p in ec._primitives
+        assert "MAKER_PRESENCE" in ec._primitives
 
 
-def test_consumer_construction_8_hypotheses():
+def test_consumer_construction_9_hypotheses():
     with tempfile.TemporaryDirectory() as tmp:
         ec = EmotCGNConsumer(save_dir=tmp)
-        assert len(ec._hypotheses) == 8
+        assert len(ec._hypotheses) == 9   # §7.D D.4 — +H9_maker_presence_love
 
 
 def test_consumer_is_active_false_in_shadow():
@@ -332,7 +336,7 @@ def test_get_current_emotion_state_returns_10d_composite():
         ec = EmotCGNConsumer(save_dir=tmp)
         s = ec.get_current_emotion_state()
         assert "one_hot" in s
-        assert len(s["one_hot"]) == 8
+        assert len(s["one_hot"]) == 9   # §7.D D.4 — +MAKER_PRESENCE
         assert "intensity" in s
         assert "confidence" in s
         assert "dominant" in s
@@ -572,9 +576,9 @@ def test_cgn_feature_dims_is_30():
     assert FEATURE_DIMS == 30
 
 
-def test_cgn_action_dims_is_8():
-    """8 emotion primitives = 8 actions."""
-    assert ACTION_DIMS == 8
+def test_cgn_action_dims_is_9():
+    """9 emotion primitives = 9 actions (§7.D D.4 — +MAKER_PRESENCE)."""
+    assert ACTION_DIMS == 9
 
 
 def test_cgn_register_sent_on_init():
@@ -588,8 +592,9 @@ def test_cgn_register_sent_on_init():
         payload = register_msgs[0]["payload"]
         assert payload["name"] == "emotional"
         assert payload["feature_dims"] == 30
-        assert payload["action_dims"] == 8
-        assert len(payload["action_names"]) == 8
+        assert payload["action_dims"] == 9
+        assert len(payload["action_names"]) == 9
+        assert payload["action_names"][-1] == "MAKER_PRESENCE"
         assert payload["reward_source"] == "terminal_reward"
 
 
@@ -633,13 +638,17 @@ def test_encode_state_30d_cluster_features_upgrade_ii():
 
 
 def test_encode_state_30d_primitive_index():
-    """[29] carries primitive index normalized (0-7 → 0-1)."""
+    """[29] carries primitive index normalized (0-8 → 0-1) — §7.D D.4 made the
+    max index 8 (MAKER_PRESENCE), so LOVE (idx 7) is now 7/8 and the new
+    MAKER_PRESENCE is the 1.0 anchor."""
     with tempfile.TemporaryDirectory() as tmp:
         ec = EmotCGNConsumer(save_dir=tmp)
         vec0 = ec.encode_state_30d("FLOW", {})
-        vec7 = ec.encode_state_30d("LOVE", {})
+        vec_love = ec.encode_state_30d("LOVE", {})
+        vec_mp = ec.encode_state_30d("MAKER_PRESENCE", {})
         assert vec0[29] == 0.0
-        assert abs(vec7[29] - 1.0) < 1e-4
+        assert abs(vec_love[29] - (7.0 / 8.0)) < 1e-4
+        assert abs(vec_mp[29] - 1.0) < 1e-4
 
 
 def test_encode_state_30d_failsafe():
@@ -807,4 +816,4 @@ def test_stats_expose_cgn_integration_block():
         ci = s["cgn_integration"]
         assert ci["consumer_name"] == "emotional"
         assert ci["feature_dims"] == 30
-        assert ci["action_dims"] == 8
+        assert ci["action_dims"] == 9   # §7.D D.4 — +MAKER_PRESENCE

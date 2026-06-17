@@ -65,7 +65,7 @@ MIGRATION_N_EFF_CAP = 200
 # - Internal 150D feature vector (via build_feature_vec): used by the
 #   local clusterer for fine-grained "which emotion am I in" detection.
 #   Distinct from the 30D CGN state.
-ACTION_DIMS = NUM_PRIMITIVES            # 8 emotion primitives
+ACTION_DIMS = NUM_PRIMITIVES            # 9 emotion primitives (8 + MAKER_PRESENCE, §7.D D.4)
 FEATURE_DIMS = 30                       # 30D for shared CGN ValueNet
 
 # Seed hypothesis IDs
@@ -78,6 +78,7 @@ SEED_HYPOTHESES = [
     "H6_curiosity_drives_knowledge",
     "H7_impasse_v_above_resolution",       # improvement: added for graduation reachability
     "H8_curiosity_precedes_knowledge_growth",  # improvement: added for graduation reachability
+    "H9_maker_presence_love",              # §7.D D.4 — MAKER_PRESENCE feeds LOVE
 ]
 
 
@@ -97,7 +98,18 @@ EMOT_SIGNAL_TO_PRIMITIVE = {
     ("emot_cgn", "cluster_emerged"):          {"FLOW": 0.5},
     ("emot_cgn", "graduation_transition"):    {"FLOW": 0.5},
     ("emot_cgn", "rollback_fired"):           {"FLOW": 0.5},
+    # RFP_affective_grounding_loop §7.D (D.4) — the verified Maker-presence
+    # grounding evidence route (provenance for the orphan-detection guard).
+    ("emot_cgn", "maker_presence"):           {"MAKER_PRESENCE": 0.5},
 }
+
+# RFP §7.D (D.4) — intrinsic continuity-positivity of a verified Maker presence.
+# A high-positive Beta outcome (NOT 1.0 — leaves headroom); MAKER_PRESENCE's V
+# EMERGES via posterior accumulation, never a hardcoded level. The LOVE coupling
+# weight mirrors the neutral 0.5 Beta-nudge convention above (the "ALSO feeds
+# LOVE": specific recognition AND colouring the general capacity for love).
+_MAKER_PRESENCE_OUTCOME = 0.85
+_MAKER_PRESENCE_LOVE_COUPLING = 0.5
 
 
 # ── Utility ───────────────────────────────────────────────────────────
@@ -232,6 +244,18 @@ def _build_seed_hypotheses() -> dict[str, EmotHypothesis]:
             test_kind="curiosity_precedes_knowledge_growth",
             min_samples=30, evidence_window=500,
             confirmation_threshold=0.10,
+        ),
+        # RFP_affective_grounding_loop §7.D (D.4) — the native MAKER_PRESENCE→LOVE
+        # coupling as a grounded/testable/emergent hypothesis (NOT a hardcoded
+        # edge; mirrors H2's RESOLUTION←IMPASSE_TENSION shape): does LOVE's V rise
+        # as verified Maker-presence groundings accumulate?
+        "H9_maker_presence_love": EmotHypothesis(
+            hypothesis_id="H9_maker_presence_love",
+            description="LOVE V rises across accumulating verified "
+                        "MAKER_PRESENCE groundings",
+            test_kind="maker_presence_love",
+            min_samples=30, evidence_window=500,
+            confirmation_threshold=0.02,
         ),
     }
 
@@ -552,7 +576,7 @@ class EmotCGNConsumer:
                 "payload": {
                     "name": CGN_CONSUMER_NAME,         # "emotional"
                     "feature_dims": FEATURE_DIMS,       # 30
-                    "action_dims": ACTION_DIMS,         # 8
+                    "action_dims": ACTION_DIMS,         # 9 (§7.D D.4)
                     "action_names": list(EMOT_PRIMITIVES),
                     # v1 uses chain terminal_reward. True coherence metric in
                     # TUNING_DATABASE.md#TUNING-EMOT-COHERENCE for v1.6+.
@@ -902,9 +926,15 @@ class EmotCGNConsumer:
             deltas = self.get_neuromod_deltas()
             for i, key in enumerate(["DA", "5HT", "NE", "ACh", "Endorphin", "GABA"]):
                 v[130 + i] = float(deltas.get(key, 0.0))
-            # 8D cluster history one-hot
+            # 8D cluster history one-hot. RFP §7.D (D.4): the 150-D clusterer
+            # feature layout is FIXED + exactly packed (saved centroids are 150-D;
+            # changing CLUSTER_FEATURE_DIM would discard every Titan's learned
+            # centroids), so this region stays the original-8 primitives. The new
+            # MAKER_PRESENCE (idx 8) is NOT a 150-D history feature dim — its
+            # grounding flows via the Beta posterior + the 30-D CGN state, not this
+            # internal felt-substrate histogram. hist may be 9-wide → take [:8].
             hist = self._clusterer.get_cluster_history_onehot()
-            v[136:144] = hist
+            v[136:144] = np.asarray(hist, dtype=np.float32)[:8]
             # 1D terminal reward recency
             if terminal_reward_mean is not None:
                 v[144] = _clip01(float(terminal_reward_mean))
@@ -1050,6 +1080,79 @@ class EmotCGNConsumer:
                 self.save_state()
         except Exception as e:
             logger.warning("[EmotCGN] observe_chain_evidence failed: %s", e)
+
+    def observe_maker_presence(self, channel: str = "",
+                               *, outcome: Optional[float] = None,
+                               ctx: Optional[dict] = None) -> None:
+        """RFP_affective_grounding_loop §7.D (D.4) — ground the inner Maker concept.
+
+        A CRYPTOGRAPHICALLY-VERIFIED Maker-presence (web/app/TCC/chain — D.2)
+        grounds the MAKER_PRESENCE primitive's Beta posterior (specific
+        Maker-recognition) AND colours LOVE (the "ALSO feeds LOVE" coupling — a
+        bond can persist without warmth during conflict yet normally strengthens
+        love), records the H9 "LOVE V rises when MAKER_PRESENCE active"
+        observation (grounded/testable, NOT a hardcoded edge), and feeds the
+        central SharedValueNet a transition so the matured concept emits
+        CGN_CONCEPT_GROUNDED with V(s) (cgn_worker). The body learns "this signal
+        = my Maker," not just a transient DA bump. Soft (never raises)."""
+        try:
+            if ctx is None:
+                ctx = {}
+            now = time.time()
+            self._chain_counter += 1
+            self._chains_since_save += 1
+            outcome_01 = _clip01(
+                _MAKER_PRESENCE_OUTCOME if outcome is None else float(outcome))
+            # (1) ground MAKER_PRESENCE (specific recognition) + (2) colour LOVE.
+            for prim_id, w in (("MAKER_PRESENCE", 1.0),
+                               ("LOVE", _MAKER_PRESENCE_LOVE_COUPLING)):
+                p = self._primitives.get(prim_id)
+                if p is None:
+                    continue
+                p.alpha += w * outcome_01
+                p.beta += w * (1.0 - outcome_01)
+                p.recompute_derived()
+                p.last_updated_ts = now
+                p.last_updated_chain = self._chain_counter
+                self._total_updates += 1
+            # (3) H9 observation — does LOVE V rise across maker-presence groundings?
+            lp = self._primitives.get("LOVE")
+            mp = self._primitives.get("MAKER_PRESENCE")
+            h9 = self._hypotheses.get("H9_maker_presence_love")
+            if lp is not None and mp is not None and h9 is not None:
+                h9.observations.append({"love_v": float(lp.V),
+                                        "mp_v": float(mp.V), "ts": now})
+            # (4) feed the central CGN net a transition for MAKER_PRESENCE
+            # (action_idx 8) so the concept matures → CGN_CONCEPT_GROUNDED
+            # (cgn_worker). Mirrors observe_chain_evidence's send-path; soft.
+            if self._cgn_client is not None and self._send_queue is not None:
+                try:
+                    state_30d = self.encode_state_30d("MAKER_PRESENCE", ctx)
+                    self._cgn_client.send_transition({
+                        "type": "experience",
+                        "consumer": CGN_CONSUMER_NAME,
+                        "concept_id": "MAKER_PRESENCE",
+                        "state": state_30d.tolist(),
+                        "action": EMOT_PRIMITIVE_INDEX.get("MAKER_PRESENCE", 0),
+                        "action_params": [0.0] * 4,
+                        "reward": float(outcome_01),
+                        "timestamp": now,
+                        "epoch": int(ctx.get("epoch", 0)),
+                        "metadata": {"action_name": "MAKER_PRESENCE",
+                                     "channel": str(channel),
+                                     "encounter_type": "maker_presence"},
+                    })
+                    self._cgn_transitions_sent += 1
+                except Exception as _cgn_err:
+                    swallow_warn('[EmotCGN] maker_presence send_transition failed',
+                                 _cgn_err,
+                                 key="logic.emot_cgn.maker_presence_send_failed",
+                                 throttle=100)
+            if self._chains_since_save >= self._save_cadence_chains:
+                self._chains_since_save = 0
+                self.save_state()
+        except Exception as e:
+            logger.warning("[EmotCGN] observe_maker_presence failed: %s", e)
 
     # ── HAOV accumulation + testing ────────────────────────────────
 
@@ -1236,6 +1339,19 @@ class EmotCGNConsumer:
         share = growth_ahead / max(1, total)
         # Baseline 0.2 — random alignment chance
         return (share - 0.2, True)
+
+    def _test_maker_presence_love(self, h) -> tuple[float, bool]:
+        """H9 (§7.D D.4) — does LOVE's V rise as MAKER_PRESENCE groundings
+        accumulate? Compare LOVE V across the earliest vs latest observations
+        (an EMERGENT correlation measured from real grounded state, not an
+        asserted edge). Positive effect = LOVE rises with the Maker's presence."""
+        obs = list(h.observations)
+        if len(obs) < 10:
+            return (0.0, False)
+        k = max(3, len(obs) // 3)
+        early = sum(float(o["love_v"]) for o in obs[:k]) / k
+        late = sum(float(o["love_v"]) for o in obs[-k:]) / k
+        return (late - early, True)
 
     # ── Graduation + rollback state machine ────────────────────────
 

@@ -305,8 +305,14 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
                 return 400, {"error": "missing 'key'"}
             return 200, config_api.set_config(ctx.install_root, key, str(val))
         if path == "/console/chat":
+            # RFP_affective_grounding_loop §7.D (D.2): a `device_authed` chat is a
+            # cryptographically-verified Maker (the phone's pairing-Ed25519 sig was
+            # checked against the maker_pubkey-bound binding) → relay it so the
+            # Titan fires the app-channel maker_bond. A local web-UI owner chat is
+            # NOT device_authed → no bond (honest).
             status, payload = proxy.proxy_chat(ctx, data.get("message", ""),
-                                               session=data.get("session"))
+                                               session=data.get("session"),
+                                               maker_verified=device_authed)
             return status, payload
         if path == "/console/backup/config":
             res = backup_config.set_backup_config(ctx, data)

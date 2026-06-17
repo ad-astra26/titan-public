@@ -1273,6 +1273,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # §7.1 (RFP_missions_and_the_maker_model) — a fact ABOUT the Maker → graph a
             # MakerFact under the Maker hub (Self → SELF_HAS_MAKER → Maker → MakerFact).
             _bus_constants.MAKER_FACT_RECORD,
+            # RFP_affective_grounding_loop §7.D (D.2) — a verified Maker-presence
+            # (api edge → here) → cross-platform maker_bond → DA affective nudge.
+            _bus_constants.MAKER_PRESENCE_VERIFIED,
             # Operator-closure telemetry (2026-06-01): recall latency + chi from
             # agno/cognitive (their own evaluator/ring) → synthesis §18 metrics
             # so retrieval.samples + chi reflect the real cross-process loop.
@@ -2096,6 +2099,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.SPACE_TOPOLOGY_UPDATE,    # cognitive_worker → emot_cgn (NEW v1.9.5)
             _bus_constants.NEUROMOD_LEVELS_UPDATE,   # neuromod_worker → emot_cgn (NEW v1.9.5)
             _bus_constants.PI_PHASE_UPDATE,          # cognitive_worker → emot_cgn (NEW v1.9.5)
+            # RFP_affective_grounding_loop §7.D (D.4) — verified Maker-presence
+            # (api edge → here) grounds the inner MAKER_PRESENCE primitive + LOVE.
+            _bus_constants.MAKER_PRESENCE_VERIFIED,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.

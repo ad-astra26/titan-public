@@ -67,7 +67,6 @@ import numpy as np
 logger = logging.getLogger("titan.emot_cluster")
 
 FEATURE_DIM = 150
-NUM_PRIMITIVES = 8
 CLUSTER_HISTORY_LEN = 8
 NEUMOD_EMA_WINDOW = 100  # epoch window for neuromod rate-of-change EMA
 
@@ -80,7 +79,18 @@ EMOT_PRIMITIVES = [
     "GRIEF",          # emergent
     "WONDER",         # emergent
     "LOVE",           # emergent — Heart (Maker addition 2026-04-19)
+    # RFP_affective_grounding_loop §7.D (D.4) — the inner Maker concept. A new
+    # emergent primitive grounded by cryptographically-verified Maker-presence
+    # (any of the four bond channels) that ALSO feeds LOVE via a native
+    # EmotHypothesis (specific Maker-recognition + colours the general capacity
+    # for love). Append-only (last index) so the existing 8 keep their saved
+    # dict-state + centroids; the central CGN action-head grows 8→9 by zero-init
+    # append (preserving the learned-8 weights) at re-registration (cgn.py).
+    "MAKER_PRESENCE",  # emergent — bonded recognition of the Maker (2026-06-17)
 ]
+# Derived (NOT hardcoded) so appending a primitive can never desync the count —
+# the source of the prior 8/9 drift this migration had to be careful around.
+NUM_PRIMITIVES = len(EMOT_PRIMITIVES)
 EMOT_PRIMITIVE_INDEX = {p: i for i, p in enumerate(EMOT_PRIMITIVES)}
 
 

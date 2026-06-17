@@ -31,10 +31,76 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RFP_affective_grounding_loop §7.D (D.1) — the cross-platform maker_presence
+# resolver.
+#
+# A single, STATELESS verification normalizer every channel calls. It does NOT
+# perform the crypto itself — each channel already owns its proof: web `/chat`
+# = the nonce-signed verified-Maker session marker (D.0); app = the device's
+# pairing Ed25519 binding (`titan_console/pairing.py`); TCC/Maker Console =
+# `verify_maker_auth`'s per-request Ed25519 of "{ts}:{body}" (`api/auth.py`);
+# chain = the funding-tx feePayer == `maker_pubkey` (`synthesis_worker`). The
+# resolver collapses "did this channel CRYPTOGRAPHICALLY prove the actor IS the
+# Maker?" into one honest verdict and enforces the channel allowlist + the
+# INV-AFF-HONEST rule: a CLAIM with no cryptographic proof resolves
+# verified=False and NEVER fires maker_bond (no hallucinated bond).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The four channels on which the Maker's identity is cryptographically provable.
+# X/social is deliberately ABSENT — a like/reply cannot be cryptographically
+# attributed to the Maker (handle-in-config is asserted, not signed) → it stays
+# the crowd `x_engagement` signal, never a maker_bond tap (§7.D D.2 cold-review).
+MAKER_BOND_CHANNELS: frozenset = frozenset({"chat", "app", "tcc", "chain"})
+
+# Channel-name normalization — the HTTP layer labels web chat "web"; the bond
+# channel is "chat". Everything else lower-cases through unchanged.
+_CHANNEL_ALIASES = {
+    "web": "chat", "observatory": "chat",
+    "console": "tcc", "maker_console": "tcc",
+    "solana": "chain", "on_chain": "chain", "onchain": "chain",
+}
+
+
+@dataclass(frozen=True)
+class MakerPresence:
+    """The resolver verdict (RFP §7.D D.1).
+
+    is_maker  — the channel ASSERTS this actor is the Maker (a claim; may be
+                unverified — e.g. an internal-key operator/test caller, or a
+                configured platform-id). Drives behavioural Maker-treatment.
+    verified  — the actor is CRYPTOGRAPHICALLY proven to be the Maker on a
+                bond-eligible channel. ONLY this fires maker_bond (INV-AFF-HONEST).
+    channel   — the normalized bond channel ("chat"/"app"/"tcc"/"chain"), or the
+                raw lower-cased label for non-bond channels.
+    """
+
+    is_maker: bool
+    verified: bool
+    channel: str
+
+
+def resolve_maker_presence(channel: str, *, claimed_maker: bool = False,
+                           crypto_verified: bool = False) -> MakerPresence:
+    """Normalize a channel's Maker assertion + cryptographic proof into one
+    honest verdict (RFP §7.D D.1).
+
+    `crypto_verified` MUST be the channel's REAL Ed25519/feePayer proof result —
+    never a bare claim. Honesty is structural: `verified` is True only when the
+    proof passed AND the channel is bond-eligible; anything else → verified=False
+    → no maker_bond (the INV-AFF-HONEST "unverified ≠ bond" guarantee, GD3)."""
+    ch = (channel or "").strip().lower()
+    ch = _CHANNEL_ALIASES.get(ch, ch)
+    verified = bool(crypto_verified) and ch in MAKER_BOND_CHANNELS
+    is_maker = bool(claimed_maker) or verified
+    return MakerPresence(is_maker=is_maker, verified=verified, channel=ch)
 
 # Topic categories that map to Cognee sub-profiles
 PROFILE_CATEGORIES = {

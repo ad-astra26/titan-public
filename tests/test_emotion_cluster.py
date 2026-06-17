@@ -22,9 +22,11 @@ from titan_hcl.logic.emotion_cluster import (
 
 # ── Module-level constants ──────────────────────────────────────────
 
-def test_num_primitives_is_8():
-    assert NUM_PRIMITIVES == 8
-    assert len(EMOT_PRIMITIVES) == 8
+def test_num_primitives_is_9():
+    # RFP_affective_grounding_loop §7.D (D.4) — 8→9: MAKER_PRESENCE appended.
+    assert NUM_PRIMITIVES == 9
+    assert len(EMOT_PRIMITIVES) == 9
+    assert EMOT_PRIMITIVES[-1] == "MAKER_PRESENCE"
 
 
 def test_feature_dim_is_150():
@@ -63,10 +65,10 @@ def test_seed_centroids_anchors_distinct():
 
 # ── EmotionClusterer construction ─────────────────────────────────
 
-def test_clusterer_construction_creates_8_clusters():
+def test_clusterer_construction_creates_9_clusters():
     with tempfile.TemporaryDirectory() as tmp:
         cl = EmotionClusterer(save_dir=tmp)
-        assert len(cl._clusters) == 8
+        assert len(cl._clusters) == 9   # §7.D D.4 — +MAKER_PRESENCE
         for p in EMOT_PRIMITIVES:
             assert p in cl._clusters
             assert isinstance(cl._clusters[p], EmotionCluster)

@@ -28,11 +28,53 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from titan_hcl.api.auth import verify_privy_token
+from titan_hcl.api.auth import verify_privy_token, resolve_maker_pubkey
+from titan_hcl.api.maker_presence_session import (
+    session_key_from_claims, emit_maker_presence)
+from titan_hcl.logic.maker_engine import resolve_maker_presence, MakerPresence
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# RFP_affective_grounding_loop §7.D (D.0/D.1/D.2) — verified-Maker presence
+# ─────────────────────────────────────────────────────────────────────
+
+def _resolve_chat_presence(request: Request, claims: Optional[dict],
+                           user_id: str, channel: str) -> MakerPresence:
+    """Resolve verified-Maker presence for a chat turn (RFP §7.D D.0/D.1).
+
+    • web  — cryptographic proof = a nonce-signed verified-Maker session marker
+             (D.0), bound to this Privy session.
+    • app  — the co-located Console (internal-key authenticated) relays its
+             device pairing-binding (Ed25519) verification via X-Titan-Maker-
+             Verified; a bare internal-key chat-test script does NOT set it.
+    Honest: an unverified "maker" claim (incl. the internal-key chat-test bypass,
+    user_id=="maker") yields is_maker=True (behaviour preserved) but verified=
+    False → no maker_bond (INV-AFF-HONEST / GD3)."""
+    ch = (channel or "web").strip().lower()
+    claimed = (user_id == "maker")
+    crypto_verified = False
+    if ch in ("web", "chat", "observatory"):
+        store = getattr(request.app.state, "maker_presence_sessions", None)
+        if store is not None:
+            crypto_verified = store.is_verified(session_key_from_claims(claims))
+    elif ch == "app":
+        is_internal = bool(claims and claims.get("iss") == "titan-internal")
+        relayed = request.headers.get("X-Titan-Maker-Verified", "") == "1"
+        crypto_verified = is_internal and relayed
+    return resolve_maker_presence(ch, claimed_maker=claimed,
+                                  crypto_verified=crypto_verified)
+
+
+def _emit_maker_presence(request: Request, presence: MakerPresence) -> None:
+    """Fire the cross-platform maker_bond tap on a cryptographically-verified
+    Maker chat turn (RFP §7.D D.2). Only verified presence emits (GD3)."""
+    if not presence.verified:
+        return
+    emit_maker_presence(request, presence.channel)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -163,14 +205,20 @@ async def chat(req: ChatRequest, request: Request,
     # Resolve user_id from Privy claims, fall back to request body
     privy_user_id = claims.get("sub", "") if claims else ""
     user_id = privy_user_id or req.user_id or "anonymous"
-    is_maker = (user_id == "maker")
+    # RFP §7.D D.0/D.1 — is_maker is now "verified-Maker present OR asserted",
+    # closing the plaintext gap: a real Privy-logged-in Maker (DID ≠ "maker") is
+    # recognized via his nonce-signed session marker, not just claims.sub=="maker".
+    channel = request.headers.get("X-Titan-Channel", "web")
+    presence = _resolve_chat_presence(request, claims, user_id, channel)
+    is_maker = presence.is_maker
+    _emit_maker_presence(request, presence)   # D.2 — verified turn → maker_bond
 
     try:
         result = await agno_proxy.chat(
             message=req.message,
             user_id=user_id,
             session_id=req.session_id or "default",
-            channel=request.headers.get("X-Titan-Channel", "web"),
+            channel=channel,
             is_maker=is_maker,
             claims_sub=privy_user_id,
         )
@@ -208,9 +256,12 @@ async def chat_stream(req: ChatRequest, request: Request,
 
     privy_user_id = claims.get("sub", "") if claims else ""
     user_id = privy_user_id or req.user_id or "anonymous"
-    is_maker = (user_id == "maker")
     session_id = req.session_id or "default"
     channel = request.headers.get("X-Titan-Channel", "web")
+    # RFP §7.D D.0/D.1/D.2 — verified-Maker presence (see /chat).
+    presence = _resolve_chat_presence(request, claims, user_id, channel)
+    is_maker = presence.is_maker
+    _emit_maker_presence(request, presence)
 
     async def _sse_relay():
         """SSE relay over CHAT_STREAM_CHUNK payloads.
@@ -280,3 +331,62 @@ async def chat_stream(req: ChatRequest, request: Request,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# RFP_affective_grounding_loop §7.D (D.0) — verified-Maker presence endpoints
+#
+# The Maker (logged in via Privy) proves control of maker_pubkey by Ed25519-
+# signing a one-time server nonce with the same Solana wallet his MakerPanel
+# already uses for proposals. On success a short-lived verified-Maker marker is
+# minted for his Privy session → /chat reads it for is_maker=verified + the
+# maker_bond tap. NON-BREAKING: additive; the MakerPanel proposal sign-flow is
+# untouched. Sovereign: Titan verifies against the maker_pubkey HE holds.
+# ─────────────────────────────────────────────────────────────────────
+
+class VerifyPresenceRequest(BaseModel):
+    nonce: str
+    signature: str   # Base58 Ed25519 signature of the nonce by the Maker wallet
+
+
+@router.post("/maker/presence-nonce")
+async def maker_presence_nonce(request: Request,
+                               claims: dict = Depends(verify_privy_token)):
+    """Issue a single-use, short-lived signing challenge bound to this Privy
+    session. The MakerPanel signs the returned `nonce` verbatim and POSTs it to
+    /chat/maker/verify-presence. Any logged-in user may request a nonce; only a
+    signature from the real maker_pubkey mints a marker (the proof, not the ask,
+    is what gates the bond)."""
+    store = getattr(request.app.state, "maker_presence_sessions", None)
+    if store is None:
+        return JSONResponse(status_code=503,
+                            content={"error": "presence store unavailable"})
+    session_key = session_key_from_claims(claims)
+    if not session_key:
+        return JSONResponse(status_code=401,
+                            content={"error": "unauthenticated"})
+    nonce = store.issue_nonce(session_key)
+    return JSONResponse(status_code=200, content={"nonce": nonce})
+
+
+@router.post("/maker/verify-presence")
+async def maker_verify_presence(req: VerifyPresenceRequest, request: Request,
+                                claims: dict = Depends(verify_privy_token)):
+    """Verify the Maker's wallet signature over the issued nonce and, on success,
+    mint a verified-Maker session marker. Returns {verified: bool}. Honest-fail
+    (verified=False) on any bad nonce/signature — no marker, no bond."""
+    store = getattr(request.app.state, "maker_presence_sessions", None)
+    if store is None:
+        return JSONResponse(status_code=503,
+                            content={"error": "presence store unavailable"})
+    session_key = session_key_from_claims(claims)
+    if not session_key:
+        return JSONResponse(status_code=401,
+                            content={"error": "unauthenticated"})
+    maker_pubkey = resolve_maker_pubkey(request)
+    if not maker_pubkey:
+        return JSONResponse(status_code=503,
+                            content={"error": "maker_pubkey unavailable"})
+    verified = store.verify_and_mint(
+        session_key, req.nonce, req.signature, maker_pubkey)
+    return JSONResponse(status_code=200, content={"verified": bool(verified)})

@@ -286,6 +286,18 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None,
             titan_state = None
     app.state.titan_state = titan_state
 
+    # ── RFP_affective_grounding_loop §7.D (D.0) — verified-Maker session store ──
+    # Per-process marker store closing the /chat plaintext gap: a Maker proves
+    # control of maker_pubkey via a wallet-signed nonce → a short-lived
+    # verified-Maker marker → /chat reads it for is_maker=verified + the
+    # cross-platform maker_bond tap (D.2). Sovereign: Titan is the sole verifier.
+    try:
+        from titan_hcl.api.maker_presence_session import VerifiedMakerSessions
+        app.state.maker_presence_sessions = VerifiedMakerSessions()
+    except Exception as e:  # noqa: BLE001
+        app.state.maker_presence_sessions = None
+        logger.warning("[create_app] VerifiedMakerSessions init failed: %s", e)
+
     # ── TitanMaker substrate (R8 + future Maker-Titan dialogic flow) ──
     # The substrate lives in the MAIN process (where dashboard endpoints
     # serve), not in any worker subprocess. Auto-seeds the Phase C contract

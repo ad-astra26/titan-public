@@ -86,6 +86,7 @@ from titan_hcl.bus import (
     TURN_REASONING_RECORD,
     MAKER_ASSESSMENT_RECORD,
     MAKER_FACT_RECORD,
+    MAKER_PRESENCE_VERIFIED,
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
@@ -717,6 +718,40 @@ def _tx_index_loop(tx_index_holder: dict, stop_event: threading.Event,
         stop_event.wait(interval_s)
 
 
+def _publish_affective_nudge(send_queue: Any, name: str, shm_bank: Any,
+                             affective_runtime: Any, signal_type: str,
+                             nudge: Any, modulator: str) -> None:
+    """Compose a fired affective nudge onto the neuromod substrate + log. Shared
+    by the §7.A/§7.C drain-tick taps AND the §7.D (D.2) MAKER_PRESENCE_VERIFIED
+    recv handler. `developmental_age` is read from SHM and passed through (the
+    dev-gate inside apply_external_nudge was removed fleet-wide — it had silently
+    suppressed every external nudge; see the affective arc scars)."""
+    if nudge is None or nudge.magnitude <= 0.0:
+        return
+    dev_age = 0.0
+    if shm_bank is not None:
+        try:
+            pi = shm_bank.read_pi_heartbeat() or {}
+            dev_age = float(pi.get("developmental_age", 0.0) or 0.0)
+        except Exception:
+            dev_age = 0.0
+    _send(send_queue, bus.NEUROMOD_EXTERNAL_NUDGE, name, "neuromod", {
+        "nudge_map": {modulator: nudge.target},
+        "max_delta": nudge.magnitude,
+        "developmental_age": dev_age,
+        "source": "affective_grounding",
+    })
+    _net_steps = getattr(getattr(affective_runtime, "net", None),
+                         "trained_steps", 0)
+    logger.info(
+        "[synthesis_worker] affective nudge — signal=%s valence=%+d "
+        "surprise=%.3f mag=%.4f target=%.1f src=%s (val=%.3f mu=%.3f n=%d "
+        "dev=%.2f)",
+        signal_type, nudge.valence, nudge.surprise, nudge.magnitude,
+        nudge.target, "net" if _net_steps >= 1 else "formula",
+        nudge.rate, nudge.mu_before, nudge.n, dev_age)
+
+
 def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                             interval_s: float, name: str,
                             send_queue: Any = None, shm_bank: Any = None,
@@ -763,32 +798,9 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
         get_cpu_load = None
 
     def _emit_affective_nudge(signal_type: str, nudge: Any, modulator: str) -> None:
-        """Compose a fired nudge onto the neuromod substrate + log. Shared by every
-        signal tap (§7.A skill_score + §7.C event signals). `developmental_age`
-        gates the nudge inside apply_external_nudge (dev <0.1 → suppressed)."""
-        if nudge is None or nudge.magnitude <= 0.0:
-            return
-        dev_age = 0.0
-        if shm_bank is not None:
-            try:
-                pi = shm_bank.read_pi_heartbeat() or {}
-                dev_age = float(pi.get("developmental_age", 0.0) or 0.0)
-            except Exception:
-                dev_age = 0.0
-        _send(send_queue, bus.NEUROMOD_EXTERNAL_NUDGE, name, "neuromod", {
-            "nudge_map": {modulator: nudge.target},
-            "max_delta": nudge.magnitude,
-            "developmental_age": dev_age,
-            "source": "affective_grounding",
-        })
-        _net_steps = getattr(affective_runtime.net, "trained_steps", 0)
-        logger.info(
-            "[synthesis_worker] affective nudge — signal=%s valence=%+d "
-            "surprise=%.3f mag=%.4f target=%.1f src=%s (val=%.3f mu=%.3f n=%d "
-            "dev=%.2f)",
-            signal_type, nudge.valence, nudge.surprise, nudge.magnitude,
-            nudge.target, "net" if _net_steps >= 1 else "formula",
-            nudge.rate, nudge.mu_before, nudge.n, dev_age)
+        """Drain-tick wrapper → the shared module-level publisher (§7.A/§7.C)."""
+        _publish_affective_nudge(send_queue, name, shm_bank, affective_runtime,
+                                 signal_type, nudge, modulator)
 
     _last_balance: Optional[float] = None       # §7.C sol_receipt: last balance_sol
     _SOL_DELTA_EPS = 1e-7                        # skip sub-100-lamport float noise
@@ -855,6 +867,13 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                                     SIGNAL_MODULATOR["sol_receipt"])
                                 # maker_bond — a +receipt whose funding feePayer is
                                 # the Maker (ONE metered RPC pair, only on +delta).
+                                # §7.D (D.2/D.3): the on-chain receipt is now ONE of
+                                # the four verified Maker-presence channels → it
+                                # routes through observe_maker_bond (recency-based
+                                # existential delta, the SAME coherent maker_bond
+                                # scale as the chat/app/TCC taps). The SOL amount
+                                # stays sol_receipt's concern; the bond's meaning is
+                                # the Maker being PRESENT, not the lamport count.
                                 if (_delta > 0.0 and solana_oracle is not None
                                         and maker_pubkey):
                                     _wallet = str((_ns or {}).get("pubkey") or "")
@@ -863,9 +882,8 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                                     if _fp and _fp == maker_pubkey:
                                         _emit_affective_nudge(
                                             "maker_bond",
-                                            affective_runtime.observe_signal(
-                                                "maker_bond", _delta, _now,
-                                                intrinsic_positive=True),
+                                            affective_runtime.observe_maker_bond(
+                                                _now),
                                             SIGNAL_MODULATOR["maker_bond"])
                         _last_balance = _bal
 
@@ -3693,6 +3711,35 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         payload.get("evaluations", 0) or 0)
                 except Exception:
                     pass
+                continue
+
+            if msg_type == MAKER_PRESENCE_VERIFIED:
+                # RFP_affective_grounding_loop §7.D (D.2) — a cryptographically-
+                # verified Maker interaction on an api-edge channel (web `/chat`
+                # D.0 · paired app · TCC `verify_maker_auth`). Drains into the ONE
+                # maker_bond signal via the recency-based existential delta (D.3),
+                # the SAME path + coherent scale as the on-chain feePayer tap. Soft
+                # + flag-gated; only the resolver's verified=True paths publish
+                # this event (INV-AFF-HONEST upstream). The on-chain channel does
+                # NOT route here — it fires inline in the drain tick.
+                if (_affective_runtime is not None
+                        and getattr(_affective_runtime.cfg, "enabled", False)
+                        and send_queue is not None):
+                    try:
+                        from titan_hcl.logic.affective_nudge import (
+                            SIGNAL_MODULATOR)
+                        _ch = str(payload.get("channel", "") or "?")
+                        _publish_affective_nudge(
+                            send_queue, name, _shm_bank, _affective_runtime,
+                            "maker_bond",
+                            _affective_runtime.observe_maker_bond(time.time()),
+                            SIGNAL_MODULATOR["maker_bond"])
+                        logger.debug(
+                            "[synthesis_worker] maker_bond tap — channel=%s", _ch)
+                    except Exception as _mpv_e:
+                        logger.debug(
+                            "[synthesis_worker] MAKER_PRESENCE_VERIFIED handler "
+                            "failed: %s", _mpv_e)
                 continue
 
             if msg_type == KNOWLEDGE_MOMENT:

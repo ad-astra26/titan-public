@@ -146,6 +146,25 @@ class ConsumerQNet(nn.Module):
         return self.net(x)  # (B, action_dims) Q-values
 
 
+def _grow_linear_out(layer: "nn.Linear", new_out: int) -> "nn.Linear":
+    """Return a NEW nn.Linear with the same in_features but `new_out` (≥ old)
+    output features — the existing rows COPIED, the appended rows ZERO-init.
+
+    RFP_affective_grounding_loop §7.D (D.4) primitive: grows a discrete-action
+    output head by one (emot 8→9 for MAKER_PRESENCE) while preserving every
+    learned weight for the existing actions; the appended action starts neutral
+    (zero logit / zero Q) and learns from its own evidence (the same additive
+    zero-init-append the affective FEATURE_DIM migration used)."""
+    old_out, in_f = int(layer.weight.shape[0]), int(layer.weight.shape[1])
+    new_layer = nn.Linear(in_f, int(new_out))
+    with torch.no_grad():
+        new_layer.weight.zero_()
+        new_layer.bias.zero_()
+        new_layer.weight[:old_out].copy_(layer.weight)
+        new_layer.bias[:old_out].copy_(layer.bias)
+    return new_layer
+
+
 # ── Transition Buffer ─────────────────────────��─────────────────────────────
 
 
@@ -324,7 +343,14 @@ class ConceptGroundingNetwork:
     def register_consumer(self, config: CGNConsumerConfig) -> str:
         """Register a cognitive consumer. Returns consumer handle (name)."""
         if config.name in self._consumers:
-            logger.debug("[CGN] Consumer '%s' already registered", config.name)
+            # RFP §7.D (D.4) — if re-registered with a LARGER action space (emot
+            # 8→9 when MAKER_PRESENCE is appended), grow the action-head + Q-nets
+            # by zero-init append (preserving learned weights). No-op for every
+            # unchanged consumer (the common case → byte-identical behaviour).
+            if int(config.action_dims) > int(self._consumers[config.name].action_dims):
+                self._grow_consumer_action_dims(config)
+            else:
+                logger.debug("[CGN] Consumer '%s' already registered", config.name)
             return config.name
 
         self._consumers[config.name] = config
@@ -363,6 +389,46 @@ class ConceptGroundingNetwork:
                     config.name, config.feature_dims, config.action_dims,
                     ", ".join(config.action_names))
         return config.name
+
+    def _grow_consumer_action_dims(self, config: CGNConsumerConfig) -> None:
+        """RFP_affective_grounding_loop §7.D (D.4) — grow an ALREADY-registered
+        consumer's discrete action space (emot 8→9 for the appended
+        MAKER_PRESENCE primitive) by ZERO-INIT-APPENDING the new rows to the
+        action-head + Q/target output layers, preserving the learned weights of
+        the existing actions. Optimizers are rebuilt (their param refs go stale
+        on the layer swap). Idempotent + no-op when new ≤ old, so a settled fleet
+        re-running registration never double-grows."""
+        name = config.name
+        old_dims = int(self._consumers[name].action_dims)
+        new_dims = int(config.action_dims)
+        if new_dims <= old_dims:
+            return
+        anet = self._action_nets.get(name)
+        if anet is not None:
+            with torch.no_grad():
+                anet.action_head = _grow_linear_out(anet.action_head, new_dims)
+            anet.action_dims = new_dims
+            self._action_optimizers[name] = torch.optim.Adam(
+                anet.parameters(), lr=self._policy_lr)
+        for store in (self._q_nets, self._q_targets):
+            qnet = store.get(name)
+            if qnet is not None:
+                with torch.no_grad():
+                    qnet.net[-1] = _grow_linear_out(qnet.net[-1], new_dims)
+                qnet.action_dims = new_dims
+        if name in self._q_nets:
+            self._q_optimizers[name] = torch.optim.Adam(
+                self._q_nets[name].parameters(), lr=self._policy_lr)
+        # Re-sync the Polyak target to the (grown) live Q-net so the appended
+        # action's target Q starts identical to its zero-init online Q.
+        if name in self._q_targets and name in self._q_nets:
+            self._q_targets[name].load_state_dict(self._q_nets[name].state_dict())
+            for _p in self._q_targets[name].parameters():
+                _p.requires_grad_(False)
+        self._consumers[name] = config   # adopt the new dims + action_names
+        logger.info("[CGN] Grew consumer '%s' action space %d→%d (zero-init "
+                    "append, learned weights preserved) — RFP §7.D D.4",
+                    name, old_dims, new_dims)
 
     # ── Core: ground() ───────────────────────���──────────────────────────
 

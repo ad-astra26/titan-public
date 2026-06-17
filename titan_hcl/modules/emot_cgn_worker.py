@@ -807,6 +807,21 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
             except Exception as _e:
                 logger.warning("[EmotCGNWorker] EMOT_CHAIN_EVIDENCE error: %s", _e)
 
+        # ── MAKER_PRESENCE_VERIFIED (api edge → emot_cgn) ─────
+        # RFP_affective_grounding_loop §7.D (D.4) — a cryptographically-verified
+        # Maker-presence grounds the inner MAKER_PRESENCE primitive (+ colours
+        # LOVE via H9). Fired in parallel with the synthesis DA nudge (D.2). Soft.
+        elif msg_type == bus.MAKER_PRESENCE_VERIFIED:
+            try:
+                emot_cgn.observe_maker_presence(
+                    channel=str(payload.get("channel", "")),
+                    ctx={"epoch": int(payload.get("epoch", 0) or 0)},
+                )
+                _write_state_to_shm()
+            except Exception as _e:
+                logger.warning(
+                    "[EmotCGNWorker] MAKER_PRESENCE_VERIFIED error: %s", _e)
+
         # ── FELT_CLUSTER_UPDATE (spirit → emot_cgn) ────────────
         elif msg_type == bus.FELT_CLUSTER_UPDATE:
             try:

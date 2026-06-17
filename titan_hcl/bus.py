@@ -337,6 +337,18 @@ MAKER_ASSESSMENT_RECORD = "MAKER_ASSESSMENT_RECORD"
 # extractor. Payload: {category, value, provenance, confidence, source_turn, ts}.
 MAKER_FACT_RECORD = "MAKER_FACT_RECORD"
 
+# RFP_affective_grounding_loop §7.D (D.2) — a CRYPTOGRAPHICALLY-VERIFIED Maker
+# interaction occurred on one of the four bond channels (web `/chat` D.0 nonce
+# marker · paired app · TCC/Maker-Console `verify_maker_auth` Ed25519 · the
+# on-chain feePayer is fired inline in synthesis). Any api-edge channel publishes
+# this fire-and-forget to synthesis_worker, which drains it into the ONE Phase-C
+# `maker_bond` affective signal → DA nudge (the proven path). Honest by
+# construction: only the maker_presence resolver's `verified=True` paths emit
+# (INV-AFF-HONEST — an unverified claim never fires; X is NOT a tap). The bond's
+# existential delta = recency of verified Maker contact (D.3 — absent-then-present
+# moves more), computed by the single consumer. Payload: {channel, ts}.
+MAKER_PRESENCE_VERIFIED = "MAKER_PRESENCE_VERIFIED"
+
 # Phase 2 standing-contract event (PLAN_synthesis_engine_Phase2.md 2B,
 # D-P2-4): emitted by the post-seal contract hook in
 # timechain_v2.Mempool/BlockBuilder for every TX sealed that matches an

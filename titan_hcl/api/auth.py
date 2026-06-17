@@ -124,6 +124,43 @@ async def verify_privy_token(request: Request) -> Optional[dict]:
 _REQUEST_TTL = 60
 
 
+def resolve_maker_pubkey(request: Request) -> str:
+    """Resolve the Maker's Base58 pubkey (the sovereign trust root) from the api
+    process — SoulAccessor SHM-direct first (G18), then the legacy
+    plugin.soul._maker_pubkey fallback. Returns "" if unresolvable.
+
+    Shared by verify_maker_auth (admin Ed25519) and the §7.D (D.0) verified-Maker
+    presence endpoint, so both verify against the SAME maker_pubkey Titan holds."""
+    maker_pubkey_str = ""
+    titan_state = getattr(request.app.state, "titan_state", None)
+    if titan_state is not None:
+        soul_accessor = getattr(titan_state, "soul", None)
+        if soul_accessor is not None:
+            try:
+                # SoulAccessor.maker_pubkey is a @property (reads soul_state.bin
+                # SHM slot) — property access, NOT a call.
+                mk = soul_accessor.maker_pubkey
+                if mk:
+                    maker_pubkey_str = str(mk)
+            except Exception:
+                logger.debug("[Auth] soul_accessor.maker_pubkey lookup failed",
+                             exc_info=True)
+    if not maker_pubkey_str:
+        plugin = getattr(request.app.state, "titan_hcl", None)
+        if plugin is not None and hasattr(plugin, "soul") and plugin.soul:
+            # Legacy fallback — in api_subprocess `plugin` is an RPC proxy and
+            # bare attribute access returns an `_RPCRemoteRef`; resolve by call.
+            try:
+                ref = plugin.soul._maker_pubkey
+                mk = ref() if callable(ref) else ref
+                if mk and not str(mk).startswith("<_RPCRemoteRef"):
+                    maker_pubkey_str = str(mk)
+            except Exception:
+                logger.debug("[Auth] plugin.soul._maker_pubkey fallback failed",
+                             exc_info=True)
+    return maker_pubkey_str
+
+
 async def verify_maker_auth(request: Request):
     """
     FastAPI dependency that enforces Maker Ed25519 authentication.
@@ -189,34 +226,13 @@ async def verify_maker_auth(request: Request):
     if plugin is None:
         raise HTTPException(status_code=503, detail="Titan plugin not initialized.")
 
-    maker_pubkey_str = ""
-    titan_state = getattr(request.app.state, "titan_state", None)
-    if titan_state is not None:
-        soul_accessor = getattr(titan_state, "soul", None)
-        if soul_accessor is not None:
-            try:
-                # SoulAccessor.maker_pubkey is a @property (not a method) —
-                # reads soul_state.bin SHM slot. Property access, NOT a call.
-                mk = soul_accessor.maker_pubkey
-                if mk:
-                    maker_pubkey_str = str(mk)
-            except Exception:
-                logger.debug("[Auth] soul_accessor.maker_pubkey lookup failed", exc_info=True)
-    if not maker_pubkey_str and hasattr(plugin, "soul") and plugin.soul:
-        # Legacy fallback — plugin.soul._maker_pubkey. In api_subprocess
-        # context `plugin` is an RPC proxy and bare attribute access
-        # returns an `_RPCRemoteRef`, whose str() repr is
-        # `<_RPCRemoteRef path=soul._maker_pubkey>` — NOT the pubkey.
-        # Resolve the ref by calling it (the proxy treats __call__ as a
-        # value fetch); if that doesn't yield a string, skip — the
-        # SoulAccessor path above is the canonical source.
-        try:
-            ref = plugin.soul._maker_pubkey
-            mk = ref() if callable(ref) else ref
-            if mk and not str(mk).startswith("<_RPCRemoteRef"):
-                maker_pubkey_str = str(mk)
-        except Exception:
-            logger.debug("[Auth] plugin.soul._maker_pubkey fallback failed", exc_info=True)
+    # The original code referenced an undefined `titan_state` variable
+    # (pre-existing typo / incomplete refactor), which made every Ed25519-signed
+    # admin call crash with 500 NameError. MakerPanel had been silently using the
+    # internal-key bypass instead; the wallet-sig path was untested for months
+    # until /admin/pitch-sessions exercised it (2026-05-27). Pubkey resolution is
+    # now the shared resolve_maker_pubkey helper (also used by §7.D D.0).
+    maker_pubkey_str = resolve_maker_pubkey(request)
 
     if not maker_pubkey_str:
         raise HTTPException(
@@ -241,3 +257,13 @@ async def verify_maker_auth(request: Request):
         raise HTTPException(status_code=401, detail="Invalid signature.")
 
     logger.info("[Auth] Maker authenticated successfully.")
+    # RFP_affective_grounding_loop §7.D (D.2) — a cryptographically-verified Maker
+    # interaction on the TCC / Maker-Console channel. Fire the cross-platform
+    # maker_bond tap (fire-and-forget → synthesis_worker). ONLY the Ed25519 path
+    # reaches here; the internal-key bypass returned early above and does NOT fire
+    # (a bearer secret is not a cryptographic Maker-presence proof — INV-AFF-HONEST).
+    try:
+        from titan_hcl.api.maker_presence_session import emit_maker_presence
+        emit_maker_presence(request, "tcc")
+    except Exception:  # noqa: BLE001
+        logger.debug("[Auth] maker_presence tcc emit failed", exc_info=True)

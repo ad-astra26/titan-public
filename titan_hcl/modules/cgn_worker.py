@@ -454,10 +454,17 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         cgn.register_consumer(CGNConsumerConfig(
             name="emotional",
             feature_dims=30,
-            action_dims=8,
+            # RFP_affective_grounding_loop §7.D (D.4) — 8→9: MAKER_PRESENCE appended
+            # (matches emotion_cluster.EMOT_PRIMITIVES order = EMOT_PRIMITIVE_INDEX,
+            # which the CGN transition's action_idx uses). On an EXISTING Titan this
+            # static block is skipped (consumer already restored) — the dynamic
+            # CGN_REGISTER(9) from emot_cgn grows the loaded 8-net 8→9 (zero-init
+            # append, learned weights preserved); fresh installs register at 9 here.
+            action_dims=9,
             action_names=[
                 "FLOW", "IMPASSE_TENSION", "RESOLUTION",
                 "PEACE", "CURIOSITY", "GRIEF", "WONDER", "LOVE",
+                "MAKER_PRESENCE",
             ],
             # v1 uses chain terminal_reward as reward signal. True
             # emotional_coherence metric (e.g., 1 - variance(V_across_primitives))
