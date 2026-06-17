@@ -6184,6 +6184,41 @@ async def get_v4_pi_heartbeat(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# GET /v6/mastery — emergent MasteryLevel (RFP_emergent_mastery_curriculum P3)
+# ---------------------------------------------------------------------------
+@router.get("/v6/mastery")
+async def get_v6_mastery(request: Request):
+    """Emergent MasteryLevel readout (ARCHITECTURE_mastery_leveling.md §2.2).
+
+    Reads the `mastery_level_state` SHM slot (self_learning_worker sole writer,
+    G21): the competence-gated symlog-V̄ grade + the SOAR competence/chunk signals.
+    Returns a "not yet published" stub until the first idle IQL pass runs.
+    """
+    _get_plugin(request)
+    try:
+        import asyncio
+        from titan_hcl.core.state_registry import (
+            StateRegistryReader, ensure_shm_root, resolve_titan_id,
+        )
+        from titan_hcl.synthesis.mastery_level import (
+            MASTERY_LEVEL_STATE_SPEC, mastery_flat_to_readout,
+        )
+
+        def _read_shm():
+            reader = StateRegistryReader(
+                MASTERY_LEVEL_STATE_SPEC, ensure_shm_root(resolve_titan_id()))
+            return reader.read()
+
+        flat = await asyncio.to_thread(_read_shm)
+        if flat is None:
+            return _ok({"status": "not yet published (no idle IQL pass yet)"})
+        return _ok(mastery_flat_to_readout(flat))
+    except Exception as e:
+        logger.error("[Dashboard] /v6/mastery error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
 # GET /v4/chi — Chi (Λ) Life Force Engine state
 # ---------------------------------------------------------------------------
 async def get_v4_chi(request: Request):
