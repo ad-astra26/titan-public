@@ -1,4 +1,4 @@
-"""RFP_agno_memory_bypass §1b (D-SPEC-158) — Titan's own recent-conversation store
+"""RFP_agno_memory_bypass §1b (D-SPEC-159) — Titan's own recent-conversation store
 replacing agno's `add_history_to_context` (the ~30MB/turn retainer).
 
 Verifies: bounded per-session ring (last N), LRU session cap, TEXT-only context

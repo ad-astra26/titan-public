@@ -109,7 +109,7 @@ def _pre_hook_cache_set_with_ttl(key: str, value, *, ttl_s: float) -> None:
     _pre_hook_cache[key] = (value, _time_for_cache.time() + ttl_s)
 
 
-# ── Titan-owned recent-conversation store (RFP_agno_memory_bypass §1b, D-SPEC-158) ──
+# ── Titan-owned recent-conversation store (RFP_agno_memory_bypass §1b, D-SPEC-159) ──
 # Replaces agno's `add_history_to_context` (the dominant retainer of the ~30MB/turn
 # leak — Stage-0 verified). We own the format → future control + lets us eventually
 # drop agno's db entirely. BOUNDED + leak-free: last N (user,assistant) TEXT pairs
@@ -3260,7 +3260,7 @@ def create_post_hook(plugin):
         # 0. Identify user for social tracking
         user_id = getattr(plugin, '_current_user_id', None) or "anonymous"
 
-        # RFP_agno_memory_bypass §1b (D-SPEC-158) — record this turn into Titan's
+        # RFP_agno_memory_bypass §1b (D-SPEC-159) — record this turn into Titan's
         # own bounded recent-conversation store; the PreHook injects it next turn
         # (replaces agno's add_history_to_context, the ~30MB/turn retainer). TEXT
         # only, leak-free; never breaks the PostHook.

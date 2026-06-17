@@ -390,7 +390,7 @@ def create_agent(plugin: Any, agent_config: Optional[dict] = None):
         post_hooks=[post_hook],
         db=db,
         additional_context=skill_context or None,
-        # RFP_agno_memory_bypass §1b (D-SPEC-158) — agno's per-run history LOAD is
+        # RFP_agno_memory_bypass §1b (D-SPEC-159) — agno's per-run history LOAD is
         # the dominant retainer of the ~30MB/turn leak (it reloads the last N runs,
         # each carrying Titan's large V5-enriched prompt, into context every arun()).
         # Titan owns its own recent-conversation context (agno_hooks recent-turns
