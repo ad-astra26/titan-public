@@ -146,6 +146,27 @@ OUTER_POLICY_INPUT_DIM = len(OUTER_FEATURE_NAMES)  # 30 (8 base + 20 MSL + 2 ret
 _H1 = 16
 _H2 = 8
 
+# ── Canonical-IQL learner dims (RFP_emergent_mastery_curriculum P2) ───
+# A learned V(s) + Q(s,a) + Polyak Q-target, mirroring the CGN-IQL ALGORITHM
+# (logic/cgn.py:_iql_update_consumer) BY HAND in numpy — never importing the
+# torch classes (INV-MC-6 / INV-OML-8). The π net (w1/w2/w3) above is unchanged
+# in shape; with IQL on it is updated by advantage-weighted-regression (AWR)
+# instead of REINFORCE. These are TRAINING-only (self_learning_worker); the
+# agno DECIDE path reads only the π net from SHM, so to_flat/from_flat + the
+# SHM slot are byte-identical to legacy (the IQL nets persist separately).
+# Fixed (not config) so the iql-flat layout never drifts.
+_IQL_VH = 24   # V-net hidden width  (in → _IQL_VH → 1)
+_IQL_QH = 24   # Q-net hidden width  (in → _IQL_QH → NUM_OUTER_ACTIONS)
+
+# iql-flat layout (worker-only durable artifact, NOT the SHM slot):
+#   V:  vw1[d,VH] vb1[VH] vw2[VH,1] vb2[1]
+#   Q:  qw1[d,QH] qb1[QH] qw2[QH,A] qb2[A]
+#   Qt: (same shape as Q)
+#   meta: total_iql_updates (1)
+_IQL_V_N = (OUTER_POLICY_INPUT_DIM * _IQL_VH) + _IQL_VH + (_IQL_VH * 1) + 1
+_IQL_Q_N = (OUTER_POLICY_INPUT_DIM * _IQL_QH) + _IQL_QH + (_IQL_QH * NUM_OUTER_ACTIONS) + NUM_OUTER_ACTIONS
+IQL_FLAT_DIM = _IQL_V_N + 2 * _IQL_Q_N + 1
+
 # Flat SHM layout: all weights/biases (row-major) then the metadata tail
 # (total_updates, reward_baseline, *reward_baseline_per_action). Reconstructed by
 # from_flat() using the constant dims below — fixed size, so a fixed float32
@@ -479,6 +500,14 @@ class OuterMetaPolicy:
         # (the worker log line, the GB3 "baseline moves" gate, the diagnostic).
         self.reward_baseline = 0.0
         self._cache: dict = {}
+        # ── Canonical-IQL learner state (P2) — lazily allocated by init_iql()
+        # so a flag-off policy is byte-identical to legacy. V/Q/Q-target nets
+        # + their own update counter. Training-only; never published to SHM.
+        self._iql_inited: bool = False
+        self.total_iql_updates: int = 0
+        self._vw1 = self._vb1 = self._vw2 = self._vb2 = None
+        self._qw1 = self._qb1 = self._qw2 = self._qb2 = None
+        self._qtw1 = self._qtb1 = self._qtw2 = self._qtb2 = None
 
     # -- inference ---------------------------------------------------
     def forward(self, x: np.ndarray) -> np.ndarray:
@@ -705,10 +734,257 @@ class OuterMetaPolicy:
         p.reward_baseline_per_action = take(NUM_OUTER_ACTIONS).astype(np.float32).copy()
         return p
 
+    # ── Canonical-IQL learner (RFP_emergent_mastery_curriculum P2) ───────
+    # Mirrors the CGN-IQL ALGORITHM (logic/cgn.py:_iql_update_consumer) by hand
+    # in numpy: expectile-V regression toward Q_target(s,a), Bellman-Q backup
+    # with V(s') (never max_a Q → no OOD), AWR policy extraction, Polyak target.
+    # FULL IQL (not bandit): transitions carry next_state/terminal. INV-MC-6.
+
+    def init_iql(self) -> None:
+        """Lazily allocate the V/Q/Q-target nets (He init). Idempotent — a no-op
+        once allocated (so a load via iql_from_flat is not clobbered)."""
+        if self._iql_inited:
+            return
+        d = self.input_dim
+        sv = math.sqrt(2.0 / d)
+        sq = math.sqrt(2.0 / d)
+        svo = math.sqrt(2.0 / _IQL_VH)
+        sqo = math.sqrt(2.0 / _IQL_QH)
+        self._vw1 = (np.random.randn(d, _IQL_VH).astype(np.float32) * sv)
+        self._vb1 = np.zeros(_IQL_VH, dtype=np.float32)
+        self._vw2 = (np.random.randn(_IQL_VH, 1).astype(np.float32) * svo)
+        self._vb2 = np.zeros(1, dtype=np.float32)
+        self._qw1 = (np.random.randn(d, _IQL_QH).astype(np.float32) * sq)
+        self._qb1 = np.zeros(_IQL_QH, dtype=np.float32)
+        self._qw2 = (np.random.randn(_IQL_QH, NUM_OUTER_ACTIONS).astype(np.float32) * sqo)
+        self._qb2 = np.zeros(NUM_OUTER_ACTIONS, dtype=np.float32)
+        # Polyak target = exact copy of Q at init.
+        self._qtw1 = self._qw1.copy()
+        self._qtb1 = self._qb1.copy()
+        self._qtw2 = self._qw2.copy()
+        self._qtb2 = self._qb2.copy()
+        self._iql_inited = True
+
+    @staticmethod
+    def _mlp2_forward(X, w1, b1, w2, b2):
+        """Batched 2-layer ReLU MLP forward. Returns (out, cache)."""
+        z1 = X @ w1 + b1
+        h1 = np.maximum(0.0, z1)
+        out = h1 @ w2 + b2
+        return out, (X, z1, h1)
+
+    @staticmethod
+    def _mlp2_backward(d_out, w2, cache):
+        """Batched backprop for _mlp2_forward. d_out is ∂L/∂out [B, out_dim]
+        already scaled by 1/B. Returns (dw1, db1, dw2, db2)."""
+        X, z1, h1 = cache
+        dw2 = h1.T @ d_out
+        db2 = d_out.sum(axis=0)
+        dh1 = d_out @ w2.T
+        dz1 = dh1 * (z1 > 0)
+        dw1 = X.T @ dz1
+        db1 = dz1.sum(axis=0)
+        return dw1, db1, dw2, db2
+
+    @staticmethod
+    def _clip_grad_norm(grads, max_norm: float) -> None:
+        """Global-norm gradient clip across the listed arrays (mirrors CGN's
+        torch.nn.utils.clip_grad_norm_). Rescales in place if exceeded."""
+        if max_norm <= 0:
+            return
+        total = math.sqrt(sum(float(np.sum(g * g)) for g in grads))
+        if total > max_norm and total > 1e-12:
+            scale = max_norm / total
+            for g in grads:
+                g *= scale
+
+    def train_iql(self, transitions, *, tau: float = 0.7, beta: float = 3.0,
+                  gamma: float = 0.99, polyak: float = 0.005,
+                  adv_clip: float = 100.0, lr: float = 0.003,
+                  steps: int = 20, batch_size: int = 32,
+                  max_grad_norm: float = 1.0) -> dict:
+        """One canonical-IQL consolidation pass over `transitions` (offline,
+        idle-tick only). Each transition is a dict/tuple with keys/fields
+        (state, action, reward, next_state, terminal). next_state may be None
+        when terminal. Updates the π net (w1/w2/w3) by AWR. Returns loss stats.
+
+        Mirrors cgn._iql_update_consumer exactly (numpy-by-hand):
+          1. V ← expectile_τ regression toward Q_target(s, a_taken)
+          2. Q ← Bellman backup r + γ(1−terminal)·V(s')   (never max_a Q)
+          3. π ← AWR: weight=clamp(exp(β·(Q(s,a)−V(s))), max=adv_clip)
+          4. Polyak: Q_target ← (1−polyak)Q_target + polyak·Q
+        """
+        self.init_iql()
+        n = len(transitions)
+        if n < 2:
+            return {"skipped": True, "transitions": n}
+
+        def _state(t):
+            return np.asarray(t["state"], dtype=np.float32)
+
+        def _next(t):
+            ns = t.get("next_state")
+            return (np.zeros(self.input_dim, dtype=np.float32)
+                    if ns is None else np.asarray(ns, dtype=np.float32))
+
+        bs = min(batch_size, n)
+        tot_v = tot_q = tot_p = 0.0
+        for _ in range(int(steps)):
+            idx = np.random.choice(n, bs, replace=False)
+            batch = [transitions[i] for i in idx]
+            S = np.array([_state(t) for t in batch], dtype=np.float32)        # [B,in]
+            S2 = np.array([_next(t) for t in batch], dtype=np.float32)         # [B,in]
+            A = np.array([int(t["action"]) for t in batch], dtype=np.int64)    # [B]
+            R = np.array([float(t["reward"]) for t in batch], dtype=np.float32)
+            NT = np.array([0.0 if t.get("terminal") else 1.0 for t in batch],
+                          dtype=np.float32)                                    # nonterminal
+            B = S.shape[0]
+            rows = np.arange(B)
+
+            # 1. V update — expectile regression toward Q_target(s, a_taken).
+            q_tgt_all, _ = self._mlp2_forward(S, self._qtw1, self._qtb1,
+                                              self._qtw2, self._qtb2)          # [B,A]
+            q_sa_tgt = q_tgt_all[rows, A]                                      # [B]
+            v_pred, v_cache = self._mlp2_forward(S, self._vw1, self._vb1,
+                                                 self._vw2, self._vb2)         # [B,1]
+            v_pred = v_pred.reshape(B)
+            diff = q_sa_tgt - v_pred                                           # target − pred
+            w = np.where(diff < 0.0, 1.0 - tau, tau).astype(np.float32)
+            v_loss = float(np.mean(w * diff * diff))
+            d_v = (-2.0 * w * diff / B).reshape(B, 1).astype(np.float32)       # ∂L/∂V_pred
+            dvw1, dvb1, dvw2, dvb2 = self._mlp2_backward(d_v, self._vw2, v_cache)
+            self._clip_grad_norm([dvw1, dvb1, dvw2, dvb2], max_grad_norm)
+            self._vw1 -= lr * dvw1; self._vb1 -= lr * dvb1
+            self._vw2 -= lr * dvw2; self._vb2 -= lr * dvb2
+
+            # 2. Q update — Bellman backup with V(s') (never max_a Q → no OOD).
+            v_next, _ = self._mlp2_forward(S2, self._vw1, self._vb1,
+                                           self._vw2, self._vb2)
+            v_next = v_next.reshape(B) * NT
+            q_backup = R + gamma * v_next                                      # [B]
+            q_all, q_cache = self._mlp2_forward(S, self._qw1, self._qb1,
+                                                self._qw2, self._qb2)          # [B,A]
+            q_sa = q_all[rows, A]
+            q_err = q_sa - q_backup
+            q_loss = float(np.mean(q_err * q_err))
+            d_q = np.zeros((B, NUM_OUTER_ACTIONS), dtype=np.float32)
+            d_q[rows, A] = (2.0 * q_err / B).astype(np.float32)               # taken-action head only
+            dqw1, dqb1, dqw2, dqb2 = self._mlp2_backward(d_q, self._qw2, q_cache)
+            self._clip_grad_norm([dqw1, dqb1, dqw2, dqb2], max_grad_norm)
+            self._qw1 -= lr * dqw1; self._qb1 -= lr * dqb1
+            self._qw2 -= lr * dqw2; self._qb2 -= lr * dqb2
+
+            # 3. Policy update — advantage-weighted regression (AWR) on the π net.
+            q_all2, _ = self._mlp2_forward(S, self._qw1, self._qb1,
+                                           self._qw2, self._qb2)
+            v_pred2, _ = self._mlp2_forward(S, self._vw1, self._vb1,
+                                            self._vw2, self._vb2)
+            adv = q_all2[rows, A] - v_pred2.reshape(B)                         # [B]
+            weight = np.minimum(np.exp(beta * adv), adv_clip).astype(np.float32)
+            # π forward (batched) — own cache; does NOT touch self._cache (REINFORCE path).
+            z1 = S @ self.w1 + self.b1; h1 = np.maximum(0.0, z1)
+            z2 = h1 @ self.w2 + self.b2; h2 = np.maximum(0.0, z2)
+            z3 = h2 @ self.w3 + self.b3                                        # logits [B,A]
+            z3 = z3 - z3.max(axis=1, keepdims=True)
+            exp_s = np.exp(z3)
+            probs = exp_s / (exp_s.sum(axis=1, keepdims=True) + 1e-8)
+            target = np.zeros((B, NUM_OUTER_ACTIONS), dtype=np.float32)
+            target[rows, A] = 1.0
+            # ∂L/∂logits for L = mean(−weight·logπ(a)) = (1/B)·weight·(probs − onehot)
+            d_z3 = (probs - target) * (weight.reshape(B, 1) / B)
+            d_w3 = h2.T @ d_z3; d_b3 = d_z3.sum(axis=0)
+            d_h2 = d_z3 @ self.w3.T; d_z2 = d_h2 * (z2 > 0)
+            d_w2 = h1.T @ d_z2; d_b2 = d_z2.sum(axis=0)
+            d_h1 = d_z2 @ self.w2.T; d_z1 = d_h1 * (z1 > 0)
+            d_w1 = S.T @ d_z1; d_b1 = d_z1.sum(axis=0)
+            self._clip_grad_norm([d_w1, d_b1, d_w2, d_b2, d_w3, d_b3], max_grad_norm)
+            policy_loss = float(np.mean(-weight * np.log(probs[rows, A] + 1e-8)))
+            self.w1 -= lr * d_w1; self.b1 -= lr * d_b1
+            self.w2 -= lr * d_w2; self.b2 -= lr * d_b2
+            self.w3 -= lr * d_w3; self.b3 -= lr * d_b3
+            if self.weight_decay:
+                self.w1 *= (1.0 - self.weight_decay)
+                self.w2 *= (1.0 - self.weight_decay)
+                self.w3 *= (1.0 - self.weight_decay)
+            self._clip_weight_norms()
+
+            # 4. Polyak target update: Q_target ← (1−polyak)Q_target + polyak·Q.
+            self._qtw1 = (1.0 - polyak) * self._qtw1 + polyak * self._qw1
+            self._qtb1 = (1.0 - polyak) * self._qtb1 + polyak * self._qb1
+            self._qtw2 = (1.0 - polyak) * self._qtw2 + polyak * self._qw2
+            self._qtb2 = (1.0 - polyak) * self._qtb2 + polyak * self._qb2
+
+            self.total_updates += 1
+            self.total_iql_updates += 1
+            tot_v += v_loss; tot_q += q_loss; tot_p += policy_loss
+
+        s = max(1, int(steps))
+        return {"v_loss": tot_v / s, "q_loss": tot_q / s,
+                "policy_loss": tot_p / s, "transitions": n,
+                "iql_updates": self.total_iql_updates}
+
+    def value(self, x) -> float:
+        """V(s) — the learned expectile state-value (P3 MasteryLevel reads this).
+        0.0 if IQL not yet initialised."""
+        if not self._iql_inited:
+            return 0.0
+        out, _ = self._mlp2_forward(
+            np.asarray(x, dtype=np.float32).reshape(1, -1),
+            self._vw1, self._vb1, self._vw2, self._vb2)
+        return float(out.reshape(-1)[0])
+
+    def iql_to_flat(self) -> np.ndarray:
+        """Pack the V/Q/Q-target nets + iql metadata into a flat float32 vector
+        (worker-only durable artifact; NOT the SHM slot). init_iql() first so a
+        never-trained policy still round-trips a valid (random-init) net."""
+        self.init_iql()
+        return np.concatenate([
+            self._vw1.ravel(), self._vb1.ravel(), self._vw2.ravel(), self._vb2.ravel(),
+            self._qw1.ravel(), self._qb1.ravel(), self._qw2.ravel(), self._qb2.ravel(),
+            self._qtw1.ravel(), self._qtb1.ravel(), self._qtw2.ravel(), self._qtb2.ravel(),
+            np.array([float(self.total_iql_updates)], dtype=np.float32),
+        ]).astype(np.float32)
+
+    def iql_from_flat(self, flat) -> bool:
+        """Restore the IQL nets from iql_to_flat(). Returns False (and leaves a
+        fresh init) on any size/shape mismatch (schema drift → relearn)."""
+        try:
+            flat = np.asarray(flat, dtype=np.float32).ravel()
+            if flat.shape[0] != IQL_FLAT_DIM:
+                return False
+            d = self.input_dim
+            i = 0
+            def take(n):
+                nonlocal i
+                seg = flat[i:i + n]; i += n
+                return seg
+            self._vw1 = take(d * _IQL_VH).reshape(d, _IQL_VH).astype(np.float32)
+            self._vb1 = take(_IQL_VH).astype(np.float32)
+            self._vw2 = take(_IQL_VH * 1).reshape(_IQL_VH, 1).astype(np.float32)
+            self._vb2 = take(1).astype(np.float32)
+            self._qw1 = take(d * _IQL_QH).reshape(d, _IQL_QH).astype(np.float32)
+            self._qb1 = take(_IQL_QH).astype(np.float32)
+            self._qw2 = take(_IQL_QH * NUM_OUTER_ACTIONS).reshape(
+                _IQL_QH, NUM_OUTER_ACTIONS).astype(np.float32)
+            self._qb2 = take(NUM_OUTER_ACTIONS).astype(np.float32)
+            self._qtw1 = take(d * _IQL_QH).reshape(d, _IQL_QH).astype(np.float32)
+            self._qtb1 = take(_IQL_QH).astype(np.float32)
+            self._qtw2 = take(_IQL_QH * NUM_OUTER_ACTIONS).reshape(
+                _IQL_QH, NUM_OUTER_ACTIONS).astype(np.float32)
+            self._qtb2 = take(NUM_OUTER_ACTIONS).astype(np.float32)
+            self.total_iql_updates = int(round(float(take(1)[0])))
+            self._iql_inited = True
+            return True
+        except Exception:
+            self._iql_inited = False
+            self.init_iql()
+            return False
+
 
 __all__ = (
     "OUTER_ACTIONS", "NUM_OUTER_ACTIONS", "OUTER_FEATURE_NAMES",
-    "OUTER_POLICY_INPUT_DIM", "OUTER_POLICY_FLAT_DIM", "MSL_CONTEXT_DIM",
+    "OUTER_POLICY_INPUT_DIM", "OUTER_POLICY_FLAT_DIM", "IQL_FLAT_DIM",
+    "MSL_CONTEXT_DIM",
     "OUTER_META_POLICY_STATE_SLOT", "OUTER_META_POLICY_STATE_SPEC",
     "OUTER_META_POLICY_STATE_SCHEMA_VERSION",
     "OUTER_MSL_CONTEXT_STATE_SLOT", "OUTER_MSL_CONTEXT_STATE_SPEC",
