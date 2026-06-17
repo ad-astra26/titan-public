@@ -667,15 +667,22 @@ async def get_status(request: Request):
                 float((p or {}).get("total_updates", 0.0) or 0.0)
                 for p in _programs.values()
             ))
+            # Rich π-heartbeat stats (developmental_age=cluster_count,
+            # heartbeat_ratio, …) ARE published cross-process: cognitive_worker
+            # co-publishes pi_monitor.get_stats() into meta_reasoning_state.bin
+            # under the `pi_heartbeat` key (MetaReasoningStatePublisher) — the
+            # SAME source /v4/pi-heartbeat + /v4/dreaming already read. The old
+            # "no canonical SHM source post-v1.19.0" TODO was stale.
+            # (RFP_emergent_mastery_curriculum P1 / INV-MC-1: secondary signal.)
+            _pi_rich = _mr.get("pi_heartbeat", {}) if isinstance(_mr, dict) else {}
+            if not isinstance(_pi_rich, dict):
+                _pi_rich = {}
             data["lifetime"] = {
                 "total_epochs": total_epochs,
-                # TODO(rFP follow-up): developmental_age was PiHeartbeat
-                # cluster_count; no canonical SHM source post-v1.19.0.
-                "developmental_age": 0,
-                # TODO(rFP follow-up): heartbeat_ratio needs both π-pulses
-                # and total observed; pi_heartbeat.bin schema is lean
-                # (phase + pulse_count only) per SPEC §7.1 row pi_heartbeat.
-                "heartbeat_ratio": 0.0,
+                # developmental_age = completed π-clusters (PiHeartbeat).
+                "developmental_age": int(_pi_rich.get("developmental_age", 0) or 0),
+                # heartbeat_ratio = π-epochs / total epochs observed.
+                "heartbeat_ratio": float(_pi_rich.get("heartbeat_ratio", 0.0) or 0.0),
                 # TODO(rFP follow-up): dream_state.bin schema v1 (D-SPEC-56)
                 # carries current state, not cumulative cycle counter.
                 "dream_cycles": 0,
