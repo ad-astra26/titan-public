@@ -3800,13 +3800,10 @@ delta                = 1.0    # explicit confirm ("thanks/correct") → confirma
 delta_weak           = 0.3    # no dispute within the window (silence ≠ endorsement) → weak-confirm → promote
 dispute_delta        = -1.0   # explicit dispute ("no/wrong/search more") → confirmation_score += this → prune + re-research
 
-[soul_diary]
-# RFP_titan_authored_soul_diary §7.P8 / INV-SD-11 — the per-Titan DailyNFT mint gate.
-# Base default OFF (safe): mainnet T1 mints NOTHING until explicitly flipped, even
-# though the path is fully wired + tested. Devnet T2/T3 set `mint_enabled = true` in
-# their `~/.titan/microkernel_<id>.toml` override (the same deep-merge as
-# l0_rust_enabled). No mint path bypasses this flag.
-mint_enabled = false
+# [soul_diary].mint_enabled relocated to config.toml [soul_diary] (RFP_config_as_shm_state
+# §7.C / C.0, 2026-06-18): it is an OPERATIONAL/environment toggle (mainnet=false / devnet=true),
+# NOT Titan DNA — so it is user/box-tunable config, not a params key. INV-SD-11 mint-gate
+# semantics unchanged; only its config HOME moved (strict INV-CFG-6 disjointness, no per_titan).
 
 [affective]
 # RFP_affective_grounding_loop §7.A — the Affective Grounding Loop (real events →

@@ -187,10 +187,7 @@ local_base = "data/backups/mirror"
 distill_enabled = true
 # On-chain anchoring: write consciousness checkpoints to Solana memo
 anchor_enabled = true
-# Curvature threshold (radians) for anchoring — π/3 ≈ 60° trajectory bend
-anchor_curvature_threshold = 1.047
-# Density threshold — anchor when in truly uncharted territory
-anchor_density_threshold = 0.15
+# (anchor_curvature_threshold / anchor_density_threshold are DNA — titan_params.toml [consciousness])
 
 [maker_relationship]
 enabled = true
@@ -351,26 +348,17 @@ sandbox_timeout = 30
 sandbox_memory_mb = 256
 sandbox_pip_allowed = true
 
-[sphere_clock]
-# V4 Time Awareness — Sphere Clock parameters
-# Base contraction speed (scalar units per tick, higher = faster pulse generation)
-base_contraction_speed = 0.05
-# Minimum sphere radius after repeated balanced pulses (prevents collapse to zero)
-min_radius = 0.3
-# Sphere shrink rate per balanced pulse (tighter spheres for healthy parts)
-pulse_shrink_rate = 0.02
-# Balance threshold — within this delta from center = "balanced" (20% of 0.5 range)
-balance_threshold = 0.20
-# Minimum velocity factor (even sick hearts beat)
-min_velocity_factor = 0.15
-# Tick interval in seconds (how often sphere clocks are updated)
-tick_interval = 60.0
+# [sphere_clock] is pure DNA (all keys in titan_params.toml [sphere_clock]) — no user-tunable knobs.
 
 [spirit_enrichment]
 # The Divine Spark — continuous Spirit self-observation between GREAT PULSEs
+# (enrichment_rate / min_alignment_threshold are DNA — titan_params.toml [spirit_enrichment])
 micro_tick_interval = 10.0
-enrichment_rate = 0.02
-min_alignment_threshold = 0.1
+
+[soul_diary]
+# DailyNFT mint gate (INV-SD-11). OPERATIONAL toggle, NOT DNA: mainnet keeps false
+# (no real-SOL diary mints); devnet sets true to exercise the mint path.
+mint_enabled = false
 
 [epochs]
 # Production timing (seconds)

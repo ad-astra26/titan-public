@@ -370,6 +370,7 @@
 "social_x.seal_cluster" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
 "social_x.self_handles" = {type="list", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
 "social_x.url_domain" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
+"soul_diary.mint_enabled" = {type="bool", constraint="", reload="hot", owner=["soul_diary"], sensitive=false}
 "spirit_enrichment.micro_tick_interval" = {type="float", constraint=">0", reload="hot", owner=["cognitive_worker"], sensitive=false}
 "stealth_sage.doc_safe_room" = {type="str", constraint="", reload="hot", owner=["agency_worker", "social_worker"], sensitive=false}
 "stealth_sage.firecrawl_api_key" = {type="str", constraint="", reload="hot", owner=["agency_worker", "social_worker"], sensitive=true}
@@ -1462,7 +1463,6 @@
 "social_delegate.min_confidence" = {type="float", constraint="0..1", reload="hot", owner=["social_worker"], sensitive=false}
 "social_delegate.min_vocabulary" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
 "social_delegate.self_titan_id" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
-"soul_diary.mint_enabled" = {type="bool", constraint="", reload="hot", owner=["soul_diary"], sensitive=false}
 "sphere_clock.balance_threshold" = {type="float", constraint="0..1", reload="hot", owner=["cognitive_worker"], sensitive=false}
 "sphere_clock.base_contraction_speed" = {type="float", constraint="0..1", reload="hot", owner=["cognitive_worker"], sensitive=false}
 "sphere_clock.min_radius" = {type="float", constraint="0..1", reload="hot", owner=["cognitive_worker"], sensitive=false}
