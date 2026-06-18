@@ -93,6 +93,18 @@ weight_topology = 0.3
 topology_buffer_max = 500
 
 
+# ─── TITAN-TIME SPINE (RFP_verifiable_autobiographical_presence_memory §7.0) ──
+# Circadian-cycle counter latch thresholds on the 0..1 get_circadian_phase()
+# wall-clock overlay (trough≈0.2 at 2-5am, peak≈0.9 midday). Config GAINS, not
+# hardcoded magnitudes (Q1) — emergence over determinism. The trough-meditation
+# latch increments the Titan-owned cycle_id exactly once per night (hysteresis:
+# fire below trough_threshold, re-arm above rearm_threshold). DNA/temperament —
+# per-Titan divergence allowed (BRAIN INV-17).
+[titan_time]
+trough_threshold = 0.30
+rearm_threshold  = 0.45
+
+
 # ─── SPHERE CLOCKS (V4 Emergent Time) ────────────────────────────
 # Six inner clocks that pulse when their corresponding Trinity dimension
 # is balanced. Pulses drive resonance → GREAT PULSEs → growth.

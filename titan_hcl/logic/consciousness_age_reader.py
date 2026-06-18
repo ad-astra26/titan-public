@@ -86,5 +86,33 @@ class ConsciousnessAgeReader:
         except (TypeError, ValueError):
             return 0
 
+    def get_age_snapshot(self) -> tuple[int, float]:
+        """`(age_epochs, ts)` from a single SHM read — the live anchor pair the
+        Titan-time translator measures the per-Titan epoch↔wall-clock rate from
+        (BRAIN §248: the rate drifts/differs per Titan and is NEVER hardcoded).
+        `ts` is the publisher's wall-clock at last publish (NOT a boot anchor).
+        Returns `(0, 0.0)` on cold-boot / read failure (the grandfather signal —
+        never raises)."""
+        try:
+            raw = self._r_state.read_variable()
+        except Exception:  # noqa: BLE001 — cold-boot / slot-absent tolerant
+            self._fallback_count += 1
+            return 0, 0.0
+        if raw is None:
+            self._fallback_count += 1
+            return 0, 0.0
+        try:
+            decoded = msgpack.unpackb(raw, raw=False)
+        except Exception as e:  # noqa: BLE001
+            self._fallback_count += 1
+            logger.warning("[ConsciousnessAgeReader] msgpack decode raised: %s", e)
+            return 0, 0.0
+        if not isinstance(decoded, dict):
+            return 0, 0.0
+        try:
+            return int(decoded.get("age_epochs", 0) or 0), float(decoded.get("ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0, 0.0
+
 
 __all__ = ("ConsciousnessAgeReader",)

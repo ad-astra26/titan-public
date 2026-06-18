@@ -1602,6 +1602,8 @@
 "titan_self.weight_felt" = {type="float", constraint="0..1", reload="hot", owner=["cognitive_worker"], sensitive=false}
 "titan_self.weight_journey" = {type="float", constraint="0..1", reload="hot", owner=["cognitive_worker"], sensitive=false}
 "titan_self.weight_topology" = {type="float", constraint="0..1", reload="hot", owner=["cognitive_worker"], sensitive=false}
+"titan_time.rearm_threshold" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"titan_time.trough_threshold" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
 "titan_vm.max_instructions" = {type="int", constraint=">=0", reload="hot", owner=["cognitive_worker"], sensitive=false}
 "titan_vm.max_stack_depth" = {type="int", constraint=">=0", reload="hot", owner=["cognitive_worker"], sensitive=false}
 "titan_vm.min_reward_threshold" = {type="float", constraint="0..1", reload="hot", owner=["cognitive_worker"], sensitive=false}
