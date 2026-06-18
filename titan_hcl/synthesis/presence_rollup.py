@@ -68,15 +68,20 @@ class PresenceRollup:
         row per person. Returns the number of person-rows folded (0 on empty/soft
         failure). Idempotent — safe to call every dream."""
         cycle_id, cycle_start_epoch = read_current_cycle(self._save_dir)
-        # READ (direct on the shared conn): per-person aggregates over THIS cycle's
-        # atoms (age_epochs >= the cycle's start; Titan-time partition).
-        try:
-            rows = self._conn.execute(
+        # READ per-person aggregates over THIS cycle's atoms (age_epochs >= the
+        # cycle's start; Titan-time partition). The ActivationStore conn is GUARDED
+        # (guard_conn) — EVERY .execute(), read OR write, must run on the sole
+        # SynthesisWriter thread (G21), so the SELECT routes through submit_sync too
+        # (not a direct conn read — that raises off-thread; caught live on T3).
+        def _read():
+            return self._conn.execute(
                 "SELECT person_id, MIN(age_epochs), MAX(age_epochs), COUNT(*), "
                 f"MAX({_EVIDENCE_CASE_SQL}) "
                 "FROM person_interactions WHERE age_epochs >= ? "
                 "GROUP BY person_id",
                 [int(cycle_start_epoch)]).fetchall()
+        try:
+            rows = self._writer.submit_sync(_read)
         except Exception as e:  # noqa: BLE001
             logger.warning("[presence_rollup] fold read failed (%s)", e)
             return 0
