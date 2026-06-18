@@ -1147,7 +1147,10 @@ class SocialXGateway:
     # few decisive write rejections and backs off exponentially.
     _WRITE_REJECT_THRESHOLD = 3        # decisive write-422/226 before suspend
     _WRITE_SUSPEND_BASE_S = 3600.0     # first suspension 1h
-    _WRITE_SUSPEND_CAP_S = 86400.0     # cap 24h
+    _WRITE_SUSPEND_CAP_S = 21600.0     # cap 6h — auto-probes recovery ≤6h after
+    #                                    the account is unblocked (kill-switch is
+    #                                    the instant hard-stop; deleting
+    #                                    data/social_x_write_state.json clears now)
     _SESSION_REFRESH_MIN_INTERVAL_S = 21600.0   # ≤1 login / 6h
     _READ_OK_SESSION_GRACE_S = 600.0   # a read OK within 10min ⇒ session alive
 
