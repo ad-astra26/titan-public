@@ -471,6 +471,34 @@ class OuterFeatures:
         return np.array(base + msl + retrieval, dtype=np.float32)
 
 
+# ── P8 (RFP_emergent_mastery_curriculum §7.P8.1) — autonomous-experience φ ────
+# Map a routing-relevant agency helper to its outer action + build the 30-D
+# OuterFeatures for an AUTONOMOUS (no-chat) run, so its correctness-verified outcome
+# trains the SAME outer routing IQL as a chat decision (engagement-independent).
+_HELPER_TO_OUTER_ACTION: dict = {
+    "coding_sandbox": "tool",      # ran deterministic code → the tool lane
+    "web_search": "research",      # looked it up → the research lane
+    "code_knowledge": "research",  # read-only code inspection → research lane
+}
+
+
+def autonomous_features_for_helper(helper_name: str, *, msl_context=None):
+    """P8.1 — `(OuterFeatures φ, action_index)` for an autonomous helper run, or
+    `(None, None)` for a non-routing helper. The φ mirrors the structural-oracle
+    feature axes the chat path would set for this lane (tool ⇒ tool/code-shaped;
+    research ⇒ the 'doesn't-know → look up' shape, recall/skill at zero), plus the
+    live MSL context (read from SHM by the caller). Pure — no I/O here."""
+    action = _HELPER_TO_OUTER_ACTION.get(helper_name)
+    if action is None:
+        return None, None
+    if action == "tool":
+        feats = OuterFeatures(requires_tool=True, has_code_signal=True,
+                              msl_context=msl_context)
+    else:  # research lane — low recall, no skill/tool/code
+        feats = OuterFeatures(msl_context=msl_context)
+    return feats, OUTER_ACTIONS.index(action)
+
+
 class OuterMetaPolicy:
     """Numpy ReLU MLP (30 → 16 → 8 → 5) trained by REINFORCE-with-baseline.
 

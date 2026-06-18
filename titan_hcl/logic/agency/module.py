@@ -332,21 +332,26 @@ class AgencyModule:
         source_layer: str,
         source_dims: list,
         deficit_values: list,
+        correction: str = "",
     ) -> dict:
         """
         Use LLM to generate Python code for the coding sandbox.
 
         Called when coding_sandbox is selected but no code was provided.
-        Returns params dict with 'code' key.
+        Returns params dict with 'code' key. `correction` (P8.2 solve-until-correct)
+        appends the task-completion judge's concrete fix so the retry regenerates code
+        that actually solves the task (not just runs clean).
         """
         if not self._llm_fn:
             return {}
 
         reason = _POSTURE_REASONS.get(posture, "Inner state needs rebalancing")
+        _fix = (f"\nPREVIOUS ATTEMPT DID NOT SOLVE THE TASK. Fix this concretely: "
+                f"{correction}\n" if correction else "")
         prompt = (
             f"You are Titan, a sovereign AI. Your inner state needs rebalancing.\n"
             f"Intent: {posture} — {reason}\n"
-            f"Source: {source_layer}[{source_dims}], deficit={deficit_values}\n\n"
+            f"Source: {source_layer}[{source_dims}], deficit={deficit_values}\n{_fix}\n"
             f"Write a short Python script (max 30 lines) that does something "
             f"meaningful for this intent. Examples:\n"
             f"- research: compute statistics, analyze data patterns\n"
@@ -376,6 +381,39 @@ class AgencyModule:
             logger.warning("[Agency] Code generation failed: %s", e)
 
         return {}
+
+    async def p8_rerun(self, helper_name: str, intent: dict,
+                       correction: str) -> Optional[dict]:
+        """P8.2 (solve-until-correct) — re-run a routing helper applying the task-
+        completion judge's correction. coding_sandbox → REGENERATE code incorporating
+        the correction; web_search/code_knowledge → re-query with the correction as a
+        refinement. Budget-gated (counts against the agency LLM budget). Returns the
+        helper result dict, or None (budget exhausted / helper missing / no code)."""
+        self._check_budget_reset()
+        if self._llm_calls_this_hour >= self._budget_per_hour:
+            return None
+        helper = self._registry.get_helper(helper_name)
+        if helper is None:
+            return None
+        posture = intent.get("posture", "meditate")
+        params = {"trinity_snapshot": intent.get("trinity_snapshot", {}),
+                  "posture": posture}
+        if helper_name == "coding_sandbox":
+            gen = await self._generate_sandbox_code(
+                posture, intent.get("source_layer", "unknown"),
+                intent.get("source_dims", []), intent.get("deficit_values", []),
+                correction=correction)
+            if not gen.get("code"):
+                return None
+            params.update(gen)
+        else:  # research lane — refine the query with the correction
+            reason = _POSTURE_REASONS.get(posture, "")
+            params["query"] = f"{posture}: {reason}. {correction}".strip()
+        try:
+            return await helper.execute(params)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Agency] p8_rerun helper '%s' failed: %s", helper_name, e)
+            return None
 
     @staticmethod
     def _parse_selection(raw: str) -> Optional[dict]:

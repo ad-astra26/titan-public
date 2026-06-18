@@ -236,6 +236,17 @@ _DEFAULTS = {
     "idk_oracle_enabled": True,
     "idk_verified_reward": 0.15,     # honest verified-IDK reward (slightly > a damped direct)
     "idk_unverified_penalty": -0.5,  # IDK chosen with strong recall (knew & bailed)
+    # ── P8 — engagement-independent experience (ARCHITECTURE §7.P8.1/§7.P8.2) ──
+    # Score agency's AUTONOMOUS (no-chat) tool/research outcomes into the outer IQL
+    # so a low-traffic Titan still accrues correctness-grounded experience (INV-MC-8).
+    # USER-CONTROLLED COST: every autonomous intent runs a TaskCompletionJudge LLM
+    # call, and each solve-until-correct retry adds a code-regen + judge call — so the
+    # kill-switch (zero extra cost when off) and the retry bound are live config.
+    # Read by AGENCY (logic/agency/module.py + agency_worker) via get_params("synthesis").
+    "oml_autonomous_experience_enabled": True,  # master kill-switch (off ⇒ no autonomous judge → zero extra LLM cost)
+    "p8_max_attempts": 3,            # solve-until-correct bound: 1 = judge-once (no retry); 3 = up to 2 corrections
+    "autonomous_oracle_reward_weight": 1.0,   # deterministic autonomous oracle (P9 known-target / self-test)
+    "task_completion_reward_weight": 1.0,     # the LLM task-completion judge
     # ── P7 — clean-baseline reset (uncollapse) ──────────────────────────────
     # One-shot reset trigger: if this sentinel file exists at worker boot, the
     # collapsed routing policy + IQL nets + level + replay buffer are CLEARED →
@@ -255,7 +266,14 @@ _DEFAULTS = {
 # return a dereferenceable hit?) → top authority, same tier as `oracle`. (The IDK
 # reward travels the v1.1 direct path, which bypasses this gate; the entry is
 # defensive so a future async IDK correction is never rank-0-dropped on a contended tx.)
-_REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3, "idk_oracle": 3}
+# P8: `autonomous_oracle` = a DETERMINISTIC autonomous verdict (P9 known-target /
+# Titan-written self-test) → top tier (=oracle, objective). `task_completion` = the
+# LLM TaskCompletionJudge → `llm_judge` tier (=0): LLM-assisted, lowest authority, so
+# it can NEVER override a real deterministic oracle on a contended tx (INV-MC-8 — the
+# deterministic oracle dominates). Unregistered sources default to rank 0 → would be
+# silently dropped on a contended join, so both are registered explicitly.
+_REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3,
+                       "idk_oracle": 3, "autonomous_oracle": 3, "task_completion": 0}
 _SURVIVAL_STATES = frozenset({"SURVIVAL", "STARVATION"})
 
 

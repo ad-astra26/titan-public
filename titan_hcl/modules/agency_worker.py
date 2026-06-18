@@ -345,6 +345,91 @@ def _maybe_emit_onchain_anchor_catalyst(
             _err)
 
 
+def _p8_problem_text(intent: dict, action_result: dict) -> str:
+    """The TASK the judge scores against — the self-intent's posture + selection
+    reasoning (what Titan was TRYING to do), not the output."""
+    posture = str(intent.get("posture", "") or "")
+    reason = str(action_result.get("reasoning", "") or "")
+    txt = f"{posture}: {reason}".strip(": ").strip()
+    return txt or posture or "autonomous self-directed task"
+
+
+def _maybe_emit_autonomous_experience(
+        send_queue, name: str, titan_id: str, intent: dict,
+        action_result: Optional[dict], agency, judge) -> None:
+    """P8.1+P8.2 — wire an AUTONOMOUS (no-chat) routing-helper outcome into the OUTER
+    routing IQL as correctness-grounded experience (INV-MC-8 / §7.P8). Builds φ, runs
+    the TaskCompletionJudge, drives solve-until-correct retries (bounded + budget-
+    gated), and emits ONE SELF_LEARN_REWARD on the v1.1 DIRECT path (mirrors the
+    verifiable tool lane — features present, no stash/join). The kill-switch +
+    retry-bound are read FRESH (hot-reloadable cost control). Never raises (must not
+    break the agency loop)."""
+    try:
+        if not isinstance(action_result, dict):
+            return
+        sl = get_params("synthesis").get("self_learning", {}) or {}
+        if not bool(sl.get("oml_autonomous_experience_enabled", True)):
+            return  # master kill-switch (off ⇒ zero extra LLM cost)
+        max_attempts = max(1, int(sl.get("p8_max_attempts", 3)))
+        helper = action_result.get("helper")
+        from titan_hcl.core.state_registry import ensure_shm_root
+        from titan_hcl.synthesis.outer_meta_policy import (
+            autonomous_features_for_helper, read_msl_context)
+        feats, action_idx = autonomous_features_for_helper(
+            helper, msl_context=read_msl_context(ensure_shm_root(titan_id)))
+        if feats is None:
+            return  # non-routing helper (memo_inscribe, art_generate, …) — not scored
+        problem = _p8_problem_text(intent, action_result)
+        action_name = str(action_result.get("action_type") or helper)
+        gc = f"autonomous:{action_name}"
+        evidence = str(action_result.get("result") or "")
+
+        verdict = judge.judge(problem=problem, action=action_name, evidence=evidence)
+        attempts = 1
+        # solve-until-correct: retry (regen code / refine query) while unsolved.
+        while (verdict is not None and not verdict.get("solved")
+               and attempts < max_attempts and verdict.get("correction")):
+            new_res = _run_async(
+                agency.p8_rerun(helper, intent, verdict["correction"]))
+            attempts += 1
+            if not isinstance(new_res, dict):
+                break  # budget exhausted / regen failed → stop retrying
+            evidence = str(new_res.get("result") or "")
+            verdict = judge.judge(problem=problem, action=action_name, evidence=evidence)
+
+        if verdict is None:
+            return  # judge LLM miss → stays untrained (no false-positive reward)
+        solved = bool(verdict.get("solved"))
+        # Apply the source weight HERE (the v1.1 direct path does NOT apply
+        # `*_reward_weight` — only the join path does), so task_completion stays a
+        # live, user-tunable trust dial on LLM-judge-backed autonomous experience
+        # (down-weight it < 1 relative to chat-oracle rewards). autonomous_oracle
+        # (the deterministic P9 case) applies its own weight when P9 emits it.
+        weight = float(sl.get("task_completion_reward_weight", 1.0))
+        reward = (float(verdict.get("confidence", 1.0)) if solved else -0.5) * weight
+        send_queue.put({
+            "type": bus.SELF_LEARN_REWARD, "src": name, "dst": "self_learning",
+            "payload": {
+                "features": list(feats.to_vector().tolist()),
+                "action": int(action_idx),
+                "reward": float(reward),
+                "goal_class": gc,
+                "source": "task_completion",
+            },
+            "ts": time.time(),
+        })
+        logger.info("[AgencyWorker][P8] autonomous %s → solved=%s reward=%+.2f "
+                    "attempts=%d (engagement-independent IQL experience)",
+                    action_name, solved, reward, attempts)
+        if not solved:
+            # P9 (failed-attempts store) not built yet → the NEGATIVE reward IS
+            # emitted (not a stub); log the unresolved problem for P9 to later mine.
+            logger.info("[AgencyWorker][P8] unresolved after %d attempts (P9 enqueue "
+                        "pending P9 build): %s", attempts, problem[:80])
+    except Exception as e:  # noqa: BLE001 — never break the agency loop
+        logger.debug("[AgencyWorker][P8] autonomous experience skipped: %s", e)
+
+
 @with_error_envelope(module_name="agency_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Agency worker subprocess.
@@ -425,6 +510,26 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     agency = AgencyModule(registry=registry, llm_fn=llm_fn,
                           budget_per_hour=budget_per_hour)
     assessment = SelfAssessment(llm_fn=llm_fn)
+
+    # P8 (RFP_emergent_mastery_curriculum §7.P8) — the TaskCompletionJudge for
+    # autonomous-experience scoring. A sync provider wrapping the async agency LLM
+    # (mirrors synthesis_worker's TurnJudge wiring). Stateless → built once at boot;
+    # the kill-switch + retry-bound are read FRESH per intent (hot-reloadable cost).
+    _p8_judge = None
+    try:
+        from titan_hcl.synthesis.task_completion_judge import TaskCompletionJudge
+
+        def _p8_judge_llm(prompt, timeout_s, _fn=llm_fn):
+            try:
+                return _run_async(_fn(prompt, task="p8_task_judge")) or ""
+            except Exception:  # noqa: BLE001
+                return ""
+        _p8_judge = TaskCompletionJudge(llm_provider=_p8_judge_llm)
+        logger.info("[AgencyWorker] §7.P8 TaskCompletionJudge wired "
+                    "(autonomous-experience scoring)")
+    except Exception as _p8_err:  # noqa: BLE001
+        logger.warning("[AgencyWorker] P8 judge wiring failed (autonomous "
+                       "experience off): %s", _p8_err)
 
     logger.info("[AgencyWorker] Booted: %d helpers (%s)",
                 helper_count, registry.list_all_names())
@@ -609,6 +714,13 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 # D-SPEC-66 v1.11.0 PLAN §1.1 site #1 closure.
                 _maybe_emit_onchain_anchor_catalyst(
                     send_queue, name, _ar_single)
+                # P8 (§7.P8) — wire the autonomous routing-helper outcome into the
+                # OUTER routing IQL (engagement-independent experience). Gated +
+                # bounded by the hot-reloadable cost levers; never breaks the loop.
+                if _p8_judge is not None:
+                    _maybe_emit_autonomous_experience(
+                        send_queue, name, titan_id, intent, _ar_single,
+                        agency, _p8_judge)
 
             elif action == "dispatch_from_nervous_signals":
                 outer_signals = payload.get("outer_signals") or []

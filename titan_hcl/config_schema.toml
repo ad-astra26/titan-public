@@ -401,6 +401,22 @@
 "synthesis.self_learning.explore_interval_s" = {type="float", constraint=">0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.macro_min_wins" = {type="int", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.policy_lr" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+# Emergent Mastery Curriculum tunables (ARCHITECTURE_mastery_leveling.md §5) —
+# P5 co-adaptive teacher · P6 IDK-oracle · P8 engagement-independent experience.
+"synthesis.self_learning.teacher_coadaptive_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.teacher_relself_gain" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.teacher_relself_ema_alpha" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.teacher_judge_weight_floor" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.teacher_authority_rise_gain" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.idk_oracle_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.idk_verified_reward" = {type="float", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.idk_unverified_penalty" = {type="float", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+# P8 cost levers — user-controlled (each retry = extra LLM calls; the kill-switch
+# disables the autonomous judge entirely).
+"synthesis.self_learning.oml_autonomous_experience_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.p8_max_attempts" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.autonomous_oracle_reward_weight" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.task_completion_reward_weight" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "twitter_social.auth_session" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=true}
 "twitter_social.email" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
 "twitter_social.engagement_check_interval" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
