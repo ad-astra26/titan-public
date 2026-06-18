@@ -74,8 +74,11 @@ except Exception:
 def setup_logging() -> None:
     """Configure logging based on merged config plugin_log_level."""
     try:
-        from titan_hcl.config_loader import load_titan_config
-        level_str = load_titan_config().get("openclaw", {}).get("plugin_log_level", "INFO")
+        # RFP_config_as_shm_state §7.C/C.6: read [openclaw] from the SHM slot
+        # (config-as-state, INV-CFG-7). SHM is live at B8 (daemon seeds at B3.5
+        # before python spawn); SHM-absent → get_params bootstraps.
+        from titan_hcl.params import get_params
+        level_str = get_params("openclaw").get("plugin_log_level", "INFO")
     except Exception:
         level_str = "INFO"
     level = getattr(logging, level_str.upper(), logging.INFO)

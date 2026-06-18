@@ -76,8 +76,11 @@ except Exception:
 def setup_logging():
     """Configure logging based on merged config plugin_log_level."""
     try:
-        from titan_hcl.config_loader import load_titan_config
-        level_str = load_titan_config().get("openclaw", {}).get("plugin_log_level", "INFO")
+        # RFP_config_as_shm_state §7.C/C.6: read [openclaw] from the SHM slot
+        # (config-as-state, INV-CFG-7). SHM is live at B8 (daemon seeds at B3.5
+        # before python spawn); SHM-absent → get_params bootstraps.
+        from titan_hcl.params import get_params
+        level_str = get_params("openclaw").get("plugin_log_level", "INFO")
     except Exception:
         level_str = "INFO"
 
@@ -233,8 +236,9 @@ def _resolve_asyncio_pool_size(config: dict | None = None) -> int:
     """
     if config is None:
         try:
-            from titan_hcl.config_loader import load_titan_config
-            config = load_titan_config()
+            # RFP_config_as_shm_state §7.C/C.6: [microkernel] from the SHM slot.
+            from titan_hcl.params import get_params
+            config = {"microkernel": get_params("microkernel")}
         except Exception:
             config = {}
     mk = config.get("microkernel", {}) if isinstance(config, dict) else {}
@@ -382,11 +386,11 @@ async def run(health_only: bool = False, server_only: bool = False,
     # Load config for wallet path override
     wallet_path = os.path.join(os.path.dirname(__file__), "..", "authority.json")
     try:
-        from titan_hcl.config_loader import load_titan_config
-        cfg = load_titan_config()
-        wallet_path = cfg.get("network", {}).get("wallet_keypair_path", wallet_path)
+        # RFP_config_as_shm_state §7.C/C.6: [network] from the SHM slot.
+        from titan_hcl.params import get_params
+        wallet_path = get_params("network").get("wallet_keypair_path", wallet_path)
     except Exception:
-        cfg = {}
+        pass
 
     # ── Phase 11 §11.I.1 / D-SPEC-141 — Orchestrator boot (peer-spawn) ──
     # Pre-Phase-11 the Orchestrator + start_all + lifecycle subscriber
