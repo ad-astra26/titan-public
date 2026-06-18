@@ -391,11 +391,14 @@ class TitanKnowledgeGraph:
         try:
             from titan_hcl.logic.social_x.schema_migrations import (
                 apply_kuzu_person_migrations,
+                apply_kuzu_person_presence_migrations,
             )
             apply_kuzu_person_migrations(self)
+            # Presence Memory Phase F (F.1): presence_* + did_hash/ip_hash columns.
+            apply_kuzu_person_presence_migrations(self)
         except Exception as exc:
             logger.warning(
-                "[KnowledgeGraph] X-voice Person migration skipped: %s", exc
+                "[KnowledgeGraph] X-voice/presence Person migration skipped: %s", exc
             )
 
         # Phase 4/B — synthesis-engine Engram-spine schema (§6.1 / §6.2 / §10).
@@ -537,6 +540,74 @@ class TitanKnowledgeGraph:
         except Exception as e:
             swallow_warn(f"[KnowledgeGraph] Entity insert error for '{name}'", e,
                          key="core.direct_memory.entity_insert_error_for", throttle=100)
+
+    def record_presence(
+        self, name: str, user_id: str = "", age_epochs: int = 0,
+        evidence_strength: str = "", chain_status: str = "",
+        tx_hash: str = "", did_hash: str = "", ip_hash: str = "",
+    ):
+        """Presence Memory Phase F (F.1): enrich the social-graph Person node with
+        the presence gradient + hashed identity helping-signals.
+
+        The full per-interaction history lives in synthesis.duckdb::person_interactions
+        — this is the queryable graph-side index (rank persons by recency, merge by
+        hash). Newest interaction wins for last_seen/chain/tx; the STRONGEST evidence
+        seen is retained (INV-PAM-HONEST-GRADIENT); did_hash/ip_hash are filled when
+        provided and are INTERNAL-ONLY (never rendered — RFP §7.F privacy rule).
+        Computed Python-side then upserted (single-process writer → no race).
+        """
+        if not name:
+            return
+        # crypto_verified_maker › crypto_verified_device › asserted_identity › ''
+        rank = {"crypto_verified_maker": 3, "crypto_verified_device": 2,
+                "asserted_identity": 1, "": 0}
+        now = time.time()
+        try:
+            cur = {"epoch": 0, "evidence": "", "chain": "", "tx": "",
+                   "count": 0, "did": "", "ip": ""}
+            try:
+                qr = self._conn.execute(
+                    "MATCH (p:Person {name: $name}) RETURN "
+                    "p.presence_last_seen_epoch, p.presence_evidence_strength, "
+                    "p.presence_chain_status, p.presence_last_tx_hash, "
+                    "p.presence_count, p.did_hash, p.ip_hash",
+                    {"name": name})
+                if qr.has_next():
+                    r = qr.get_next()
+                    cur = {"epoch": int(r[0] or 0), "evidence": r[1] or "",
+                           "chain": r[2] or "", "tx": r[3] or "",
+                           "count": int(r[4] or 0), "did": r[5] or "", "ip": r[6] or ""}
+            except Exception:
+                pass  # node absent or columns not yet migrated — treat as fresh
+            is_newer = int(age_epochs or 0) >= cur["epoch"]
+            f_epoch = max(int(age_epochs or 0), cur["epoch"])
+            f_evidence = evidence_strength if rank.get(evidence_strength, 0) >= rank.get(cur["evidence"], 0) else cur["evidence"]
+            f_chain = (chain_status if (is_newer and chain_status) else (cur["chain"] or chain_status))
+            f_tx = (tx_hash if (is_newer and tx_hash) else (cur["tx"] or tx_hash))
+            f_count = cur["count"] + 1
+            f_did = did_hash or cur["did"]
+            f_ip = ip_hash or cur["ip"]
+            params = {"name": name, "uid": user_id, "ts": now,
+                      "epoch": f_epoch, "evidence": f_evidence, "chain": f_chain,
+                      "tx": f_tx, "count": f_count, "did": f_did, "ip": f_ip}
+            presence_set = (
+                "p.presence_last_seen_epoch = $epoch, "
+                "p.presence_evidence_strength = $evidence, "
+                "p.presence_chain_status = $chain, "
+                "p.presence_last_tx_hash = $tx, "
+                "p.presence_count = $count, "
+                "p.did_hash = $did, p.ip_hash = $ip"
+            )
+            self._conn.execute(
+                "MERGE (p:Person {name: $name}) "
+                "ON CREATE SET p.user_id = $uid, p.first_seen = $ts, "
+                "p.last_seen = $ts, p.interaction_count = 1, " + presence_set + " "
+                "ON MATCH SET p.last_seen = $ts, " + presence_set,
+                params,
+            )
+        except Exception as e:
+            swallow_warn(f"[KnowledgeGraph] record_presence error for '{name}'", e,
+                         key="core.direct_memory.record_presence_error", throttle=100)
 
     def add_relationship(
         self, src_name: str, src_type: str, dst_name: str, dst_type: str,

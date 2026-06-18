@@ -37,6 +37,29 @@ logger = logging.getLogger(__name__)
 DEFAULT_SAVE_DIR = "data/titan_time"
 SNAPSHOT_NAME = "presence_recall_snapshot.json"
 
+# INV-PAM-HONEST-GRADIENT ordering (strongest first).
+_EVIDENCE_RANK = {"crypto_verified_maker": 3, "crypto_verified_device": 2,
+                  "asserted_identity": 1, "": 0}
+_CHAIN_RANK = {"CHAINED": 3, "WIRED": 2, "UNSEALED": 1, "": 0}
+
+
+def _strongest_evidence(values) -> str:
+    best, best_rank = "asserted_identity", -1
+    for v in values:
+        r = _EVIDENCE_RANK.get(v or "", 0)
+        if r > best_rank:
+            best, best_rank = (v or "asserted_identity"), r
+    return best
+
+
+def _best_chain(values) -> str:
+    best, best_rank = "UNSEALED", -1
+    for v in values:
+        r = _CHAIN_RANK.get(v or "", 0)
+        if r > best_rank:
+            best, best_rank = (v or "UNSEALED"), r
+    return best
+
 
 class PresenceRecall:
     """Reads the lock-free presence snapshot → a per-person verified fact-bundle."""
@@ -83,20 +106,49 @@ class PresenceRecall:
             logger.debug("[presence_recall] snapshot unreadable (%s)", e)
             return {}
 
-    def recall(self, person_id: str, now_age_epochs: Optional[int] = None) -> Optional[dict]:
+    def _did_group(self, persons: dict, person_id: str, rec: Optional[dict],
+                   did_hash: str) -> list:
+        """§7.F (F.2) cross-handle identity merge. Return the records for `person_id`
+        PLUS every sibling handle that shares the SAME non-empty `did_hash` (the same
+        Privy identity under a different handle). Merge key is the cryptographic DID
+        ONLY — `ip_hash` is NEVER a merge key (many humans share an IP behind NAT/proxy
+        → merging on it would FALSELY recognize the wrong person, an anti-hallucination
+        violation). So cross-handle recognition is as strong as the DID linkage."""
+        # the DID we anchor on: this person's stored did, else the current turn's.
+        anchor_did = (rec or {}).get("did_hash", "") or did_hash or ""
+        group = []
+        if rec:
+            group.append(rec)
+        if anchor_did:
+            for pid, r in persons.items():
+                if pid == person_id:
+                    continue
+                if (r.get("did_hash", "") or "") == anchor_did:
+                    group.append(r)
+        return group
+
+    def recall(self, person_id: str, now_age_epochs: Optional[int] = None,
+               *, did_hash: str = "", ip_hash: str = "") -> Optional[dict]:
         """Resolve `person_id` → a verified presence fact-bundle, or `None` if no
         prior verified presence is anchored for them (honest non-recognition).
 
-        Returns: `{person_id, gap_epochs, gap_human, evidence_strength, chain_status,
-        anchor, last_seen_epoch}`. `gap_epochs` is Titan-time; `gap_human` is the
-        only human-time value (translated at this narration edge)."""
+        Cross-handle (§7.F F.2): if `did_hash` is given (the current turn's Privy DID
+        hash), recognition survives a HANDLE CHANGE — a sibling handle sharing the
+        same DID is merged (strongest evidence + most-recent last_seen across the
+        group). `ip_hash` is accepted but is NOT a merge key (shared-IP false-merge
+        guard). Returns: `{person_id, gap_epochs, gap_human, evidence_strength,
+        chain_status, anchor, last_seen_epoch, merged_handles}`."""
         if not person_id:
             return None
-        rec = self._read_snapshot().get(person_id)
-        if not rec:
+        persons = self._read_snapshot()
+        rec = persons.get(person_id)
+        group = self._did_group(persons, person_id, rec, did_hash)
+        if not group:
             return None  # no anchored prior presence → no recognition (INV-PAM-SOVEREIGN-BOUNDED)
+        # most-recent presence across all the person's handles
+        best = max(group, key=lambda r: int(r.get("last_seen_epoch", 0) or 0))
         try:
-            last_seen = int(rec["last_seen_epoch"])
+            last_seen = int(best["last_seen_epoch"])
         except (KeyError, TypeError, ValueError):
             return None
         if now_age_epochs is None:
@@ -107,11 +159,70 @@ class PresenceRecall:
             "person_id": person_id,
             "gap_epochs": gap_epochs,
             "gap_human": gap_human,
-            "evidence_strength": rec.get("evidence_strength", "asserted_identity"),
-            "chain_status": rec.get("chain_status", "UNSEALED"),
-            "anchor": rec.get("anchor"),
+            "evidence_strength": _strongest_evidence(
+                [r.get("evidence_strength", "asserted_identity") for r in group]),
+            "chain_status": _best_chain(
+                [r.get("chain_status", "UNSEALED") for r in group]),
+            "anchor": best.get("anchor"),
             "last_seen_epoch": last_seen,
+            "merged_handles": len(group),
         }
+
+    def recall_recent(self, now_age_epochs: Optional[int] = None, *,
+                      exclude_person_id: str = "", exclude_did_hash: str = "",
+                      top_k: int = 3, max_gap_epochs: Optional[int] = None) -> list:
+        """§7.F (F.3) sovereign multi-person recall. Rank OTHER anchored persons by
+        recency and return up to `top_k` compact bundles `{person_id, gap_epochs,
+        gap_human, evidence_strength, chain_status}` — the grounded source for the
+        `### Recent Presence` block. Honest-by-construction: only real anchored
+        persons appear (INV-PAM-SOVEREIGN-BOUNDED). Excludes the current speaker AND
+        their DID-siblings (so the speaker isn't surfaced as a 'recent other').
+        `did:`-prefixed person_ids are skipped (a raw DID is not a nameable handle —
+        keeps recognition honest and avoids leaking opaque identifiers)."""
+        persons = self._read_snapshot()
+        if not persons:
+            return []
+        if now_age_epochs is None:
+            now_age_epochs = int(self._get_age_reader().get_age_epochs())
+        # collapse DID-siblings → one row per human (most-recent), excluding the speaker
+        by_did: dict = {}
+        singles: list = []
+        for pid, r in persons.items():
+            if pid == exclude_person_id:
+                continue
+            did = r.get("did_hash", "") or ""
+            if exclude_did_hash and did and did == exclude_did_hash:
+                continue  # a sibling handle of the speaker
+            if pid.startswith("did:"):
+                continue  # opaque identifier — not a surfaceable handle
+            entry = dict(r); entry["person_id"] = pid
+            if did:
+                cur = by_did.get(did)
+                if cur is None or int(r.get("last_seen_epoch", 0) or 0) > int(cur.get("last_seen_epoch", 0) or 0):
+                    by_did[did] = entry
+            else:
+                singles.append(entry)
+        candidates = list(by_did.values()) + singles
+        out = []
+        for r in candidates:
+            last_seen = int(r.get("last_seen_epoch", 0) or 0)
+            gap = max(0, int(now_age_epochs) - last_seen)
+            if max_gap_epochs is not None and gap > max_gap_epochs:
+                continue
+            out.append({
+                "person_id": r["person_id"],
+                "gap_epochs": gap,
+                "last_seen_epoch": last_seen,
+                "evidence_strength": r.get("evidence_strength", "asserted_identity"),
+                "chain_status": r.get("chain_status", "UNSEALED"),
+            })
+        out.sort(key=lambda b: b["gap_epochs"])  # most-recent first
+        out = out[:max(0, int(top_k))]
+        # translate at the narration edge only (INV-PAM-TITAN-TIME)
+        tr = self._get_translator()
+        for b in out:
+            b["gap_human"] = tr.to_human(b["gap_epochs"])
+        return out
 
 
 def render_presence_context_block(bundle) -> str:
@@ -161,5 +272,28 @@ def render_presence_context_block(bundle) -> str:
         "you last saw them — narrate ONLY these verified facts, nothing more.\n\n")
 
 
+def render_recent_presence_block(recent) -> str:
+    """RFP §7.F (F.3) — render the `recall_recent` list into a TERSE grounded block
+    of OTHER recently-seen, anchored persons. Sovereign-but-honest: Titan MAY mention
+    these people if relevant (INV-PAM-SOVEREIGN-BOUNDED) but can never fabricate one —
+    the block contains ONLY real anchored persons (the LLM narrates the bundle only,
+    INV-PAM-NARRATE-ONLY). Placed AFTER the speaker's `### Verified Presence` block so
+    the speaker recognition still leads the OVG first-500-char window (Phase E). Kept
+    short on purpose. Empty list → '' (no block)."""
+    if not recent:
+        return ""
+    lines = []
+    for b in recent:
+        who = b.get("person_id", "someone")
+        gap = b.get("gap_human", "recently")
+        lines.append(f"- {who} — {gap}")
+    return (
+        "### Recent Presence (other people in your anchored memory)\n"
+        "You have also recently been present with these people (real, stored "
+        "records). You MAY mention them ONLY if relevant — narrate ONLY these "
+        "facts, never invent a person or a time:\n"
+        + "\n".join(lines) + "\n\n")
+
+
 __all__ = ("PresenceRecall", "render_presence_context_block",
-           "SNAPSHOT_NAME", "DEFAULT_SAVE_DIR")
+           "render_recent_presence_block", "SNAPSHOT_NAME", "DEFAULT_SAVE_DIR")

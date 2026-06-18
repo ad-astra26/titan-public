@@ -223,13 +223,26 @@ class AutobiographySeal:
         # presence is valid the instant it is written, like a mempool memory; the seal
         # adds permanence, not validity). The atom is written at capture + this export
         # fires in the capture handler, so there is no fold-lag window.
+        _ev_case = ("MAX(CASE evidence_strength "
+                    " WHEN 'crypto_verified_maker' THEN 3 "
+                    " WHEN 'crypto_verified_device' THEN 2 ELSE 1 END) AS ev_ord")
+
         def _read():
-            return self._conn.execute(
-                "SELECT person_id, MAX(age_epochs) AS last_seen, "
-                "MAX(CASE evidence_strength "
-                " WHEN 'crypto_verified_maker' THEN 3 "
-                " WHEN 'crypto_verified_device' THEN 2 ELSE 1 END) AS ev_ord "
-                "FROM person_interactions GROUP BY person_id").fetchall()
+            # §7.F (F.2) — representative identity hashes per person (internal-only;
+            # used ONLY to merge the same human across handles at recall). Resilient
+            # to a person_interactions table created before the Phase-F migration
+            # (a box mid-deploy): fall back to the pre-F shape with empty hashes.
+            try:
+                return self._conn.execute(
+                    "SELECT person_id, MAX(age_epochs) AS last_seen, "
+                    + _ev_case + ", MAX(did_hash) AS did_h, MAX(ip_hash) AS ip_h "
+                    "FROM person_interactions GROUP BY person_id").fetchall()
+            except Exception:
+                rows = self._conn.execute(
+                    "SELECT person_id, MAX(age_epochs) AS last_seen, "
+                    + _ev_case + " FROM person_interactions "
+                    "GROUP BY person_id").fetchall()
+                return [(r[0], r[1], r[2], "", "") for r in (rows or [])]
         try:
             rows = self._writer.submit_sync(_read)
         except Exception as e:  # noqa: BLE001
@@ -239,7 +252,7 @@ class AutobiographySeal:
         _EV = {3: "crypto_verified_maker", 2: "crypto_verified_device", 1: "asserted_identity"}
         cycles = ledger.get("cycles", {})
         persons = {}
-        for pid, last_seen, ev_ord in (rows or []):
+        for pid, last_seen, ev_ord, did_h, ip_h in (rows or []):
             last_seen = int(last_seen)
             # chain_status = provability of the cycle whose age_epoch_range contains
             # last_seen (CHAINED › WIRED). No sealed cycle contains it ⇒ it is in the
@@ -259,6 +272,10 @@ class AutobiographySeal:
                 "chain_status": chain_status,
                 "cycle_id": cyc_id,
                 "anchor": anchor,
+                # §7.F (F.2) — internal-only identity helping-signals (NEVER
+                # rendered into context/output); recall merges handles by these.
+                "did_hash": did_h or "",
+                "ip_hash": ip_h or "",
             }
 
         data = {"persons": persons, "updated_ts": time.time()}

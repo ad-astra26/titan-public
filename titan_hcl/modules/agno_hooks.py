@@ -1557,6 +1557,7 @@ def create_pre_hook(plugin):
         # synthesis.duckdb — G18). None ⇒ no prior anchored presence (honest non-
         # recognition). Soft — never blocks the turn.
         plugin._pre_chat_presence_record = None
+        plugin._pre_chat_recent_presence = None
         if user_id and user_id != "anonymous":
             try:
                 _me_rec = getattr(plugin, "maker_engine", None)
@@ -1567,13 +1568,28 @@ def create_pre_hook(plugin):
                     from titan_hcl.core.state_registry import resolve_titan_id as _pr_tid
                     plugin._presence_recall = PresenceRecall(titan_id=_pr_tid())
                 import asyncio as _aio_pr
+                # §7.F (F.2) — pass the turn's identity hashes so recognition survives
+                # a handle change (cross-handle merge keys on the DID hash only).
+                _did_h = getattr(plugin, "_current_did_hash", "") or ""
+                _ip_h = getattr(plugin, "_current_ip_hash", "") or ""
                 _rec = await _aio_pr.to_thread(
-                    plugin._presence_recall.recall, _person_id)
+                    lambda: plugin._presence_recall.recall(
+                        _person_id, did_hash=_did_h, ip_hash=_ip_h))
                 plugin._pre_chat_presence_record = _rec
                 if _rec:
                     logger.info("[PreHook] presence recall: %s gap=%d epochs (%s, %s)",
                                 _person_id, _rec["gap_epochs"], _rec["gap_human"],
                                 _rec["chain_status"])
+                # §7.F (F.3) — sovereign multi-person recall: the OTHER anchored,
+                # recently-seen persons Titan MAY surface (honest-by-construction).
+                _recent = await _aio_pr.to_thread(
+                    lambda: plugin._presence_recall.recall_recent(
+                        exclude_person_id=_person_id, exclude_did_hash=_did_h,
+                        top_k=3))
+                plugin._pre_chat_recent_presence = _recent or None
+                if _recent:
+                    logger.info("[PreHook] recent presence: %d other person(s) "
+                                "surfaced", len(_recent))
             except Exception as _pr_e:  # noqa: BLE001
                 logger.debug("[PreHook] presence recall skipped: %s", _pr_e)
 
@@ -3176,15 +3192,22 @@ def create_pre_hook(plugin):
         # empty when there is none ⇒ the OVG blocks an "I recognize you" over-claim
         # (honest). output_verifier.py UNCHANGED — we feed the gate, never weaken it.
         try:
-            from titan_hcl.logic.presence_recall import render_presence_context_block
+            from titan_hcl.logic.presence_recall import (
+                render_presence_context_block, render_recent_presence_block,
+            )
             presence_context = render_presence_context_block(
                 getattr(plugin, '_pre_chat_presence_record', None))
+            # §7.F (F.3) — the OTHER recently-seen persons, placed AFTER the speaker's
+            # recognition block so that block still leads the OVG first-500-char window.
+            recent_presence_context = render_recent_presence_block(
+                getattr(plugin, '_pre_chat_recent_presence', None))
         except Exception as _pe_e:  # noqa: BLE001
             presence_context = ""
+            recent_presence_context = ""
             logger.debug("[PreHook] presence block render skipped: %s", _pe_e)
         # Inject context into agent's additional_context
         # V5: inner state sections + V6: MSL/CGN/social/reasoning enrichment
-        injected = (presence_context + recent_turns_context +
+        injected = (presence_context + recent_presence_context + recent_turns_context +
                     perceptual_field_text + interface_coloring + consciousness_context +
                     maker_context + voice_context + social_context + user_memory_context +
                     grounded_context + directive_context + status_context +
@@ -3449,12 +3472,31 @@ def create_post_hook(plugin):
                     and not (_me_pr and _me_pr.is_maker(user_id))):
                 from titan_hcl import bus as _bus_pr_mod
                 from titan_hcl.bus import make_msg as _mk_pr
+                _evid_pr = "asserted_identity"
+                _chan_pr = getattr(plugin, "_current_channel", None) or "web"
+                _did_pr = getattr(plugin, "_current_did_hash", "") or ""
+                _ip_pr = getattr(plugin, "_current_ip_hash", "") or ""
                 _bus_pr.publish(_mk_pr(
                     _bus_pr_mod.PERSON_TURN_PRESENCE, "post_hook", "synthesis", {
                         "person_id": user_id,
-                        "channel": getattr(plugin, "_current_channel", None) or "web",
+                        "channel": _chan_pr,
                         "ts": time.time(),
-                        "evidence_strength": "asserted_identity",
+                        "evidence_strength": _evid_pr,
+                        # §7.F (F.2) — hashed identity helping-signals (internal-only,
+                        # never rendered); carried for cross-handle identity merge.
+                        "did_hash": _did_pr,
+                        "ip_hash": _ip_pr,
+                    }))
+                # §7.F (F.1) — enrich the social-graph Person node. TARGETED to memory
+                # (the sole knowledge_graph.kuzu writer); mirrors RESEARCH_CONFIRMED.
+                _bus_pr.publish(_mk_pr(
+                    _bus_pr_mod.PRESENCE_GRAPH_ENRICH, "post_hook", "memory", {
+                        "person_id": user_id,
+                        "evidence_strength": _evid_pr,
+                        "channel": _chan_pr,
+                        "did_hash": _did_pr,
+                        "ip_hash": _ip_pr,
+                        "ts": time.time(),
                     }))
         except Exception as _ptp_err:
             logger.debug("[PostHook] PERSON_TURN_PRESENCE emit skipped: %s", _ptp_err)

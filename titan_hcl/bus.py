@@ -358,6 +358,15 @@ MAKER_PRESENCE_VERIFIED = "MAKER_PRESENCE_VERIFIED"
 # (crypto_verified_maker only ever arrives on the verified path, never here).
 PERSON_TURN_PRESENCE = "PERSON_TURN_PRESENCE"
 
+# RFP_verifiable_autobiographical_presence_memory §7.F (F.1) — enrich the social-graph
+# Person node with the presence gradient. TARGETED dst="memory" (the memory_worker is
+# the sole writer of knowledge_graph.kuzu; synthesis cannot touch it — cross-process
+# Kuzu lock). Published by the agno PostHook on a completed non-Maker turn (mirrors the
+# RESEARCH_CONFIRMED→memory pattern; reaches memory despite reply_only because it is
+# targeted). Payload: {person_id, evidence_strength, channel, did_hash, ip_hash, ts}.
+# memory reads age_epochs itself; chain_status is UNSEALED at capture.
+PRESENCE_GRAPH_ENRICH = "PRESENCE_GRAPH_ENRICH"
+
 # RFP_verifiable_autobiographical_presence_memory §7.C (SEAL) — a circadian cycle
 # just CLOSED at the trough meditation. Published by soul_diary_worker when its
 # CircadianCycleCounter.latch_if_trough() fires (soul_diary owns the latch; the

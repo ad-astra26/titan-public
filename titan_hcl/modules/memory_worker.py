@@ -771,6 +771,45 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     _rc_err)
             continue
 
+        # ── §7.F (F.1) — social-graph Person presence enrichment ──────
+        # memory_worker is the SOLE writer of knowledge_graph.kuzu (synthesis cannot
+        # touch it — cross-process Kuzu lock), so the presence gradient + hashed
+        # identity helping-signals land on the Person node HERE. Targeted dst="memory"
+        # (mirrors RESEARCH_CONFIRMED). Soft — must NEVER break a chat turn.
+        if msg_type == bus.PRESENCE_GRAPH_ENRICH:
+            _pp = msg.get("payload", {}) or {}
+            try:
+                _pid = str(_pp.get("person_id", "") or "")
+                _graph = getattr(getattr(ctx, "memory", None), "_graph", None)
+                if _pid and _graph is not None and hasattr(_graph, "record_presence"):
+                    _ar = getattr(ctx, "_presence_age_reader", None)
+                    if _ar is None:
+                        from titan_hcl.logic.consciousness_age_reader import (
+                            ConsciousnessAgeReader,
+                        )
+                        from titan_hcl.core.state_registry import (
+                            resolve_titan_id as _pg_tid,
+                        )
+                        _ar = ConsciousnessAgeReader(titan_id=_pg_tid())
+                        ctx._presence_age_reader = _ar
+                    _age = int(_ar.get_age_epochs())
+                    with ctx.write_lock:
+                        _graph.record_presence(
+                            name=_pid, user_id=_pid, age_epochs=_age,
+                            evidence_strength=str(
+                                _pp.get("evidence_strength", "asserted_identity")
+                                or "asserted_identity"),
+                            chain_status="UNSEALED", tx_hash="",
+                            did_hash=str(_pp.get("did_hash", "") or ""),
+                            ip_hash=str(_pp.get("ip_hash", "") or ""))
+                    logger.info(
+                        "[MemoryWorker] presence-graph enrich: person=%s age=%d",
+                        _pid, _age)
+            except Exception as _pg_err:  # noqa: BLE001
+                logger.debug(
+                    "[MemoryWorker] PRESENCE_GRAPH_ENRICH soft-fail: %s", _pg_err)
+            continue
+
         # ── Everything else goes through the dispatcher ───────────────
         # router.dispatch classifies bus.QUERY by action (read/write/
         # meditation) and routes bus.MEMORY_ADD / bus.MEMORY_MEMPOOL_ADD

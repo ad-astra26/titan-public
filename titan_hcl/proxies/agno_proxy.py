@@ -101,6 +101,7 @@ class AgnoProxy:
         channel: str = "web",
         is_maker: bool = False,
         claims_sub: str = "",
+        ip_hash: str = "",
     ) -> dict[str, Any]:
         """Synchronous chat — round-trips CHAT_REQUEST/CHAT_RESPONSE.
 
@@ -113,7 +114,7 @@ class AgnoProxy:
                 return await self._bridge.chat(
                     message,
                     user_id=user_id, session_id=session_id, channel=channel,
-                    is_maker=is_maker, claims_sub=claims_sub,
+                    is_maker=is_maker, claims_sub=claims_sub, ip_hash=ip_hash,
                 )
             except Exception as e:
                 self._error_count += 1
@@ -126,7 +127,7 @@ class AgnoProxy:
         return await self._chat_via_bus(
             message,
             user_id=user_id, session_id=session_id, channel=channel,
-            is_maker=is_maker, claims_sub=claims_sub,
+            is_maker=is_maker, claims_sub=claims_sub, ip_hash=ip_hash,
         )
 
     async def chat_stream(
@@ -138,6 +139,7 @@ class AgnoProxy:
         channel: str = "web",
         is_maker: bool = False,
         claims_sub: str = "",
+        ip_hash: str = "",
     ) -> AsyncIterator[dict[str, Any]]:
         """SSE relay — yields chunk dicts until agno_worker emits done=true.
 
@@ -154,7 +156,7 @@ class AgnoProxy:
                 async for chunk in self._bridge.chat_stream(
                     message,
                     user_id=user_id, session_id=session_id, channel=channel,
-                    is_maker=is_maker, claims_sub=claims_sub,
+                    is_maker=is_maker, claims_sub=claims_sub, ip_hash=ip_hash,
                 ):
                     yield chunk
                 return
@@ -171,7 +173,7 @@ class AgnoProxy:
         async for chunk in self._stream_via_bus(
             message,
             user_id=user_id, session_id=session_id, channel=channel,
-            is_maker=is_maker, claims_sub=claims_sub,
+            is_maker=is_maker, claims_sub=claims_sub, ip_hash=ip_hash,
         ):
             yield chunk
 
@@ -201,7 +203,7 @@ class AgnoProxy:
     async def _chat_via_bus(
         self, message: str, *,
         user_id: str, session_id: str, channel: str,
-        is_maker: bool, claims_sub: str,
+        is_maker: bool, claims_sub: str, ip_hash: str = "",
     ) -> dict[str, Any]:
         """Publish CHAT_REQUEST + await CHAT_RESPONSE by rid on a reply
         queue. Uses in-process DivineBus subscribe (works in parent;
@@ -223,6 +225,7 @@ class AgnoProxy:
             "channel": channel,
             "is_maker": is_maker,
             "claims_sub": claims_sub,
+            "ip_hash": ip_hash,
             "prefer_streaming": False,
             "ts": time.time(),
         }
@@ -269,7 +272,7 @@ class AgnoProxy:
     async def _stream_via_bus(
         self, message: str, *,
         user_id: str, session_id: str, channel: str,
-        is_maker: bool, claims_sub: str,
+        is_maker: bool, claims_sub: str, ip_hash: str = "",
     ) -> AsyncIterator[dict[str, Any]]:
         """Parent-process streaming — uses DivineBus subscribe (works in
         the parent because subscribe is in-process, NOT kernel_rpc).
@@ -285,6 +288,7 @@ class AgnoProxy:
             "channel": channel,
             "is_maker": is_maker,
             "claims_sub": claims_sub,
+            "ip_hash": ip_hash,
             "stream": True,
             "prefer_streaming": True,
             "ts": time.time(),

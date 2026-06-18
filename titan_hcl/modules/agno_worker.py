@@ -512,6 +512,21 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         # channel so the PostHook can label the PERSON_TURN_PRESENCE atom
         # (web/app/tcc). Mirrors the _current_user_id stash above.
         worker_plugin._current_channel = channel
+        # §7.F (F.2) — hashed identity helping-signals for cross-handle merge
+        # (internal-only, NEVER rendered). did_hash from the already-plumbed Privy
+        # DID (claims_sub); ip_hash hashed at the api edge (raw IP never plumbed).
+        # Same per-Titan salt (api.internal_key) in both processes → consistent.
+        try:
+            from titan_hcl.params import get_params as _gp
+            from titan_hcl.utils.identity_hash import (
+                derive_salt as _ds, identity_hash as _ih,
+            )
+            _salt = _ds((_gp("api") or {}).get("internal_key", "") or "")
+            worker_plugin._current_did_hash = _ih(
+                payload.get("claims_sub", "") or "", _salt)
+        except Exception:
+            worker_plugin._current_did_hash = ""
+        worker_plugin._current_ip_hash = payload.get("ip_hash", "") or ""
 
         # ── Pre-LLM goal hook (Phase 7 / INV-Syn-17) ────────────────────
         # Write {text, concept_ids, ts} into the `goal` buffer and the

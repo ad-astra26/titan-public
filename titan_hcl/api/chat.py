@@ -174,6 +174,27 @@ def _result_to_response(result: dict) -> JSONResponse:
 # POST /chat — synchronous chat
 # ─────────────────────────────────────────────────────────────────────
 
+
+def _compute_ip_hash(request: Request) -> str:
+    """Presence Memory §7.F (F.2) — hash the client IP at the edge so the RAW IP
+    never leaves this process (never onto the bus, never into a store). Titan is
+    behind its OWN nginx → the left-most X-Forwarded-For hop is the real client.
+    Same per-Titan salt (api.internal_key) as the agno subprocess → consistent
+    with the did_hash computed there. Soft: any failure → '' (no signal)."""
+    try:
+        from titan_hcl.params import get_params
+        from titan_hcl.utils.identity_hash import (
+            client_ip_from_xff, derive_salt, identity_hash,
+        )
+        salt = derive_salt((get_params("api") or {}).get("internal_key", "") or "")
+        ip = client_ip_from_xff(
+            request.headers.get("X-Forwarded-For", ""),
+            request.client.host if request.client else "")
+        return identity_hash(ip, salt)
+    except Exception:
+        return ""
+
+
 @router.post("", response_model=ChatResponse)
 async def chat(req: ChatRequest, request: Request,
                claims: dict = Depends(verify_privy_token)):
@@ -221,6 +242,7 @@ async def chat(req: ChatRequest, request: Request,
             channel=channel,
             is_maker=is_maker,
             claims_sub=privy_user_id,
+            ip_hash=_compute_ip_hash(request),
         )
     except Exception as e:
         logger.error("[Chat] agno_proxy.chat raised: %s", e, exc_info=True)
@@ -283,6 +305,7 @@ async def chat_stream(req: ChatRequest, request: Request,
                 channel=channel,
                 is_maker=is_maker,
                 claims_sub=privy_user_id,
+                ip_hash=_compute_ip_hash(request),
             ):
                 if not isinstance(payload, dict):
                     continue

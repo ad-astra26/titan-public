@@ -3888,7 +3888,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                     or "asserted_identity"),
                                 channel=str(payload.get("channel", "") or ""),
                                 person_ref=str(payload.get("person_ref", "") or ""),
-                                ts=payload.get("ts"))
+                                ts=payload.get("ts"),
+                                # §7.F (F.2) — hashed identity helping-signals.
+                                did_hash=str(payload.get("did_hash", "") or ""),
+                                ip_hash=str(payload.get("ip_hash", "") or ""))
                             # §7.D — refresh the recall surface AT CAPTURE so this
                             # person is recognizable immediately (no fold-lag window).
                             if autobiography_seal is not None:

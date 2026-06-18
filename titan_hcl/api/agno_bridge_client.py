@@ -216,6 +216,7 @@ class AgnoBridgeClient:
         channel: str = "web",
         is_maker: bool = False,
         claims_sub: str = "",
+        ip_hash: str = "",
     ) -> dict[str, Any]:
         """Sync round-trip: CHAT_REQUEST → CHAT_RESPONSE (rid-matched).
 
@@ -245,6 +246,7 @@ class AgnoBridgeClient:
             "channel": channel,
             "is_maker": is_maker,
             "claims_sub": claims_sub,
+            "ip_hash": ip_hash,
             "prefer_streaming": False,
             "ts": time.time(),
         }
@@ -281,6 +283,7 @@ class AgnoBridgeClient:
         channel: str = "web",
         is_maker: bool = False,
         claims_sub: str = "",
+        ip_hash: str = "",
     ) -> AsyncIterator[dict[str, Any]]:
         """SSE relay: CHAT_STREAM_REQUEST → CHAT_STREAM_CHUNK frames.
 
@@ -313,6 +316,7 @@ class AgnoBridgeClient:
             "channel": channel,
             "is_maker": is_maker,
             "claims_sub": claims_sub,
+            "ip_hash": ip_hash,
             "stream": True,
             "prefer_streaming": True,
             "ts": time.time(),

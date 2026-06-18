@@ -62,7 +62,17 @@ class PresenceCapture:
                     " evidence_strength VARCHAR NOT NULL,"
                     " channel VARCHAR,"
                     " age_epochs BIGINT NOT NULL,"
-                    " ts_utc DOUBLE)")
+                    " ts_utc DOUBLE,"
+                    # §7.F (F.2) — hashed identity helping-signals (internal-only,
+                    # never rendered): the salted-HMAC of the Privy DID / client IP,
+                    # used ONLY to merge the same human across handles at recall.
+                    " did_hash VARCHAR DEFAULT '',"
+                    " ip_hash VARCHAR DEFAULT '')")
+                # Idempotent add for graphs created before Phase F.
+                for _col in ("did_hash", "ip_hash"):
+                    self._conn.execute(
+                        f"ALTER TABLE person_interactions "
+                        f"ADD COLUMN IF NOT EXISTS {_col} VARCHAR DEFAULT ''")
             self._writer.submit_sync(_ddl)
             return True
         except Exception as e:  # noqa: BLE001 — soft per INV-Syn-3
@@ -78,6 +88,8 @@ class PresenceCapture:
         channel: str = "",
         person_ref: str = "",
         ts: Optional[float] = None,
+        did_hash: str = "",
+        ip_hash: str = "",
     ) -> Optional[str]:
         """Capture ONE presence atom → returns the anchoring `tx_hash`, or None on
         soft failure. Idempotent: a re-record with identical content (same
@@ -86,6 +98,8 @@ class PresenceCapture:
 
         `age_epochs` is read live from `consciousness_age` (the time key);
         `evidence_strength` is validated against the honesty gradient.
+        `did_hash`/`ip_hash` (§7.F F.2) are salted-HMAC identity helping-signals
+        (internal-only, never rendered) stored for cross-handle merge at recall.
         """
         if not person_id:
             logger.debug("[presence_capture] record skipped — empty person_id")
@@ -117,10 +131,10 @@ class PresenceCapture:
             self._conn.execute(
                 "INSERT INTO person_interactions "
                 "(tx_hash, person_id, person_ref, evidence_strength, channel, "
-                " age_epochs, ts_utc) VALUES (?,?,?,?,?,?,?) "
+                " age_epochs, ts_utc, did_hash, ip_hash) VALUES (?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT (tx_hash) DO NOTHING",
                 [tx_hash, person_id, person_ref or "", evidence_strength,
-                 channel or "", age_epochs, ts])
+                 channel or "", age_epochs, ts, did_hash or "", ip_hash or ""])
         try:
             self._writer.submit_sync(_ins)
         except Exception as e:  # noqa: BLE001

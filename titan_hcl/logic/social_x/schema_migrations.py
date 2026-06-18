@@ -150,6 +150,48 @@ def _kuzu_person_has_column(conn, column: str) -> bool:
     return False
 
 
+# ── Kuzu Person presence (Verifiable Autobiographical Presence Memory, Phase F) ──
+# Enriches the social-graph Person node with the presence-memory gradient so the
+# social brain can reason over who-was-present-when (the queryable history stays in
+# synthesis.duckdb::person_interactions; these fields are the graph-side index).
+# did_hash/ip_hash are salted-HMAC helping-signals for cross-handle identity merge —
+# internal-only, NEVER rendered (RFP §7.F / INV-PAM hashed-helping-signal).
+_KUZU_PERSON_PRESENCE_COLUMNS = (
+    ("presence_last_seen_epoch",  "INT64 DEFAULT 0"),
+    ("presence_evidence_strength", "STRING DEFAULT ''"),
+    ("presence_chain_status",     "STRING DEFAULT ''"),
+    ("presence_last_tx_hash",     "STRING DEFAULT ''"),
+    ("presence_count",            "INT64 DEFAULT 0"),
+    ("did_hash",                  "STRING DEFAULT ''"),
+    ("ip_hash",                   "STRING DEFAULT ''"),
+)
+
+
+def apply_kuzu_person_presence_migrations(graph) -> dict:
+    """Add presence_* + did_hash/ip_hash columns to the Kuzu Person node table.
+
+    `graph` is a TitanKnowledgeGraph instance (or anything exposing `_conn`).
+    All ADDs are idempotent (skip if the column already exists). RFP §7.F (F.1).
+    """
+    out = {"added": []}
+    conn = getattr(graph, "_conn", None)
+    if conn is None:
+        logger.warning("[schema_migrations] kuzu graph has no _conn — skipping Person presence migration")
+        return out
+    for col, decl in _KUZU_PERSON_PRESENCE_COLUMNS:
+        if _kuzu_person_has_column(conn, col):
+            continue
+        try:
+            conn.execute(f"ALTER TABLE Person ADD {col} {decl}")
+            out["added"].append(f"Person.{col}")
+            logger.info("[schema_migrations] Person ADD %s %s", col, decl)
+        except Exception as e:
+            # Common: the table doesn't exist yet (fresh install) — _init_schema
+            # will create it WITHOUT the new columns; we run again on next boot.
+            logger.warning("[schema_migrations] Person presence ADD %s failed: %s", col, e)
+    return out
+
+
 def apply_kuzu_person_migrations(graph) -> dict:
     """Add last_felt_* columns to Kuzu Person node table.
 
@@ -207,5 +249,6 @@ __all__ = (
     "apply_social_x_migrations",
     "apply_inner_memory_migrations",
     "apply_kuzu_person_migrations",
+    "apply_kuzu_person_presence_migrations",
     "verify_distilled_wisdom",
 )
