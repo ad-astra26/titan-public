@@ -209,6 +209,21 @@ _DEFAULTS = {
     "direct_ungrounded_recall_threshold": 0.5,  # recall_top_cosine below this = ungrounded
     "direct_ungrounded_extra_damping": 0.7,     # ungrounded direct damped MORE
     "direct_graduated_floor": 0.6,    # mastered (chunked) goal_class → ease damping (higher floor)
+    # ── P5 — level-adaptive co-adaptive teacher (ARCHITECTURE_mastery_leveling.md §4) ──
+    # The teacher is driven by the EMERGENT ratcheted level (NOT a hand-drawn curve —
+    # Q2 resolved 2026-06-18): `level_norm = level / level_n_grades` ∈ [0,1] linearly
+    # maps the reward-source mix. (a) relative-to-self + (b) level-rubric live in the
+    # synthesis TurnJudge (teacher_relself_*); (c) the graduated source-mix is here:
+    # as level↑ the llm_judge weight DECAYS toward a floor>0 (the non-verifiable lane
+    # never fully starves — INV-MC-4 spirit) while oracle/maker RISE. "self" is NOT a
+    # source (Q4 → RFP_introspective_inner_turn's grounded predict-vs-measure signal).
+    # _REWARD_SOURCE_RANK authority order is UNCHANGED — only the magnitudes graduate.
+    # flag-off ⇒ static Phase-B weights, byte-identical (INV-MC-7).
+    "teacher_coadaptive_enabled": True,
+    "teacher_relself_gain": 1.0,        # (a) relative-to-self strength (read by synthesis TurnJudge)
+    "teacher_relself_ema_alpha": 0.1,   # (a) recent-self EMA smoothing (read by synthesis TurnJudge)
+    "teacher_judge_weight_floor": 0.3,  # (c) llm_judge weight floor>0 at max level (INV-MC-4 spirit)
+    "teacher_authority_rise_gain": 1.0, # (c) oracle/maker rise: weight = base × (1 + gain·level_norm)
     # ── P7 — clean-baseline reset (uncollapse) ──────────────────────────────
     # One-shot reset trigger: if this sentinel file exists at worker boot, the
     # collapsed routing policy + IQL nets + level + replay buffer are CLEARED →
@@ -226,6 +241,33 @@ _DEFAULTS = {
 # today; the rank governs any future join-path correction of the turn-judge.)
 _REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3}
 _SURVIVAL_STATES = frozenset({"SURVIVAL", "STARVATION"})
+
+
+def _graduated_source_weight(src: str, base_weight: float, level_norm: float,
+                             cfg) -> float:
+    """P5 (c) — the level-graduated reward-source weight (ARCHITECTURE §4).
+
+    EMERGENT (Q2): the multiplier is a MINIMAL LINEAR map on the agent's own proven
+    `level_norm` ∈ [0,1] (no hand-drawn curve, only config gains/floors):
+      • `llm_judge`        → DECAYS  `base × max(judge_floor, 1 − level_norm)` — wean
+        off the noisy LLM crutch as proven ability rises, but a floor>0 keeps the
+        non-verifiable lane a live signal (INV-MC-4 spirit; the relative-to-self
+        rubric is what keeps that floored stream non-stale, INV-MC-3).
+      • `oracle` / `maker` → RISE    `base × (1 + rise_gain · level_norm)` — lean on
+        the correctness-/authority-grounded signals more as he graduates.
+      • everything else (`user`)     → unchanged base.
+    flag-off (`teacher_coadaptive_enabled=false`) or an unpublished level
+    (`level_norm<=0`) ⇒ returns `base_weight` unchanged (byte-identical, INV-MC-7)."""
+    if not bool(cfg.get("teacher_coadaptive_enabled", True)) or level_norm <= 0.0:
+        return base_weight
+    ln = max(0.0, min(1.0, float(level_norm)))
+    if src == "llm_judge":
+        floor = float(cfg.get("teacher_judge_weight_floor", 0.3))
+        return base_weight * max(floor, 1.0 - ln)
+    if src in ("oracle", "maker"):
+        rise = float(cfg.get("teacher_authority_rise_gain", 1.0))
+        return base_weight * (1.0 + rise * ln)
+    return base_weight
 
 
 # ── The worker's OWN durable store (G21 — NOT synthesis.duckdb) ─────────────
@@ -1099,8 +1141,18 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
 
         if msg_type == SELF_LEARN_REWARD:
             try:
+                # P5 (c) — the in-process emergent level (self_learning is the sole
+                # MasteryLevel writer). None/0 when not yet published ⇒ static mix.
+                _lvl_norm = 0.0
+                if _mastery is not None:
+                    try:
+                        _lvl_norm = max(0.0, min(1.0, float(
+                            _mastery.readout().get("level", 0.0))
+                            / float(max(1, int(cfg["level_n_grades"])))))
+                    except Exception:  # noqa: BLE001
+                        _lvl_norm = 0.0
                 if _handle_reward(payload, store, policy, _shm_writer, cfg,
-                                  send_queue, name):
+                                  send_queue, name, level_norm=_lvl_norm):
                     trained += 1
                 processed += 1
             except Exception as e:  # noqa: BLE001
@@ -1109,7 +1161,8 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
             continue
 
 
-def _handle_reward(payload, store, policy, shm_writer, cfg, send_queue, name) -> bool:
+def _handle_reward(payload, store, policy, shm_writer, cfg, send_queue, name,
+                   level_norm: float = 0.0) -> bool:
     """One policy update from a verdict-time OR genuinely-async reward.
 
     v1.1 (Phase 1, INV-OML-12): the synthesis-side C1 capture emits
@@ -1146,8 +1199,11 @@ def _handle_reward(payload, store, policy, shm_writer, cfg, send_queue, name) ->
         if len(features) != OUTER_POLICY_INPUT_DIM:
             return False
         src = source or "llm_judge"
-        effective = float(payload.get("reward", 0.0)) * float(
-            cfg.get(f"{src}_reward_weight", 1.0))
+        # P5 (c) — the level-graduated source weight (EMERGENT, level_norm-driven;
+        # flag-off / unpublished level ⇒ the static Phase-B base, byte-identical).
+        _base_w = float(cfg.get(f"{src}_reward_weight", 1.0))
+        effective = float(payload.get("reward", 0.0)) * _graduated_source_weight(
+            src, _base_w, level_norm, cfg)
         if applied_source is None:
             train_reward = effective                 # first reward for this turn
             macro_reward = effective

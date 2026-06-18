@@ -40,6 +40,24 @@ JUDGE_PROMPT_TEMPLATE = (
 )
 
 
+def _rubric_line(level_norm: float) -> str:
+    """P5 (b) — the level-conditioned rubric (`ARCHITECTURE_mastery_leveling.md` §4).
+
+    A CONTINUOUS descriptor (no discrete hand-set bands — the bar scales smoothly
+    with the agent's emergent proven ability `level_norm` ∈ [0,1]), PREPENDED to the
+    base template so `JUDGE_PROMPT_TEMPLATE` stays byte-identical (drift-tag stable).
+    Lenient at low ability → demanding at high ability: the SAME answer earns a worse
+    verdict as the agent grows (the co-adaptive teacher never goes stale, INV-MC-3)."""
+    pct = int(round(max(0.0, min(1.0, level_norm)) * 100))
+    return (
+        "GRADING STANDARD: this agent's own PROVEN mastery is at the "
+        f"{pct}th-percentile of its ability ladder — hold it to a correspondingly "
+        "higher bar. At LOW proven ability, reward any helpful, honest, grounded "
+        "turn as 'good'. At HIGH proven ability, reserve 'good' for an OPTIMALLY-"
+        "routed, well-grounded, concise turn and grade a merely-adequate turn as "
+        "'ok' (not 'good'). Scale your strictness to that percentile.\n\n")
+
+
 def _prompt_version_tag(model_id: str) -> str:
     h = hashlib.sha256(JUDGE_PROMPT_TEMPLATE.encode()).hexdigest()[:12]
     return f"turn|{model_id}|{h}"
@@ -80,24 +98,47 @@ class TurnJudge:
         llm_provider: Callable[[str, float], str],
         model_id: str = "ollama_cloud_deepseek",
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        relself_gain: float = 1.0,
+        ema_alpha: float = 0.1,
     ):
         self._llm = llm_provider
         self._model_id = model_id
         self._timeout_s = float(timeout_s)
         self._version_tag = _prompt_version_tag(model_id)
+        # P5 (a) relative-to-self: a streaming EMA of the agent's own recent RAW
+        # rewards — repeating prior competence yields diminishing shaped reward
+        # (INV-MC-3). Held on the instance (persists across the daemon loop).
+        self._relself_gain = float(relself_gain)
+        self._ema_alpha = float(ema_alpha)
+        self._reward_ema = 0.0
 
     @property
     def version_tag(self) -> str:
         return self._version_tag
 
-    def score(self, *, prompt: str, action: str, response: str) -> Optional[dict]:
-        """Return `{reward, verdict, confidence, version_tag}` or None on LLM
-        failure / unparseable response (→ the turn simply stays untrained)."""
+    @property
+    def reward_ema(self) -> float:
+        return self._reward_ema
+
+    def score(self, *, prompt: str, action: str, response: str,
+              level_norm: Optional[float] = None) -> Optional[dict]:
+        """Return `{reward, raw_reward, verdict, confidence, version_tag, level_norm}`
+        or None on LLM failure / unparseable response (→ the turn stays untrained).
+
+        P5 co-adaptive teacher: when `level_norm` is given (∈ [0,1], the agent's
+        emergent proven ability read from the `mastery_level_state` SHM slot), the
+        judge (b) injects a level-conditioned rubric and (a) shapes the reward
+        relative-to-self (`raw − level_norm·gain·EMA(recent raw)`). `level_norm=None`
+        ⇒ the legacy path: base template, raw reward, no EMA update — BYTE-IDENTICAL
+        to pre-P5 (the `teacher_coadaptive_enabled=false` rollback, INV-MC-7)."""
         if not prompt or not response:
             return None
-        full = JUDGE_PROMPT_TEMPLATE.format(
+        coadaptive = level_norm is not None
+        ln = max(0.0, min(1.0, float(level_norm))) if coadaptive else 0.0
+        base = JUDGE_PROMPT_TEMPLATE.format(
             action=str(action or "direct"),
             prompt=str(prompt)[:1500], response=str(response)[:1500])
+        full = (_rubric_line(ln) + base) if coadaptive else base
         try:
             raw = self._llm(full, self._timeout_s)
         except Exception as e:  # noqa: BLE001
@@ -106,10 +147,18 @@ class TurnJudge:
         parsed = _parse_verdict(raw)
         if not parsed:
             return None
-        reward = _VERDICT_REWARD[parsed["verdict"]] * float(parsed["confidence"])
+        raw_reward = _VERDICT_REWARD[parsed["verdict"]] * float(parsed["confidence"])
+        reward = raw_reward
+        if coadaptive:
+            # (a) relative-to-self: subtract a level-scaled fraction of recent self.
+            reward = raw_reward - (ln * self._relself_gain) * self._reward_ema
+            self._reward_ema = ((1.0 - self._ema_alpha) * self._reward_ema
+                                + self._ema_alpha * raw_reward)
         return {
             "reward": reward,
+            "raw_reward": raw_reward,
             "verdict": parsed["verdict"],
             "confidence": parsed["confidence"],
             "version_tag": self._version_tag,
+            "level_norm": ln,
         }

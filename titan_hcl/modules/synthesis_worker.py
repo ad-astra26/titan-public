@@ -928,9 +928,30 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
         stop_event.wait(interval_s)
 
 
+def _read_mastery_level_norm(titan_id: str, n_grades: int):
+    """P5 — read the emergent `level` from the `mastery_level_state` SHM slot
+    (self_learning sole writer; the `dashboard.py:6204` reader pattern) and
+    normalize to [0,1]. Returns None if the slot is unpublished (no idle IQL pass
+    yet) → the caller falls back to the legacy (level-unaware) judge path."""
+    try:
+        from titan_hcl.core.state_registry import StateRegistryReader, ensure_shm_root
+        from titan_hcl.synthesis.mastery_level import (
+            MASTERY_LEVEL_STATE_SPEC, mastery_flat_to_readout,
+        )
+        reader = StateRegistryReader(MASTERY_LEVEL_STATE_SPEC, ensure_shm_root(titan_id))
+        flat = reader.read()
+        if flat is None:
+            return None
+        level = float(mastery_flat_to_readout(flat).get("level", 0.0))
+        return max(0.0, min(1.0, level / float(max(1, n_grades))))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
                      stop_event: threading.Event, interval_s: float,
-                     per_pass_cap: int = 20) -> None:
+                     per_pass_cap: int = 20, *, titan_id: str = "",
+                     coadaptive: bool = False, n_grades: int = 10) -> None:
     """§7.B (B.2) — the metered turn-judge daemon. Drains the bounded queue of
     recent NON-verifiable turns (FRESH prompt/response held there by the
     TURN_REASONING_RECORD handler), scores each via the LLM `TurnJudge` (capped per
@@ -943,6 +964,10 @@ def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
     stop_event.wait(min(interval_s, 25.0))   # settle; offset from the recompute pass
     while not stop_event.is_set():
         scored = 0
+        # P5 — refresh the emergent level once per pass (cheap SHM read); None when
+        # co-adaptive is off OR the slot is unpublished → legacy level-unaware path.
+        level_norm = (_read_mastery_level_norm(titan_id, n_grades)
+                      if coadaptive else None)
         try:
             # No cpu_load gate (the B1 lesson — gating at load>X STARVED the skill
             # drain on the steadily-busy 2-Titan box). The judge call is NETWORK-
@@ -960,7 +985,8 @@ def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
                     out = judge.score(
                         prompt=item.get("prompt", ""),
                         action=item.get("action", "direct"),
-                        response=item.get("response", ""))
+                        response=item.get("response", ""),
+                        level_norm=level_norm)
                 except Exception:  # noqa: BLE001
                     out = None
                 if out is None:
@@ -2899,17 +2925,32 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     temperature=0.2, max_tokens=200, timeout=float(timeout_s))) or ""
 
             _tj_model = (inference_cfg.get("ollama_cloud_model", "") or "ollama_cloud")
-            _turn_judge = TurnJudge(llm_provider=_turn_judge_llm, model_id=str(_tj_model))
+            # P5 co-adaptive teacher config (defaults mirror self_learning_worker
+            # _DEFAULTS; the canonical owner is config[synthesis][self_learning]).
+            _sl_cfg = get_params("synthesis").get("self_learning", {}) or {}
+            _turn_judge = TurnJudge(
+                llm_provider=_turn_judge_llm, model_id=str(_tj_model),
+                relself_gain=float(_sl_cfg.get("teacher_relself_gain", 1.0)),
+                ema_alpha=float(_sl_cfg.get("teacher_relself_ema_alpha", 0.1)))
     except Exception as _tj_err:  # noqa: BLE001
         _turn_judge = None
         logger.warning("[synthesis_worker] TurnJudge wiring failed (B.2 off): %s", _tj_err)
     if _turn_judge is not None:
+        # P5 — the co-adaptive teacher reads the emergent level from the
+        # `mastery_level_state` SHM slot (self_learning is the sole writer, a
+        # DIFFERENT process). flag-off ⇒ level_norm=None ⇒ byte-identical (INV-MC-7).
+        _sl_cfg = get_params("synthesis").get("self_learning", {}) or {}
+        _tj_coadaptive = bool(_sl_cfg.get("teacher_coadaptive_enabled", True))
+        _tj_n_grades = int(_sl_cfg.get("level_n_grades", 10))
         threading.Thread(
             target=_turn_judge_loop,
             args=(turn_judge_queue, _turn_judge, send_queue, name, stop_event,
                   interval_s),
+            kwargs={"titan_id": titan_id, "coadaptive": _tj_coadaptive,
+                    "n_grades": _tj_n_grades},
             daemon=True, name=f"synthesis-turn-judge-{name}").start()
-        logger.info("[synthesis_worker] §7.B TurnJudge daemon started (B.2)")
+        logger.info("[synthesis_worker] §7.B TurnJudge daemon started (B.2; "
+                    "P5 co-adaptive=%s)", _tj_coadaptive)
 
     # §7.1 — the Maker-fact extractor daemon (sibling of the turn-judge): when the
     # Maker is speaking (is_maker), a gated post-turn extraction learns durable facts

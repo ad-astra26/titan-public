@@ -21,7 +21,9 @@ class _FakeJudge:
     def __init__(self, reward):
         self._r = reward
 
-    def score(self, *, prompt, action, response):
+    def score(self, *, prompt, action, response, level_norm=None):
+        # level_norm added by P5 (the co-adaptive teacher reads the SHM level);
+        # the daemon always passes it (None when co-adaptive is off).
         if not prompt or not response:
             return None
         return {"reward": self._r, "verdict": "good", "confidence": 1.0}
