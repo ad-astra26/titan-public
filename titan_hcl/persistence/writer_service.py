@@ -74,7 +74,15 @@ class IMWDaemon:
     # ── lifecycle ────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        self._wal = ServiceWAL(self._cfg.wal_path, max_mb=self._cfg.service_wal_max_mb)
+        # BOOT RESILIENCE (V+C): `ServiceWAL.__init__` runs `_scan_last_checkpoint`,
+        # a SYNCHRONOUS full-wal scan (read + msgpack-unpack every record). On a large
+        # wal that blocks the event-loop thread → starves the supervision threads.
+        # Build it in an executor so the scan runs off the loop thread (the heartbeat +
+        # bus-watcher threads keep running via GIL time-slicing). The replay itself is
+        # made cooperative in _replay_service_wal.
+        _loop = asyncio.get_running_loop()
+        self._wal = await _loop.run_in_executor(
+            None, ServiceWAL, self._cfg.wal_path, self._cfg.service_wal_max_mb)
         self._conn = self._open_db(self._cfg.db_path)
         # Optional shadow connection — needed by any mode that fires shadow
         # writes (Phase 1 shadow mode + Phase 3 hybrid mode for non-canonical
@@ -246,7 +254,33 @@ class IMWDaemon:
     async def _replay_service_wal(self) -> None:
         if self._wal is None or self._conn is None:
             return
+        # BOOT RESILIENCE (V+C): the OLD path did per-record BEGIN/COMMIT inside an
+        # `async` loop that NEVER `await`ed. For a large uncommitted wal (e.g. 61MB
+        # after an unclean shutdown) that is tens of thousands of one-row txns run as
+        # ONE synchronous GIL-holding block → it starves the heartbeat + bus-watcher
+        # threads (persistence_entry.py) → guardian's hb_timeout fires mid-replay →
+        # imw is killed and restarts the replay from scratch → an infinite boot loop
+        # (observed live on T1, 2026-06-18). Fix: chunk into batched transactions
+        # (one COMMIT per _REPLAY_BATCH records) AND `await asyncio.sleep(0)` at each
+        # batch boundary so the GIL is released and the supervision threads run. Same
+        # work, applied cooperatively + far fewer commits → boots regardless of size.
+        _REPLAY_BATCH = 1000
         count = 0
+        in_batch = 0
+        open_conns: dict = {}  # id(conn) -> conn with an OPEN replay transaction
+
+        def _commit_open() -> None:
+            for conn in list(open_conns.values()):
+                try:
+                    conn.execute("COMMIT")
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception as _se:
+                        swallow_warn("[persistence.writer_service] _replay_service_wal commit/rollback",
+                                     _se, key='persistence.writer_service._replay.commit', throttle=100)
+            open_conns.clear()
+
         for offset, rec in self._wal.iter_uncommitted():
             req_id = rec.get("req_id")
             sql = rec.get("sql")
@@ -261,20 +295,26 @@ class IMWDaemon:
                 # e.g., shadow record but no shadow_conn configured this boot
                 continue
             try:
-                conn.execute("BEGIN")
+                if id(conn) not in open_conns:
+                    conn.execute("BEGIN")
+                    open_conns[id(conn)] = conn
                 conn.execute(sql, params or ())
-                conn.execute("COMMIT")
                 self._seen_req_ids.add(req_id)
                 count += 1
             except sqlite3.Error as e:
-                try:
-                    conn.execute("ROLLBACK")
-                except Exception as _swallow_exc:
-                    swallow_warn("[persistence.writer_service] IMWDaemon._replay_service_wal: conn.execute('ROLLBACK')", _swallow_exc,
-                                 key='persistence.writer_service.IMWDaemon._replay_service_wal.line223', throttle=100)
+                # Skip the bad record; the failed statement did NOT apply (binding/
+                # constraint errors don't abort the open txn) → the batch's good
+                # records still commit. Matches the robustness of _commit_per_write.
                 logger.warning("[imw] WAL replay of %s failed: %s", req_id, e)
+            in_batch += 1
+            if in_batch >= _REPLAY_BATCH:
+                _commit_open()
+                in_batch = 0
+                await asyncio.sleep(0)  # release GIL → heartbeat + bus threads run
+        _commit_open()  # flush the final partial batch
         if count:
-            logger.info("[imw] service-WAL replay applied %d uncommitted writes", count)
+            logger.info("[imw] service-WAL replay applied %d uncommitted writes "
+                        "(batched, cooperative)", count)
             self._wal.checkpoint(self._wal._last_ckpt_offset)
 
     async def _replay_orphan_caller_journals(self) -> None:
