@@ -54,7 +54,7 @@ async def _launch_adapter(name: str, module_path: str, func_name: str, titan_url
 async def main(titan_url: str) -> None:
     """Discover enabled channels and start them concurrently."""
     # Load the full merged channels config (config.toml + ~/.titan/secrets.toml)
-    from titan_hcl.config_loader import load_titan_config
+    from titan_hcl.params import load_titan_params as load_titan_config
     full_config = load_titan_config()
     if not full_config:
         logger.error("Merged config empty — check titan_hcl/config.toml + ~/.titan/secrets.toml")

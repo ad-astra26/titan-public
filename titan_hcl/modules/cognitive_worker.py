@@ -2828,7 +2828,6 @@ def _make_neuromod_reader():
     """
     try:
         from titan_hcl.core.state_registry import NEUROMOD_STATE, RegistryBank
-        from titan_hcl.config_loader import load_titan_config
         # 2026-05-10 — pass the merged runtime config so is_enabled() can
         # evaluate microkernel.shm_neuromod_enabled against the canonical
         # value from titan_params.toml + per-Titan overrides. Pre-fix
@@ -3275,7 +3274,6 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
         try:
             from titan_hcl.core.state_registry import (
                 NEUROMOD_STATE, RegistryBank)
-            from titan_hcl.config_loader import load_titan_config
             from titan_hcl.logic.neuromodulator import (
                 compute_modulation_from_state)
             from titan_hcl.modules.neuromod_worker import (

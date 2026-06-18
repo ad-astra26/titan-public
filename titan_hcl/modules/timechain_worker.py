@@ -184,7 +184,6 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             _net = {}
             _api_port = 7777
             try:
-                from titan_hcl.config_loader import load_titan_config
                 _cfg_full = load_titan_params()
                 _net = get_params("network")
                 _api_port = get_params("api").get("port", 7777)

@@ -1046,7 +1046,7 @@ class SocialXGateway:
         """
         import httpx
         try:
-            from titan_hcl.config_loader import load_titan_config
+            from titan_hcl.params import load_titan_params as load_titan_config
             full_cfg = load_titan_params()
             tc = get_params("twitter_social")
 

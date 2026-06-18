@@ -254,7 +254,6 @@ class WorkerPlugin:
                 _api_cfg = dict(get_params("api") or {})
                 if not _api_cfg.get("internal_key"):
                     try:
-                        from titan_hcl.config_loader import load_titan_config
                         _merged_api = (get_params("api") or {})
                         if _merged_api.get("internal_key"):
                             _api_cfg = _merged_api

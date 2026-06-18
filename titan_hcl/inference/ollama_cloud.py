@@ -52,7 +52,6 @@ _HEAVY_MODEL = "deepseek-v3.1:671b"
 _TEACHER_MODEL = "gemma4:31b"
 
 try:
-    from titan_hcl.config_loader import load_titan_config
     _inf = get_params("inference")
     _LIGHT_MODEL = _inf.get("ollama_cloud_light_model", _LIGHT_MODEL)
     _HEAVY_MODEL = _inf.get("ollama_cloud_heavy_model", _HEAVY_MODEL)

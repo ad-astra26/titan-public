@@ -301,7 +301,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     haov_config = {}
     try:
         import json as _hc_json
-        from titan_hcl.config_loader import load_titan_config as _hc_load
         _params = load_titan_params()
         _haov_raw = _params.get("cgn", {}).get("haov", {})
         # Base config: all non-dict values from [cgn.haov]

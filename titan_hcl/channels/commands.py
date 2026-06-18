@@ -53,7 +53,6 @@ class CommandRegistry:
     def _load_maker_ids(self) -> None:
         """Load registered maker platform IDs from config."""
         try:
-            from titan_hcl.config_loader import load_titan_config
             cfg = load_titan_params()
             maker_ids = cfg.get("channels", {}).get("maker_platform_ids", "")
             if maker_ids:
@@ -309,7 +308,6 @@ class CommandRegistry:
 
     async def _cmd_wallet(self, args: str, user_id: str) -> str:
         try:
-            from titan_hcl.config_loader import load_titan_config
             cfg = load_titan_params()
             network_cfg = cfg.get("network", {})
             solana_network = network_cfg.get("solana_network", "devnet")
@@ -387,7 +385,6 @@ class CommandRegistry:
 
     async def _cmd_maker(self, args: str, user_id: str) -> str:
         try:
-            from titan_hcl.config_loader import load_titan_config
             cfg = load_titan_params()
             network = cfg.get("network", {})
             twitter = cfg.get("twitter_social", {})
@@ -451,7 +448,6 @@ class CommandRegistry:
 
     async def _cmd_settings(self, args: str, user_id: str) -> str:
         try:
-            from titan_hcl.config_loader import load_titan_config
             config_path = _PROJECT_ROOT / "titan_hcl" / "config.toml"
             # Read the merged view (config.toml + ~/.titan/secrets.toml) for display.
             # Writes below still go to config.toml; sensitive-key writes are refused
@@ -681,7 +677,6 @@ def _mask_sensitive(key: str, value) -> str:
 def _get_internal_key() -> str:
     """Load internal API key from merged config."""
     try:
-        from titan_hcl.config_loader import load_titan_config
         return get_params("api").get("internal_key", "") or ""
     except Exception:
         return ""

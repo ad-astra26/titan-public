@@ -111,7 +111,6 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
             import time as _time
             import urllib.request as _url
             try:
-                from titan_hcl.config_loader import load_titan_config as _ltc
                 _port = int(_os.environ.get("TITAN_API_PORT")
                             or get_params("api").get("port", 7777))
             except Exception:  # noqa: BLE001

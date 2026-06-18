@@ -299,8 +299,6 @@ def test_load_config_surfaces_voice_section(tmp_path, monkeypatch):
     This test writes a minimal config.toml with a [voice] section, points
     the loader at it, and asserts the dict surfaces the keys.
     """
-    import titan_hcl.config_loader as cl
-
     cfg_path = tmp_path / "config.toml"
     cfg_path.write_text(
         '[social_x]\nenabled = true\n\n'
@@ -310,12 +308,15 @@ def test_load_config_surfaces_voice_section(tmp_path, monkeypatch):
         'x_grounding_cooldown_secs = 1800\n'
     )
 
-    def fake_load(force_reload=False):
-        import tomllib
-        with open(cfg_path, "rb") as f:
-            return tomllib.load(f)
-
-    monkeypatch.setattr(cl, "load_titan_config", fake_load)
+    # C.5/C.6: _load_config reads each section from SHM via get_params (the
+    # config_loader.load_titan_config whole-config seam is retired). Patch
+    # get_params to serve the temp config's sections.
+    import tomllib
+    with open(cfg_path, "rb") as f:
+        _cfg_data = tomllib.load(f)
+    import titan_hcl.logic.social_x_gateway as _sxg
+    monkeypatch.setattr(_sxg, "get_params",
+                        lambda section: dict(_cfg_data.get(section, {})))
     monkeypatch.setattr("titan_hcl.logic.social_x_gateway.logger.warning",
                         lambda *a, **kw: None)
 

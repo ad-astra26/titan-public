@@ -30,7 +30,6 @@ _DEFAULT_COOLDOWN_S = 86400  # 1 day
 def _get_telegram_creds() -> tuple[Optional[str], Optional[str]]:
     """Resolve (bot_token, maker_chat_id) from config."""
     try:
-        from titan_hcl.config_loader import load_titan_config
         cfg = load_titan_params()
         ch = cfg.get("channels", {}).get("telegram", {}) or {}
         mr = cfg.get("maker_relationship", {}) or {}

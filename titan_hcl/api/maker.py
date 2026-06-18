@@ -521,7 +521,7 @@ async def trigger_shadow_swap(request: Request):
         # 2026-05-04 — fix broken import (was titan_hcl.utils.config_loader.get_config
         # which never existed; ModuleNotFoundError silently locked full_stop=True).
         # Real loader is titan_hcl.config_loader.load_titan_config.
-        from titan_hcl.config_loader import load_titan_config
+        from titan_hcl.params import load_titan_params as load_titan_config
         cfg = load_titan_params() or {}
         full_stop = bool(cfg.get("microkernel", {})
                          .get("shadow_swap", {})

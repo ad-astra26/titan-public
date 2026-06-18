@@ -28,7 +28,6 @@ class MemoInscribeHelper:
         # Read from merged config (config.toml + ~/.titan/secrets.toml) if not explicitly provided
         if rpc_url is None or keypair_path is None:
             try:
-                from titan_hcl.config_loader import load_titan_config
                 net_cfg = get_params("network")
                 if rpc_url is None:
                     rpc_url = net_cfg.get("premium_rpc_url",

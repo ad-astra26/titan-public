@@ -35,7 +35,6 @@ def _load_internal_key() -> str:
     if _cached_internal_key is not None:
         return _cached_internal_key
     try:
-        from titan_hcl.config_loader import load_titan_config
         _cached_internal_key = get_params("api").get("internal_key", "") or ""
         return _cached_internal_key
     except Exception:
@@ -271,7 +270,6 @@ def get_channel_config(channel: str) -> dict:
     from the ``[channels]`` section.  Falls back to an empty dict if the
     section or keys are missing.
     """
-    from titan_hcl.config_loader import load_titan_config
     full = load_titan_params()
     channels_section = full.get("channels", {})
     prefix = f"{channel}_"

@@ -63,7 +63,7 @@ def test_bus_ipc_socket_enabled_flag_registered():
     bool — matches whatever the config currently declares (True under
     microkernel v2 mode).
     """
-    from titan_hcl.config_loader import load_titan_config
+    from titan_hcl.params import load_titan_params as load_titan_config
     cfg = load_titan_config()
     micro = cfg.get("microkernel", {})
     assert "bus_ipc_socket_enabled" in micro, \

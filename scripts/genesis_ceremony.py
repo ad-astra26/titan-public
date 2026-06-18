@@ -134,7 +134,7 @@ def load_ceremony_inputs(*, skip_onchain: bool) -> dict:
     """
     name, maker, titan_id = "Titan", "", "titan"
     try:
-        from titan_hcl.config_loader import load_titan_config
+        from titan_hcl.params import load_titan_params as load_titan_config
         cfg = load_titan_config()
         net = cfg.get("network", {}) or {}
         maker = (net.get("maker_pubkey") or "").strip()

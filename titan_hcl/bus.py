@@ -146,7 +146,6 @@ def get_bus_ipc_pool() -> concurrent.futures.ThreadPoolExecutor:
             return _bus_ipc_pool
         size = _BUS_IPC_DEFAULT_WORKERS
         try:
-            from titan_hcl.config_loader import load_titan_config
             cfg = load_titan_params() or {}
             size = int(cfg.get("runtime", {}).get("pools", {}).get(
                 "bus_ipc_workers", _BUS_IPC_DEFAULT_WORKERS))

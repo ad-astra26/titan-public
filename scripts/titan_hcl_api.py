@@ -48,7 +48,7 @@ except ImportError:
 def setup_logging() -> None:
     """Configure logging based on merged config plugin_log_level."""
     try:
-        from titan_hcl.config_loader import load_titan_config
+        from titan_hcl.params import load_titan_params as load_titan_config
         level_str = load_titan_config().get("openclaw", {}).get("plugin_log_level", "INFO")
     except Exception:
         level_str = "INFO"
@@ -64,7 +64,7 @@ def run() -> int:
     setup_logging()
     logger = logging.getLogger(__name__)
 
-    from titan_hcl.config_loader import load_titan_config
+    from titan_hcl.params import load_titan_params as load_titan_config
     from titan_hcl.core.state_registry import resolve_titan_id
 
     cfg = load_titan_config()

@@ -320,7 +320,6 @@ def _init_post_dispatch_orchestrator(state_refs: dict, name: str,
         _api_port = 7777
         _internal_key = ""
         try:
-            from titan_hcl.config_loader import load_titan_config
             _cfg = load_titan_params() or {}
             _api_port = int(get_params("api").get("port", 7777))
             _internal_key = get_params("api").get("internal_key", "") or ""
@@ -945,7 +944,6 @@ def _init_social_x_gateway(config: dict, name: str, send_queue) -> dict:
         import httpx
         api_port = 7777
         try:
-            from titan_hcl.config_loader import load_titan_config
             api_port = int(get_params("api").get("port", 7777))
         except Exception:
             pass
@@ -1150,8 +1148,6 @@ def _handle_heal_request(payload: dict, state_refs: dict,
                 # Defense-in-depth fallback: direct config loader
                 # mirroring the gateway's resolution chain by hand.
                 try:
-                    from titan_hcl.config_loader import (
-                        load_titan_config)
                     full_cfg = load_titan_params(force_reload=True)
                     sx_cfg = get_params("social_x") or {}
                     sage_cfg = get_params("stealth_sage") or {}

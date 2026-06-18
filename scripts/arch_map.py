@@ -16392,7 +16392,7 @@ def run_module_methods(all_titans: bool = False) -> int:
         spawn_ref_flag = "?"
         if tid == "T1":
             try:
-                from titan_hcl.config_loader import load_titan_config
+                from titan_hcl.params import load_titan_params as load_titan_config
                 cfg = load_titan_config()
                 spawn_ref_flag = cfg.get("microkernel", {}).get(
                     "spawn_reference_worker_enabled", False)

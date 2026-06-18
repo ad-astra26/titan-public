@@ -58,7 +58,6 @@ from typing import Any
 
 from titan_hcl import bus
 from titan_hcl.api.shm_reader_bank import ShmReaderBank
-from titan_hcl.config_loader import load_titan_config
 from titan_hcl.core.state_registry import (
     ensure_shm_root,
     resolve_titan_id,

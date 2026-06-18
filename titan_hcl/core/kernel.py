@@ -2621,7 +2621,6 @@ class TitanKernel:
     @staticmethod
     def _load_full_config() -> dict:
         """Load the full merged Titan config (config.toml + ~/.titan/secrets.toml)."""
-        from titan_hcl.config_loader import load_titan_config
         return load_titan_params()
 
     def _resolve_wallet(self, wallet_path: str) -> Optional[str]:

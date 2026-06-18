@@ -292,7 +292,6 @@ def _load_meta_teacher_llm_ctx(full_config: dict):
             # every critique returns default score=0.50, reward_w=0, 0 primitives
             # (llm_ok=False) — i.e. the teacher "runs" but teaches nothing.
             try:
-                from titan_hcl.config_loader import load_titan_config
                 _canon_api = get_params("api") or {}
                 internal_key = _canon_api.get("internal_key", "") or ""
                 if internal_key:

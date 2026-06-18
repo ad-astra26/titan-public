@@ -110,7 +110,6 @@ def serialize_for_arweave(
     # Read maker pubkey from merged config
     maker_pubkey = ""
     try:
-        from titan_hcl.config_loader import load_titan_config
         maker_pubkey = get_params("network").get("maker_pubkey", "") or ""
     except Exception:
         pass
@@ -147,7 +146,6 @@ def _resolve_maker_pubkey(explicit: Optional[str] = None) -> str:
     if explicit:
         return explicit
     try:
-        from titan_hcl.config_loader import load_titan_config
         return get_params("network").get("maker_pubkey", "") or ""
     except Exception:
         return ""

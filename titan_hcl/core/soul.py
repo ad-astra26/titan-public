@@ -277,7 +277,6 @@ class SovereignSoul:
         # Fallback: read GenesisNFT address from merged config if not in state file
         if not self._nft_address:
             try:
-                from titan_hcl.config_loader import load_titan_config
                 self._nft_address = get_params("network").get("genesis_nft_address", "")
                 if self._nft_address:
                     logger.info("[Soul] GenesisNFT address loaded from config: %s",
@@ -331,7 +330,6 @@ class SovereignSoul:
 
             # Read merged config for RPC
             try:
-                from titan_hcl.config_loader import load_titan_config
                 rpc_url = get_params("network").get("premium_rpc_url",
                           "https://api.mainnet-beta.solana.com")
             except Exception:

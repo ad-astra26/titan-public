@@ -384,7 +384,6 @@ class ArweaveStore:
     def _get_rpc_url(self) -> str:
         """Get the RPC URL from merged config or default."""
         try:
-            from titan_hcl.config_loader import load_titan_config
             return get_params("network").get("premium_rpc_url", "https://api.mainnet-beta.solana.com")
         except Exception:
             return "https://api.mainnet-beta.solana.com"

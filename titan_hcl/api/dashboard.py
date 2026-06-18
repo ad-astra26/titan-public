@@ -6336,7 +6336,6 @@ async def get_v4_backup_status(request: Request):
         backup = getattr(plugin, 'backup', None)
         cfg_backup = {}
         try:
-            from titan_hcl.config_loader import load_titan_config
             _cfg = load_titan_params()
             cfg_backup = _cfg.get("backup", {}) or {}
         except Exception:
@@ -6441,7 +6440,6 @@ async def get_v4_backup_wallet_runway(request: Request):
     """rFP I6 — Irys deposit + estimated days of runway at current spend rate."""
     try:
         import os as _os, subprocess as _sp, json as _json
-        from titan_hcl.config_loader import load_titan_config
         cfg = load_titan_params()
         kp = cfg.get("network", {}).get("wallet_keypair_path", "")
         if not kp or not _os.path.exists(kp):
@@ -6493,7 +6491,6 @@ async def get_v4_backup_manifest(request: Request):
         from titan_hcl.logic.timechain_backup import _manifest_path
         titan_id = "T1"
         try:
-            from titan_hcl.config_loader import load_titan_config
             titan_id = get_params("info_banner").get(
                 "titan_id", "T1")
         except Exception:
@@ -6758,7 +6755,6 @@ def _get_llm_distill_ctx():
     if _llm_distill_ctx is not None:
         return _llm_distill_ctx
     try:
-        from titan_hcl.config_loader import load_titan_config
         cfg = load_titan_params()
         api_cfg = cfg.get("api", {}) or {}
         internal_key = api_cfg.get("internal_key", "") or ""
@@ -9683,7 +9679,6 @@ async def get_v1_kin_identity(request: Request):
         genesis_nft = ""
         # Read merged config for genesis NFT + keypair path
         try:
-            from titan_hcl.config_loader import load_titan_config
             _cfg = load_titan_params()
             soul = _cfg.get("soul", {})
             genesis_nft = soul.get("genesis_nft_address", "")
@@ -9792,7 +9787,6 @@ async def get_v1_kin_meta_cgn_snapshot(request: Request):
         signature = ""
         signed_by = "unsigned"
         try:
-            from titan_hcl.config_loader import load_titan_config
             _cfg = load_titan_params()
             kp_path = _P(_cfg.get("soul", {}).get(
                 "keypair_path", "~/.config/solana/id.json")).expanduser()

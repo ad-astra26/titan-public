@@ -793,7 +793,7 @@ def _l0_rust_enabled() -> bool:
     if _L0_RUST_ENABLED_CACHE is not None:
         return _L0_RUST_ENABLED_CACHE
     try:
-        from titan_hcl.config_loader import load_titan_config
+        from titan_hcl.params import load_titan_params as load_titan_config
         config = load_titan_params()
         _L0_RUST_ENABLED_CACHE = bool(
             config.get("microkernel", {}).get("l0_rust_enabled", False)
