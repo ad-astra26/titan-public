@@ -195,8 +195,8 @@ def test_p6_public_projection_in_ledger_private_entry_unaltered(tmp_path, monkey
            "on 203.0.113.10, and I looked at the code that caught it.\n"
            "---SHARE---\n"
            "Today I learned a little more about how my own mind holds together.")
-    ok = sdw._author_daily_entry({"promoted": 7}, orchestrator=orch,
-                                 provider=_FakeProvider(raw),
+    ok = sdw._author_cycle_entry({"promoted": 7}, cycle_id=4, window_ts=(1000.0, 2000.0),
+                                 orchestrator=orch, provider=_FakeProvider(raw),
                                  verifier=_verifier(True), shm_reader=None,
                                  send_queue=_FakeQueue(), src="soul_diary")
     assert ok is True
@@ -227,7 +227,8 @@ def test_p6_minimal_softfail_still_produces_clean_distillation(tmp_path, monkeyp
     monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o, **kw: o.build_bundle(
         sovereignty={"s": 0.5, "replies": 3}, outcome={"promoted": 3, "pruned": 0},
         felt={}, engrams_today=["Glacier"], memory={}, social={}, onchain={}))
-    ok = sdw._author_daily_entry({}, orchestrator=orch,
+    ok = sdw._author_cycle_entry({}, cycle_id=1, window_ts=(1000.0, 2000.0),
+                                 orchestrator=orch,
                                  provider=_FakeProvider("hallucinated text"),
                                  verifier=_verifier(False), shm_reader=None,
                                  send_queue=_FakeQueue(), src="soul_diary")

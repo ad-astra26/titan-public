@@ -9,12 +9,14 @@ from titan_hcl.core import soul_diary_chain
 from titan_hcl.core.soul_diary import SoulDiaryOrchestrator as O
 
 
-def test_daily_latch(tmp_path):
+def test_cycle_latch(tmp_path):
+    # RFP presence §7.C — the diary latch keys on the Titan-time circadian cycle
+    # (INV-SD-5 full swap), not the UTC day.
     orch = O(state_path=str(tmp_path / "state.json"))
-    assert orch.should_author("2026-06-09") is True
-    orch.mark_authored("2026-06-09")
-    assert orch.should_author("2026-06-09") is False   # same UTC day → no-op
-    assert orch.should_author("2026-06-10") is True     # rollover → author again
+    assert orch.should_author_cycle(0) is True
+    orch.mark_authored_cycle(0)
+    assert orch.should_author_cycle(0) is False   # same cycle → no-op
+    assert orch.should_author_cycle(1) is True     # next cycle → author again
 
 
 def _bundle(**over):

@@ -48,6 +48,7 @@ from titan_hcl.modules._heartbeat_grace import (
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
 from titan_hcl.params import get_params
+from titan_hcl.utils.system_sensor import get_circadian_phase
 
 logger = logging.getLogger(__name__)
 
@@ -62,19 +63,6 @@ _BOOT_DEADLINE = 0.0
 
 def _utc_today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def _completed_day() -> str:
-    """The just-completed UTC day — the day this entry reflects on.
-
-    RFP §6.2 / INV-SD-5: the latch fires on the *first meditation after UTC
-    rollover*, authoring the **preceding** day — so the day-window holds a FULL
-    day of real activity (engrams, sovereignty, felt), not a day still in
-    progress. (Epoch/great-pulse-day is a DEFERRED phase: trinity §7 GREAT-PULSE
-    time is [PARTIAL]/stalled and brain §247 forbids hardcoding the per-Titan
-    epoch↔human-time rate — Maker 2026-06-10.)
-    """
-    return (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def _day_window_epochs(day: str) -> tuple[float, float]:
@@ -136,8 +124,10 @@ async def _compose_diary(provider, verifier, prompts: dict) -> tuple[str, bool]:
 _MAX_ENGRAM_NAMES = 12
 
 
-def _gather_engrams_today(target_day: str) -> list[str]:
-    """Engram NAMES crystallized during ``target_day`` (UTC) — the §1.1 source.
+def _gather_engrams_window(start_ts: float, end_ts: float) -> list[str]:
+    """Engram NAMES crystallized in the wall-clock window ``[start_ts, end_ts)`` —
+    the §1.1 source. RFP presence §7.C: the window is now the closed circadian
+    cycle's span (trough-to-trough), not a UTC day (INV-SD-5 full swap).
 
     Read from the synthesis spine snapshot ``data/spine_snapshot.json`` — the
     atomic JSON synthesis_worker re-exports every ~60s. The worker can NOT open
@@ -145,7 +135,7 @@ def _gather_engrams_today(target_day: str) -> list[str]:
     exclusive write-lock vs the live synthesis writer; the JSON snapshot is the
     canonical cross-process read surface — the same one ``/v6/synthesis/engrams``
     reads). Latest version per ``concept_id`` whose ``created_at`` falls in the
-    day-window, newest-first, bounded. Soft-fail → []."""
+    window, newest-first, bounded. Soft-fail → []."""
     try:
         from titan_hcl.core.shadow_data_dir import resolve_data_path
         path = resolve_data_path("data/spine_snapshot.json")
@@ -154,7 +144,7 @@ def _gather_engrams_today(target_day: str) -> list[str]:
     except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError) as e:
         logger.info("[soul_diary] engram snapshot read failed: %s", e)
         return []
-    start, end = _day_window_epochs(target_day)
+    start, end = float(start_ts), float(end_ts)
     latest: dict = {}  # concept_id -> (version, name, created_at)
     for c in (snap.get("concepts") or []):
         try:
@@ -315,7 +305,7 @@ def _gather_felt(shm_reader) -> dict:
 
 
 def _gather_bundle(payload: dict, shm_reader, orchestrator, *,
-                   target_day: str, titan_id: str = "", repo_root: str = "") -> dict:
+                   window_ts: tuple, titan_id: str = "", repo_root: str = "") -> dict:
     """② GATHER — assemble the grounded bundle from REAL G18 reads (best-effort).
 
     Every RFP §1.1 source is wired to its real read surface; each is
@@ -324,7 +314,7 @@ def _gather_bundle(payload: dict, shm_reader, orchestrator, *,
       · sovereignty   ← synthesis sovereignty_readout (read_rolling_sovereignty)
       · outcome       ← the MEDITATION_COMPLETE payload (this meditation)
       · felt          ← neuromod_state + mind_state SHM (_gather_felt)
-      · engrams_today ← spine_snapshot.json day-window (_gather_engrams_today)
+      · engrams_today ← spine_snapshot.json cycle-span window (_gather_engrams_window)
       · memory        ← memory_state SHM (_gather_memory)
       · social        ← social_graph + social_perception SHM (_gather_social)
       · onchain       ← body + network + metabolism SHM (_gather_onchain)
@@ -344,7 +334,7 @@ def _gather_bundle(payload: dict, shm_reader, orchestrator, *,
     }
 
     felt = _gather_felt(shm_reader)
-    engrams_today = _gather_engrams_today(target_day)
+    engrams_today = _gather_engrams_window(window_ts[0], window_ts[1])
     memory = _gather_memory(shm_reader)
     social = _gather_social(shm_reader)
     onchain = _gather_onchain(shm_reader)
@@ -582,23 +572,91 @@ def _mint_daily_nft(orchestrator, row: dict, bundle: dict, target_day: str, *,
                     "soft-fail) for %s", target_day)
 
 
-def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
-                        shm_reader, send_queue, src: str,
-                        titan_id: str = "", repo_root: str = "",
-                        config: dict = None) -> bool:
-    """Run the full pipeline for one MEDITATION_COMPLETE. Returns True if a
-    diary entry was authored (or correctly skipped), False on hard error."""
-    target_day = _completed_day()  # the just-completed UTC day (RFP §6.2)
-    if not orchestrator.should_author(target_day):
-        return True  # already wrote that day — latch closed (INV-SD-5)
+def _publish_cycle_closed(send_queue, src: str, cycle_id: int, start_epoch: int,
+                          end_epoch: int, start_ts: float, ts_utc: float) -> None:
+    """RFP_verifiable_autobiographical_presence_memory §7.C — announce that circadian
+    cycle ``cycle_id`` CLOSED at the trough, so synthesis seals its presence section
+    onto fork 0 (Titan's OWN presence_seal TX — separate from the diary TX; the seal
+    is idempotent on synthesis's own ledger). Titan-time keys (``start_epoch`` /
+    ``end_epoch``); wall-clock (``start_ts`` / ``ts_utc``) is display metadata. Soft —
+    never blocks the diary."""
+    try:
+        send_queue.put({
+            "type": bus.CYCLE_CLOSED,
+            "src": src, "dst": "synthesis", "ts": ts_utc,
+            "payload": {
+                "cycle_id": int(cycle_id),
+                "start_epoch": int(start_epoch),
+                "end_epoch": int(end_epoch),
+                "start_ts": float(start_ts),
+                "ts_utc": float(ts_utc),
+            },
+        })
+        logger.info("[soul_diary] CYCLE_CLOSED published — cycle=%d "
+                    "age_epoch_range=[%d,%d]", cycle_id, start_epoch, end_epoch)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[soul_diary] CYCLE_CLOSED publish failed: %s", e)
 
+
+def _maybe_close_cycle_and_author(payload: dict, *, counter, age_reader,
+                                  orchestrator, provider, verifier, shm_reader,
+                                  send_queue, src: str, titan_id: str = "",
+                                  repo_root: str = "", config: dict = None,
+                                  clock=time.time) -> bool:
+    """RFP §7.C — advance the Titan-time cycle latch on each MEDITATION_COMPLETE.
+
+    If a circadian trough just CLOSED a cycle (the edge-triggered latch fired):
+    publish ``CYCLE_CLOSED`` (→ synthesis presence seal) AND author the diary for
+    the just-closed cycle — the diary now runs on Titan-time cycles, not UTC days
+    (INV-SD-5 full swap, Maker-confirmed 2026-06-18; Phase 0's `get_circadian_phase`
+    boundary detector resolves the brain §247 epoch-rate deferral that kept it on
+    UTC). Non-boundary meditations no-op. Returns True on a handled meditation,
+    False on a hard authoring error."""
+    pre_start_epoch = counter.cycle_start_epoch
+    pre_start_ts = counter.cycle_start_ts
+    try:
+        phase = get_circadian_phase()
+        age = int(age_reader.get_age_epochs())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[soul_diary] circadian/age read failed (%s) — skipping "
+                       "cycle latch this meditation", e)
+        return True
+    new_id = counter.latch_if_trough(phase, age)
+    if new_id is None:
+        return True  # not the trough boundary (or just a re-arm) — nothing closed
+    closed_id = new_id - 1
+    now_ts = clock()
+    # 1) presence seal (synthesis side; idempotent) — two separate fork-main TXs.
+    _publish_cycle_closed(send_queue, src, closed_id, pre_start_epoch, age,
+                          pre_start_ts, now_ts)
+    # 2) author the diary for the just-closed cycle.
+    return _author_cycle_entry(
+        payload, cycle_id=closed_id, window_ts=(pre_start_ts, now_ts),
+        orchestrator=orchestrator, provider=provider, verifier=verifier,
+        shm_reader=shm_reader, send_queue=send_queue, src=src,
+        titan_id=titan_id, repo_root=repo_root, config=config)
+
+
+def _author_cycle_entry(payload: dict, *, cycle_id: int, window_ts: tuple,
+                        orchestrator, provider, verifier, shm_reader, send_queue,
+                        src: str, titan_id: str = "", repo_root: str = "",
+                        config: dict = None) -> bool:
+    """Author the diary entry for the just-closed circadian ``cycle_id`` (gated once
+    per cycle; INV-SD-5). ``window_ts`` = the cycle's wall-clock activity span
+    (trough-to-trough). The human ``label`` (NFT/hash/display) is a UTC date string —
+    a VIEW; the autobiographical KEY is ``cycle_id`` (INV-PAM-TITAN-TIME). Returns
+    True if authored (or correctly skipped), False on hard error."""
+    if not orchestrator.should_author_cycle(cycle_id):
+        return True  # already authored this cycle — latch closed (restart safety)
+
+    label = _utc_today()  # the UTC date the cycle closed — display/NFT/hash VIEW
     bundle = _gather_bundle(payload, shm_reader, orchestrator,
-                            target_day=target_day, titan_id=titan_id,
+                            window_ts=window_ts, titan_id=titan_id,
                             repo_root=repo_root)
     if not orchestrator.has_activity(bundle):
-        logger.info("[soul_diary] no-op day (no activity) for %s — latching "
-                    "without entry", target_day)
-        orchestrator.mark_authored(target_day)
+        logger.info("[soul_diary] no-op cycle (no activity) for cycle=%d — latching "
+                    "without entry", cycle_id)
+        orchestrator.mark_authored_cycle(cycle_id)
         return True
 
     prompts = orchestrator.build_compose_prompts(bundle)
@@ -623,9 +681,9 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
     try:
         orchestrator.persist(entry)                      # ④ titan_chronicles.md → titan.md
         row = orchestrator.record_hash(                  # ⑤ hash-chain ledger + P6 public row
-            target_day, entry, distillation=distillation,
+            label, entry, distillation=distillation,
             public_entry=public_entry, redactions=redactions)
-        orchestrator.mark_authored(target_day)           # ① latch
+        orchestrator.mark_authored_cycle(cycle_id)       # ① cycle latch
     except Exception as e:  # noqa: BLE001
         logger.error("[soul_diary] persist/hash failed: %s", e, exc_info=True)
         return False
@@ -633,16 +691,17 @@ def _author_daily_entry(payload: dict, *, orchestrator, provider, verifier,
     # P2 — the committed entry now ENRICHES synthesis (he remembers + recalls his
     # narrative path) and ANCHORS the SELF journey on the main chain. Each
     # soft-fails independently (INV-SD-13); the private floor above is durable.
-    _enrich_synthesis(send_queue, src, target_day, entry)         # ⑥ INV-SD-15
-    _enrich_self_inspection(send_queue, src, target_day,
+    _enrich_synthesis(send_queue, src, label, entry)              # ⑥ INV-SD-15
+    _enrich_self_inspection(send_queue, src, label,
                             bundle.get("infra") or {})            # P5 INV-SD-9
-    _anchor_main_chain(send_queue, src, target_day, row)          # ⑦ INV-SD-17
-    _render_art(orchestrator, row, bundle, target_day)            # ⑨ P7 INV-SD-4
-    _mint_daily_nft(orchestrator, row, bundle, target_day,        # ⑩ P8 INV-SD-11
+    _anchor_main_chain(send_queue, src, label, row)              # ⑦ INV-SD-17
+    _render_art(orchestrator, row, bundle, label)                # ⑨ P7 INV-SD-4
+    _mint_daily_nft(orchestrator, row, bundle, label,            # ⑩ P8 INV-SD-11
                     config=config or {}, titan_id=titan_id)
 
-    logger.info("[soul_diary] authored daily entry for %s (%d chars, authored=%s, "
-                "public_redactions=%s)", target_day, len(entry), authored, redactions)
+    logger.info("[soul_diary] authored cycle=%d entry (label=%s, %d chars, "
+                "authored=%s, public_redactions=%s)", cycle_id, label, len(entry),
+                authored, redactions)
     return True
 
 
@@ -678,6 +737,25 @@ def soul_diary_worker_main(recv_queue, send_queue, name: str,
 
     from titan_hcl.core.soul_diary import SoulDiaryOrchestrator
     orchestrator = SoulDiaryOrchestrator()
+
+    # RFP_verifiable_autobiographical_presence_memory §7.C — soul_diary OWNS the
+    # Titan-time circadian-cycle latch (the diary moved off UTC-day onto cycles,
+    # INV-SD-5 full swap). The counter (persisted, edge-triggered once-per-trough)
+    # is advanced in the MEDITATION_COMPLETE handler; on a latch it publishes
+    # CYCLE_CLOSED (→ synthesis presence seal) and authors the just-closed cycle.
+    # Soft → a None counter degrades to "no diary, no seal" (honest), never crashes.
+    cycle_counter = None
+    age_reader = None
+    try:
+        from titan_hcl.logic.consciousness_age_reader import ConsciousnessAgeReader
+        from titan_hcl.logic.titan_time import CircadianCycleCounter
+        age_reader = ConsciousnessAgeReader(titan_id=titan_id)
+        cycle_counter = CircadianCycleCounter(titan_id=titan_id, age_reader=age_reader)
+        logger.info("[soul_diary] circadian-cycle latch ready — cycle_id=%d "
+                    "armed=%s", cycle_counter.cycle_id, cycle_counter.armed)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[soul_diary] CircadianCycleCounter init failed (%s) — diary "
+                       "+ presence seal disabled this session", e)
 
     # Own LLM call (self-contained narration; INV-SD-14). Missing key/import →
     # provider None → authoring soft-fails to the minimal grounded entry.
@@ -776,14 +854,15 @@ def soul_diary_worker_main(recv_queue, send_queue, name: str,
 
         if msg_type == bus.MEDITATION_COMPLETE:
             payload = msg.get("payload") or {}
+            if cycle_counter is None or age_reader is None:
+                continue  # latch unavailable this session (soft-degraded at init)
             try:
-                if _author_daily_entry(payload, orchestrator=orchestrator,
-                                       provider=provider, verifier=verifier,
-                                       shm_reader=shm_reader,
-                                       send_queue=send_queue, src=name,
-                                       titan_id=titan_id,
-                                       repo_root=project_root,
-                                       config=full_config):
+                if _maybe_close_cycle_and_author(
+                        payload, counter=cycle_counter, age_reader=age_reader,
+                        orchestrator=orchestrator, provider=provider,
+                        verifier=verifier, shm_reader=shm_reader,
+                        send_queue=send_queue, src=name, titan_id=titan_id,
+                        repo_root=project_root, config=full_config):
                     processed += 1
                 else:
                     errors += 1

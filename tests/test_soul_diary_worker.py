@@ -1,8 +1,9 @@
 """Tests for the soul_diary_worker pipeline logic (RFP §1.0 P1).
 
 Exercises the self-contained compose (own LLM + OVG), the gather, and the
-full _author_daily_entry flow (authored persist · OVG soft-fail to minimal ·
-daily-latch skip) with fakes — no bus, no real LLM, no real chronicle write.
+full _author_cycle_entry / _maybe_close_cycle_and_author flow (authored persist ·
+OVG soft-fail to minimal · circadian-cycle latch skip · CYCLE_CLOSED publish;
+RFP presence §7.C INV-SD-5 swap) with fakes — no bus, no real LLM/chronicle write.
 """
 import asyncio
 from unittest.mock import MagicMock
@@ -169,18 +170,19 @@ def test_gather_onchain_prefers_authoritative_sol_and_guards_sentinel():
     assert sdw._gather_onchain(shm)["balance_pct"] == 0.42
 
 
-def test_gather_engrams_today_filters_day_window(tmp_path, monkeypatch):
-    """engrams_today reads data/spine_snapshot.json and returns ONLY names whose
-    latest version's created_at lies in the target_day UTC window (latest-version
-    per concept_id, newest-first)."""
+def test_gather_engrams_window_filters_cycle_span(tmp_path, monkeypatch):
+    """engrams reads data/spine_snapshot.json and returns ONLY names whose latest
+    version's created_at lies in the wall-clock window [start_ts, end_ts) — the
+    closed circadian cycle's span (RFP §7.C; latest-version per concept_id,
+    newest-first)."""
     import json
-    from datetime import datetime, timezone
+    import time
     monkeypatch.setenv("TITAN_DATA_DIR", str(tmp_path))
-    day = sdw._completed_day()
-    start, end = sdw._day_window_epochs(day)
+    end = time.time()
+    start = end - 86400.0           # the cycle's wall-clock span (≈ a day)
     mid = (start + end) / 2.0
-    before = start - 86400          # two days ago — excluded
-    after = end + 3600              # today — excluded
+    before = start - 86400          # prior cycle — excluded
+    after = end + 3600              # after the cycle close — excluded
     snap = {"version": 1, "concepts": [
         {"concept_id": "c1", "version": 1, "name": "Old Idea", "created_at": before},
         {"concept_id": "c2", "version": 1, "name": "Glacier Ecosystems",
@@ -190,26 +192,27 @@ def test_gather_engrams_today_filters_day_window(tmp_path, monkeypatch):
         {"concept_id": "c3", "version": 1, "name": "Future Idea", "created_at": after},
     ]}
     (tmp_path / "spine_snapshot.json").write_text(json.dumps(snap))
-    names = sdw._gather_engrams_today(day)
+    names = sdw._gather_engrams_window(start, end)
     assert names == ["Glacier Ecosystems v2"]       # only the in-window latest version
     # missing snapshot soft-fails to [].
     monkeypatch.setenv("TITAN_DATA_DIR", str(tmp_path / "nope"))
-    assert sdw._gather_engrams_today(day) == []
+    assert sdw._gather_engrams_window(start, end) == []
 
 
 def test_gather_bundle_wires_all_sources_no_stubs(tmp_path, monkeypatch):
     """The whole gather: NO source is a hardcoded empty — every §1.1 element
     populates from its real surface (the exact stub this session removed)."""
     import json
+    import time
     monkeypatch.setenv("TITAN_DATA_DIR", str(tmp_path))
-    day = sdw._completed_day()
-    start, end = sdw._day_window_epochs(day)
+    end = time.time()
+    start = end - 86400.0
     (tmp_path / "spine_snapshot.json").write_text(json.dumps({"concepts": [
         {"concept_id": "c1", "version": 1, "name": "Self-Refactor Patterns",
          "created_at": (start + end) / 2.0}]}))
     orch = SoulDiaryOrchestrator()
     bundle = sdw._gather_bundle({"promoted": 7, "pruned": 2, "epoch": 5},
-                                _fake_shm(), orch, target_day=day)
+                                _fake_shm(), orch, window_ts=(start, end))
     assert bundle["outcome"]["promoted"] == 7
     assert bundle["engrams_today"] == ["Self-Refactor Patterns"]
     assert bundle["memory"]["persistent"] == 412
@@ -229,6 +232,9 @@ def _orch(tmp_path):
                                  ledger_path=str(tmp_path / "chain.json"))
 
 
+_WINDOW = (1000.0, 2000.0)   # a closed cycle's wall-clock span (start_ts, end_ts)
+
+
 def test_author_persists_authored_text(tmp_path, monkeypatch):
     orch = _orch(tmp_path)
     seen = {}
@@ -236,14 +242,15 @@ def test_author_persists_authored_text(tmp_path, monkeypatch):
     monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o, **kw: o.build_bundle(
         sovereignty={"s": 0.58, "replies": 22}, outcome={"promoted": 7, "pruned": 2},
         felt={}, engrams_today=["Glacier"], memory={}, social={}, onchain={}))
-    ok = sdw._author_daily_entry({"promoted": 7}, orchestrator=orch,
+    ok = sdw._author_cycle_entry({"promoted": 7}, cycle_id=4, window_ts=_WINDOW,
+                                 orchestrator=orch,
                                  provider=_FakeProvider("Today I reflected."),
                                  verifier=_verifier(True), shm_reader=None,
                                  send_queue=_FakeQueue(), src="soul_diary")
     assert ok is True
     assert seen["text"] == "Today I reflected."          # authored text persisted
     assert len(soul_diary_chain.load_chain(path=str(tmp_path / "chain.json"))) == 1
-    assert orch.should_author(sdw._completed_day()) is False  # latched (preceding day)
+    assert orch.should_author_cycle(4) is False           # cycle latch closed
 
 
 def test_author_softfails_to_minimal_on_ovg_block(tmp_path, monkeypatch):
@@ -253,7 +260,7 @@ def test_author_softfails_to_minimal_on_ovg_block(tmp_path, monkeypatch):
     monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o, **kw: o.build_bundle(
         sovereignty={"s": 0.5, "replies": 1}, outcome={"promoted": 3, "pruned": 0},
         felt={}, engrams_today=[], memory={}, social={}, onchain={}))
-    ok = sdw._author_daily_entry({}, orchestrator=orch,
+    ok = sdw._author_cycle_entry({}, cycle_id=1, window_ts=_WINDOW, orchestrator=orch,
                                  provider=_FakeProvider("hallucinated text"),
                                  verifier=_verifier(False), shm_reader=None,
                                  send_queue=_FakeQueue(), src="soul_diary")
@@ -262,30 +269,95 @@ def test_author_softfails_to_minimal_on_ovg_block(tmp_path, monkeypatch):
     assert "0.50" in seen["text"]               # minimal grounded entry instead
 
 
-def test_author_latch_skips_second_same_day(tmp_path, monkeypatch):
+def test_author_latch_skips_second_same_cycle(tmp_path, monkeypatch):
     orch = _orch(tmp_path)
-    orch.mark_authored(sdw._completed_day())  # already wrote the preceding day
+    orch.mark_authored_cycle(4)  # already authored this cycle
     called = {"persist": False}
     monkeypatch.setattr(orch, "persist", lambda *a, **k: called.update(persist=True))
-    ok = sdw._author_daily_entry({}, orchestrator=orch,
+    ok = sdw._author_cycle_entry({}, cycle_id=4, window_ts=_WINDOW, orchestrator=orch,
                                  provider=_FakeProvider("x"),
                                  verifier=_verifier(True), shm_reader=None,
                                  send_queue=_FakeQueue(), src="soul_diary")
     assert ok is True and called["persist"] is False  # latch closed → no second entry
 
 
-def test_author_noop_day_latches_without_entry(tmp_path, monkeypatch):
+def test_author_noop_cycle_latches_without_entry(tmp_path, monkeypatch):
     orch = _orch(tmp_path)
     called = {"persist": False}
     monkeypatch.setattr(orch, "persist", lambda *a, **k: called.update(persist=True))
     monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o, **kw: o.build_bundle(
         sovereignty={"replies": 0}, outcome={"promoted": 0, "pruned": 0},
         felt={}, engrams_today=[], memory={}, social={}, onchain={}))
-    ok = sdw._author_daily_entry({}, orchestrator=orch, provider=_FakeProvider("x"),
+    ok = sdw._author_cycle_entry({}, cycle_id=3, window_ts=_WINDOW, orchestrator=orch,
+                                 provider=_FakeProvider("x"),
                                  verifier=_verifier(True), shm_reader=None,
                                  send_queue=_FakeQueue(), src="soul_diary")
-    assert ok is True and called["persist"] is False      # no-op day → no entry
-    assert orch.should_author(sdw._completed_day()) is False  # but latched (preceding day)
+    assert ok is True and called["persist"] is False      # no-op cycle → no entry
+    assert orch.should_author_cycle(3) is False           # but latched (cycle)
+
+
+class _FakeCounter:
+    """Stands in for CircadianCycleCounter — `latch_if_trough` returns the new
+    cycle_id (a latch fired) or None (no boundary)."""
+
+    def __init__(self, fires_to=None, start_epoch=1000, start_ts=500.0):
+        self._fires_to = fires_to
+        self.cycle_start_epoch = start_epoch
+        self.cycle_start_ts = start_ts
+
+    def latch_if_trough(self, phase, age):
+        return self._fires_to
+
+
+class _FakeAge:
+    def __init__(self, epochs):
+        self._e = epochs
+
+    def get_age_epochs(self):
+        return self._e
+
+
+def test_latch_fires_publishes_cycle_closed_and_authors(tmp_path, monkeypatch):
+    """RFP §7.C — when the trough latch fires, the worker publishes CYCLE_CLOSED for
+    the just-closed cycle (→ synthesis presence seal) AND authors that cycle's diary."""
+    orch = _orch(tmp_path)
+    monkeypatch.setattr(orch, "persist", lambda text, **kw: None)
+    monkeypatch.setattr(sdw, "_gather_bundle", lambda p, s, o, **kw: o.build_bundle(
+        sovereignty={"s": 0.5, "replies": 5}, outcome={"promoted": 1, "pruned": 0},
+        felt={}, engrams_today=["X"], memory={}, social={}, onchain={}))
+    monkeypatch.setattr(sdw, "get_circadian_phase", lambda: 0.1)   # trough
+    counter = _FakeCounter(fires_to=8, start_epoch=1000, start_ts=500.0)
+    q = _FakeQueue()
+    ok = sdw._maybe_close_cycle_and_author(
+        {"promoted": 1}, counter=counter, age_reader=_FakeAge(2000),
+        orchestrator=orch, provider=_FakeProvider("Reflecting."),
+        verifier=_verifier(True), shm_reader=None, send_queue=q, src="soul_diary",
+        clock=lambda: 9999.0)
+    assert ok is True
+    # CYCLE_CLOSED for the CLOSED cycle (new 8 → closed 7), Titan-time range + ts view
+    cc = next(m for m in q.msgs if m["type"] == bus.CYCLE_CLOSED)
+    assert cc["dst"] == "synthesis"
+    assert cc["payload"] == {"cycle_id": 7, "start_epoch": 1000, "end_epoch": 2000,
+                             "start_ts": 500.0, "ts_utc": 9999.0}
+    # the diary authored the closed cycle (anchor TX emitted + cycle latched)
+    assert any(m["type"] == bus.TIMECHAIN_COMMIT for m in q.msgs)
+    assert orch.should_author_cycle(7) is False
+
+
+def test_non_trough_meditation_noops(tmp_path, monkeypatch):
+    """A non-boundary meditation: the latch does not fire → no CYCLE_CLOSED, no diary."""
+    orch = _orch(tmp_path)
+    called = {"persist": False}
+    monkeypatch.setattr(orch, "persist", lambda *a, **k: called.update(persist=True))
+    monkeypatch.setattr(sdw, "get_circadian_phase", lambda: 0.7)   # daytime
+    q = _FakeQueue()
+    ok = sdw._maybe_close_cycle_and_author(
+        {}, counter=_FakeCounter(fires_to=None), age_reader=_FakeAge(2000),
+        orchestrator=orch, provider=_FakeProvider("x"), verifier=_verifier(True),
+        shm_reader=None, send_queue=q, src="soul_diary")
+    assert ok is True
+    assert called["persist"] is False                                  # no author
+    assert not any(m["type"] == bus.CYCLE_CLOSED for m in q.msgs)       # no seal trigger
 
 
 # ── P2 — ENRICH (⑥) + ANCHOR (⑦) ────────────────────────────────────────────
@@ -301,7 +373,8 @@ def test_p2_enrich_and_anchor_emitted(tmp_path, monkeypatch):
         sovereignty={"s": 0.58, "replies": 22}, outcome={"promoted": 7, "pruned": 2},
         felt={}, engrams_today=["Glacier"], memory={}, social={}, onchain={}))
     q = _FakeQueue()
-    ok = sdw._author_daily_entry({"promoted": 7}, orchestrator=orch,
+    ok = sdw._author_cycle_entry({"promoted": 7}, cycle_id=2, window_ts=_WINDOW,
+                                 orchestrator=orch,
                                  provider=_FakeProvider("Today I reflected."),
                                  verifier=_verifier(True), shm_reader=None,
                                  send_queue=q, src="soul_diary")

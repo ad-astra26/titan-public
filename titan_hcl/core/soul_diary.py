@@ -72,13 +72,7 @@ class SoulDiaryOrchestrator:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
 
-    def should_author(self, today: str) -> bool:
-        """True iff no entry has been authored for the UTC date ``today`` yet."""
-        return self._load_state().get("last_diary_date") != today
-
-    def mark_authored(self, today: str) -> None:
-        state = self._load_state()
-        state["last_diary_date"] = today
+    def _save_state(self, state: dict) -> None:
         os.makedirs(os.path.dirname(self._state_path) or ".", exist_ok=True)
         tmp = self._state_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -86,6 +80,21 @@ class SoulDiaryOrchestrator:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self._state_path)
+
+    def should_author_cycle(self, cycle_id: int) -> bool:
+        """True iff no entry has been authored for circadian ``cycle_id`` yet.
+
+        RFP_verifiable_autobiographical_presence_memory §7.C (INV-SD-5 full-swap,
+        2026-06-18): the diary moved off the UTC-day key onto the Titan-time cycle
+        key. Crash-safe authoring latch — the cycle counter increments at the trough
+        (once), and this gate ensures the diary is authored exactly once per cycle,
+        retried across meditations if a prior author crashed before marking."""
+        return self._load_state().get("last_diary_cycle") != int(cycle_id)
+
+    def mark_authored_cycle(self, cycle_id: int) -> None:
+        state = self._load_state()
+        state["last_diary_cycle"] = int(cycle_id)
+        self._save_state(state)
 
     # ── ② gather → bundle + compose prompts ──────────────────────────
     @staticmethod
