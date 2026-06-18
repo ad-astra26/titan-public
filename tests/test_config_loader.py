@@ -352,18 +352,18 @@ port = 7777
 # titan_hcl.params delegates to config_loader (BUG-CONFIG-LOADER-MERGE-TITAN-PARAMS)
 # ---------------------------------------------------------------------------
 
-def test_params_get_params_returns_merged_layers(tmp_path):
-    """``params.get_params(section)`` must return the merged config view.
+def test_bootstrap_merge_overlays_config_over_params(tmp_path):
+    """The SHM-absent fallback ``params._bootstrap_merge`` deep-merges config.toml
+    (Layer 2) over titan_params.toml (Layer 1).
 
-    Pre-fix, ``params.py`` read ``titan_params.toml`` directly and skipped
-    Layers 2-4. After the fix it delegates to ``config_loader.load_titan_config``
-    so a section value written in config.toml (Layer 2) overrides
-    titan_params.toml (Layer 1) and is visible to ``get_params``.
+    RFP_config_as_shm_state §7.C / C.4: ``get_params`` no longer delegates to the
+    (retired) ``config_loader`` 4-layer merge. On a live box the in-kernel daemon
+    owns the merge (SHM slots, GB1 parity-verified). When SHM is unavailable
+    (pytest/birth/pre-daemon) ``_bootstrap_merge`` performs the equivalent
+    params⊎config overlay that get_params callers see.
     """
-    titan_params = tmp_path / "titan_params.toml"
-    base = tmp_path / "config.toml"
     _write_toml(
-        titan_params,
+        tmp_path / "titan_params.toml",
         """\
 [reflexes]
 fire_threshold = 0.10
@@ -371,31 +371,26 @@ cooldown_ms = 250
 """,
     )
     _write_toml(
-        base,
+        tmp_path / "config.toml",
         """\
 [reflexes]
 fire_threshold = 0.20
 """,
     )
 
-    from titan_hcl import config_loader, params as params_mod
+    from titan_hcl import params as params_mod
 
-    config_loader.clear_cache()
-    with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", titan_params), mock.patch.object(
-        config_loader, "BASE_CONFIG_PATH", base
-    ):
-        section = params_mod.get_params("reflexes")
+    merged = params_mod._bootstrap_merge(base_dir=str(tmp_path))
+    section = merged["reflexes"]
+    # Layer 2 (config.toml) overrides Layer 1 (titan_params.toml) — fire_threshold
+    assert section["fire_threshold"] == 0.20
+    # Layer 1 keys not overridden in Layer 2 must still be visible
+    assert section["cooldown_ms"] == 250
 
-        # Layer 2 (config.toml) overrides Layer 1 (titan_params.toml) — fire_threshold
-        assert section["fire_threshold"] == 0.20
-        # Layer 1 keys not overridden in Layer 2 must still be visible
-        assert section["cooldown_ms"] == 250
-        # Returned dict is a copy — mutating it must not corrupt the cache.
-        # (Re-read stays inside the patched-paths context: the mtime-aware
-        # cache would otherwise correctly rebuild from the real config files.)
-        section["fire_threshold"] = 99.0
-        section_again = params_mod.get_params("reflexes")
-        assert section_again["fire_threshold"] == 0.20
+    # get_params returns a FRESH dict (mutating it must not affect a re-read).
+    sec1 = params_mod.get_params("reflexes")
+    sec1["fire_threshold"] = 99.0
+    assert params_mod.get_params("reflexes").get("fire_threshold") != 99.0
 
 
 def test_params_get_params_unknown_section_returns_empty_dict(tmp_path):

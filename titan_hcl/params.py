@@ -1,25 +1,22 @@
 """
-Centralized parameter loader for Titan V4 — thin delegator over
-``titan_hcl.config_loader.load_titan_config``.
+Centralized parameter loader for Titan — config-as-SHM-state (INV-CFG-7).
 
-Originally (pre-2026-04-29) this module read ``titan_params.toml`` directly
-into its own cache, bypassing the 4-layer merge that ``config_loader``
-performs (titan_params.toml < config.toml < ~/.titan/secrets.toml <
-~/.titan/microkernel_<TID>.toml). That parallel system meant any
-``[reflexes]`` / ``[meta_cgn]`` / ``[emot_cgn]`` / ``[prediction_engine]``
-override placed in config.toml or the per-Titan override file was invisible
-to ``get_params(section)`` callers — see BUG-CONFIG-LOADER-MERGE-TITAN-PARAMS.
+``get_params(section)`` reads the per-section SHM slot the in-kernel config
+daemon seeds + maintains (``/dev/shm/titan_<id>/config/<section>.bin``, msgpack)
+— config IS SHM-state. ``load_titan_params()`` assembles the whole config by
+enumerating every ``config/*.bin`` slot. This is the ONLY worker config read
+path (RFP_config_as_shm_state §7.C / Phase C, 2026-06-18).
 
-This rewrite delegates to ``config_loader.load_titan_config`` so all callers
-see the same merged view. The public API (``get_params``, ``load_titan_params``)
-is preserved byte-for-byte.
+When the SHM stack is unavailable — pytest with no daemon, or birth/installer
+before the daemon seeds slots — both fall back to ``_bootstrap_merge`` (the
+minimal ``titan_params.toml ⊎ config.toml`` + ``~/.titan/secrets.toml`` overlay,
+mirroring the Rust daemon, NO microkernel layer). 🚫 ``_bootstrap_merge`` is NOT
+a worker runtime path (INV-CFG-1): on a live box every worker reads SHM.
 
-Phase B (RFP_config_as_shm_state §7.B, 2026-06-17): ``get_params`` now reads the
-per-section SHM slot the in-kernel config daemon seeds + maintains
-(``/dev/shm/titan_<id>/config/<section>.bin``, msgpack) — config-as-SHM-state
-(INV-CFG-7). It falls back to the legacy ``config_loader`` merge when the slot is
-absent (a box without the Phase-A daemon, or boot before the seed) or when
-``TITAN_CONFIG_SHM_READ=0``. The ~8 existing callsites change zero lines.
+The legacy ``config_loader.load_titan_config`` 4-layer merge + the per-section
+``_legacy_get_params`` fallback are RETIRED in Phase C (C.4) — the merged view a
+worker sees comes from the daemon's slots, not a Python re-merge.
+
 ``register_config_reload`` + ``poll_config_reloads`` give a worker's heartbeat a
 cheap version-poll so a cached/derived ``hot`` value can be re-applied on a slot
 bump (the §1.2 "worker reads on heartbeat" model).
@@ -34,8 +31,6 @@ import os
 import threading
 import time
 from typing import Callable, Optional
-
-from titan_hcl.config_loader import load_titan_config
 
 _LOG = logging.getLogger("titan.params")
 
@@ -53,15 +48,16 @@ _watch_lock = threading.Lock()
 
 
 def _config_shm_enabled() -> bool:
-    """Whether ``get_params`` reads the SHM slot (vs the legacy ``config_loader`` merge).
+    """Whether ``get_params`` reads the SHM slot (vs the ``_bootstrap_merge`` fallback).
 
-    DEFAULT-OFF as a DELIBERATE Phase-B-completion gate (not a forgotten flag — see
-    RFP_config_as_shm_state §7.B): B-core (this reimpl) is parity-verified on T1, but
-    flipping the fleet to SHM reads is unsafe until the B-sweep lands AND T2/T3's
-    `microkernel_<id>.toml` overrides are folded into config.toml (the daemon doesn't
-    read overrides, so T2/T3 slots are override-incomplete). Set ``TITAN_CONFIG_SHM_READ=1``
-    to enable (T1 is ready today). When B fully completes fleet-wide, flip this default ON."""
-    return os.environ.get("TITAN_CONFIG_SHM_READ", "0").lower() in ("1", "true", "yes", "on")
+    DEFAULT-ON (RFP_config_as_shm_state §7.C / C.4, 2026-06-18): SHM is the canonical
+    worker config read path fleet-wide (Phase B verified parity 100% on all 3 boxes;
+    overrides folded). The ``TITAN_CONFIG_SHM_READ=0`` env kill-switch is retained for
+    emergencies only — the per-box ``.titan_env`` gate that used to flip this ON is
+    removed at deploy (SHM is the only path, no env dependency). When SHM is genuinely
+    unavailable (pytest/birth/pre-daemon) the slot read returns None and the caller
+    bootstraps; the flag does not need to be off for those paths to work."""
+    return os.environ.get("TITAN_CONFIG_SHM_READ", "1").lower() in ("1", "true", "yes", "on")
 
 
 def _reader_for(section: str):
@@ -92,7 +88,7 @@ def _reader_for(section: str):
         return reader
     except Exception as e:  # SHM stack missing (minimal test env) → permanent fallback
         _shm_unavailable = True
-        _LOG.info("params: SHM config read unavailable (%s) — using config_loader fallback", e)
+        _LOG.info("params: SHM config read unavailable (%s) — using bootstrap-merge fallback", e)
         return None
 
 
@@ -113,11 +109,6 @@ def _read_config_slot(section: str) -> Optional[dict]:
         return None
 
 
-def _legacy_get_params(section: str) -> dict:
-    cfg = load_titan_config()
-    return dict(cfg.get(section, {}))
-
-
 def _deep_merge_into(base: dict, overlay: dict) -> None:
     """Table-deep, later-wins merge of ``overlay`` into ``base`` (in place) — mirrors the
     Rust config daemon's ``deep_merge`` and the retired ``config_loader._deep_merge``."""
@@ -128,16 +119,20 @@ def _deep_merge_into(base: dict, overlay: dict) -> None:
             base[k] = v
 
 
-def _bootstrap_merge() -> dict:
+def _bootstrap_merge(base_dir: Optional[str] = None) -> dict:
     """Minimal whole-config merge: ``titan_params.toml ⊎ config.toml`` + the
     ``~/.titan/secrets.toml`` overlay — table-deep, later-wins, NO microkernel layer
     (matching the Rust config daemon, which dropped the override layer in Phase 0).
 
     🚫 NOT a worker runtime path (INV-CFG-1). Used ONLY when the SHM config stack is
     unavailable: pytest with no daemon, or birth/installer before the daemon seeds slots.
-    On a live box every worker reads SHM (``get_params`` / ``load_titan_params`` assembly)."""
+    On a live box every worker reads SHM (``get_params`` / ``load_titan_params`` assembly).
+
+    ``base_dir`` overrides where the two config TOMLs are read from (tests only; the
+    secrets overlay path is unaffected). Production callers pass nothing → titan_hcl/."""
     import tomllib
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if base_dir is None:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
     merged: dict = {}
     for fname in ("titan_params.toml", "config.toml"):
         path = os.path.join(base_dir, fname)
@@ -201,8 +196,9 @@ def load_titan_params(force_reload: bool = False) -> dict:
 
 
 def get_params(section: str) -> dict:
-    """Get a section's config dict — from the per-section SHM slot (Phase B), with
-    a fallback to the ``config_loader`` merge when the slot is absent or SHM is off.
+    """Get a section's config dict — from the per-section SHM slot (config-as-state,
+    INV-CFG-7). Falls back to ``_bootstrap_merge`` ONLY when the SHM slot is absent
+    (pytest with no daemon, or birth/installer before the daemon seeds slots).
 
     Returns a fresh dict so callers cannot mutate cached state in place.
     """
@@ -210,7 +206,7 @@ def get_params(section: str) -> dict:
         d = _read_config_slot(section)
         if d is not None:
             return d
-    return _legacy_get_params(section)
+    return dict(_bootstrap_merge().get(section, {}))
 
 
 def register_config_reload(section: str, callback: Callable[[dict], None]) -> None:

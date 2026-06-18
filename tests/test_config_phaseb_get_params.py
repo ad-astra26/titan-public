@@ -60,18 +60,21 @@ def test_get_params_reads_shm_slot(shm):
     assert out == {"post_dispatch_tick_interval_seconds": 15.0, "enabled": True}
 
 
-def test_absent_slot_falls_back_to_loader(shm):
-    # no slot for "reflexes" → _read_config_slot returns None → legacy path
+def test_absent_slot_falls_back_to_bootstrap(shm):
+    # Phase C / C.4: no slot for "reflexes" → _read_config_slot returns None →
+    # _bootstrap_merge (the SHM-absent fallback; the legacy config_loader path is retired).
     assert params._read_config_slot("reflexes") is None
-    with mock.patch.object(params, "load_titan_config", return_value={"reflexes": {"fire_threshold": 0.15}}):
+    with mock.patch.object(params, "_bootstrap_merge", return_value={"reflexes": {"fire_threshold": 0.15}}):
         assert params.get_params("reflexes") == {"fire_threshold": 0.15}
 
 
-def test_kill_switch_forces_legacy(shm, monkeypatch):
+def test_kill_switch_forces_bootstrap(shm, monkeypatch):
+    # Phase C / C.4: the TITAN_CONFIG_SHM_READ=0 emergency kill-switch routes
+    # around the slot to _bootstrap_merge (not the retired config_loader merge).
     _write_slot(shm, "social_x", {"x": 1})  # slot exists...
     monkeypatch.setenv("TITAN_CONFIG_SHM_READ", "0")  # ...but flag off
-    with mock.patch.object(params, "load_titan_config", return_value={"social_x": {"x": 999}}):
-        assert params.get_params("social_x") == {"x": 999}  # legacy value, not the slot
+    with mock.patch.object(params, "_bootstrap_merge", return_value={"social_x": {"x": 999}}):
+        assert params.get_params("social_x") == {"x": 999}  # bootstrap value, not the slot
 
 
 def test_get_params_returns_fresh_copy(shm):
