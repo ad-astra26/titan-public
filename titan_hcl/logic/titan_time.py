@@ -44,6 +44,24 @@ DEFAULT_REARM_THRESHOLD: float = 0.45
 DEFAULT_SAVE_DIR: str = "data/titan_time"
 
 
+def read_current_cycle(save_dir: str = DEFAULT_SAVE_DIR) -> tuple[int, int]:
+    """Read-only `(cycle_id, cycle_start_epoch)` of the currently-OPEN cycle from
+    the persisted counter state — NO side effects (never seeds, never writes).
+
+    Returns `(0, 0)` if the counter file does not exist yet (it won't until Phase C
+    wires the trough-latch). `cycle_start_epoch=0` means "fold every atom" → all
+    interactions roll under cycle 0 pre-Phase-C — correct and self-correcting once
+    the latch begins partitioning cycles. For consumers (Phase B rollup) that need
+    the current cycle key without owning/incrementing the counter."""
+    path = os.path.join(save_dir, "cycle_state.json")
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return int(data["cycle_id"]), int(data["cycle_start_epoch"])
+    except Exception:  # noqa: BLE001 — absent/corrupt → grandfather (cycle 0 from epoch 0)
+        return 0, 0
+
+
 def _load_titan_time_config() -> dict:
     """Read the `[titan_time]` config section via the Phase-B SHM path; tolerant of
     being called outside a worker (returns {} → defaults apply)."""
@@ -267,4 +285,4 @@ class TitanTimeTranslator:
     NOMINAL_SEC_PER_EPOCH: float = COGNITIVE_EPOCH_DEFAULT_INTERVAL_S
 
 
-__all__ = ("CircadianCycleCounter", "TitanTimeTranslator")
+__all__ = ("CircadianCycleCounter", "TitanTimeTranslator", "read_current_cycle")

@@ -1612,6 +1612,19 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         logger.warning("[synthesis_worker] PresenceCapture init failed (%s) — "
                        "presence capture disabled this session", _pc_e)
 
+    # RFP_verifiable_autobiographical_presence_memory §7.B — PresenceRollup: at each
+    # dream-boundary consolidation, fold the current cycle's person_interactions atoms
+    # into presence_cycle_rollup (derived index; raw atoms retained). Shares store._conn
+    # + db_writer (G21). Hooked into the dream sequence after consolidation_pass.run().
+    presence_rollup = None
+    try:
+        from titan_hcl.synthesis.presence_rollup import PresenceRollup
+        _pr = PresenceRollup(store._conn, db_writer)
+        presence_rollup = _pr if _pr.ensure_schema() else None
+    except Exception as _pr_e:  # noqa: BLE001 — rollup disabled, synthesis unaffected
+        logger.warning("[synthesis_worker] PresenceRollup init failed (%s) — "
+                       "presence rollup disabled this session", _pr_e)
+
     # Phase 2 D-P2-4 standing-bundle store — sole writer of
     # data/synthesis.duckdb / association_bundles. CONN-2 FOLD (AUDIT §5.2):
     # shares ActivationStore's ONE guarded connection (store._conn) rather than
@@ -3651,6 +3664,15 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     logger.warning(
                         "[synthesis_worker] consolidation_pass crashed: %s", e,
                         exc_info=True)
+            # 5.5) PresenceRollup fold (RFP_verifiable_autobiographical_presence_memory
+            #      §7.B) — fold the current cycle's person_interactions atoms into the
+            #      presence_cycle_rollup index (idempotent; raw atoms retained). Soft.
+            if presence_rollup is not None:
+                try:
+                    presence_rollup.fold()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[synthesis_worker] presence_rollup fold failed: %s", e)
             # 6) ForkGC sweep — after consolidation (which may mark new
             #    graduated/abandoned forks the sweep then handles).
             if fork_gc is not None:
