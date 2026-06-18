@@ -186,6 +186,16 @@ class ServiceWAL:
         except OSError:
             return 0.0
 
+    def uncommitted_mb(self) -> float:
+        """MB of wal PAST the last durable checkpoint — the real backlog. The raw
+        file (`size_mb`) stays large until rotation/clean-shutdown even when fully
+        committed, so backlog (not file size) is the signal that commits have stalled."""
+        try:
+            size = self._path.stat().st_size
+            return max(0, size - self._last_ckpt_offset) / (1024 * 1024)
+        except OSError:
+            return 0.0
+
     def close(self) -> None:
         with self._lock:
             if self._closed:

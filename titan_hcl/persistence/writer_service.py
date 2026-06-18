@@ -522,15 +522,18 @@ class IMWDaemon:
         try:
             if self._wal is None:
                 return
-            size_mb = self._wal.size_mb()
-            if size_mb >= self._cfg.service_wal_max_mb * 0.6:
+            # Use the UNCOMMITTED backlog (records past the durable checkpoint), NOT
+            # the raw file size — the file stays large until rotation even when fully
+            # committed, so file size over-warns. Backlog growing = real commit stall.
+            backlog_mb = self._wal.uncommitted_mb()
+            if backlog_mb >= self._cfg.service_wal_max_mb * 0.6:
                 now = time.time()
                 if now - self._last_wal_warn_ts >= 30.0:
                     self._last_wal_warn_ts = now
                     logger.warning(
-                        "[imw] service-WAL backing up: %.1fMB / %dMB cap "
-                        "(queue_depth=%d) — commits not draining the wal",
-                        size_mb, self._cfg.service_wal_max_mb, self._queue.qsize())
+                        "[imw] service-WAL backlog %.1fMB uncommitted / %dMB cap "
+                        "(queue_depth=%d) — commits are not draining the wal",
+                        backlog_mb, self._cfg.service_wal_max_mb, self._queue.qsize())
         except Exception:  # noqa: BLE001
             pass
 
