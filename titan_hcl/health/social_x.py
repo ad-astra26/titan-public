@@ -162,17 +162,15 @@ class SocialXHealthCheck(HealthCheckPlugin):
 
     def _check_pipeline(self) -> HealthResult:
         """Hit twitterapi.io with X-API-Key only — no session, no mutation."""
-        # Master hibernation (2026-06-18): while the account is on X review hold,
-        # don't spend even the user/info probe credit. Sentinel = data/.x_hibernate.
-        import os
+        # Master switch (2026-06-18): when social_x.enabled=false the whole X
+        # subsystem is off, so don't spend even the user/info probe credit.
         try:
-            _sentinel = os.path.join(os.path.dirname(__file__), "..", "..",
-                                     "data", ".x_hibernate")
-            if os.path.exists(_sentinel):
+            from titan_hcl.params import get_params
+            if not bool((get_params("social_x") or {}).get("enabled", True)):
                 return HealthResult(
                     plugin=self.name, layer="pipeline", status="OK",
-                    reason="hibernated (X review hold — probe skipped)",
-                    details={"hibernated": True}, heal_recommended=False)
+                    reason="disabled (social_x.enabled=false — probe skipped)",
+                    details={"disabled": True}, heal_recommended=False)
         except Exception:
             pass
         if not self._api_key:

@@ -1186,46 +1186,27 @@ class SocialXGateway:
         except OSError:
             pass
 
-    def _write_enabled(self) -> bool:
-        """Kill-switch — `[social_x].write_enabled` (default True). False halts
-        ALL X writes (post/reply/like/retweet/follow) before any API call."""
-        try:
-            return bool((get_params("social_x") or {}).get("write_enabled", True))
-        except Exception:
-            return True
-
     def x_api_hibernated(self) -> bool:
-        """Master hibernation — when True, the SOLE twitterapi.io caller refuses
-        EVERY call (reads AND writes), so the subsystem costs ZERO credits. Used
-        while the shared @your_x_handle account is on a months-long X review hold:
-        no point polling mentions / searching / probing for a dead account.
-
-        Flipped by EITHER a sentinel file `data/.x_hibernate` (live, no restart,
-        no config-schema churn — `touch` to hibernate, `rm` to wake) OR config
-        `[social_x].api_enabled = false`. Default = NOT hibernated."""
-        import os
+        """Master X on/off — the SINGLE canonical lever `[social_x].enabled`.
+        When false, the SOLE twitterapi.io caller refuses EVERY call (reads AND
+        writes AND the health probe), so the whole subsystem costs ZERO credits.
+        It is hot-reloadable: flip `enabled` in config.toml and it applies live
+        in seconds (config-as-SHM, no restart) — used to hibernate during the X
+        account review hold and to wake it later. Default = enabled (not
+        hibernated). Replaces the prior sentinel / write_enabled / api_enabled
+        levers (consolidated 2026-06-18)."""
         try:
-            sentinel = os.path.join(os.path.dirname(__file__), "..", "..",
-                                    "data", ".x_hibernate")
-            if os.path.exists(sentinel):
-                return True
-        except Exception:
-            pass
-        try:
-            return not bool((get_params("social_x") or {}).get(
-                "api_enabled", True))
+            return not bool((get_params("social_x") or {}).get("enabled", True))
         except Exception:
             return False
 
     def _write_block_reason(self) -> str:
-        """Non-empty reason if writes are currently blocked (hibernation OR
-        kill-switch OR an active auto-suspension), else "". Checked at every
-        write entry so a blocked write costs ZERO twitterapi.io credits — and
-        short-circuits BEFORE compose/media-upload."""
+        """Non-empty reason if writes are currently blocked (X disabled via
+        `social_x.enabled=false`, OR an active auto-suspension), else "". Checked
+        at every write entry so a blocked write costs ZERO twitterapi.io credits
+        — and short-circuits BEFORE compose/media-upload."""
         if self.x_api_hibernated():
-            return "X API hibernated (account on X review hold)"
-        if not self._write_enabled():
-            return "write_enabled=false (kill-switch)"
+            return "X disabled (social_x.enabled=false)"
         if self._write_suspended_until > time.time():
             mins = int((self._write_suspended_until - time.time()) / 60)
             return f"write auto-suspended {mins}min (persistent 422/226 block)"
