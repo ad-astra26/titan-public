@@ -278,13 +278,24 @@ class PostDispatchOrchestrator:
         # (SocialXGateway._build_state_signature reads .get(code, 0.5)).
         neuromods = self._read_neuromods_scalar()
 
-        # Emotion — canonical neuromod_state.bin (Rust L0) is numeric-only.
-        # The string label travels via NEUROMOD_STATS_UPDATED bus event
-        # (neuromod_worker._build_stats_payload current_emotion field).
-        # Until that label is SHM-published, default to "wonder" per
-        # legacy post_dispatch behavior (the previous code path also
-        # fell through to "wonder" once spirit_supplemental retired).
+        # Emotion — the canonical felt label is the EMOTIONAL CGN's current
+        # state (emot-cgn), read via the emotion bundle (v3 affective region →
+        # legacy human-readable label). This is the DEEP affective source the
+        # rest of the gateway already consults for emotion context — not a cosine
+        # match over raw neuromod levels, and not the old hardcoded "wonder" that
+        # made EVERY post's footer report "◇ wonder" regardless of real state
+        # (2026-06-18, Maker: "we've got emot-cgn for this"). Falls back to
+        # "wonder" only when the emot reader is inactive (cold boot).
         emotion = "wonder"
+        try:
+            from titan_hcl.logic.emot_bundle_protocol import (
+                read_full_emotion_context)
+            _emo_ctx = read_full_emotion_context()
+            if _emo_ctx and _emo_ctx.get("legacy_label"):
+                emotion = str(_emo_ctx["legacy_label"]).lower()
+        except Exception as _emo_err:
+            logger.debug("[PostDispatch] emot-cgn emotion read failed: %s",
+                         _emo_err)
 
         # Epoch — prefer unified_spirit.latest_epoch.epoch_id (Rust L1),
         # then unified_spirit.epoch_count, then Rust L0 epoch_counter.bin.
