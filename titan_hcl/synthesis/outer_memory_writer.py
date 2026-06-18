@@ -523,6 +523,62 @@ class OuterMemoryWriter:
         self.emit(event)
         return anchor_tx
 
+    def write_presence_interaction(
+        self,
+        *,
+        person_id: str,
+        person_ref: str,
+        evidence_strength: str,
+        channel: str,
+        age_epochs: int,
+        ts: Optional[float] = None,
+        significance: float = 0.45,
+        novelty: float = 0.2,
+        coherence: float = 0.8,
+    ) -> str:
+        """RFP_verifiable_autobiographical_presence_memory §7.A (CAPTURE) — anchor
+        ONE verified/asserted person-presence interaction as an EPISODIC-fork TX:
+        the autobiographical atom. **Content-addressed** (like write_concept_version):
+        returns the deterministic SHA-256 hex content-hash (the `tx_hash`)
+        immediately, so synthesis writes the `person_interactions` row without
+        waiting for the chain seal — the same hash the timechain TX will carry.
+
+        Titan-time: `age_epochs` is the time KEY; `ts` is human-display metadata
+        only (INV-PAM-TITAN-TIME). `evidence_strength` ∈ {crypto_verified_maker,
+        crypto_verified_device, asserted_identity} (INV-PAM-HONEST-GRADIENT) — carried
+        end-to-end so recall never overstates certainty.
+
+        Tags: ["presence_interaction", "person:<id>", "evidence:<strength>",
+               "channel:<channel>"]
+        """
+        content = {
+            "person_id": person_id,
+            "person_ref": person_ref or "",
+            "evidence_strength": evidence_strength,
+            "channel": channel or "",
+            "age_epochs": int(age_epochs),
+            "ts": float(ts) if ts is not None else time.time(),
+        }
+        anchor_tx = _canonical_concept_content_hash(content)
+        tags = [
+            "presence_interaction",
+            f"person:{person_id}",
+            f"evidence:{evidence_strength}",
+            f"channel:{channel or '?'}",
+        ]
+        event = OuterMemoryEvent(
+            fork="episodic",
+            thought_type="presence_interaction",
+            source=self._src,
+            content=content,
+            tags=tags,
+            significance=significance,
+            novelty=novelty,
+            coherence=coherence,
+        )
+        self.emit(event)
+        return anchor_tx
+
     def write_reasoning_composite(
         self,
         *,
