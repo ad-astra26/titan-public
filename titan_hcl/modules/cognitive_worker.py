@@ -2629,6 +2629,22 @@ def _run_dream_bridge(state_refs: dict, neuromod_reader, send_queue, name: str) 
     except Exception as _imp_err:
         logger.debug("[DreamBridge] inner-memory prune skipped: %s", _imp_err)
 
+    # Consciousness retention (2026-06-18) — bound `epochs` (1.23M rows, ~10s tick)
+    # + `trinity_journey_gifts` (676k) that bloated consciousness.db to 2.7GB on T1.
+    # epochs prune KEEPS the meaningful set (anchored + high-curvature) forever; gifts
+    # keep a recent window. Writer-routed (consciousness_writer), no VACUUM. ≥30min,
+    # best-effort. The local ConsciousnessDB is GC'd after (read conn released).
+    try:
+        _now_c = time.time()
+        if _now_c - float(state_refs.get("_last_consciousness_prune", 0.0)) >= 1800:
+            from titan_hcl.logic.consciousness import ConsciousnessDB
+            _cdb = ConsciousnessDB("./data/consciousness.db")
+            _cdb.prune_epochs(keep_rows=50_000)
+            _cdb.prune_journey_gifts(keep_rows=50_000)
+            state_refs["_last_consciousness_prune"] = _now_c
+    except Exception as _cp_err:
+        logger.debug("[DreamBridge] consciousness prune skipped: %s", _cp_err)
+
 
 def _dispatch_experience_record(state_refs: dict, payload: dict) -> None:
     """EXPERIENCE_RECORD consumer — Record stage of the ExperienceOrchestrator

@@ -636,6 +636,34 @@ class ConsciousnessDB:
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
 
+    def prune_epochs(self, keep_rows: int = 50_000) -> None:
+        """Retention (2026-06-18): bound the `epochs` log — the epoch tick fires
+        ~every 10s, accumulating 1.23M rows (the bulk of a 2.7GB consciousness.db on
+        T1). KEEP the meaningful ones forever — anchored epochs (`anchored_tx != ''`,
+        Solana-committed) and high-curvature epochs (`curvature > 3.0`, the dashboard's
+        significant set) — plus the most-recent `keep_rows` (covers get_recent_epochs /
+        get_recent_journey_points, both windowed; the full-history get_all_journey_points
+        is dead — only get_recent_journey_points is called). DELETE only the routine
+        bulk, writer-routed, NO VACUUM (T3 2026-04-21 lesson)."""
+        self._route_write(
+            "DELETE FROM epochs "
+            "WHERE epoch_id <= (SELECT MAX(epoch_id) FROM epochs) - ? "
+            "AND (anchored_tx IS NULL OR anchored_tx = '') AND curvature <= 3.0",
+            (int(keep_rows),),
+            table="epochs",
+        )
+
+    def prune_journey_gifts(self, keep_rows: int = 50_000) -> None:
+        """Retention (2026-06-18): bound `trinity_journey_gifts` (676k rows on T1).
+        Read only via get_journey_gifts (ORDER BY gift_id DESC LIMIT) — a recent window
+        — so keeping the most-recent `keep_rows` is safe. Writer-routed, NO VACUUM."""
+        self._route_write(
+            "DELETE FROM trinity_journey_gifts "
+            "WHERE gift_id <= (SELECT MAX(gift_id) FROM trinity_journey_gifts) - ?",
+            (int(keep_rows),),
+            table="trinity_journey_gifts",
+        )
+
     def close(self):
         try:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
