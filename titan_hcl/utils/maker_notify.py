@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Optional
 from titan_hcl.utils.silent_swallow import swallow_warn
+from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ def _get_telegram_creds() -> tuple[Optional[str], Optional[str]]:
     """Resolve (bot_token, maker_chat_id) from config."""
     try:
         from titan_hcl.config_loader import load_titan_config
-        cfg = load_titan_config()
+        cfg = load_titan_params()
         ch = cfg.get("channels", {}).get("telegram", {}) or {}
         mr = cfg.get("maker_relationship", {}) or {}
         # Try both common keys

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from titan_hcl import bus
 from titan_hcl.params import get_params
+from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -602,29 +603,16 @@ class SocialXGateway:
     # ── Config ──────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
-        """Return merged config ([social_x] + credential keys). Called before
-        EVERY action — relies on config_loader's mtime-aware cache, so repeated
-        calls are cheap (no disk re-read unless a source file actually changed)
-        yet still reflect live edits to config.toml / ~/.titan/secrets.toml.
+        """Return merged config ([social_x] + credential keys), read from SHM via
+        get_params — the in-kernel config daemon keeps the per-section slots live,
+        hot-reseeding on a config.toml / ~/.titan/secrets.toml edit. Cheap on the
+        repeated calls this makes before every action.
 
-        Uses titan_hcl.config_loader so secrets in ~/.titan/secrets.toml
-        are deep-merged over the base config.
+        RFP_config_as_shm_state §7.C/C.3: the prior whole-config load_titan_config()
+        (and the ``_config_path`` test-seam that fed it) was removed — ``full`` was
+        write-only after the Phase-B repoint of the section reads below to get_params,
+        so the returned dict (built entirely from get_params) is byte-for-byte unchanged.
         """
-        try:
-            from titan_hcl.config_loader import load_titan_config
-            # Honor per-instance config_path (tests inject a tmp_config via
-            # the constructor). When None or the prod default, falls through
-            # to BASE_CONFIG_PATH inside load_titan_config — production
-            # behavior unchanged.
-            _instance_path = getattr(self, "_config_path", None)
-            _use_path = (_instance_path
-                         if _instance_path and _instance_path != "./titan_hcl/config.toml"
-                         else None)
-            full = load_titan_config(config_path=_use_path)
-        except Exception as e:
-            logger.warning("[SocialXGateway] Config load failed: %s", e)
-            return {"enabled": False}
-
         sx = get_params("social_x")
         # Also read credentials from existing sections for backward compat
         tw = get_params("twitter_social")
@@ -1059,7 +1047,7 @@ class SocialXGateway:
         import httpx
         try:
             from titan_hcl.config_loader import load_titan_config
-            full_cfg = load_titan_config()
+            full_cfg = load_titan_params()
             tc = get_params("twitter_social")
 
             user_name = tc.get("user_name", "")

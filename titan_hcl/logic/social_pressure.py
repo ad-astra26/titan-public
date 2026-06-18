@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 from titan_hcl.params import get_params
+from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ class XSessionManager:
         """Read auth_session from merged config and validate."""
         try:
             from titan_hcl.config_loader import load_titan_config
-            cfg = load_titan_config()
+            cfg = load_titan_params()
             session = get_params("twitter_social").get("auth_session", "")
             if session:
                 self._cached_session = session

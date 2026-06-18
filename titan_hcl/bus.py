@@ -147,7 +147,7 @@ def get_bus_ipc_pool() -> concurrent.futures.ThreadPoolExecutor:
         size = _BUS_IPC_DEFAULT_WORKERS
         try:
             from titan_hcl.config_loader import load_titan_config
-            cfg = load_titan_config() or {}
+            cfg = load_titan_params() or {}
             size = int(cfg.get("runtime", {}).get("pools", {}).get(
                 "bus_ipc_workers", _BUS_IPC_DEFAULT_WORKERS))
         except Exception:
@@ -1790,6 +1790,7 @@ class DivineBus:
 
 _emit_gate_last_ts: dict[tuple, float] = {}
 import threading as _threading
+from titan_hcl.params import load_titan_params
 _emit_gate_lock = _threading.Lock()
 
 

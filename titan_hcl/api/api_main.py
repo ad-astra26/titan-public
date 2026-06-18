@@ -20,6 +20,7 @@ function is preserved as the body — this file is a thin entry that:
   3. Delegates to api_subprocess_main for the unchanged body
 """
 from __future__ import annotations
+from titan_hcl.params import get_params
 
 
 def entry(recv_queue, send_queue, name: str, config: dict) -> None:
@@ -112,7 +113,7 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
             try:
                 from titan_hcl.config_loader import load_titan_config as _ltc
                 _port = int(_os.environ.get("TITAN_API_PORT")
-                            or _ltc().get("api", {}).get("port", 7777))
+                            or get_params("api").get("port", 7777))
             except Exception:  # noqa: BLE001
                 _port = int(_os.environ.get("TITAN_API_PORT", "7777"))
             _hc = f"http://127.0.0.1:{_port}/health"

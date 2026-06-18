@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Awaitable, Optional
 
 import httpx
+from titan_hcl.params import get_params, load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ class CommandRegistry:
         """Load registered maker platform IDs from config."""
         try:
             from titan_hcl.config_loader import load_titan_config
-            cfg = load_titan_config()
+            cfg = load_titan_params()
             maker_ids = cfg.get("channels", {}).get("maker_platform_ids", "")
             if maker_ids:
                 self._maker_ids = {mid.strip() for mid in maker_ids.split(",") if mid.strip()}
@@ -309,7 +310,7 @@ class CommandRegistry:
     async def _cmd_wallet(self, args: str, user_id: str) -> str:
         try:
             from titan_hcl.config_loader import load_titan_config
-            cfg = load_titan_config()
+            cfg = load_titan_params()
             network_cfg = cfg.get("network", {})
             solana_network = network_cfg.get("solana_network", "devnet")
 
@@ -387,7 +388,7 @@ class CommandRegistry:
     async def _cmd_maker(self, args: str, user_id: str) -> str:
         try:
             from titan_hcl.config_loader import load_titan_config
-            cfg = load_titan_config()
+            cfg = load_titan_params()
             network = cfg.get("network", {})
             twitter = cfg.get("twitter_social", {})
 
@@ -455,7 +456,7 @@ class CommandRegistry:
             # Read the merged view (config.toml + ~/.titan/secrets.toml) for display.
             # Writes below still go to config.toml; sensitive-key writes are refused
             # with a pointer to ~/.titan/secrets.toml.
-            cfg = load_titan_config()
+            cfg = load_titan_params()
 
             if not args:
                 # List top-level sections
@@ -681,6 +682,6 @@ def _get_internal_key() -> str:
     """Load internal API key from merged config."""
     try:
         from titan_hcl.config_loader import load_titan_config
-        return load_titan_config().get("api", {}).get("internal_key", "") or ""
+        return get_params("api").get("internal_key", "") or ""
     except Exception:
         return ""

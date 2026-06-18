@@ -29,6 +29,7 @@ from typing import AsyncIterator, Any, Optional
 import httpx
 
 from .base import InferenceProvider
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ _TEACHER_MODEL = "gemma4:31b"
 
 try:
     from titan_hcl.config_loader import load_titan_config
-    _inf = load_titan_config().get("inference", {})
+    _inf = get_params("inference")
     _LIGHT_MODEL = _inf.get("ollama_cloud_light_model", _LIGHT_MODEL)
     _HEAVY_MODEL = _inf.get("ollama_cloud_heavy_model", _HEAVY_MODEL)
     _TEACHER_MODEL = _inf.get("ollama_cloud_teacher_model", _TEACHER_MODEL)

@@ -54,6 +54,7 @@ from titan_hcl.bus import (
 # (scripts/guardian_hcl.py). The kernel holds a thin bus client mirroring
 # Guardian's public surface — see titan_hcl/guardian_hcl_client.py.
 from titan_hcl.guardian_hcl_client import GuardianHCLClient
+from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -2621,7 +2622,7 @@ class TitanKernel:
     def _load_full_config() -> dict:
         """Load the full merged Titan config (config.toml + ~/.titan/secrets.toml)."""
         from titan_hcl.config_loader import load_titan_config
-        return load_titan_config()
+        return load_titan_params()
 
     def _resolve_wallet(self, wallet_path: str) -> Optional[str]:
         """Resolve wallet keypair (lifted from TitanCore._resolve_wallet).

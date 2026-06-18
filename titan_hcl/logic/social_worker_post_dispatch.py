@@ -70,6 +70,7 @@ from titan_hcl.logic.social_x_gateway import (
     ReplyContext,
 )
 from titan_hcl.params import get_params
+from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -1046,7 +1047,7 @@ class PostDispatchOrchestrator:
           9. Mention discovery + reply cycle (30-min cooldown).
         """
         try:
-            full_config = load_titan_config()
+            full_config = load_titan_params()
         except Exception as _err:
             logger.warning(
                 "[PostDispatch] config load failed — skipping tick: %s",

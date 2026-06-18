@@ -10,6 +10,7 @@ from fastapi import APIRouter, Request, Depends
 
 from .auth import verify_maker_auth
 from titan_hcl import bus
+from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -521,7 +522,7 @@ async def trigger_shadow_swap(request: Request):
         # which never existed; ModuleNotFoundError silently locked full_stop=True).
         # Real loader is titan_hcl.config_loader.load_titan_config.
         from titan_hcl.config_loader import load_titan_config
-        cfg = load_titan_config() or {}
+        cfg = load_titan_params() or {}
         full_stop = bool(cfg.get("microkernel", {})
                          .get("shadow_swap", {})
                          .get("maker_full_stop", True))

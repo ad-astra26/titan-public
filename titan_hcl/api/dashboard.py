@@ -6340,7 +6340,7 @@ async def get_v4_backup_status(request: Request):
         cfg_backup = {}
         try:
             from titan_hcl.config_loader import load_titan_config
-            _cfg = load_titan_config()
+            _cfg = load_titan_params()
             cfg_backup = _cfg.get("backup", {}) or {}
         except Exception:
             _cfg = {}
@@ -6445,7 +6445,7 @@ async def get_v4_backup_wallet_runway(request: Request):
     try:
         import os as _os, subprocess as _sp, json as _json
         from titan_hcl.config_loader import load_titan_config
-        cfg = load_titan_config()
+        cfg = load_titan_params()
         kp = cfg.get("network", {}).get("wallet_keypair_path", "")
         if not kp or not _os.path.exists(kp):
             return _ok({"available": False, "reason": "no_keypair"})
@@ -6497,7 +6497,7 @@ async def get_v4_backup_manifest(request: Request):
         titan_id = "T1"
         try:
             from titan_hcl.config_loader import load_titan_config
-            titan_id = load_titan_config().get("info_banner", {}).get(
+            titan_id = get_params("info_banner").get(
                 "titan_id", "T1")
         except Exception:
             pass
@@ -6762,7 +6762,7 @@ def _get_llm_distill_ctx():
         return _llm_distill_ctx
     try:
         from titan_hcl.config_loader import load_titan_config
-        cfg = load_titan_config()
+        cfg = load_titan_params()
         api_cfg = cfg.get("api", {}) or {}
         internal_key = api_cfg.get("internal_key", "") or ""
         if not internal_key:
@@ -9688,7 +9688,7 @@ async def get_v1_kin_identity(request: Request):
         # Read merged config for genesis NFT + keypair path
         try:
             from titan_hcl.config_loader import load_titan_config
-            _cfg = load_titan_config()
+            _cfg = load_titan_params()
             soul = _cfg.get("soul", {})
             genesis_nft = soul.get("genesis_nft_address", "")
             titan_id = _cfg.get("titan_id", "T1")
@@ -9797,7 +9797,7 @@ async def get_v1_kin_meta_cgn_snapshot(request: Request):
         signed_by = "unsigned"
         try:
             from titan_hcl.config_loader import load_titan_config
-            _cfg = load_titan_config()
+            _cfg = load_titan_params()
             kp_path = _P(_cfg.get("soul", {}).get(
                 "keypair_path", "~/.config/solana/id.json")).expanduser()
             if kp_path.exists():
@@ -12479,3 +12479,4 @@ from titan_hcl.api.synthesis_metrics_handlers import (
     post_v6_synthesis_feedback,
     post_v6_synthesis_turn_feedback,
 )
+from titan_hcl.params import load_titan_params

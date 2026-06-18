@@ -34,6 +34,7 @@ import logging
 import secrets
 import threading
 from typing import Optional
+from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,7 @@ def get_user_id_hash_salt() -> bytes:
 
         from titan_hcl.config_loader import load_titan_config, update_secret
 
-        cfg = load_titan_config() or {}
+        cfg = load_titan_params() or {}
         synth_section = cfg.get("synthesis") or {}
         salt_hex = synth_section.get("user_id_hash_salt", "")
 

@@ -35,6 +35,7 @@ from titan_hcl.health import (
     HealthCheckPlugin,
     HealthResult,
 )
+from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger("health.social_x")
 
@@ -105,7 +106,7 @@ class SocialXHealthCheck(HealthCheckPlugin):
         # Layer-1+2 fallbacks (user_name, db_path) can come from either.
         try:
             from titan_hcl.config_loader import load_titan_config
-            full_cfg = load_titan_config(force_reload=True)
+            full_cfg = load_titan_params(force_reload=True)
         except Exception:
             full_cfg = {}
         sx_secrets = (full_cfg.get("social_x") or {}) if full_cfg else {}

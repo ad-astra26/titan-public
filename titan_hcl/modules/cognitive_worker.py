@@ -106,6 +106,7 @@ from titan_hcl._phase_c_constants import (
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
 from titan_hcl.params import get_params
+from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -2834,7 +2835,7 @@ def _make_neuromod_reader():
         # `RegistryBank()` defaulted to empty config → is_enabled always
         # returned False → reader was always None → NeuromodRewardObserver
         # ran in dormant levels_provider=none mode on T3.
-        bank = RegistryBank(config=load_titan_config())
+        bank = RegistryBank(config=load_titan_params())
         if not bank.is_enabled(NEUROMOD_STATE):
             return None
         reader = bank.reader(NEUROMOD_STATE)
@@ -3280,7 +3281,7 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
             from titan_hcl.modules.neuromod_worker import (
                 decode_neuromod_state)
             if "_neuromod_state_reader" not in state_refs:
-                _bank_q10 = RegistryBank(config=load_titan_config())
+                _bank_q10 = RegistryBank(config=load_titan_params())
                 if _bank_q10.is_enabled(NEUROMOD_STATE):
                     state_refs["_neuromod_state_reader"] = _bank_q10.reader(
                         NEUROMOD_STATE)

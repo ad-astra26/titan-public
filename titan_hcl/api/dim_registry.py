@@ -33,6 +33,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterator, NamedTuple, Optional
+from titan_hcl.params import load_titan_params
 
 # Block layout (start_index, length, block_name).
 _BLOCKS: list[tuple[int, int, str]] = [
@@ -793,7 +794,7 @@ def _l0_rust_enabled() -> bool:
         return _L0_RUST_ENABLED_CACHE
     try:
         from titan_hcl.config_loader import load_titan_config
-        config = load_titan_config()
+        config = load_titan_params()
         _L0_RUST_ENABLED_CACHE = bool(
             config.get("microkernel", {}).get("l0_rust_enabled", False)
         )

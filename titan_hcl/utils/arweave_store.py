@@ -25,6 +25,7 @@ import os
 import time
 from pathlib import Path
 from typing import Optional
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +385,7 @@ class ArweaveStore:
         """Get the RPC URL from merged config or default."""
         try:
             from titan_hcl.config_loader import load_titan_config
-            return load_titan_config().get("network", {}).get("premium_rpc_url", "https://api.mainnet-beta.solana.com")
+            return get_params("network").get("premium_rpc_url", "https://api.mainnet-beta.solana.com")
         except Exception:
             return "https://api.mainnet-beta.solana.com"
 

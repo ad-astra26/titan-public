@@ -18,6 +18,7 @@ from typing import Optional
 
 from titan_hcl.utils.crypto import verify_maker_signature as _verify_maker_sig
 from titan_hcl.utils.crypto import sign_solana_payload
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +278,7 @@ class SovereignSoul:
         if not self._nft_address:
             try:
                 from titan_hcl.config_loader import load_titan_config
-                self._nft_address = load_titan_config().get("network", {}).get("genesis_nft_address", "")
+                self._nft_address = get_params("network").get("genesis_nft_address", "")
                 if self._nft_address:
                     logger.info("[Soul] GenesisNFT address loaded from config: %s",
                                 self._nft_address[:20] + "...")
@@ -331,7 +332,7 @@ class SovereignSoul:
             # Read merged config for RPC
             try:
                 from titan_hcl.config_loader import load_titan_config
-                rpc_url = load_titan_config().get("network", {}).get("premium_rpc_url",
+                rpc_url = get_params("network").get("premium_rpc_url",
                           "https://api.mainnet-beta.solana.com")
             except Exception:
                 rpc_url = "https://api.mainnet-beta.solana.com"

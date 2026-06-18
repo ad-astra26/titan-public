@@ -131,6 +131,7 @@ from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
 from titan_hcl.params import get_params
+from titan_hcl.params import load_titan_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -320,7 +321,7 @@ def _init_post_dispatch_orchestrator(state_refs: dict, name: str,
         _internal_key = ""
         try:
             from titan_hcl.config_loader import load_titan_config
-            _cfg = load_titan_config() or {}
+            _cfg = load_titan_params() or {}
             _api_port = int(get_params("api").get("port", 7777))
             _internal_key = get_params("api").get("internal_key", "") or ""
         except Exception:
@@ -1151,7 +1152,7 @@ def _handle_heal_request(payload: dict, state_refs: dict,
                 try:
                     from titan_hcl.config_loader import (
                         load_titan_config)
-                    full_cfg = load_titan_config(force_reload=True)
+                    full_cfg = load_titan_params(force_reload=True)
                     sx_cfg = get_params("social_x") or {}
                     sage_cfg = get_params("stealth_sage") or {}
                     tw_cfg = get_params("twitter_social") or {}

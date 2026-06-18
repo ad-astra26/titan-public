@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 from titan_hcl.modules._heartbeat_grace import (
     boot_deadline_from_now, shm_heartbeat_allowed,
 )
+from titan_hcl.params import load_titan_params
 
 _WORKER_READY: bool = False
 _BOOT_DEADLINE = None  # boot-grace deadline (monotonic); None=no grace
@@ -301,7 +302,7 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     try:
         import json as _hc_json
         from titan_hcl.config_loader import load_titan_config as _hc_load
-        _params = _hc_load()
+        _params = load_titan_params()
         _haov_raw = _params.get("cgn", {}).get("haov", {})
         # Base config: all non-dict values from [cgn.haov]
         haov_config = {k: v for k, v in _haov_raw.items()

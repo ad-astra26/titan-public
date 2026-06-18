@@ -16,6 +16,7 @@ except ModuleNotFoundError:
 
 from .base import AbstractMoodAddon
 from titan_hcl.params import get_params
+from titan_hcl.params import load_titan_params
 
 class MoodRegistry:
     """
@@ -82,7 +83,7 @@ class MoodEngine:
         """Reads merged config and triggers the registry hot-loader."""
         try:
             from titan_hcl.config_loader import load_titan_config
-            config = load_titan_config()
+            config = load_titan_params()
         except Exception as e:
             logging.warning(f"[MoodEngine] Config load failed: {e}. Using defaults.")
             return

@@ -11,6 +11,7 @@ import re
 from typing import Optional
 
 import httpx
+from titan_hcl.params import get_params, load_titan_params
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ def _load_internal_key() -> str:
         return _cached_internal_key
     try:
         from titan_hcl.config_loader import load_titan_config
-        _cached_internal_key = load_titan_config().get("api", {}).get("internal_key", "") or ""
+        _cached_internal_key = get_params("api").get("internal_key", "") or ""
         return _cached_internal_key
     except Exception:
         pass
@@ -271,7 +272,7 @@ def get_channel_config(channel: str) -> dict:
     section or keys are missing.
     """
     from titan_hcl.config_loader import load_titan_config
-    full = load_titan_config()
+    full = load_titan_params()
     channels_section = full.get("channels", {})
     prefix = f"{channel}_"
     return {
