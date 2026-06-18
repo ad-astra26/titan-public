@@ -118,16 +118,86 @@ def _legacy_get_params(section: str) -> dict:
     return dict(cfg.get(section, {}))
 
 
-def load_titan_params(force_reload: bool = False) -> dict:
-    """Return the full merged Titan config (4-layer).
+def _deep_merge_into(base: dict, overlay: dict) -> None:
+    """Table-deep, later-wins merge of ``overlay`` into ``base`` (in place) — mirrors the
+    Rust config daemon's ``deep_merge`` and the retired ``config_loader._deep_merge``."""
+    for k, v in overlay.items():
+        if isinstance(base.get(k), dict) and isinstance(v, dict):
+            _deep_merge_into(base[k], v)
+        else:
+            base[k] = v
 
-    Backwards-compatible wrapper around ``config_loader.load_titan_config``.
-    The legacy name is preserved so existing callers keep working without
-    edits; the returned dict now reflects the full merge instead of just
-    Layer 1. (Whole-config reads stay file-backed; only per-section
-    ``get_params`` moved to SHM in Phase B.)
-    """
-    return load_titan_config(force_reload=force_reload)
+
+def _bootstrap_merge() -> dict:
+    """Minimal whole-config merge: ``titan_params.toml ⊎ config.toml`` + the
+    ``~/.titan/secrets.toml`` overlay — table-deep, later-wins, NO microkernel layer
+    (matching the Rust config daemon, which dropped the override layer in Phase 0).
+
+    🚫 NOT a worker runtime path (INV-CFG-1). Used ONLY when the SHM config stack is
+    unavailable: pytest with no daemon, or birth/installer before the daemon seeds slots.
+    On a live box every worker reads SHM (``get_params`` / ``load_titan_params`` assembly)."""
+    import tomllib
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    merged: dict = {}
+    for fname in ("titan_params.toml", "config.toml"):
+        path = os.path.join(base_dir, fname)
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    _deep_merge_into(merged, tomllib.load(f))
+            except Exception as e:
+                _LOG.warning("params: bootstrap merge of %s failed: %s", fname, e)
+    secrets = os.path.expanduser("~/.titan/secrets.toml")
+    if os.path.exists(secrets):
+        try:
+            with open(secrets, "rb") as f:
+                _deep_merge_into(merged, tomllib.load(f))
+        except Exception as e:
+            _LOG.warning("params: bootstrap secrets merge failed: %s", e)
+    return merged
+
+
+def _all_config_sections() -> Optional[list]:
+    """Top-level config section names from the SHM ``config/`` dir (one ``<section>.bin``
+    slot per section, seeded by the in-kernel daemon). ``None`` ⇒ SHM unavailable ⇒ the
+    caller bootstraps."""
+    global _shm_root, _shm_unavailable
+    if _shm_unavailable:
+        return None
+    try:
+        from titan_hcl.core.state_registry import resolve_shm_root
+        if _shm_root is None:
+            _shm_root = resolve_shm_root()
+        cfg_dir = os.path.join(str(_shm_root), "config")
+        if not os.path.isdir(cfg_dir):
+            return None
+        return sorted(n[:-4] for n in os.listdir(cfg_dir) if n.endswith(".bin"))
+    except Exception as e:
+        _LOG.debug("params: cannot list SHM config slots (%s)", e)
+        return None
+
+
+def load_titan_params(force_reload: bool = False) -> dict:
+    """Return the full merged Titan config as ``{section: dict}``.
+
+    SHM-assembled (Phase C / INV-CFG-7): reads every per-section config slot the in-kernel
+    daemon seeds (``/dev/shm/titan_<id>/config/*.bin``) and assembles them — config IS
+    SHM-state. Falls back to ``_bootstrap_merge`` (the minimal file merge) ONLY when SHM is
+    unavailable (pytest with no daemon, or birth/installer before the daemon seeds slots).
+
+    ``force_reload`` is accepted for backwards-compatibility but is a no-op: SHM reads are
+    always fresh (no cache); the bootstrap path re-reads each call."""
+    if _config_shm_enabled():
+        sections = _all_config_sections()
+        if sections:
+            whole: dict = {}
+            for sec in sections:
+                d = _read_config_slot(sec)
+                if d is not None:
+                    whole[sec] = d
+            if whole:
+                return whole
+    return _bootstrap_merge()
 
 
 def get_params(section: str) -> dict:

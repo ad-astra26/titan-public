@@ -106,6 +106,46 @@ def test_poll_never_raises_without_slot(shm):
     assert params.poll_config_reloads() == []  # no slot → no fire, no raise
 
 
+def test_load_titan_params_assembles_all_slots(shm):
+    """C.2 (§7.C): load_titan_params() SHM-assembles every per-section slot into the
+    whole {section: dict} merged config (replacing the config_loader file merge)."""
+    _write_slot(shm, "social_x", {"enabled": True, "x_min_post_interval": 900})
+    _write_slot(shm, "reflexes", {"fire_threshold": 0.15})
+    whole = params.load_titan_params()
+    assert whole == {
+        "social_x": {"enabled": True, "x_min_post_interval": 900},
+        "reflexes": {"fire_threshold": 0.15},
+    }
+
+
+def test_load_titan_params_bootstraps_when_no_slots(shm, monkeypatch):
+    """C.2: flag on but no SHM slots (empty config/ dir) → falls back to _bootstrap_merge."""
+    monkeypatch.setattr(params, "_bootstrap_merge", lambda: {"_bootstrap": True})
+    assert params.load_titan_params() == {"_bootstrap": True}
+
+
+def test_load_titan_params_bootstraps_when_flag_off(shm, monkeypatch):
+    """C.2: SHM read flag off → bootstrap path (never the slots)."""
+    _write_slot(shm, "social_x", {"enabled": True})
+    monkeypatch.setenv("TITAN_CONFIG_SHM_READ", "0")
+    monkeypatch.setattr(params, "_bootstrap_merge", lambda: {"_bootstrap": True})
+    assert params.load_titan_params() == {"_bootstrap": True}
+
+
+def test_deep_merge_into_table_deep_later_wins():
+    """C.2: _bootstrap_merge's deep-merge mirrors the Rust daemon (table-deep, later-wins)."""
+    base = {"a": {"x": 1, "y": 2}, "b": 5}
+    params._deep_merge_into(base, {"a": {"y": 9, "z": 3}, "c": 7})
+    assert base == {"a": {"x": 1, "y": 9, "z": 3}, "b": 5, "c": 7}
+
+
+def test_bootstrap_merge_reads_real_params():
+    """C.2: _bootstrap_merge reads the real titan_params.toml (config.toml absent in a
+    worktree is handled) → returns a dict carrying known DNA sections."""
+    out = params._bootstrap_merge()
+    assert isinstance(out, dict) and "consciousness" in out and "sphere_clock" in out
+
+
 def test_trinity_restoring_rehome_fires_publisher_on_bump(shm):
     """C.1 (§7.C): the trinity-restoring sidecar republish — formerly triggered by the
     now-retired /v4/reload-config endpoint — is re-homed as a heartbeat config-watch
