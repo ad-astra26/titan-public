@@ -129,8 +129,10 @@ def test_graduated_mix_unpublished_level_is_base():
 
 
 def test_authority_rank_order_unchanged():
-    # P5 graduates only MAGNITUDES; the authority order (corrective-delta) is fixed.
-    assert _REWARD_SOURCE_RANK == {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3}
+    # P5 graduates only MAGNITUDES; the authority order (corrective-delta) of the
+    # existing sources is fixed. (P6 adds `idk_oracle` additively at the oracle tier.)
+    for _k, _v in {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3}.items():
+        assert _REWARD_SOURCE_RANK[_k] == _v
 
 
 # ── SHM level → level_norm normalization (the synthesis reader's math) ───────

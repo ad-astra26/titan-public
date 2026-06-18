@@ -500,6 +500,88 @@ def _emit_nonverifiable_decision(plugin, features, action, prompt_text, user_id)
         return None
 
 
+def _idk_oracle_cfg(plugin):
+    """P6 — the IDK-oracle config (mirrors `_self_learning_enabled`'s read; defaults
+    match `self_learning_worker._DEFAULTS`). Returns a dict when enabled, else None
+    (→ caller keeps IDK on the legacy quality-judge stash, byte-identical INV-MC-7)."""
+    try:
+        cfg = (getattr(plugin, "_full_config", {}) or {}).get("synthesis", {}) or {}
+        sl = cfg.get("self_learning", {}) or {}
+        if not bool(sl.get("idk_oracle_enabled", True)):
+            return None
+        return {
+            "know_threshold": float(sl.get("explore_know_threshold", 0.65)),
+            "verified_reward": float(sl.get("idk_verified_reward", 0.15)),
+            "unverified_penalty": float(sl.get("idk_unverified_penalty", -0.5)),
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fire_idk_gap_fill(plugin, topic: str) -> None:
+    """P6 — a verified-empty IDK fires a DEFERRED gap-fill: research the topic in the
+    background via the canonical knowledge pipeline (`CGN_KNOWLEDGE_REQ` →
+    knowledge_worker → knowledge_dispatcher → wiki/engram seed → recallable). That
+    pipeline is already rate-gated + queue-bounded (Q3 — no new gate). The honest
+    'I don't know' is STILL returned this turn; the gap fills for NEXT time. Never
+    raises (hot path; INV-OML-7)."""
+    try:
+        import uuid
+        from titan_hcl import bus as _bus_mod
+        from titan_hcl.bus import make_msg as _mk
+        _bus = getattr(plugin, "bus", None)
+        if _bus is None or not (topic or "").strip():
+            return
+        _bus.publish(_mk(
+            _bus_mod.CGN_KNOWLEDGE_REQ, "pre_hook", "knowledge", {
+                "topic": str(topic)[:500],
+                "requestor": "idk_oracle.gap_fill",
+                "urgency": 0.5,
+                "request_id": uuid.uuid4().hex,
+            }))
+    except Exception as e:  # noqa: BLE001 — never break chat
+        logger.debug("[PreHook] P6 idk gap-fill skipped: %s", e)
+
+
+def _emit_idk_oracle_reward(plugin, features, action, prompt_text, user_id, oc) -> None:
+    """P6 — score an IDK turn on the recall ORACLE (NOT the quality turn-judge):
+    verified-empty recall ⇒ honest IDK rewarded slightly > a damped `direct`; recall
+    strong ⇒ he KNEW and bailed ⇒ penalized (INV-MC-5/INV-MC-8). The verdict is
+    SYNCHRONOUS (`recall_top = φ[1]`), so the reward travels the v1.1 'decision+outcome
+    together' DIRECT path (features+action+reward present → `_handle_reward` trains it,
+    no async join, no quality-judge). A verified-empty IDK also fires a deferred
+    gap-fill. Never raises (hot path; INV-OML-7)."""
+    try:
+        from titan_hcl import bus as _bus_mod
+        from titan_hcl.bus import make_msg as _mk
+        from titan_hcl.synthesis.idk_oracle import idk_verdict
+        _bus = getattr(plugin, "bus", None)
+        if _bus is None:
+            return
+        recall_top = float(features[1])   # φ[1] = recall_top_cosine (OuterFeatures order)
+        v = idk_verdict(recall_top=recall_top,
+                        know_threshold=oc["know_threshold"],
+                        verified_reward=oc["verified_reward"],
+                        unverified_penalty=oc["unverified_penalty"])
+        try:
+            from titan_hcl.synthesis.goal_class import goal_class as _gc_fn
+            gc = _gc_fn(prompt_text or "")
+        except Exception:
+            gc = ""
+        _bus.publish(_mk(
+            _bus_mod.SELF_LEARN_REWARD, "pre_hook", "self_learning", {
+                "features": list(features),
+                "action": int(action),
+                "reward": float(v["reward"]),
+                "goal_class": gc,
+                "source": "idk_oracle",
+            }))
+        if v["verified"]:
+            _fire_idk_gap_fill(plugin, prompt_text)
+    except Exception as e:  # noqa: BLE001 — never break chat
+        logger.debug("[PreHook] P6 idk-oracle reward skipped: %s", e)
+
+
 def _emit_research_confirmed(plugin, node) -> None:
     """DK.1 (§7.D-knowledge) — a researched finding the user just CONFIRMED → tell
     memory_worker to promote+anchor it NOW + seed the declarative concept
@@ -1912,10 +1994,22 @@ def create_pre_hook(plugin):
                         _mode_override, _features, _action = _outer
                         mode = _mode_override
                         plugin._last_outer_decision = (_features, _action)
-                        # RFP §7.B (B.1) — non-verifiable lane: stash the decision
-                        # for an async reward (turn-judge / user / Maker rating).
-                        plugin._last_reasoning_id = _emit_nonverifiable_decision(
-                            plugin, _features, _action, prompt_text, user_id)
+                        # P6 — IDK is recall-VERIFIABLE: when idk_oracle is on, score
+                        # it on the recall oracle (NOT the quality turn-judge) + fire
+                        # a deferred gap-fill on a verified-empty IDK. `_last_reasoning_id`
+                        # stays None ⇒ no TURN_REASONING_RECORD queued (INV-MC-8). Any
+                        # other action (or flag-off IDK) → the legacy non-verifiable
+                        # stash for an async reward (byte-identical, INV-MC-7).
+                        from titan_hcl.synthesis.outer_meta_policy import (
+                            OUTER_ACTIONS as _OA_p6)
+                        _oc_p6 = (_idk_oracle_cfg(plugin)
+                                  if _OA_p6[int(_action)] == "IDK" else None)
+                        if _oc_p6:
+                            _emit_idk_oracle_reward(
+                                plugin, _features, _action, prompt_text, user_id, _oc_p6)
+                        else:
+                            plugin._last_reasoning_id = _emit_nonverifiable_decision(
+                                plugin, _features, _action, prompt_text, user_id)
                         logger.info(
                             "[PreHook] outer-policy → %s (action=%d) — overrides "
                             "grounded_route", mode, _action)

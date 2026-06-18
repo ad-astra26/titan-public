@@ -224,6 +224,18 @@ _DEFAULTS = {
     "teacher_relself_ema_alpha": 0.1,   # (a) recent-self EMA smoothing (read by synthesis TurnJudge)
     "teacher_judge_weight_floor": 0.3,  # (c) llm_judge weight floor>0 at max level (INV-MC-4 spirit)
     "teacher_authority_rise_gain": 1.0, # (c) oracle/maker rise: weight = base × (1 + gain·level_norm)
+    # ── P6 — IDK-oracle + gap-fill (ARCHITECTURE_mastery_leveling.md §7.P6) ──
+    # Promote the structural IDK oracle to a live per-turn verdict: IDK LEAVES the
+    # quality-judge lane (INV-MC-8) and is scored on the recall axis — verified-empty
+    # recall (recall_top < explore_know_threshold) ⇒ honest IDK rewarded slightly >
+    # a damped direct; recall strong ⇒ he KNEW & bailed ⇒ penalized (INV-MC-5). A
+    # verified-IDK fires a DEFERRED gap-fill research IMPULSE (agency web_search →
+    # DK.1 seed), gated by the agency pipeline's OWN budget+chi (Q3 — no new gate).
+    # flag-off ⇒ IDK stays quality-judged, byte-identical. (know-threshold reuses the
+    # existing explore_know_threshold=0.65; the verdict kernel = synthesis/idk_oracle.py.)
+    "idk_oracle_enabled": True,
+    "idk_verified_reward": 0.15,     # honest verified-IDK reward (slightly > a damped direct)
+    "idk_unverified_penalty": -0.5,  # IDK chosen with strong recall (knew & bailed)
     # ── P7 — clean-baseline reset (uncollapse) ──────────────────────────────
     # One-shot reset trigger: if this sentinel file exists at worker boot, the
     # collapsed routing policy + IQL nets + level + replay buffer are CLEARED →
@@ -239,7 +251,11 @@ _DEFAULTS = {
 # (the quality turn-judge, a user/Maker rating): a numerically-wrong answer is
 # wrong regardless of how it reads. (Emitted at verdict-time on the direct path
 # today; the rank governs any future join-path correction of the turn-judge.)
-_REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3}
+# `idk_oracle` (P6) is a deterministic recall-VERIFICATION (objective: did memory
+# return a dereferenceable hit?) → top authority, same tier as `oracle`. (The IDK
+# reward travels the v1.1 direct path, which bypasses this gate; the entry is
+# defensive so a future async IDK correction is never rank-0-dropped on a contended tx.)
+_REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3, "idk_oracle": 3}
 _SURVIVAL_STATES = frozenset({"SURVIVAL", "STARVATION"})
 
 
