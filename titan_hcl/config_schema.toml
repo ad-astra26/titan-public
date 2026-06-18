@@ -419,9 +419,6 @@
 "synthesis.self_learning.task_completion_reward_weight" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "twitter_social.auth_session" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=true}
 "twitter_social.email" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
-"twitter_social.engagement_check_interval" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
-"twitter_social.max_likes_per_day" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
-"twitter_social.max_replies_per_day" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
 "twitter_social.password" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=true}
 "twitter_social.totp_secret" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=true}
 "twitter_social.user_name" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
