@@ -489,8 +489,11 @@ def neuromod_worker_main(
     # builder, but movement clearance reads movement_<MOD> keys here too).
     try:
         # RFP_config_as_shm_state §7.C/C.3b: read [neuromodulator_dna] from the
-        # SHM slot (config-as-state, INV-CFG-7).
-        from titan_hcl.params import get_params
+        # SHM slot (config-as-state, INV-CFG-7). get_params is module-level
+        # (line 392) — a function-local re-import here shadowed it, making the
+        # earlier get_params("info_banner") use an UnboundLocalError that
+        # crashed the worker on every boot (no neuromod data in Observatory);
+        # fixed C.6 2026-06-18.
         neuromod_system._dna_cache = get_params("neuromodulator_dna")
         if neuromod_system._dna_cache:
             logger.info("[NeuromodWorker] DNA cache loaded (%d keys)",

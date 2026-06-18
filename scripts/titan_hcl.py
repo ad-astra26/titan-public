@@ -616,7 +616,8 @@ async def run(health_only: bool = False, server_only: bool = False,
         core._observatory_app.state.titan_agent = agent
 
     v3_status = core.get_v3_status()
-    api_port = cfg.get("api", {}).get("port", 7777)
+    from titan_hcl.params import get_params as _gp
+    api_port = _gp("api").get("port", 7777)
     print(f"  Bus modules:  {v3_status['bus_modules']}")
     print(f"  Bus stats:    {v3_status['bus_stats']}")
     print(f"  Observatory:  http://localhost:{api_port}")

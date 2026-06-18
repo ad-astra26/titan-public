@@ -46,6 +46,7 @@ from queue import Empty
 from titan_hcl import bus
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
+from titan_hcl.params import get_params
 
 logger = logging.getLogger("reflex")
 
@@ -111,7 +112,6 @@ def reflex_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[ReflexWorker] Booting — titan_id=%s", titan_id)
 
     try:
-        from titan_hcl.params import get_params
         from titan_hcl.logic.reflexes import ReflexCollector
         reflex_cfg = get_params("reflexes")
         # Stateless aggregator — no executors registered. Cooldowns are
