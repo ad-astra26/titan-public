@@ -3690,6 +3690,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             if presence_rollup is not None:
                 try:
                     presence_rollup.fold()
+                    # §7.D — refresh the lock-free recall surface the agno PreHook
+                    # reads (per-person last-seen + chain_status). Soft.
+                    if autobiography_seal is not None:
+                        autobiography_seal.export_recall_snapshot()
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
                         "[synthesis_worker] presence_rollup fold failed: %s", e)
@@ -3908,6 +3912,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             autobiography_seal.seal_closed_cycle(
                                 int(_cid), int(_start), int(_end),
                                 ts_utc_range=_utc_range)
+                            # §7.D — refresh the recall surface (the just-closed
+                            # cycle's seal updates chain_status / last-seen).
+                            autobiography_seal.export_recall_snapshot()
                         else:
                             logger.warning("[synthesis_worker] CYCLE_CLOSED missing "
                                            "cycle_id/start/end — skipping seal: %s",
@@ -3925,10 +3932,14 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 if (autobiography_seal is not None
                         and str(payload.get("fork", "")) == "main"):
                     try:
-                        autobiography_seal.note_fork_main_sealed(
+                        _upg = autobiography_seal.note_fork_main_sealed(
                             int(payload.get("block_height", 0)),
                             str(payload.get("block_hash", "")),
                             float(msg.get("ts", 0.0) or 0.0))
+                        # §7.D — a WIRED→CHAINED flip changes the recall surface's
+                        # chain_status/anchor; refresh it when something upgraded.
+                        if _upg:
+                            autobiography_seal.export_recall_snapshot()
                     except Exception as _ts_e:  # noqa: BLE001
                         logger.debug("[synthesis_worker] TIMECHAIN_SEALED CHAINED "
                                      "update failed: %s", _ts_e)

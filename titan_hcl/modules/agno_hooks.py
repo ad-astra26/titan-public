@@ -1547,6 +1547,36 @@ def create_pre_hook(plugin):
             except Exception as e:
                 logger.debug("[PreHook] KnownUserResolver failed: %s", e)
 
+        # RFP_verifiable_autobiographical_presence_memory §7.D — presence recall.
+        # Resolve the turn's person_id (Maker → the literal "maker" via is_maker;
+        # else the user_id — SYMMETRIC with §7.A capture which writes person_id=
+        # user_id) → their last verified presence → a fact-bundle, STASHED on
+        # plugin._pre_chat_presence_record for Phase E to inject into the grounded
+        # context. No context injection / no OVG here (that is Phase E). Reads the
+        # lock-free presence_recall_snapshot.json (synthesis exports it; never opens
+        # synthesis.duckdb — G18). None ⇒ no prior anchored presence (honest non-
+        # recognition). Soft — never blocks the turn.
+        plugin._pre_chat_presence_record = None
+        if user_id and user_id != "anonymous":
+            try:
+                _me_rec = getattr(plugin, "maker_engine", None)
+                _person_id = ("maker" if (_me_rec and _me_rec.is_maker(user_id))
+                              else user_id)
+                if not hasattr(plugin, "_presence_recall"):
+                    from titan_hcl.logic.presence_recall import PresenceRecall
+                    from titan_hcl.core.state_registry import resolve_titan_id as _pr_tid
+                    plugin._presence_recall = PresenceRecall(titan_id=_pr_tid())
+                import asyncio as _aio_pr
+                _rec = await _aio_pr.to_thread(
+                    plugin._presence_recall.recall, _person_id)
+                plugin._pre_chat_presence_record = _rec
+                if _rec:
+                    logger.info("[PreHook] presence recall: %s gap=%d epochs (%s, %s)",
+                                _person_id, _rec["gap_epochs"], _rec["gap_human"],
+                                _rec["chain_status"])
+            except Exception as _pr_e:  # noqa: BLE001
+                logger.debug("[PreHook] presence recall skipped: %s", _pr_e)
+
         # Fallback: basic engagement context if resolver didn't produce anything
         if "user_recognition" in active_features and not social_context and social_graph and user_id != "anonymous":
             try:

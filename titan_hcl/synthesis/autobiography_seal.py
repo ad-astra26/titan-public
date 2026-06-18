@@ -198,6 +198,69 @@ class AutobiographySeal:
                     len(person_rollups), len(tx_hashes), merkle_root[:12])
         return entry
 
+    # ── §7.D: the lock-free recall surface (PreHook reads this, never the DuckDB) ──
+    def export_recall_snapshot(self, snapshot_path: Optional[str] = None) -> int:
+        """RFP §7.D — export the per-person presence-recall surface as an atomic JSON
+        (mirrors `engram_store.export_snapshot` → `spine_snapshot.json`). The agno
+        PreHook reads THIS (cross-process; never opens synthesis.duckdb — G18). Per
+        person: their most-recent verified presence (`last_seen_epoch`), evidence,
+        and the `chain_status` of the cycle that holds it (CHAINED › WIRED ›
+        UNSEALED). Returns the number of persons written. Reads on the writer
+        thread (G21). Soft-fails to 0 (recall degrades to "no recognition" — honest).
+
+        Default path = `<save_dir>/presence_recall_snapshot.json` — the same
+        relative `data/titan_time/` dir the whole titan_time family uses (both the
+        synthesis and agno processes share cwd), matching `presence_recall.py`'s
+        read default (`PresenceRecall.SNAPSHOT_NAME`)."""
+        if snapshot_path is None:
+            # NOTE: filename kept in sync with logic/presence_recall.py SNAPSHOT_NAME
+            snapshot_path = os.path.join(self._save_dir, "presence_recall_snapshot.json")
+        ledger = self._load_ledger()
+
+        def _read():
+            # the row with the MAX last_seen_epoch per person (cycle_id tie-break)
+            return self._conn.execute(
+                "SELECT person_id, last_seen_epoch, cycle_id, evidence_strength FROM ("
+                " SELECT person_id, last_seen_epoch, cycle_id, evidence_strength,"
+                "  ROW_NUMBER() OVER (PARTITION BY person_id "
+                "   ORDER BY last_seen_epoch DESC, cycle_id DESC) AS rn"
+                " FROM presence_cycle_rollup) WHERE rn = 1").fetchall()
+        try:
+            rows = self._writer.submit_sync(_read)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[autobiography_seal] recall snapshot read failed (%s)", e)
+            return 0
+
+        persons = {}
+        for pid, last_seen, cycle_id, evidence in (rows or []):
+            cyc = ledger["cycles"].get(str(int(cycle_id)))
+            if cyc:
+                chain_status = cyc.get("chain_status", "WIRED")
+                anchor = cyc.get("block_hash") or cyc.get("merkle_root")
+            else:
+                chain_status, anchor = "UNSEALED", None   # cycle not yet sealed (open)
+            persons[str(pid)] = {
+                "last_seen_epoch": int(last_seen),
+                "evidence_strength": str(evidence),
+                "chain_status": chain_status,
+                "cycle_id": int(cycle_id),
+                "anchor": anchor,
+            }
+
+        data = {"persons": persons, "updated_ts": time.time()}
+        try:
+            os.makedirs(os.path.dirname(snapshot_path) or ".", exist_ok=True)
+            tmp = snapshot_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, snapshot_path)  # atomic (G16)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[autobiography_seal] recall snapshot write failed (%s)", e)
+            return 0
+        return len(persons)
+
     # ── §7.C step 5: CHAINED on the next fork-main seal ──────────────────────────
     def note_fork_main_sealed(self, block_height: int, block_hash: str,
                               sealed_ts: float) -> int:
