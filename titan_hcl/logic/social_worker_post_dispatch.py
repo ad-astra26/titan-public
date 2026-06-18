@@ -839,8 +839,26 @@ class PostDispatchOrchestrator:
                            emotion: str, now: float) -> int:
         """30-min-cooldown mention discovery + reply loop. Mirrors
         spirit_worker:8303-8390. Returns number of replies posted."""
-        replies_cfg = (get_params("social_x") or {}).get(
-            "replies") or {}
+        sx_cfg = get_params("social_x") or {}
+        replies_cfg = sx_cfg.get("replies") or {}
+        # INV-XEFF (2026-06-18): the 3 Titans share ONE @your_x_handle account, so
+        # 3 independent mention polls = 3× the paid /twitter/user/mentions reads
+        # of the SAME inbox. Collapse to a SINGLE poller — the deterministic
+        # owner of the account handle under the same fleet partition used for
+        # tagging (drift-proof: matching rosters → exactly one box polls). That
+        # owner then replies to ALL mentions (the per-mention reply partition is
+        # moot once a single box owns the shared inbox — see the reply loop).
+        self._mention_single_owner = bool(
+            sx_cfg.get("mention_poll_single_owner", True))
+        if self._mention_single_owner:
+            from titan_hcl.logic.social_x.archetypes.base import (
+                engagement_owner_for)
+            _roster = sx_cfg.get("engagement_fleet") or ["T1", "T2", "T3"]
+            _acct = (get_params("twitter_social") or {}).get(
+                "user_name") or "your_x_handle"
+            _acct_owner = engagement_owner_for(_acct, _roster)
+            if _acct_owner and _acct_owner != self._titan_id:
+                return 0  # another box owns the shared-account mention poll
         base_cooldown = float(replies_cfg.get(
             "mention_check_cooldown_seconds",
             _DEFAULT_MENTION_COOLDOWN_S))
@@ -894,8 +912,14 @@ class PostDispatchOrchestrator:
             # person across T1/T2/T3. Same deterministic author-hash as proactive
             # engagement; zero coordination.
             _sx_cfg = get_params("social_x") or {}
-            _reply_partition_on = bool(
-                _sx_cfg.get("engagement_partition_enabled", True))
+            # When single-owner polling is on, THIS box is the sole poller of the
+            # shared inbox, so it must reply to ALL mentions — the per-mention
+            # author partition (which existed to stop 3 boxes double-replying) is
+            # redundant and would silently drop every mention not hashing to this
+            # box (they'd never be answered, since no other box polls).
+            _reply_partition_on = (
+                not getattr(self, "_mention_single_owner", False)
+                and bool(_sx_cfg.get("engagement_partition_enabled", True)))
             _reply_roster = _sx_cfg.get("engagement_fleet") or ["T1", "T2", "T3"]
             from titan_hcl.logic.social_x.archetypes.base import (
                 engagement_owner_for,

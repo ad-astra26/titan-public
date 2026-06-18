@@ -302,6 +302,21 @@ class SocialXGateway:
         self._post_success_callback = None
         # Session auto-refresh state
         self._refreshed_session = ""  # Cached refreshed session (overrides config)
+        # Credit-leak defense (2026-06-18). A write-422 is X rejecting the WRITE
+        # (account automation-block) — NOT a session expiry: reads keep
+        # succeeding, so re-logging-in burns ~500cr/login for nothing. Track the
+        # last successful read + last refresh so _call_x_api only refreshes when
+        # the session is genuinely dead (reads also failing) and at most 1/6h.
+        self._last_read_ok_ts: float = 0.0
+        self._last_refresh_ts: float = 0.0
+        # Persistent write-suspension: N consecutive decisive write rejections
+        # (X-422 / 226 automated) → suspend ALL writes (no API call, no credit)
+        # until `_write_suspended_until`, surviving restarts via a tiny JSON.
+        # Exponential backoff, reset on the first successful write.
+        self._write_suspended_until: float = 0.0
+        self._write_reject_streak: int = 0
+        self._write_suspend_backoff_s: float = 0.0
+        self._load_write_suspension()
         # Grounding-gate per-topic cooldown (rFP_phase5_narrator_evolution §9.3).
         # Prevents CGN_KNOWLEDGE_REQ spam when the same ungrounded topic keeps
         # catalysing suppressed posts. Key = topic word, value = last request ts.
@@ -1124,6 +1139,108 @@ class SocialXGateway:
             "status 407", "proxy", "session refresh failed",
             "could not connect", "connection error", "timed out", "timeout"))
 
+    # ── Credit-leak defense: write kill-switch + persistent suspension ──
+    # (2026-06-18). Two levers that stop burning paid twitterapi.io credits
+    # while X has the account write-blocked (every create_tweet → 422) yet reads
+    # keep succeeding: (1) a config kill-switch to halt all writes instantly;
+    # (2) an auto, persistent, restart-surviving suspension that trips after a
+    # few decisive write rejections and backs off exponentially.
+    _WRITE_REJECT_THRESHOLD = 3        # decisive write-422/226 before suspend
+    _WRITE_SUSPEND_BASE_S = 3600.0     # first suspension 1h
+    _WRITE_SUSPEND_CAP_S = 86400.0     # cap 24h
+    _SESSION_REFRESH_MIN_INTERVAL_S = 21600.0   # ≤1 login / 6h
+    _READ_OK_SESSION_GRACE_S = 600.0   # a read OK within 10min ⇒ session alive
+
+    def _write_state_path(self) -> str:
+        import os
+        return os.path.join(os.path.dirname(__file__), "..", "..",
+                            "data", "social_x_write_state.json")
+
+    def _load_write_suspension(self) -> None:
+        try:
+            with open(self._write_state_path()) as _f:
+                st = json.load(_f)
+            self._write_suspended_until = float(st.get("suspended_until", 0.0))
+            self._write_reject_streak = int(st.get("reject_streak", 0))
+            self._write_suspend_backoff_s = float(st.get("backoff_s", 0.0))
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save_write_suspension(self) -> None:
+        import os, tempfile
+        try:
+            d = {"suspended_until": self._write_suspended_until,
+                 "reject_streak": self._write_reject_streak,
+                 "backoff_s": self._write_suspend_backoff_s}
+            path = self._write_state_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+            with os.fdopen(fd, "w") as _f:
+                json.dump(d, _f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _write_enabled(self) -> bool:
+        """Kill-switch — `[social_x].write_enabled` (default True). False halts
+        ALL X writes (post/reply/like/retweet/follow) before any API call."""
+        try:
+            return bool((get_params("social_x") or {}).get("write_enabled", True))
+        except Exception:
+            return True
+
+    def _write_block_reason(self) -> str:
+        """Non-empty reason if writes are currently blocked (kill-switch OR an
+        active auto-suspension), else "". Checked at every write entry so a
+        blocked write costs ZERO twitterapi.io credits."""
+        if not self._write_enabled():
+            return "write_enabled=false (kill-switch)"
+        if self._write_suspended_until > time.time():
+            mins = int((self._write_suspended_until - time.time()) / 60)
+            return f"write auto-suspended {mins}min (persistent 422/226 block)"
+        return ""
+
+    @staticmethod
+    def _is_decisive_write_reject(result: dict, http_code: int) -> bool:
+        """True for an X-side WRITE rejection that won't clear on retry — the
+        relayed 422 (account write-block) or 226 'automated' challenge. These
+        are what should arm the persistent suspension (vs transient proxy/5xx)."""
+        msg = str(result.get("message", "")).lower()
+        return ("status 422" in msg or "status 226" in msg
+                or "looks like it might be automated" in msg)
+
+    def _note_write_outcome(self, result: dict, http_code: int) -> None:
+        """Feed a write result into the persistent suspension state. A decisive
+        reject increments the streak (→ suspend at threshold, exp-backoff); any
+        success resets streak + clears suspension."""
+        is_success = (http_code == 200
+                      and result.get("status") not in ("error", "circuit_breaker"))
+        if is_success:
+            if (self._write_reject_streak or self._write_suspended_until
+                    or self._write_suspend_backoff_s):
+                self._write_reject_streak = 0
+                self._write_suspended_until = 0.0
+                self._write_suspend_backoff_s = 0.0
+                self._save_write_suspension()
+                logger.info("[SocialXGateway] write suspension CLEARED — a write "
+                            "succeeded")
+            return
+        if not self._is_decisive_write_reject(result, http_code):
+            return
+        self._write_reject_streak += 1
+        if self._write_reject_streak >= self._WRITE_REJECT_THRESHOLD:
+            self._write_suspend_backoff_s = (
+                self._WRITE_SUSPEND_BASE_S if self._write_suspend_backoff_s <= 0
+                else min(self._write_suspend_backoff_s * 2,
+                         self._WRITE_SUSPEND_CAP_S))
+            self._write_suspended_until = time.time() + self._write_suspend_backoff_s
+            logger.error(
+                "[SocialXGateway] writes AUTO-SUSPENDED %.0fh after %d decisive "
+                "rejections (X write-block: %s). No write API calls until %s.",
+                self._write_suspend_backoff_s / 3600.0, self._write_reject_streak,
+                str(result.get("message", ""))[:60], int(self._write_suspended_until))
+        self._save_write_suspension()
+
     # ── The ONE API Caller ──────────────────────────────────────────
 
     def _cache_key_for(self, endpoint: str, method: str, payload: dict | None) -> tuple:
@@ -1221,6 +1338,14 @@ class SocialXGateway:
 
         # ── Circuit breaker check (per-domain: write=POST, read=GET) ──
         is_write = (method == "POST")
+        # Credit-leak backstop: when writes are kill-switched/suspended, refuse
+        # ALL write POSTs here too (covers like/retweet/follow which don't pass
+        # through post()/reply()). The session-refresh login uses httpx directly,
+        # so it is unaffected — and post()/reply() already short-circuit earlier.
+        if is_write:
+            _wb = self._write_block_reason()
+            if _wb:
+                return {"status": "write_blocked", "message": _wb}
         domain = "write" if is_write else "read"
         cb_tripped_at = self._cb_tripped_at_write if is_write else self._cb_tripped_at
         cb_failures = self._cb_failures_write if is_write else self._cb_failures
@@ -1280,13 +1405,33 @@ class SocialXGateway:
         # match; the recency-guarded verifier added the same day catches
         # the "tweet landed but API misreported" case via the timeline
         # check below, without re-posting.
+        # Credit-leak fix (2026-06-18): a write-422 is NOT proof of session
+        # expiry. When reads are still succeeding (a GET ok within the last
+        # 10 min) the cookie is demonstrably valid → the 422 is X blocking the
+        # WRITE, and re-logging-in burns ~500cr for nothing. Only refresh when
+        # there's NO recent read success (session plausibly dead) AND not more
+        # than once per 6 h. Otherwise the 422 just feeds the breaker/suspension.
+        _now = time.time()
+        _session_plausibly_dead = (
+            _now - self._last_read_ok_ts > self._READ_OK_SESSION_GRACE_S)
+        _refresh_throttle_ok = (
+            _now - self._last_refresh_ts > self._SESSION_REFRESH_MIN_INTERVAL_S)
         is_session_expired = (
             method == "POST" and
             result.get("status") == "error" and
             "422" in str(result.get("message", ""))
         )
+        if is_session_expired and session and not (
+                _session_plausibly_dead and _refresh_throttle_ok):
+            logger.info(
+                "[SocialXGateway] write-422 but session valid (read ok %.0fs ago) "
+                "or refresh throttled — NOT re-logging in (saves ~500cr login)",
+                _now - self._last_read_ok_ts)
+            is_session_expired = False
         if is_session_expired and session:
-            logger.info("[SocialXGateway] Session expired (422) — attempting auto-refresh...")
+            self._last_refresh_ts = time.time()
+            logger.info("[SocialXGateway] Session likely expired (422, no recent "
+                        "read) — attempting auto-refresh...")
             new_session = self._refresh_session(api_key, proxy)
             if new_session:
                 # Retry the POST with refreshed session
@@ -1309,6 +1454,14 @@ class SocialXGateway:
         # trip after CB_PROXY_MAX_FAILURES; everything else after CB_MAX_FAILURES.
         is_success = (http_code == 200 and
                       result.get("status") not in ("error",))
+        # Credit-leak fix: remember the last time a READ succeeded — proof the
+        # session cookie is valid, which gates the write-422 login above.
+        if is_success and not is_write:
+            self._last_read_ok_ts = time.time()
+        # Feed every write result into the persistent suspension state
+        # (decisive 422/226 streak → suspend; success → clear).
+        if is_write:
+            self._note_write_outcome(result, http_code)
         if is_write:
             if is_success:
                 if self._cb_failures_write > 0:
@@ -3479,6 +3632,15 @@ class SocialXGateway:
             ActionResult — status="not_prepared" if caller skipped step 1
             (descriptor is None or composed_text empty).
         """
+        # Credit-leak guard (2026-06-18): if writes are kill-switched off or
+        # auto-suspended (persistent X 422/226 block), refuse BEFORE any paid
+        # twitterapi.io call — zero credits burned while the account is blocked.
+        _wblock = self._write_block_reason()
+        if _wblock:
+            self._log_telemetry({"event": "post_write_blocked", "reason": _wblock,
+                                 "titan_id": context.titan_id})
+            return ActionResult(status="write_blocked", reason=_wblock)
+
         # Pre-flight: enforce that caller went through prepare_post() first.
         # See rFP §10.2.ω-bis Risks #3 — explicit failure mode, telemetry-visible.
         if descriptor is None:
@@ -3807,6 +3969,12 @@ class SocialXGateway:
         config = self._load_config()
         if not config.get("enabled"):
             return ActionResult(status="disabled")
+        # Credit-leak guard (2026-06-18): kill-switch / persistent write-block.
+        _wblock = self._write_block_reason()
+        if _wblock:
+            self._log_telemetry({"event": "reply_write_blocked",
+                                 "reason": _wblock, "titan_id": context.titan_id})
+            return ActionResult(status="write_blocked", reason=_wblock)
         if self._cb_is_open(write=True):
             return ActionResult(status="circuit_breaker",
                                 reason="API disabled after consecutive failures")
