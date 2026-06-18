@@ -19,6 +19,12 @@ from titan_hcl.synthesis.outer_meta_policy import (
 TOOL = OUTER_ACTIONS.index("tool")
 DIRECT = OUTER_ACTIONS.index("direct")
 
+# These tests pin the PER-TURN correctness-credit training contract (immediate
+# policy.forward shift). With IQL on (the P2 default) _handle_reward buffers
+# instead of training per-turn, so they run the legacy REINFORCE path — which
+# also makes them the INV-MC-7 flag-off parity guard for correctness-aware credit.
+_LEGACY = {"synthesis": {"self_learning": {"oml_iql_enabled": False}}}
+
 
 class _Q:
     def __init__(self):
@@ -60,7 +66,7 @@ def test_consumer_credit_trains_tool_penalty_trains_chosen(tmp_path):
         goal_class="general-compute", oracle_id="", parent_tool_call_tx="tx1")
     updates0 = policy.total_updates
     for m in msgs:
-        assert _handle_reward(m, store, policy, None, _cfg({}), _Q(),
+        assert _handle_reward(m, store, policy, None, _cfg(_LEGACY), _Q(),
                               "self_learning") is True
     # both rewards trained (direct path — features+action present, no join)
     assert policy.total_updates == updates0 + 2
@@ -80,7 +86,7 @@ def test_routing_shifts_toward_tool_after_repeated_salvage(tmp_path):
     # force a starting bias toward direct on this vector
     policy.seed_prior(DIRECT, strength=3.0)
     assert int(policy.exploit_action(np.asarray(feats, dtype=np.float32))) == DIRECT
-    cfg = _cfg({})
+    cfg = _cfg(_LEGACY)
     for _ in range(40):
         for m in _correctness_aware_reward_msgs(
                 decision_feats=feats, policy_action=DIRECT, tool_action=TOOL,

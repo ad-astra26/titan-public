@@ -807,6 +807,15 @@ def _cfg(config: dict) -> dict:
     sub = (get_params("synthesis") or {}).get("self_learning", {}) or {}
     out = dict(_DEFAULTS)
     out.update({k: v for k, v in sub.items() if k in _DEFAULTS})
+    # Caller-supplied overrides take precedence. Called ONCE at boot
+    # (self_learning_worker_main:837) with `full_config`, whose
+    # [synthesis][self_learning] == the get_params boot snapshot → a no-op in
+    # production (no SHM-liveness regression). In tests it applies injected flags
+    # (e.g. oml_iql_enabled=False to exercise the legacy REINFORCE path). Without
+    # this the `config` arg was silently ignored — a latent regression that left
+    # the legacy-path tests asserting against the IQL-default-on behavior.
+    ov = ((config or {}).get("synthesis", {}) or {}).get("self_learning", {}) or {}
+    out.update({k: v for k, v in ov.items() if k in _DEFAULTS})
     return out
 
 
