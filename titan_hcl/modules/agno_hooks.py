@@ -3299,6 +3299,29 @@ def create_post_hook(plugin):
         except Exception as _trr_err:
             logger.debug("[PostHook] §7.B turn record emit skipped: %s", _trr_err)
 
+        # ── RFP_verifiable_autobiographical_presence_memory §7.A — non-Maker
+        # presence atom. A completed chat turn = a person was present; emit it to
+        # synthesis (PresenceCapture → episodic TX + person_interactions row). SKIP
+        # the Maker — his presence is captured on the cryptographically-verified
+        # MAKER_PRESENCE_VERIFIED path, so emitting here too would double-record
+        # (with a weaker asserted_identity). Never raises.
+        try:
+            _me_pr = getattr(plugin, "maker_engine", None)
+            _bus_pr = getattr(plugin, "bus", None)
+            if (_bus_pr is not None and user_id and user_id != "anonymous"
+                    and not (_me_pr and _me_pr.is_maker(user_id))):
+                from titan_hcl import bus as _bus_pr_mod
+                from titan_hcl.bus import make_msg as _mk_pr
+                _bus_pr.publish(_mk_pr(
+                    _bus_pr_mod.PERSON_TURN_PRESENCE, "post_hook", "synthesis", {
+                        "person_id": user_id,
+                        "channel": getattr(plugin, "_current_channel", None) or "web",
+                        "ts": time.time(),
+                        "evidence_strength": "asserted_identity",
+                    }))
+        except Exception as _ptp_err:
+            logger.debug("[PostHook] PERSON_TURN_PRESENCE emit skipped: %s", _ptp_err)
+
         # 0b. V5 Post-Hook: Emotional coherence validation (soft logging only)
         try:
             def _fetch_post_state():

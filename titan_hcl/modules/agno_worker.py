@@ -508,6 +508,10 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         # _resolve_chat_id can construct f"{user_id}:{session_id}" for the
         # BufferCache call. Mirrors _current_user_id pattern above.
         worker_plugin._current_session_id = session_id
+        # RFP_verifiable_autobiographical_presence_memory §7.A — expose the turn's
+        # channel so the PostHook can label the PERSON_TURN_PRESENCE atom
+        # (web/app/tcc). Mirrors the _current_user_id stash above.
+        worker_plugin._current_channel = channel
 
         # ── Pre-LLM goal hook (Phase 7 / INV-Syn-17) ────────────────────
         # Write {text, concept_ids, ts} into the `goal` buffer and the

@@ -87,6 +87,7 @@ from titan_hcl.bus import (
     MAKER_ASSESSMENT_RECORD,
     MAKER_FACT_RECORD,
     MAKER_PRESENCE_VERIFIED,
+    PERSON_TURN_PRESENCE,
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
@@ -1563,6 +1564,27 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     felt_bridge: Optional[FeltBridge] = FeltBridge(store._conn, db_writer)
     if not felt_bridge.ensure_schema():
         felt_bridge = None
+
+    # RFP_verifiable_autobiographical_presence_memory §7.A — PresenceCapture: the
+    # sole-writer recorder of autobiographical presence atoms (episodic TX +
+    # person_interactions row). Shares ActivationStore's ONE guarded conn +
+    # db_writer (G21 / INV-Syn-3, like recall_attribution/felt_bridge). Its own
+    # OuterMemoryWriter (cheap; send_queue+src) anchors the episodic TX; a
+    # ConsciousnessAgeReader supplies the Titan-time key. Fed by the
+    # MAKER_PRESENCE_VERIFIED + PERSON_TURN_PRESENCE handlers below. Soft → None.
+    presence_capture = None
+    try:
+        from titan_hcl.synthesis.presence_capture import PresenceCapture
+        from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter as _OMW
+        from titan_hcl.logic.consciousness_age_reader import ConsciousnessAgeReader
+        _pc = PresenceCapture(
+            store._conn, db_writer,
+            omw_writer=_OMW(send_queue=send_queue, src="presence_capture"),
+            age_reader=ConsciousnessAgeReader())
+        presence_capture = _pc if _pc.ensure_schema() else None
+    except Exception as _pc_e:  # noqa: BLE001 — capture disabled, synthesis unaffected
+        logger.warning("[synthesis_worker] PresenceCapture init failed (%s) — "
+                       "presence capture disabled this session", _pc_e)
 
     # Phase 2 D-P2-4 standing-bundle store — sole writer of
     # data/synthesis.duckdb / association_bundles. CONN-2 FOLD (AUDIT §5.2):
@@ -3741,6 +3763,44 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         logger.debug(
                             "[synthesis_worker] MAKER_PRESENCE_VERIFIED handler "
                             "failed: %s", _mpv_e)
+                # RFP_verifiable_autobiographical_presence_memory §7.A — capture the
+                # verified Maker presence as an autobiographical atom (crypto_verified_
+                # maker; person_ref = wallet if the api edge supplied it). Independent
+                # of the affective tap above; soft.
+                if presence_capture is not None:
+                    try:
+                        presence_capture.record(
+                            person_id="maker",
+                            evidence_strength="crypto_verified_maker",
+                            channel=str(payload.get("channel", "") or ""),
+                            person_ref=str(payload.get("person_ref", "") or ""),
+                            ts=payload.get("ts"))
+                    except Exception as _pcm_e:  # noqa: BLE001
+                        logger.debug("[synthesis_worker] presence capture (maker) "
+                                     "failed: %s", _pcm_e)
+                continue
+
+            if msg_type == PERSON_TURN_PRESENCE:
+                # RFP_verifiable_autobiographical_presence_memory §7.A — a non-Maker
+                # person completed a chat turn (asserted/ device-verified). Capture
+                # the autobiographical atom; the agno PostHook SKIPS the Maker (his
+                # verified path is MAKER_PRESENCE_VERIFIED above), so no double row.
+                if presence_capture is not None:
+                    try:
+                        _pid = str(payload.get("person_id", "") or "")
+                        if _pid:
+                            presence_capture.record(
+                                person_id=_pid,
+                                evidence_strength=str(
+                                    payload.get("evidence_strength",
+                                                "asserted_identity")
+                                    or "asserted_identity"),
+                                channel=str(payload.get("channel", "") or ""),
+                                person_ref=str(payload.get("person_ref", "") or ""),
+                                ts=payload.get("ts"))
+                    except Exception as _ptp_e:  # noqa: BLE001
+                        logger.debug("[synthesis_worker] presence capture (person) "
+                                     "failed: %s", _ptp_e)
                 continue
 
             if msg_type == KNOWLEDGE_MOMENT:

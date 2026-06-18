@@ -349,6 +349,16 @@ MAKER_FACT_RECORD = "MAKER_FACT_RECORD"
 # moves more), computed by the single consumer. Payload: {channel, ts}.
 MAKER_PRESENCE_VERIFIED = "MAKER_PRESENCE_VERIFIED"
 
+# RFP_verifiable_autobiographical_presence_memory §7.A (CAPTURE) — a non-Maker
+# person completed a chat turn (the generic, asserted-identity presence atom; the
+# Maker has his OWN cryptographically-verified path via MAKER_PRESENCE_VERIFIED, so
+# the agno PostHook SKIPS the Maker to avoid a double row). Consumed by
+# synthesis_worker (sole presence writer, INV-Syn-3) → PresenceCapture.record() →
+# episodic TX + person_interactions row. Payload: {person_id, channel, ts,
+# evidence_strength}; evidence_strength ∈ {crypto_verified_device, asserted_identity}
+# (crypto_verified_maker only ever arrives on the verified path, never here).
+PERSON_TURN_PRESENCE = "PERSON_TURN_PRESENCE"
+
 # Phase 2 standing-contract event (PLAN_synthesis_engine_Phase2.md 2B,
 # D-P2-4): emitted by the post-seal contract hook in
 # timechain_v2.Mempool/BlockBuilder for every TX sealed that matches an
