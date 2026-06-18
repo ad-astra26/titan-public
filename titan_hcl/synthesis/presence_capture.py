@@ -128,9 +128,9 @@ class PresenceCapture:
                            e, tx_hash[:16])
             return None
 
-        logger.debug("[presence_capture] captured — person=%s evidence=%s "
-                     "channel=%s age_epochs=%d tx=%s",
-                     person_id, evidence_strength, channel, age_epochs, tx_hash[:16])
+        logger.info("[presence_capture] captured — person=%s evidence=%s "
+                    "channel=%s age_epochs=%d tx=%s",
+                    person_id, evidence_strength, channel, age_epochs, tx_hash[:16])
         return tx_hash
 
 
