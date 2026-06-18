@@ -2606,7 +2606,9 @@ def _run_dream_bridge(state_refs: dict, neuromod_reader, send_queue, name: str) 
             # VACUUM (observatory_db.py:867) — the 2026-04-21 T3-degradation
             # trigger. Skip in that case; the writer-owning process owns retention.
             if getattr(_odb, "_writer", None) is not None:
-                _odb.prune_old_data(max_days=90)
+                # Tightened 90→45d (2026-06-18, Maker) — observatory.db reached 3.5GB,
+                # the fleet's largest db; 45d of telemetry is ample for the dashboards.
+                _odb.prune_old_data(max_days=45)
                 state_refs["_last_observatory_prune"] = _now
             else:
                 logger.debug("[DreamBridge] observatory prune skipped — no writer "
