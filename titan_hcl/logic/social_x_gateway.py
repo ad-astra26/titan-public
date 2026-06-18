@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -2668,6 +2669,94 @@ class SocialXGateway:
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
+    # Owned accounts that must NEVER be @-notified by our own posts (floor,
+    # unioned with config self_handles + user_name in _sanitize_mentions).
+    _OWNED_HANDLE_FLOOR = frozenset({"your_x_handle", "iamtitantech"})
+    # X handle: 1–15 [A-Za-z0-9_]; not preceded by a word char / '@' / '.' (so
+    # emails, URLs and mid-word '@' are never matched), not followed by one.
+    _X_HANDLE_RE = re.compile(r'(?<![\w@.])@([A-Za-z0-9_]{1,15})(?![A-Za-z0-9_])')
+
+    def _owned_handles(self) -> set[str]:
+        """Lowercased set of the Titan's own X handles (floor ∪ config)."""
+        owned = {h.lower() for h in self._OWNED_HANDLE_FLOOR}
+        try:
+            cfg = self._load_config()
+            owned.add(str(cfg.get("user_name", "")).lstrip("@").lower())
+            for h in (cfg.get("self_handles", []) or []):
+                owned.add(str(h).lstrip("@").lower())
+        except Exception:
+            pass
+        owned.discard("")
+        return owned
+
+    def _sanitize_mentions(self, text: str, allowed: set[str] | None = None) -> str:
+        """INV-XTAG (airtight tag guard) — a published post/reply may notify AT
+        MOST the explicitly-allowed handles, each AT MOST ONCE. Every other
+        @handle (LLM-invented, a repeat of the target, or one of our own
+        accounts) is de-tagged: the leading '@' is stripped so the prose
+        survives but no unintended account is notified on X.
+
+        This is the SINGLE chokepoint both post() and reply() pass through — no
+        archetype output or composer text can bypass it. It is the structural
+        fix for the duplicate/cross-tagging that got the shared @your_x_handle
+        account automation-flagged (people reported being tagged repeatedly
+        across our posts), 2026-06-18. The `allowed` set is itself partition-
+        filtered upstream (see _partition_allows_tag), so the two guarantees
+        compose: at most one handle, owned by THIS Titan, tagged once.
+        """
+        if not text:
+            return text
+        allowed_norm = {h.lstrip("@").lower() for h in (allowed or set()) if h}
+        owned = self._owned_handles()
+        emitted: set[str] = set()
+
+        def _repl(m):
+            h = m.group(1)
+            hl = h.lower()
+            if hl in owned:
+                return h                      # never notify our own accounts
+            if hl in allowed_norm and hl not in emitted:
+                emitted.add(hl)
+                return "@" + h                # keep the FIRST allowed mention
+            return h                          # de-tag repeats / invented / disallowed
+        return self._X_HANDLE_RE.sub(_repl, text)
+
+    def _partition_owner(self, handle: str, titan_id: str) -> Optional[str]:
+        """The single Titan that owns engagement-tagging for `handle` under the
+        fleet author-partition (INV-FX-1), or None when partitioning is disabled.
+
+        Hashes (sha256) the SAME @handle that is about to be published, so for
+        any given person EXACTLY ONE Titan in the shared @your_x_handle fleet ever
+        emits a tag — with zero cross-box coordination. This is the airtight
+        seal the upstream per-archetype checks were meant to give but couldn't
+        guarantee: they hashed divergent keys (display-name vs @handle vs Kuzu
+        Person.name — verified divergent: author 'Ahmad' / handle 'Ademdork001'),
+        so the same person could land on two owners → the shared account tagged
+        them from 2-3 Titans → the spam that flagged the account. Enforcing it
+        HERE, on the literal tagged handle at the one publish chokepoint, makes a
+        per-path key bug or per-box roster drift incapable of producing a
+        cross-Titan multi-tag. Roster = [social_x].engagement_fleet (MUST be
+        identical across boxes — startup WARNs otherwise)."""
+        from titan_hcl.logic.social_x.archetypes.base import (
+            DEFAULT_ENGAGEMENT_FLEET, engagement_owner_for)
+        try:
+            sx = get_params("social_x") or {}
+            if not sx.get("engagement_partition_enabled", True):
+                return None
+            roster = sx.get("engagement_fleet") or list(DEFAULT_ENGAGEMENT_FLEET)
+        except Exception:
+            roster = list(DEFAULT_ENGAGEMENT_FLEET)
+        return engagement_owner_for(handle, roster)
+
+    def _partition_allows_tag(self, handle: str, titan_id: str) -> bool:
+        """True if THIS Titan may publish a tag of `handle` (it owns the
+        partition slot, or partitioning is disabled). Fail-CLOSED: an
+        undeterminable owner (empty roster/handle) is NOT tagged."""
+        owner = self._partition_owner(handle, titan_id)
+        if owner is None:
+            return True                       # partitioning disabled
+        return bool(owner) and owner == str(titan_id or "")
+
     def _latest_epoch_seal(self) -> tuple[str, int, int]:
         """Latest REAL on-chain anchor for the Epoch-Seal post footer (PART A).
 
@@ -3434,19 +3523,32 @@ class SocialXGateway:
         final_text = self._assemble_final_text(
             context.composed_text, post_type, catalyst, context, config)
 
-        # 7b. @handle guarantee (Maker 2026-05-30): outer-engagement
-        # archetypes MUST mention the cited account by its literal @handle so
-        # the person is actually notified on X — the LLM routinely references
-        # them by display name and drops the '@' ("Lopp's warning..."), which
-        # does NOT notify. Prepend the @handle if it's absent from the body.
+        # 7b. @handle guarantee (Maker 2026-05-30) + 7c. INV-XTAG airtight tag
+        # guard (2026-06-18). The engaged author is tagged ONLY if THIS Titan
+        # owns them under the fleet author-partition (INV-FX-1) — keyed on the
+        # literal @handle that gets published, so the shared @your_x_handle account
+        # can NEVER tag one person from two Titans (the spam that flagged the
+        # account). The sanitizer then guarantees AT MOST that one handle, ONCE;
+        # every other @handle the composer produced (a repeat, an invented
+        # account, our own handles) is de-tagged. Self-reflection archetypes get
+        # an EMPTY allow-set → they tag nobody.
         _arc_h = getattr(context, "archetype_candidate", None)
+        _allowed_tags: set[str] = set()
         if _arc_h is not None and getattr(_arc_h, "archetype", "") in (
                 "world_mirror", "outer_inner_bridge", "outer_rumination"):
-            from titan_hcl.logic.social_x.archetypes.base import (
-                ensure_handle_mention)
             _mh = getattr(_arc_h, "metadata", {}) or {}
-            final_text = ensure_handle_mention(
-                final_text, str(_mh.get("author") or _mh.get("handle") or ""))
+            _author = str(_mh.get("author") or _mh.get("handle") or "")
+            if _author and self._partition_allows_tag(_author, context.titan_id):
+                from titan_hcl.logic.social_x.archetypes.base import (
+                    ensure_handle_mention)
+                final_text = ensure_handle_mention(final_text, _author)
+                _allowed_tags.add(_author)
+            elif _author:
+                logger.info(
+                    "[SocialXGateway] tag of @%s suppressed — not this Titan's "
+                    "(%s) engagement partition (INV-FX-1)",
+                    _author.lstrip("@"), context.titan_id)
+        final_text = self._sanitize_mentions(final_text, _allowed_tags)
 
         # 8. Quality gate
         qg_ok, qg_reason = self._quality_gate(final_text, post_type, config)
@@ -3842,11 +3944,36 @@ class SocialXGateway:
         # Style + @mention prefix (required for X threading)
         reply_text = self._style_own_words(reply_text[:450],
                                             context.grounded_words)
+        # INV-FX-1 backstop (2026-06-18): a reply tags the parent author to
+        # thread, so on the SHARED @your_x_handle account only the Titan that owns
+        # this author's partition slot may reply — else the account replies to
+        # one person from 2-3 Titans (the cross-tag spam that flagged it). The
+        # reply cycle pre-filters by owner; this is the airtight chokepoint guard
+        # keyed on the literal @handle. Fail-closed (undeterminable owner → skip).
+        if context.mention_user and not self._partition_allows_tag(
+                context.mention_user, context.titan_id):
+            self._log_telemetry({
+                "event": "reply_partition_skip",
+                "mention_user": context.mention_user,
+                "titan_id": context.titan_id,
+                "owner": self._partition_owner(
+                    context.mention_user, context.titan_id),
+            })
+            return ActionResult(
+                status="partition_skip",
+                reason=f"@{context.mention_user} not in {context.titan_id} "
+                       f"engagement partition (INV-FX-1)")
         # @username MUST be first for X to thread the reply properly
         mention_prefix = f"@{context.mention_user} " if context.mention_user else ""
         _name = "Titan" if context.titan_id == "T1" else context.titan_id
         tag = f"[{_name}] " if context.titan_id else ""
         reply_text = f"{mention_prefix}{tag}{reply_text}"
+        # INV-XTAG airtight tag guard — a reply notifies ONLY the parent author
+        # (X also notifies them via reply_to), exactly once; every other @handle
+        # the LLM echoed back is de-tagged. Same chokepoint post() uses.
+        reply_text = self._sanitize_mentions(
+            reply_text,
+            {context.mention_user} if context.mention_user else set())
 
         # WAL insert
         try:

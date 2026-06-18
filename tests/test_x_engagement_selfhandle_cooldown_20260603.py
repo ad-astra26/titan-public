@@ -35,9 +35,13 @@ def base_archetype(tmp_path):
     return ArchetypeBase(gateway=gw, social_x_db_path=db)
 
 
-def test_b2_cooldown_is_48h():
+def test_b2_cooldown_is_24h():
+    # Owned-author re-engage floor was 7d → 48h → 24h (Maker 2026-06-13,
+    # RFP_fleet_x_engagement_coordination INV-FX-2): under the deterministic
+    # author-hash partition a person is engaged by ≤1 Titan, so 24h bounds the
+    # shared @your_x_handle account fleet-wide.
     from titan_hcl.logic.social_x.archetypes.base import DEFAULT_AUTHOR_COOLDOWN_S
-    assert DEFAULT_AUTHOR_COOLDOWN_S == 48 * 3600
+    assert DEFAULT_AUTHOR_COOLDOWN_S == 24 * 3600
 
 
 def test_b1_self_handles_from_config(base_archetype):
