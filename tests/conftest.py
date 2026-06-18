@@ -36,6 +36,30 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _disable_live_shm_config_reads(monkeypatch):
+    """Force tests onto the config bootstrap path (RFP_config_as_shm_state §7.C).
+
+    Phase C / C.4 flipped ``params._config_shm_enabled()`` to default-ON: on a
+    live box ``get_params``/``load_titan_params`` read the in-kernel daemon's SHM
+    slots. But a test process on a box where a Titan is running resolves
+    ``titan_id`` to that Titan and would read its LIVE ``/dev/shm/titan_<id>/config``
+    slots — non-hermetic (e.g. mainnet T1). Setting ``TITAN_CONFIG_SHM_READ=0``
+    routes every test through ``_bootstrap_merge`` (the documented no-daemon path:
+    titan_params.toml ⊎ config.toml + secrets), reading repo files, not live SHM.
+
+    Tests that specifically exercise the SHM read path (test_config_phaseb_get_params's
+    ``shm`` fixture) re-enable it with an ISOLATED temp ``_shm_root`` — their
+    function-scoped ``monkeypatch.setenv(..., "1")`` runs after this autouse and wins."""
+    monkeypatch.setenv("TITAN_CONFIG_SHM_READ", "0")
+    import titan_hcl.params as _params
+    # Drop any SHM reader/root state a prior test may have cached.
+    _params._shm_readers.clear()
+    _params._shm_root = None
+    _params._shm_unavailable = False
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _disable_imw_for_tests(monkeypatch):
     from titan_hcl.persistence.config import IMWConfig
     from titan_hcl.persistence import writer_client as _wc

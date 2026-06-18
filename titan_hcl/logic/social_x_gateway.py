@@ -1079,7 +1079,7 @@ class SocialXGateway:
                     # Save to ~/.titan/secrets.toml (external-secrets pattern,
                     # introduced 2026-04-16). NOT to config.toml — secrets never
                     # live in the repo tree.
-                    from titan_hcl.config_loader import update_secret
+                    from titan_hcl.params import update_secret
                     if update_secret("twitter_social", "auth_session", new_session):
                         logger.info("[SocialXGateway] Session refreshed and saved to ~/.titan/secrets.toml")
                     else:

@@ -132,11 +132,12 @@ class TestSaltBootstrapAndPersistence(unittest.TestCase):
 
     def test_bootstrap_generates_and_persists_when_missing(self) -> None:
         """No salt → generates fresh + writes to secrets.toml via
-        config_loader.update_secret."""
-        from titan_hcl import config_loader
+        params.update_secret (RFP_config_as_shm_state §7.C/C.5)."""
+        from titan_hcl import params
 
-        with patch.object(config_loader, "SECRETS_PATH", self.secrets_path):
-            config_loader.clear_cache()
+        # _SECRETS_PATH is the single read (_bootstrap_merge) + write (update_secret)
+        # secrets path — patching it redirects both the persist and the read-back.
+        with patch.object(params, "_SECRETS_PATH", str(self.secrets_path)):
             assert not self.secrets_path.exists()
             salt_a = uih.get_user_id_hash_salt()
             assert isinstance(salt_a, bytes)
@@ -150,14 +151,12 @@ class TestSaltBootstrapAndPersistence(unittest.TestCase):
     def test_persisted_salt_survives_cache_clear(self) -> None:
         """Simulate restart: clear cache, re-resolve → identical salt
         from secrets.toml."""
-        from titan_hcl import config_loader
+        from titan_hcl import params
 
-        with patch.object(config_loader, "SECRETS_PATH", self.secrets_path):
-            config_loader.clear_cache()
+        with patch.object(params, "_SECRETS_PATH", str(self.secrets_path)):
             salt_first_boot = uih.get_user_id_hash_salt()
             # Simulate process restart.
             uih.clear_cache()
-            config_loader.clear_cache()
             salt_second_boot = uih.get_user_id_hash_salt()
             assert salt_first_boot == salt_second_boot
 
@@ -167,14 +166,13 @@ class TestSaltBootstrapAndPersistence(unittest.TestCase):
         an in-process salt so OVG's build_timechain_payload never breaks
         because of a persistence problem. This is the defensive path
         that surfaced during T3 live test 2026-05-25."""
-        from titan_hcl import config_loader
-        # Force config_loader.update_secret to raise ImportError (mimics
+        from titan_hcl import params
+        # Force params.update_secret to raise ImportError (mimics
         # tomli_w not installed on the target Titan).
-        with patch.object(config_loader, "SECRETS_PATH", self.secrets_path), \
+        with patch.object(params, "_SECRETS_PATH", str(self.secrets_path)), \
                 patch.object(
-                    config_loader, "update_secret",
+                    params, "update_secret",
                     side_effect=ImportError("No module named 'tomli_w'")):
-            config_loader.clear_cache()
             uih.clear_cache()
             # Must NOT raise — must return a valid 32-byte salt.
             salt = uih.get_user_id_hash_salt()
@@ -187,14 +185,13 @@ class TestSaltBootstrapAndPersistence(unittest.TestCase):
 
     def test_invalid_hex_is_regenerated(self) -> None:
         """Garbage in secrets.toml → regenerate (don't crash)."""
-        from titan_hcl import config_loader
+        from titan_hcl import params
 
         # Seed secrets with malformed salt.
         self.secrets_path.parent.mkdir(parents=True, exist_ok=True)
         self.secrets_path.write_text(
             '[synthesis]\nuser_id_hash_salt = "not-valid-hex-XYZ-XYZ"\n')
-        with patch.object(config_loader, "SECRETS_PATH", self.secrets_path):
-            config_loader.clear_cache()
+        with patch.object(params, "_SECRETS_PATH", str(self.secrets_path)):
             salt = uih.get_user_id_hash_salt()
             assert len(salt) == 32  # regenerated
             # Verify the file was rewritten with a valid hex salt.

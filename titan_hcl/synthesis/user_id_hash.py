@@ -83,7 +83,7 @@ def get_user_id_hash_salt() -> bytes:
         if _salt_cache is not None:
             return _salt_cache
 
-        from titan_hcl.config_loader import load_titan_config, update_secret
+        from titan_hcl.params import update_secret
 
         cfg = load_titan_params() or {}
         synth_section = cfg.get("synthesis") or {}

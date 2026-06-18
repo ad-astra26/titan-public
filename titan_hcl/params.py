@@ -34,6 +34,11 @@ from typing import Callable, Optional
 
 _LOG = logging.getLogger("titan.params")
 
+# The runtime secrets overlay file. Single source for the bootstrap READ
+# (_bootstrap_merge) and the runtime WRITE (update_secret) so a test can
+# redirect both by patching this one symbol.
+_SECRETS_PATH = os.path.join(os.path.expanduser("~/.titan"), "secrets.toml")
+
 # Per-section config slot capacity — MUST match the Rust daemon's CONFIG_SLOT_BYTES
 # (titan-kernel-rs/src/config_daemon.rs); total file = 16 + 3*(16 + 65536) = 196672 B.
 _CONFIG_SLOT_BYTES = 65536
@@ -142,14 +147,65 @@ def _bootstrap_merge(base_dir: Optional[str] = None) -> dict:
                     _deep_merge_into(merged, tomllib.load(f))
             except Exception as e:
                 _LOG.warning("params: bootstrap merge of %s failed: %s", fname, e)
-    secrets = os.path.expanduser("~/.titan/secrets.toml")
-    if os.path.exists(secrets):
+    if os.path.exists(_SECRETS_PATH):
         try:
-            with open(secrets, "rb") as f:
+            with open(_SECRETS_PATH, "rb") as f:
                 _deep_merge_into(merged, tomllib.load(f))
         except Exception as e:
             _LOG.warning("params: bootstrap secrets merge failed: %s", e)
     return merged
+
+
+# ── Runtime secrets writer ──────────────────────────────────────────────────
+# The ONLY runtime config WRITE path (config is otherwise read-only SHM-state).
+# Relocated from the retired config_loader.py (RFP_config_as_shm_state §7.C/C.5).
+def update_secret(section: str, key: str, value) -> bool:
+    """Atomically update a single ``[section].key`` field in ``~/.titan/secrets.toml``.
+
+    Creates ``~/.titan/`` with mode 700 and the file with mode 600 if absent.
+    Preserves all other keys. Returns True on success.
+
+    Used by code paths that rotate secrets at runtime (e.g. SocialXGateway
+    refreshing an X session cookie). In config-as-SHM-state the in-kernel config
+    daemon watches ``secrets.toml``'s mtime (CONFIG_WATCH_POLL_MS=1s) and re-seeds
+    the affected section slots, so a subsequent ``get_params(section)`` sees the
+    new value within ~1s — no in-process cache to clear (INV-CFG-7)."""
+    import tomllib
+    import tomli_w
+
+    try:
+        secrets_dir = os.path.dirname(_SECRETS_PATH)
+        os.makedirs(secrets_dir, exist_ok=True)
+        try:
+            os.chmod(secrets_dir, 0o700)
+        except Exception:
+            pass
+
+        existing: dict = {}
+        if os.path.exists(_SECRETS_PATH):
+            try:
+                with open(_SECRETS_PATH, "rb") as f:
+                    existing = tomllib.load(f)
+            except Exception as e:
+                _LOG.warning("params: update_secret can't parse existing %s: %s", _SECRETS_PATH, e)
+                existing = {}
+
+        if section not in existing or not isinstance(existing.get(section), dict):
+            existing[section] = {}
+        existing[section][key] = value
+
+        tmp_path = _SECRETS_PATH + ".tmp"
+        with open(tmp_path, "wb") as f:
+            tomli_w.dump(existing, f)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp_path, _SECRETS_PATH)
+        return True
+    except Exception as e:
+        _LOG.warning("params: update_secret(%s.%s) failed: %s", section, key, e)
+        return False
 
 
 def _all_config_sections() -> Optional[list]:
