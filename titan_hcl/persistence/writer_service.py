@@ -63,6 +63,7 @@ class IMWDaemon:
         self._commit_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._last_committed_wal_offset = 0
+        self._last_wal_warn_ts = 0.0  # B: throttle the "wal backing up" warning
         # dedup cache size — keep last 50k req_ids
         self._dedup_cap = 50_000
 
@@ -512,33 +513,77 @@ class IMWDaemon:
 
     # ── commit loop ──────────────────────────────────────────────────
 
+    def _warn_if_wal_backing_up(self) -> None:
+        """B (observability): if the service-wal is filling while commits aren't
+        draining it, surface a LOUD throttled warning BEFORE it silently approaches
+        the rotation cap (the 61MB silent-stall condition that boot-looped T1). Names
+        the failure so the guardian/operator sees it early instead of only on the next
+        restart. Soft — never raises into the commit loop."""
+        try:
+            if self._wal is None:
+                return
+            size_mb = self._wal.size_mb()
+            if size_mb >= self._cfg.service_wal_max_mb * 0.6:
+                now = time.time()
+                if now - self._last_wal_warn_ts >= 30.0:
+                    self._last_wal_warn_ts = now
+                    logger.warning(
+                        "[imw] service-WAL backing up: %.1fMB / %dMB cap "
+                        "(queue_depth=%d) — commits not draining the wal",
+                        size_mb, self._cfg.service_wal_max_mb, self._queue.qsize())
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _commit_loop(self) -> None:
         batch_window = self._cfg.batch_window_ms / 1000.0
         max_batch = self._cfg.max_batch_size
+        # B (boot-resilience guard): the per-iteration body is wrapped so an
+        # UNEXPECTED exception (anything _commit_batch / acks / metrics could raise)
+        # can NEVER terminate the commit loop. Before this guard, a single unguarded
+        # exception silently killed the loop → commits stopped → the wal accumulated
+        # unbounded (the 61MB → boot-loop root condition, T1 2026-06-18). On error we
+        # log (throttled) + continue; the offending batch's writes stay in the wal and
+        # are replayed on the next pass/boot — never lost.
+        _consecutive_errors = 0
         while not self._stop_event.is_set():
             try:
                 first = await asyncio.wait_for(self._queue.get(), timeout=batch_window)
             except asyncio.TimeoutError:
+                self._warn_if_wal_backing_up()
                 continue
-            batch: list[_PendingRequest] = [first]
-            # Fast-path: if alone and fast-path enabled, commit immediately
-            # Otherwise, drain up to max_batch from queue
-            if self._cfg.fast_path_enabled and self._queue.empty():
-                pass  # commit single write
-            else:
-                while len(batch) < max_batch:
-                    try:
-                        batch.append(self._queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
-            self._metrics.set_queue_depth(self._queue.qsize())
-            self._metrics.set_in_flight(len(batch))
-            t0 = time.time()
-            await self._commit_batch(batch)
-            dt_ms = (time.time() - t0) * 1000.0
-            self._metrics.record_commit(len(batch), dt_ms)
-            self._metrics.incr_batches()
-            self._metrics.set_in_flight(0)
+            try:
+                batch: list[_PendingRequest] = [first]
+                # Fast-path: if alone and fast-path enabled, commit immediately
+                # Otherwise, drain up to max_batch from queue
+                if self._cfg.fast_path_enabled and self._queue.empty():
+                    pass  # commit single write
+                else:
+                    while len(batch) < max_batch:
+                        try:
+                            batch.append(self._queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
+                self._metrics.set_queue_depth(self._queue.qsize())
+                self._metrics.set_in_flight(len(batch))
+                t0 = time.time()
+                await self._commit_batch(batch)
+                dt_ms = (time.time() - t0) * 1000.0
+                self._metrics.record_commit(len(batch), dt_ms)
+                self._metrics.incr_batches()
+                self._metrics.set_in_flight(0)
+                self._warn_if_wal_backing_up()
+                _consecutive_errors = 0
+            except Exception as e:  # noqa: BLE001 — the commit loop must NEVER die
+                _consecutive_errors += 1
+                try:
+                    self._metrics.incr_errors(f"commit_loop: {e}")
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.error("[imw] commit-loop iteration error (#%d, loop survives): "
+                             "%s", _consecutive_errors, e,
+                             exc_info=(_consecutive_errors <= 3))
+                # Back off so a persistent fault can't hot-spin the CPU.
+                await asyncio.sleep(min(0.5 * _consecutive_errors, 5.0))
 
     async def _commit_batch(self, batch: list[_PendingRequest]) -> None:
         """Try transactional commit; on failure, fall back to per-write."""
