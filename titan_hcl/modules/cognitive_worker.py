@@ -5558,21 +5558,17 @@ def _persist_engine_state(state_refs: dict) -> None:
 
 
 def _load_toml_section(section: str) -> dict:
-    """Load a single top-level section from titan_params.toml.
+    """Load a single top-level config section from the SHM slot.
 
-    Reads from ``../titan_params.toml`` relative to this file
-    (titan_hcl/modules/). Returns {} on any failure (file missing,
-    parse error, section absent).
+    RFP_config_as_shm_state §7.C/C.3b: config-as-state (INV-CFG-7) — reads the
+    per-section slot via ``get_params`` instead of re-parsing titan_params.toml.
+    Returns {} on any failure (slot absent, SHM unavailable in pytest).
+    Per-Titan DNA sub-tables (``[<section>.T1/T2/T3]``) are carried verbatim in
+    the slot, so ``_merge_per_titan_dna`` resolves them exactly as before.
     """
     try:
-        import tomllib
-        params_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "titan_params.toml")
-        if not os.path.exists(params_path):
-            return {}
-        with open(params_path, "rb") as f:
-            full = tomllib.load(f)
-        return full.get(section, {})
+        from titan_hcl.params import get_params
+        return get_params(section)
     except Exception:
         return {}
 

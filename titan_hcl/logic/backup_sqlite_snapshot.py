@@ -57,13 +57,15 @@ def _iter_persistence_sections(full: Optional[dict] = None):
     """Yield (section_name, IMWConfig) for every ENABLED `[persistence*]` section.
 
     `full` = an already-parsed config dict (tests inject one); None → read the
-    live config.toml. Lazy imports keep this off the boot import graph."""
-    from titan_hcl.persistence.config import IMWConfig, _load_config_toml_cached
+    live SHM config. Lazy imports keep this off the boot import graph."""
+    from titan_hcl.persistence.config import IMWConfig
     if full is None:
-        cfg_path = Path(__file__).resolve().parent.parent / "config.toml"
-        if not cfg_path.exists():
+        # RFP_config_as_shm_state §7.C/C.3b: whole-config from the SHM slots
+        # (config-as-state, INV-CFG-7) instead of re-parsing config.toml.
+        from titan_hcl.params import load_titan_params
+        full = load_titan_params()
+        if not full:
             return
-        full = _load_config_toml_cached(cfg_path)
     for key, section in full.items():
         if key != "persistence" and not key.startswith("persistence_"):
             continue

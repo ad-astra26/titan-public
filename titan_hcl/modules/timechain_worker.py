@@ -98,18 +98,14 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     except Exception:
         pass
 
-    # ── Load config from titan_params.toml ──
+    # ── Load [timechain] config from the SHM slot ──
+    # RFP_config_as_shm_state §7.C/C.3b: config-as-state (INV-CFG-7).
     tc_config = {}
     try:
-        try:
-            import tomllib
-        except ImportError:
-            import tomli as tomllib
-        with open("titan_hcl/titan_params.toml", "rb") as f:
-            all_params = tomllib.load(f)
-        tc_config = all_params.get("timechain", {})
+        from titan_hcl.params import get_params
+        tc_config = get_params("timechain")
     except Exception as e:
-        logger.warning("[TimeChain] Could not load titan_params.toml: %s", e)
+        logger.warning("[TimeChain] Could not load [timechain] config: %s", e)
 
     enabled = tc_config.get("enabled", True)
     heartbeat_interval = tc_config.get("heartbeat_interval_epochs", 100)

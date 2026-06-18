@@ -33,9 +33,7 @@ import logging
 import os
 import threading
 import time
-import tomllib
 import uuid
-from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from ..bus import (
@@ -198,12 +196,12 @@ def _default_sub_mode_for(primitive: str) -> Optional[str]:
 
 
 def _load_config() -> dict:
-    """Read [meta_service_interface] from titan_params.toml (fail-safe)."""
+    """Read [meta_service_interface] from the SHM config slot (fail-safe).
+
+    RFP_config_as_shm_state §7.C/C.3b: config-as-state (INV-CFG-7)."""
     try:
-        path = Path(__file__).parent.parent / "titan_params.toml"
-        with open(path, "rb") as f:
-            cfg = tomllib.load(f)
-        return cfg.get("meta_service_interface", {}) or {}
+        from titan_hcl.params import get_params
+        return get_params("meta_service_interface") or {}
     except Exception as e:
         logger.warning(
             "[MetaService] config read failed (%s), using defaults", e)

@@ -430,19 +430,11 @@ class ArcSession:
         # arc_play_module.py testsuite, tests) picks up the flags uniformly.
         # Callers may still override via direct attribute assignment.
         try:
-            import os as _os
-            try:
-                import tomllib as _tomllib
-            except ImportError:
-                import tomli as _tomllib
-            # __file__ = .../titan_hcl/logic/arc/session.py
-            # → 4 dirnames reach project root, then titan_hcl/titan_params.toml
-            _here = _os.path.abspath(__file__)
-            _project_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_here))))
-            _rs_path = _os.path.join(_project_root, "titan_hcl", "titan_params.toml")
-            if _os.path.exists(_rs_path):
-                with open(_rs_path, "rb") as _rsf:
-                    _rs_cfg = _tomllib.load(_rsf).get("arc_agi_3", {}).get("reward_shaping", {})
+            # RFP_config_as_shm_state §7.C/C.3b: read [arc_agi_3.reward_shaping]
+            # from the SHM slot (config-as-state, INV-CFG-7).
+            from titan_hcl.params import get_params
+            _rs_cfg = get_params("arc_agi_3").get("reward_shaping", {})
+            if _rs_cfg:
                 self.goal_distance_reward_k = float(_rs_cfg.get("goal_distance_reward_k", 0.0))
                 self.character_target_reward_k = float(_rs_cfg.get("character_target_reward_k", 0.0))
                 self.episode_diagnostics_enabled = bool(_rs_cfg.get("episode_diagnostics_enabled", False))

@@ -4492,14 +4492,11 @@ async def get_v4_cgn_social_action(request: Request):
             features=user_features)
 
         # Add tone instruction from config
+        # RFP_config_as_shm_state §7.C/C.3b: read [cgn_social_policy] from the
+        # SHM slot (config-as-state, INV-CFG-7).
         try:
-            import tomllib
-        except ImportError:
-            import toml as tomllib
-        try:
-            with open("titan_hcl/titan_params.toml", "rb") as f:
-                cfg = tomllib.load(f)
-            csp = cfg.get("cgn_social_policy", {})
+            from titan_hcl.params import get_params
+            csp = get_params("cgn_social_policy")
             result["tone_instruction"] = csp.get(
                 result["action_name"], "")
             result["policy_weight"] = csp.get("policy_weight", 0.3)
@@ -7696,13 +7693,12 @@ async def get_v4_reasoning_rewards(request: Request):
                 out["totals"] = {"error": f"rt_read: {e}"}
 
         # Derive phase state + weights from config + totals
+        # RFP_config_as_shm_state §7.C/C.3b: read [reasoning_rewards] from the
+        # SHM slot (config-as-state, INV-CFG-7) — a cheap msgpack decode, so no
+        # asyncio.to_thread file offload is needed.
         try:
-            import tomllib
-            def _read_cfg():
-                with open("titan_hcl/titan_params.toml", "rb") as f:
-                    return tomllib.load(f)
-            cfg = await asyncio.to_thread(_read_cfg)
-            rr = cfg.get("reasoning_rewards", {})
+            from titan_hcl.params import get_params
+            rr = get_params("reasoning_rewards")
             out["enabled"] = bool(rr.get("enabled", False))
             out["publish_enabled"] = bool(rr.get("publish_enabled", False))
             out["config"] = {
@@ -10867,14 +10863,11 @@ async def post_v4_social_delegate(request: Request):
         vocabulary_count = int(body.get("vocabulary_count", 0))
 
         # Load delegate config
+        # RFP_config_as_shm_state §7.C/C.3b: read [social_delegate] from the
+        # SHM slot (config-as-state, INV-CFG-7).
         try:
-            try:
-                import tomllib
-            except ImportError:
-                import tomli as tomllib
-            with open("titan_hcl/titan_params.toml", "rb") as f:
-                _params = tomllib.load(f)
-            _dcfg = _params.get("social_delegate", {})
+            from titan_hcl.params import get_params
+            _dcfg = get_params("social_delegate")
         except Exception:
             _dcfg = {}
 

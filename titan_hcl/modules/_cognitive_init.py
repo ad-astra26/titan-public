@@ -46,15 +46,11 @@ def _init_observable_engine():
 def _init_neural_nervous_system(config: dict):
     """Initialize V5 Neural Nervous System (config-driven, learned reflexes)."""
     try:
-        # Load neural NS config from titan_params.toml
+        # RFP_config_as_shm_state §7.C/C.3b: read [neural_nervous_system] from
+        # the SHM slot (config-as-state, INV-CFG-7).
         params_config = {}
         try:
-            import tomllib
-            params_path = os.path.join(os.path.dirname(__file__), "..", "titan_params.toml")
-            if os.path.exists(params_path):
-                with open(params_path, "rb") as f:
-                    all_params = tomllib.load(f)
-                params_config = all_params.get("neural_nervous_system", {})
+            params_config = get_params("neural_nervous_system")
         except Exception:
             pass
 

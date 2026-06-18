@@ -154,16 +154,11 @@ class AgencyModule:
         # V5: Expression dispatch cooldowns (loaded from titan_params.toml)
         self._dispatch_cooldowns: dict[str, float] = {}
         self._last_dispatch_ts: dict[str, float] = {}
+        # RFP_config_as_shm_state §7.C/C.3b: read [expression_dispatch_cooldowns]
+        # from the SHM slot (config-as-state, INV-CFG-7).
         try:
-            import tomllib as _tomllib
-        except ImportError:
-            import tomli as _tomllib
-        try:
-            import os
-            _params_path = os.path.join(os.path.dirname(__file__), "..", "..", "titan_params.toml")
-            with open(_params_path, "rb") as f:
-                _params = _tomllib.load(f)
-            self._dispatch_cooldowns = _params.get("expression_dispatch_cooldowns", {})
+            from titan_hcl.params import get_params
+            self._dispatch_cooldowns = get_params("expression_dispatch_cooldowns")
             if self._dispatch_cooldowns:
                 logger.info("[Agency] Dispatch cooldowns loaded: %s",
                             {k: f"{v}s" for k, v in self._dispatch_cooldowns.items()})

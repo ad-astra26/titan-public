@@ -74,8 +74,6 @@ class XSessionManager:
     def _load_session_from_config(self) -> None:
         """Read auth_session from merged config and validate."""
         try:
-            from titan_hcl.config_loader import load_titan_config
-            cfg = load_titan_params()
             session = get_params("twitter_social").get("auth_session", "")
             if session:
                 self._cached_session = session
@@ -176,11 +174,10 @@ class XSessionManager:
         self._total_refresh_attempts += 1
 
         try:
-            import tomllib
-            with open(self._config_path, "rb") as f:
-                cfg = tomllib.load(f)
-            tc = cfg.get("twitter_social", {})
-            api_key = cfg.get("stealth_sage", {}).get("twitterapi_io_key", "")
+            # RFP_config_as_shm_state §7.C/C.3b: creds + api key resolve from the
+            # SHM slots (the daemon merges secrets.toml over config), INV-CFG-7.
+            tc = get_params("twitter_social")
+            api_key = get_params("stealth_sage").get("twitterapi_io_key", "")
 
             if not tc.get("user_name") or not tc.get("password"):
                 logger.warning("[XSession] No credentials in config — cannot refresh")

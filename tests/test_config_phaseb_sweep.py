@@ -131,11 +131,16 @@ def test_rename_map_observatory_specific_read():
 
 def test_from_titan_config_section_dotted_path():
     """IMWConfig.from_titan_config_section resolves a dotted path against the
-    nested config (e.g. 'persistence.observatory') and the bare base 'persistence'."""
+    nested config (e.g. 'persistence.observatory') and the bare base 'persistence'.
+
+    RFP_config_as_shm_state §7.C/C.3b: the loader now reads the SHM [persistence]
+    slot via params.get_params(top_section) (config-as-state) instead of re-parsing
+    config.toml — the dotted traversal of the returned section is unchanged."""
     from titan_hcl.persistence.config import IMWConfig
     nested = _nested_config()
-    with mock.patch("titan_hcl.persistence.config._load_config_toml_cached", return_value=nested), \
-         mock.patch("pathlib.Path.exists", return_value=True):
+    # get_params(top) returns the top-level section dict (here [persistence]).
+    with mock.patch("titan_hcl.params.get_params",
+                    side_effect=lambda section: nested.get(section, {})):
         obs = IMWConfig.from_titan_config_section("persistence.observatory")
         base = IMWConfig.from_titan_config_section("persistence")
     assert obs.db_path == "data/observatory.db", "dotted subtable resolved"

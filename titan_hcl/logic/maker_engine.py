@@ -209,21 +209,13 @@ class MakerRelationshipEngine:
 
     def _load_maker_ids(self) -> None:
         """Load maker platform IDs from config."""
+        # RFP_config_as_shm_state §7.C/C.3b: read [channels] from the SHM slot
+        # (config-as-state, INV-CFG-7) instead of re-parsing config.toml.
         try:
-            import tomllib
-        except ModuleNotFoundError:
-            try:
-                import tomli as tomllib  # type: ignore[no-redef]
-            except ModuleNotFoundError:
-                return
-        try:
-            config_path = Path(__file__).resolve().parent.parent / "config.toml"
-            if config_path.exists():
-                with open(config_path, "rb") as f:
-                    cfg = tomllib.load(f)
-                ids = cfg.get("channels", {}).get("maker_platform_ids", "")
-                if ids:
-                    self._maker_ids = {mid.strip() for mid in ids.split(",") if mid.strip()}
+            from titan_hcl.params import get_params
+            ids = get_params("channels").get("maker_platform_ids", "")
+            if ids:
+                self._maker_ids = {mid.strip() for mid in ids.split(",") if mid.strip()}
         except Exception:
             pass
 

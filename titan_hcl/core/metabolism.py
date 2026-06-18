@@ -17,12 +17,6 @@ import math
 import time
 from collections import deque
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib  # type: ignore
-from pathlib import Path
-
 logger = logging.getLogger(__name__)
 
 # Ring buffer cap for gate decisions (exposed via /v4/metabolism/gate-status).
@@ -57,13 +51,12 @@ def _load_metabolic_config() -> tuple[dict, dict, bool]:
     features = {k: dict(v) for k, v in _DEFAULT_FEATURES.items()}
     gates_enforced = False
 
-    params_path = Path(__file__).parent.parent / "titan_params.toml"
-    if params_path.exists():
-        try:
-            with open(params_path, "rb") as f:
-                params = tomllib.load(f)
-            mcfg = params.get("metabolism", {})
-
+    # RFP_config_as_shm_state §7.C/C.3b: read [metabolism] from the SHM slot
+    # (config-as-state, INV-CFG-7) instead of re-parsing titan_params.toml.
+    try:
+        from titan_hcl.params import get_params
+        mcfg = get_params("metabolism")
+        if mcfg:
             # Kill-switch: [metabolism] gates_enforced = true
             gates_enforced = bool(mcfg.get("gates_enforced", False))
 
@@ -81,8 +74,8 @@ def _load_metabolic_config() -> tuple[dict, dict, bool]:
                 if tier_name in features:
                     for feat, val in feat_overrides.items():
                         features[tier_name][feat] = bool(val)
-        except Exception as e:
-            logger.warning("[Metabolism] Failed to load titan_params.toml overrides: %s", e)
+    except Exception as e:
+        logger.warning("[Metabolism] Failed to load [metabolism] config overrides: %s", e)
 
     return tiers, features, gates_enforced
 

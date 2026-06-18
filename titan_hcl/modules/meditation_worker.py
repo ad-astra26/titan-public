@@ -916,21 +916,16 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
             "[MeditationWorker] Phase 11 ModuleStateWriter init failed "
             "(continuing on legacy path): %s", _sw_err)
 
-    # ── Load [meditation] config from titan_params.toml ────────────
+    # ── Load [meditation] config from the SHM slot ────────────
+    # RFP_config_as_shm_state §7.C/C.3b: config-as-state (INV-CFG-7).
     med_cfg: dict[str, Any] = {}
     try:
-        try:
-            import tomllib as _tomllib  # py311+
-        except ImportError:
-            import tomli as _tomllib  # type: ignore
-        params_path = os.path.join("titan_hcl", "titan_params.toml")
-        if os.path.exists(params_path):
-            with open(params_path, "rb") as f:
-                med_cfg = _tomllib.load(f).get("meditation", {}) or {}
+        from titan_hcl.params import get_params
+        med_cfg = get_params("meditation") or {}
     except Exception as e:
         logger.warning(
-            "[MeditationWorker] Failed to load titan_params.toml "
-            "[meditation] section: %s — using defaults", e)
+            "[MeditationWorker] Failed to load [meditation] config: "
+            "%s — using defaults", e)
 
     # Emergent driver thresholds (mirrors spirit_worker.py:2227-2231).
     _med_emergent = bool(med_cfg.get("emergent_enabled", True))

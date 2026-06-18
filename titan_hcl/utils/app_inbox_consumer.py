@@ -33,13 +33,11 @@ def _titan_dir() -> str:
 
 
 def _internal_key() -> str | None:
-    import tomllib
-    sp = os.path.join(_titan_dir(), "secrets.toml")
-    if not os.path.exists(sp):
-        return None
+    # RFP_config_as_shm_state §7.C/C.3b: read api.internal_key from the SHM slot
+    # (config-as-state, INV-CFG-7) — the daemon merges secrets.toml into the slot.
     try:
-        with open(sp, "rb") as f:
-            return (tomllib.load(f).get("api") or {}).get("internal_key")
+        from titan_hcl.params import get_params
+        return (get_params("api") or {}).get("internal_key")
     except Exception:
         return None
 

@@ -488,13 +488,11 @@ def neuromod_worker_main(
     # cross-coupling weights (set by compute_emergent_inputs in cognitive_worker
     # builder, but movement clearance reads movement_<MOD> keys here too).
     try:
-        import tomllib
-        _params_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "titan_params.toml")
-        if os.path.exists(_params_path):
-            with open(_params_path, "rb") as f:
-                _dna_full = tomllib.load(f)
-            neuromod_system._dna_cache = _dna_full.get("neuromodulator_dna", {})
+        # RFP_config_as_shm_state §7.C/C.3b: read [neuromodulator_dna] from the
+        # SHM slot (config-as-state, INV-CFG-7).
+        from titan_hcl.params import get_params
+        neuromod_system._dna_cache = get_params("neuromodulator_dna")
+        if neuromod_system._dna_cache:
             logger.info("[NeuromodWorker] DNA cache loaded (%d keys)",
                         len(neuromod_system._dna_cache))
     except Exception as e:

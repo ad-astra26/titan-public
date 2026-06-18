@@ -76,14 +76,12 @@ def _enqueue_app_sink(alert_class: str, titan_id: str, text: str) -> None:
     while a prior identical alert is still un-acked."""
     try:
         import ssl
-        import tomllib
         import urllib.request as _ur
         titan_dir = os.path.expanduser("~/.titan")
-        key = None
-        sp = os.path.join(titan_dir, "secrets.toml")
-        if os.path.exists(sp):
-            with open(sp, "rb") as f:
-                key = (tomllib.load(f).get("api") or {}).get("internal_key")
+        # RFP_config_as_shm_state §7.C/C.3b: read api.internal_key from the SHM
+        # slot (INV-CFG-7) — the daemon merges secrets.toml into the slot.
+        from titan_hcl.params import get_params
+        key = (get_params("api") or {}).get("internal_key")
         if not key:
             return  # no internal key → can't authenticate to the console; skip
         dev_path = os.path.join(titan_dir, "devices.json")

@@ -1,56 +1,16 @@
-"""IMW configuration — loaded from titan_hcl/config.toml [persistence] section."""
+"""IMW configuration — loaded from the SHM [persistence] config slot.
+
+RFP_config_as_shm_state §7.C/C.3b: config is SHM-state (INV-CFG-7). The loaders
+below read the per-section slot via ``params.get_params`` — a single-section
+msgpack decode — instead of re-parsing the whole config.toml per worker-hot-path
+call (the old mtime-gated cache that cost ~7.6% of agno_worker CPU, PROFILING.md
+F7, is no longer needed: SHM reads are already fast + always-fresh).
+"""
 from __future__ import annotations
 
-import os
-import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-
-
-# ── Parsed-config cache (mtime-gated) ───────────────────────────────────────
-# from_titan_config[_section] is called per-route in worker hot paths (e.g.
-# EventsTeacherDB constructed per chat — events_teacher.py:140) — each call
-# re-opened + re-parsed the WHOLE config.toml from disk. Under chat load this
-# was ~7.6% of agno_worker's on-CPU time (PROFILING.md F7, --gil sweep
-# 2026-05-30). Cache the parsed dict, re-parsing only when config.toml's mtime
-# changes (config is loaded at boot; a runtime edit self-corrects on the next
-# call — same self-correcting idiom as snapshot_builders'
-# _episodic_stats_mtime_gated). A fresh IMWConfig is still built per call via
-# from_dict(), so no caller can mutate a shared instance.
-_TOML_CACHE: dict = {"data": None, "mtime": None, "path": None}
-_TOML_CACHE_LOCK = threading.Lock()
-
-
-def _load_config_toml_cached(cfg_path: Path) -> dict:
-    """Return the parsed config.toml as a dict, re-parsing only on mtime change.
-
-    Returns ``{}`` if the file is absent. Thread-safe (double-checked under a
-    lock so concurrent worker threads parse at most once per mtime)."""
-    try:
-        mtime = os.path.getmtime(cfg_path)
-    except OSError:
-        return {}
-    cache = _TOML_CACHE
-    cpath = str(cfg_path)
-    if (cache["data"] is not None and cache["mtime"] == mtime
-            and cache["path"] == cpath):
-        return cache["data"]
-    with _TOML_CACHE_LOCK:
-        # Re-check under the lock — another thread may have just loaded it.
-        if (cache["data"] is not None and cache["mtime"] == mtime
-                and cache["path"] == cpath):
-            return cache["data"]
-        try:
-            import tomllib
-        except ImportError:
-            import tomli as tomllib  # type: ignore
-        with open(cfg_path, "rb") as f:
-            full = tomllib.load(f)
-        cache["data"] = full
-        cache["mtime"] = mtime
-        cache["path"] = cpath
-        return full
 
 
 DEFAULTS = {
@@ -118,34 +78,30 @@ class IMWConfig:
 
     @classmethod
     def from_titan_config(cls) -> "IMWConfig":
-        cfg_path = Path(__file__).resolve().parent.parent / "config.toml"
-        if not cfg_path.exists():
-            return cls.from_dict(None)
-        full = _load_config_toml_cached(cfg_path)
-        return cls.from_dict(full.get("persistence"))
+        from titan_hcl.params import get_params
+        return cls.from_dict(get_params("persistence") or None)
 
     @classmethod
     def from_titan_config_section(cls, section_name: str = "persistence") -> "IMWConfig":
-        """Generic loader: load a [persistence] subtable from config.toml.
+        """Generic loader: load a [persistence] subtable from the SHM config slot.
 
         Added 2026-04-21 to support multiple writer instances (rFP_observatory_
         writer_service Phase 0). ``section_name`` is a dotted path resolved
-        against the merged config (RFP_config_as_shm_state §7-Phase-B(6) Tier-1
+        against the SHM config (RFP_config_as_shm_state §7-Phase-B(6) Tier-1
         rename consolidated the per-writer DB sections under [persistence.<sub>]):
           - section_name="persistence"               → IMW (inner_memory.db)
           - section_name="persistence.observatory"   → ObservatoryWriter
           - section_name="persistence.social_graph"  → SocialGraphWriter
 
-        The parse is mtime-cached (``_load_config_toml_cached``) — this loader
-        is called per-route in worker hot paths, so re-parsing config.toml on
-        every call was a measurable chat-path CPU cost (PROFILING.md F7).
+        RFP_config_as_shm_state §7.C/C.3b: reads the per-section SHM slot
+        (config-as-state, INV-CFG-7) — a single-section msgpack decode, far
+        cheaper than the whole-config.toml reparse this loader used to do per
+        worker-hot-path call (PROFILING.md F7); the old mtime cache is gone.
         """
-        cfg_path = Path(__file__).resolve().parent.parent / "config.toml"
-        if not cfg_path.exists():
-            return cls.from_dict(None)
-        full = _load_config_toml_cached(cfg_path)
-        node = full
-        for _part in section_name.split("."):
+        from titan_hcl.params import get_params
+        parts = section_name.split(".")
+        node = get_params(parts[0])
+        for _part in parts[1:]:
             node = (node or {}).get(_part, {})
         return cls.from_dict(node or None)
 

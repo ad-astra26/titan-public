@@ -54,23 +54,17 @@ def load_config(titan_id: str | None = None) -> dict:
     if titan_id is None:
         titan_id = _get_titan_id()
 
-    # Read titan_params.toml
-    try:
-        import tomllib
-    except ImportError:
-        import tomli as tomllib  # Python < 3.11
-
-    params_path = os.path.join(
-        _PROJECT_ROOT, "titan_hcl", "titan_params.toml")
-
     base = dict(DEFAULTS)
 
+    # RFP_config_as_shm_state §7.C/C.3b: read [language] from the SHM slot
+    # (config-as-state, INV-CFG-7) instead of re-parsing titan_params.toml.
+    # The section still carries the per-Titan T1/T2/T3 sub-tables; the daemon
+    # stores the section verbatim, so the base + override merge is unchanged.
     try:
-        with open(params_path, "rb") as f:
-            params = tomllib.load(f)
+        from titan_hcl.params import get_params
+        lang_section = get_params("language")
 
         # Merge [language] base section
-        lang_section = params.get("language", {})
         for k, v in lang_section.items():
             if not isinstance(v, dict):  # Skip sub-tables (T1/T2/T3)
                 base[k] = v
@@ -80,10 +74,8 @@ def load_config(titan_id: str | None = None) -> dict:
         for k, v in titan_overrides.items():
             base[k] = v
 
-    except FileNotFoundError:
-        logger.warning("[LanguageConfig] titan_params.toml not found, using defaults")
     except Exception as e:
-        logger.warning("[LanguageConfig] Failed to load config: %s", e)
+        logger.warning("[LanguageConfig] Failed to load [language] config: %s", e)
 
     base["titan_id"] = titan_id
     return base

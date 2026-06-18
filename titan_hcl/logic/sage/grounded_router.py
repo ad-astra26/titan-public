@@ -180,16 +180,10 @@ def load_router_thresholds() -> RouterThresholds:
     in-code defaults on any error (file/section missing, parse error) so unit
     tests + cold scenarios keep working. The PreHook calls this once and caches."""
     try:
-        try:
-            import tomllib  # 3.11+
-        except ImportError:  # pragma: no cover - py<3.11 fallback
-            import tomli as tomllib  # type: ignore
-        # __file__ = titan_hcl/logic/sage/grounded_router.py → titan_hcl/ is 3 up.
-        here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        path = os.path.join(here, "titan_params.toml")
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-        sub = data.get("gatekeeper", {}).get("grounded_router", {})
+        # RFP_config_as_shm_state §7.C/C.3b: read [gatekeeper.grounded_router]
+        # from the SHM slot (config-as-state, INV-CFG-7); defaults on any error.
+        from titan_hcl.params import get_params
+        sub = get_params("gatekeeper").get("grounded_router", {})
         d = RouterThresholds()
         return RouterThresholds(
             recall_known_floor=float(sub.get("recall_known_floor", d.recall_known_floor)),

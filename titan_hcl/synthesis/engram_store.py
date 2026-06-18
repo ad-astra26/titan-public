@@ -145,20 +145,12 @@ def _load_groundedness_params_from_toml() -> _GroundednessParams:
     subtable missing) so tests + unit scenarios that don't need the toml
     keep working. Production synthesis_worker calls this at boot."""
     try:
-        import importlib.resources
-        try:
-            import tomllib  # 3.11+
-        except ImportError:
-            import tomli as tomllib  # type: ignore
-        # The params file ships under titan_hcl/titan_params.toml.
-        # In production the worker imports it from its installed package;
-        # in tests we resolve via the parent of titan_hcl/synthesis/.
-        import os
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        path = os.path.join(here, "titan_params.toml")
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-        sub = data.get("synthesis", {}).get("groundedness", {})
+        # RFP_config_as_shm_state §7.C/C.3b: read the [synthesis] section from
+        # the SHM slot (config-as-state, INV-CFG-7) instead of re-parsing
+        # titan_params.toml. SHM-absent (pytest/pre-daemon) falls back inside
+        # get_params; on any error we keep the in-code defaults below.
+        from titan_hcl.params import get_params
+        sub = get_params("synthesis").get("groundedness", {})
         return _GroundednessParams(
             w_e=float(sub.get("w_e", 0.3)),
             w_c=float(sub.get("w_c", 0.3)),
@@ -234,15 +226,10 @@ class _BlendParams:
 def _load_blend_params_from_toml() -> _BlendParams:
     """Best-effort load of `[synthesis.engram.grounding]`; in-code defaults on any error."""
     try:
-        try:
-            import tomllib  # 3.11+
-        except ImportError:
-            import tomli as tomllib  # type: ignore
-        import os
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(here, "titan_params.toml"), "rb") as f:
-            data = tomllib.load(f)
-        sub = data.get("synthesis", {}).get("engram", {}).get("grounding", {})
+        # RFP_config_as_shm_state §7.C/C.3b: read [synthesis.engram.grounding]
+        # from the SHM slot (INV-CFG-7); defaults preserved on any error.
+        from titan_hcl.params import get_params
+        sub = get_params("synthesis").get("engram", {}).get("grounding", {})
         return _BlendParams(
             w_used=float(sub.get("w_used", 0.40)),
             w_verified=float(sub.get("w_verified", 0.0)),

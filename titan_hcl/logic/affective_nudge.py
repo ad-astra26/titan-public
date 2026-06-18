@@ -128,15 +128,10 @@ def load_affective_config() -> AffectiveConfig:
     tests and minimal installs keep working. The synthesis_worker calls this
     once at boot."""
     try:
-        try:
-            import tomllib  # py3.11+
-        except ImportError:  # pragma: no cover
-            import tomli as tomllib  # type: ignore
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # → titan_hcl/
-        path = os.path.join(here, "titan_params.toml")
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-        sub = data.get("affective", {}) or {}
+        # RFP_config_as_shm_state §7.C/C.3b: read [affective] from the SHM slot
+        # (config-as-state, INV-CFG-7); in-code defaults preserved on any error.
+        from titan_hcl.params import get_params
+        sub = get_params("affective") or {}
         d = AffectiveConfig()
         return AffectiveConfig(
             enabled=bool(sub.get("enabled", d.enabled)),

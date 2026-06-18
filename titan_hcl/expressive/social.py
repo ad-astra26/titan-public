@@ -107,14 +107,11 @@ class SocialManager:
             logging.warning("[SocialGraph:X] Record failed: %s", e)
 
     def _load_social_config(self) -> dict:
-        import os
-        config_path = os.path.join(os.path.dirname(__file__), "..", "config.toml")
+        # RFP_config_as_shm_state §7.C/C.3b: read [twitter_social] from the SHM
+        # slot (config-as-state, INV-CFG-7) instead of re-parsing config.toml.
         try:
-            try: import tomllib
-            except ModuleNotFoundError: import toml as tomllib
-            with open(config_path, "rb") as f:
-                config = tomllib.load(f)
-            return config.get("twitter_social", {})
+            from titan_hcl.params import get_params
+            return get_params("twitter_social")
         except Exception as e:
             logging.error(f"[SocialManager] Failed to load config: {e}")
             return {}
@@ -555,19 +552,16 @@ class SocialManager:
             # the model override (default 'deepseek-v3.1:671b'). The api_key
             # / base_url / provider dispatch is GONE; llm_worker now owns
             # provider abstraction + failover.
-            config_path = os.path.join(os.path.dirname(__file__), "..", "config.toml")
+            # RFP_config_as_shm_state §7.C/C.3b: read [inference]/[api] from the
+            # SHM slots (config-as-state, INV-CFG-7); api.internal_key resolves
+            # via the daemon's secrets overlay.
             try:
-                try:
-                    import tomllib
-                except ModuleNotFoundError:
-                    import toml as tomllib
-                with open(config_path, "rb") as f:
-                    full_cfg = tomllib.load(f)
+                from titan_hcl.params import get_params
+                inference_cfg = get_params("inference")
+                api_cfg = get_params("api") or {}
             except Exception:
-                full_cfg = {}
-
-            inference_cfg = full_cfg.get("inference", {})
-            api_cfg = full_cfg.get("api", {}) or {}
+                inference_cfg = {}
+                api_cfg = {}
             model_id = inference_cfg.get(
                 "ollama_cloud_chat_model", "deepseek-v3.1:671b")
             _api_port = int(api_cfg.get("port", 7777))
