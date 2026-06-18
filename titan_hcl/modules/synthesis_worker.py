@@ -3862,6 +3862,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             channel=str(payload.get("channel", "") or ""),
                             person_ref=str(payload.get("person_ref", "") or ""),
                             ts=payload.get("ts"))
+                        # §7.D — refresh the recall surface AT CAPTURE so the Maker is
+                        # recognizable immediately (recognize-on-validity, no fold-lag).
+                        if autobiography_seal is not None:
+                            autobiography_seal.export_recall_snapshot()
                     except Exception as _pcm_e:  # noqa: BLE001
                         logger.debug("[synthesis_worker] presence capture (maker) "
                                      "failed: %s", _pcm_e)
@@ -3885,6 +3889,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                 channel=str(payload.get("channel", "") or ""),
                                 person_ref=str(payload.get("person_ref", "") or ""),
                                 ts=payload.get("ts"))
+                            # §7.D — refresh the recall surface AT CAPTURE so this
+                            # person is recognizable immediately (no fold-lag window).
+                            if autobiography_seal is not None:
+                                autobiography_seal.export_recall_snapshot()
                     except Exception as _ptp_e:  # noqa: BLE001
                         logger.debug("[synthesis_worker] presence capture (person) "
                                      "failed: %s", _ptp_e)

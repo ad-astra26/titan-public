@@ -3169,9 +3169,22 @@ def create_pre_hook(plugin):
         # ~30MB/turn retainer). TEXT only, from Titan's own bounded store (small).
         recent_turns_context = get_recent_turns_context(
             user_id, getattr(plugin, '_current_session_id', None) or "default")
+        # RFP_verifiable_autobiographical_presence_memory §7.E — render the Phase-D
+        # presence bundle (stashed above) into a grounded block, prepended FIRST so it
+        # is GUARANTEED inside the OVG's first-500-char window (additional_context[:500]
+        # @:3500 → verify @:3733). Recognize-on-validity: a block for ANY real record;
+        # empty when there is none ⇒ the OVG blocks an "I recognize you" over-claim
+        # (honest). output_verifier.py UNCHANGED — we feed the gate, never weaken it.
+        try:
+            from titan_hcl.logic.presence_recall import render_presence_context_block
+            presence_context = render_presence_context_block(
+                getattr(plugin, '_pre_chat_presence_record', None))
+        except Exception as _pe_e:  # noqa: BLE001
+            presence_context = ""
+            logger.debug("[PreHook] presence block render skipped: %s", _pe_e)
         # Inject context into agent's additional_context
         # V5: inner state sections + V6: MSL/CGN/social/reasoning enrichment
-        injected = (recent_turns_context +
+        injected = (presence_context + recent_turns_context +
                     perceptual_field_text + interface_coloring + consciousness_context +
                     maker_context + voice_context + social_context + user_memory_context +
                     grounded_context + directive_context + status_context +

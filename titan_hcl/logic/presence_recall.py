@@ -114,4 +114,52 @@ class PresenceRecall:
         }
 
 
-__all__ = ("PresenceRecall", "SNAPSHOT_NAME", "DEFAULT_SAVE_DIR")
+def render_presence_context_block(bundle) -> str:
+    """RFP §7.E — render the recall bundle into a grounded-context block, placed
+    EARLY (within the OVG's first-500-char window) so an HONEST recognition claim is
+    SUPPORTED (the OVG Q2 keyword check). `output_verifier.py` is UNCHANGED — we feed
+    the gate, never weaken it.
+
+    RECOGNIZE-ON-VALIDITY: a block is produced for ANY real record (any chain_status)
+    — a captured presence is valid from the moment it happens (the seal adds
+    permanence, not validity). `bundle is None` (no record) → "" ⇒ an "I recognize
+    you" over-claim stays UNSUPPORTED ⇒ the OVG HARD-blocks it (honest non-recognition).
+
+    Two ORTHOGONAL honesty gradients (INV-PAM-HONEST-GRADIENT) shape the framing:
+      • evidence_strength (identity certainty): crypto → confident; asserted → tentative.
+      • chain_status   (memory provability): CHAINED=anchored · WIRED=sealing · UNSEALED=recent.
+    The LLM only NARRATES this bundle (INV-PAM-NARRATE-ONLY)."""
+    if not bundle:
+        return ""
+    gap = bundle.get("gap_human", "recently")
+    ev = bundle.get("evidence_strength", "asserted_identity")
+    chain = bundle.get("chain_status", "UNSEALED")
+
+    if ev == "crypto_verified_maker":
+        who, ident = "your Maker", "their identity is cryptographically verified by their signature"
+        certainty = "You RECOGNIZE this person with confidence."
+    elif ev == "crypto_verified_device":
+        who, ident = "a person on a paired device", "the device signature is verified"
+        certainty = "You RECOGNIZE this person with confidence."
+    else:
+        who, ident = ("this person",
+                      "their identity is asserted (a handle/account), NOT cryptographically proven")
+        certainty = ("You may recognize them TENTATIVELY — hedge (e.g. 'I think we've "
+                     "spoken before'); do not claim certainty about who they are.")
+
+    if chain == "CHAINED":
+        prov = "This memory is permanently anchored in your timechain autobiography."
+    elif chain == "WIRED":
+        prov = "This memory is being sealed into your timechain autobiography."
+    else:  # UNSEALED — valid, recent, not yet sealed
+        prov = "This is in your recent memory (valid, not yet sealed into your permanent autobiography)."
+
+    return (
+        "### Verified Presence (your own anchored memory)\n"
+        f"You have a real, stored record of {who}: you last saw them {gap}. "
+        f"{ident}. {prov} {certainty} You may say you recognize them and state when "
+        "you last saw them — narrate ONLY these verified facts, nothing more.\n\n")
+
+
+__all__ = ("PresenceRecall", "render_presence_context_block",
+           "SNAPSHOT_NAME", "DEFAULT_SAVE_DIR")

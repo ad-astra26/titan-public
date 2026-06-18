@@ -217,33 +217,47 @@ class AutobiographySeal:
             snapshot_path = os.path.join(self._save_dir, "presence_recall_snapshot.json")
         ledger = self._load_ledger()
 
+        # Read last-seen + strongest-evidence per person DIRECTLY from the durable
+        # `person_interactions` atoms (NOT the dream-folded rollup) — so a person met
+        # moments ago is recognizable IMMEDIATELY (recognize-on-validity: a captured
+        # presence is valid the instant it is written, like a mempool memory; the seal
+        # adds permanence, not validity). The atom is written at capture + this export
+        # fires in the capture handler, so there is no fold-lag window.
         def _read():
-            # the row with the MAX last_seen_epoch per person (cycle_id tie-break)
             return self._conn.execute(
-                "SELECT person_id, last_seen_epoch, cycle_id, evidence_strength FROM ("
-                " SELECT person_id, last_seen_epoch, cycle_id, evidence_strength,"
-                "  ROW_NUMBER() OVER (PARTITION BY person_id "
-                "   ORDER BY last_seen_epoch DESC, cycle_id DESC) AS rn"
-                " FROM presence_cycle_rollup) WHERE rn = 1").fetchall()
+                "SELECT person_id, MAX(age_epochs) AS last_seen, "
+                "MAX(CASE evidence_strength "
+                " WHEN 'crypto_verified_maker' THEN 3 "
+                " WHEN 'crypto_verified_device' THEN 2 ELSE 1 END) AS ev_ord "
+                "FROM person_interactions GROUP BY person_id").fetchall()
         try:
             rows = self._writer.submit_sync(_read)
         except Exception as e:  # noqa: BLE001
             logger.warning("[autobiography_seal] recall snapshot read failed (%s)", e)
             return 0
 
+        _EV = {3: "crypto_verified_maker", 2: "crypto_verified_device", 1: "asserted_identity"}
+        cycles = ledger.get("cycles", {})
         persons = {}
-        for pid, last_seen, cycle_id, evidence in (rows or []):
-            cyc = ledger["cycles"].get(str(int(cycle_id)))
-            if cyc:
-                chain_status = cyc.get("chain_status", "WIRED")
-                anchor = cyc.get("block_hash") or cyc.get("merkle_root")
-            else:
-                chain_status, anchor = "UNSEALED", None   # cycle not yet sealed (open)
+        for pid, last_seen, ev_ord in (rows or []):
+            last_seen = int(last_seen)
+            # chain_status = provability of the cycle whose age_epoch_range contains
+            # last_seen (CHAINED › WIRED). No sealed cycle contains it ⇒ it is in the
+            # current OPEN cycle ⇒ UNSEALED (valid + recent, not yet sealed — still
+            # fully recognizable; the seal is the permanence layer).
+            chain_status, anchor, cyc_id = "UNSEALED", None, None
+            for cid, cyc in cycles.items():
+                rng = cyc.get("age_epoch_range")
+                if rng and int(rng[0]) <= last_seen < int(rng[1]):
+                    chain_status = cyc.get("chain_status", "WIRED")
+                    anchor = cyc.get("block_hash") or cyc.get("merkle_root")
+                    cyc_id = int(cid)
+                    break
             persons[str(pid)] = {
-                "last_seen_epoch": int(last_seen),
-                "evidence_strength": str(evidence),
+                "last_seen_epoch": last_seen,
+                "evidence_strength": _EV.get(int(ev_ord), "asserted_identity"),
                 "chain_status": chain_status,
-                "cycle_id": int(cycle_id),
+                "cycle_id": cyc_id,
                 "anchor": anchor,
             }
 

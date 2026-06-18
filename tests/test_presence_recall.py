@@ -132,6 +132,37 @@ def test_chain_status_flips_chained_after_block_seal(setup):
     assert rec["anchor"] == "blockX"                         # block_hash is the anchor
 
 
+def test_unsealed_fresh_presence_is_recognized(setup):
+    """RECOGNIZE-ON-VALIDITY — the headline freshness guarantee: a presence captured
+    in the CURRENT open cycle (NOT yet sealed) is STILL recalled (chain_status
+    UNSEALED), so Titan recognizes someone he just met. The seal adds permanence,
+    not validity. last_seen reads from person_interactions directly (no fold-lag)."""
+    seal, recall, conn, tmp, snap_path = setup
+    _seed_atoms(conn, [
+        (_hx("old"), "maker", "crypto_verified_maker", 100),     # cycle 1 (will seal)
+        (_hx("fresh"), "maker", "crypto_verified_maker", 500),   # open cycle (unsealed)
+    ])
+    seal.seal_closed_cycle(1, 0, 200)        # seals [0,200) — does NOT cover epoch 500
+    seal.export_recall_snapshot()
+    rec = recall.recall("maker", now_age_epochs=520)
+    assert rec is not None                    # recognized despite the fresh atom unsealed
+    assert rec["last_seen_epoch"] == 500      # the FRESH atom, not the sealed 100
+    assert rec["chain_status"] == "UNSEALED"  # valid + recent, not yet sealed
+    assert rec["gap_epochs"] == 20            # 520 - 500 (Titan-time)
+
+
+def test_recognized_with_no_seal_at_all(setup):
+    """A presence with NO seal yet (pure working/mempool state) is recognized too —
+    the OVG passes on REAL captured data, not on a seal."""
+    seal, recall, conn, tmp, snap_path = setup
+    _seed_atoms(conn, [(_hx("m"), "maker", "asserted_identity", 50)])
+    assert seal.export_recall_snapshot() == 1   # no seal_closed_cycle → empty ledger
+    rec = recall.recall("maker", now_age_epochs=55)
+    assert rec is not None
+    assert rec["chain_status"] == "UNSEALED"
+    assert rec["last_seen_epoch"] == 50
+
+
 def test_empty_rollup_exports_no_persons(setup):
     seal, recall, conn, tmp, snap_path = setup
     _seed_atoms(conn, [])                       # table exists, no atoms
