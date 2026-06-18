@@ -2644,6 +2644,21 @@ def _run_dream_bridge(state_refs: dict, neuromod_reader, send_queue, name: str) 
     except Exception as _prune_err:
         logger.debug("[DreamBridge] observatory prune skipped: %s", _prune_err)
 
+    # Inner-memory retention (A, 2026-06-18) — bound the high-frequency
+    # `program_fires` telemetry (478k rows / 1.1GB on T1; the inner programs fire
+    # several times/sec and nothing reads beyond a recent window). Unlike the daily
+    # observatory prune, this runs at ≥30min so the table can't bloat between runs;
+    # the DELETE is writer-routed (IMW), touches only OLD ids, and SKIPS VACUUM (same
+    # safety as above). Best-effort — never raises into the dream/epoch path.
+    try:
+        _now_im = time.time()
+        if _now_im - float(state_refs.get("_last_inner_memory_prune", 0.0)) >= 1800:
+            from titan_hcl.logic.inner_memory import InnerMemoryStore
+            InnerMemoryStore().prune_program_fires(keep_rows=50_000)
+            state_refs["_last_inner_memory_prune"] = _now_im
+    except Exception as _imp_err:
+        logger.debug("[DreamBridge] inner-memory prune skipped: %s", _imp_err)
+
 
 def _dispatch_experience_record(state_refs: dict, payload: dict) -> None:
     """EXPERIENCE_RECORD consumer — Record stage of the ExperienceOrchestrator

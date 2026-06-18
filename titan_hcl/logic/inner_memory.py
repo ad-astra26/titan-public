@@ -319,6 +319,26 @@ class InnerMemoryStore:
             table="program_fires",
         )
 
+    def prune_program_fires(self, keep_rows: int = 50_000) -> None:
+        """Retention: bound the high-frequency `program_fires` telemetry log. Every
+        inner-program fire (VIGILANCE/REFLEX/FOCUS/… ~several per second) writes a
+        durable row; nothing reads more than a recent window (`get_recent_fires`
+        LIMIT ≤50; the dashboard narrated-feed LIMIT 15), so the older rows are dead
+        weight that bloated `inner_memory.db` to 1.1GB on T1 (2026-06-18). Keep the
+        most recent `keep_rows` (by autoincrement id) and DELETE the rest.
+
+        Routes the DELETE through the IMW writer (serialized with the live writes —
+        it only touches OLD ids, never the high-id rows being appended). NO VACUUM:
+        a large VACUUM under load degraded T3 (2026-04-21); on-disk shrink stays a
+        separate maintenance-window op. When the table is already ≤ keep_rows the
+        cutoff is negative → deletes nothing (safe)."""
+        self._client.write(
+            "DELETE FROM program_fires "
+            "WHERE id <= (SELECT MAX(id) FROM program_fires) - ?",
+            (int(keep_rows),),
+            table="program_fires",
+        )
+
     # ── Outer Layer: Write API ───────────────────────────────────────
 
     def record_action_chain(
