@@ -1283,6 +1283,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # turn (agno PostHook) → PresenceCapture records the asserted-identity
             # autobiographical atom (the Maker rides MAKER_PRESENCE_VERIFIED above).
             _bus_constants.PERSON_TURN_PRESENCE,
+            # RFP_verifiable_autobiographical_presence_memory §7.C (SEAL) — a
+            # circadian cycle closed at the trough (soul_diary's CircadianCycleCounter
+            # latch) → AutobiographySeal final-folds + Merkle-roots + emits a
+            # presence_seal fork-main TX. TIMECHAIN_SEALED (dst="all", but listed so
+            # the subscription is explicit) → flips WIRED seals to CHAINED on a
+            # fork=main block (Phase D recall reads chain_status).
+            _bus_constants.CYCLE_CLOSED,
+            _bus_constants.TIMECHAIN_SEALED,
             # Operator-closure telemetry (2026-06-01): recall latency + chi from
             # agno/cognitive (their own evaluator/ring) → synthesis §18 metrics
             # so retrieval.samples + chi reflect the real cross-process loop.

@@ -359,6 +359,16 @@ MAKER_PRESENCE_VERIFIED = "MAKER_PRESENCE_VERIFIED"
 # (crypto_verified_maker only ever arrives on the verified path, never here).
 PERSON_TURN_PRESENCE = "PERSON_TURN_PRESENCE"
 
+# RFP_verifiable_autobiographical_presence_memory §7.C (SEAL) — a circadian cycle
+# just CLOSED at the trough meditation. Published by soul_diary_worker when its
+# CircadianCycleCounter.latch_if_trough() fires (soul_diary owns the latch; the
+# diary itself moved onto Titan-time cycles — INV-SD-5 UTC→cycle, full swap
+# 2026-06-18). Consumed by synthesis_worker → final-fold the closed cycle +
+# Merkle-root its interaction set + emit a `presence_seal` fork-main TX. Payload:
+# {cycle_id (the CLOSED id), start_epoch, end_epoch (Titan-time age_epoch range),
+# start_ts, ts_utc (wall-clock VIEW metadata)}.
+CYCLE_CLOSED = "CYCLE_CLOSED"
+
 # Phase 2 standing-contract event (PLAN_synthesis_engine_Phase2.md 2B,
 # D-P2-4): emitted by the post-seal contract hook in
 # timechain_v2.Mempool/BlockBuilder for every TX sealed that matches an
@@ -2637,6 +2647,11 @@ TIMECHAIN_CHECK      = "TIMECHAIN_CHECK"
 TIMECHAIN_CHECKPOINT = "TIMECHAIN_CHECKPOINT"
 TIMECHAIN_COMMIT     = "TIMECHAIN_COMMIT"
 TIMECHAIN_COMMITTED  = "TIMECHAIN_COMMITTED"
+# Emitted by BlockBuilder.seal_fork (timechain_v2) after a fork block seals;
+# dst="all". Payload: {fork, fork_id, block_height, block_hash, tx_count,
+# tx_merkle_root, sig_avg, trigger}. Consumed by synthesis_worker (RFP presence
+# §7.C) to flip WIRED presence seals → CHAINED on a fork=main block.
+TIMECHAIN_SEALED     = "TIMECHAIN_SEALED"
 TIMECHAIN_COMPARE    = "TIMECHAIN_COMPARE"
 TIMECHAIN_QUERY      = "TIMECHAIN_QUERY"
 TIMECHAIN_QUERY_RESP = "TIMECHAIN_QUERY_RESP"

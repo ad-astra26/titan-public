@@ -66,20 +66,39 @@ class PresenceRollup:
     def fold(self) -> int:
         """Recompute the CURRENT open cycle's rollup from its raw atoms; UPSERT one
         row per person. Returns the number of person-rows folded (0 on empty/soft
-        failure). Idempotent — safe to call every dream."""
+        failure). Idempotent — safe to call every dream. No end-bound (open cycle)."""
         cycle_id, cycle_start_epoch = read_current_cycle(self._save_dir)
-        # READ per-person aggregates over THIS cycle's atoms (age_epochs >= the
-        # cycle's start; Titan-time partition). The ActivationStore conn is GUARDED
-        # (guard_conn) — EVERY .execute(), read OR write, must run on the sole
-        # SynthesisWriter thread (G21), so the SELECT routes through submit_sync too
-        # (not a direct conn read — that raises off-thread; caught live on T3).
+        return self._fold_range(int(cycle_id), int(cycle_start_epoch), None)
+
+    def fold_closed_cycle(self, cycle_id: int, start_epoch: int,
+                          end_epoch: int) -> int:
+        """RFP §7.C — final-fold the CLOSED cycle ``[start_epoch, end_epoch)`` under
+        ``cycle_id`` (the end-bounded variant of ``fold()``). Catches atoms captured
+        between the last dream fold and the trough latch. Idempotent UPSERT. Returns
+        the number of person-rows folded (0 on an empty cycle — the seal still fires;
+        INV-PAM-NO-GAPS is enforced at the seal layer, not here)."""
+        return self._fold_range(int(cycle_id), int(start_epoch), int(end_epoch))
+
+    def _fold_range(self, cycle_id: int, start_epoch: int,
+                    end_epoch) -> int:
+        """Shared fold: per-person aggregate over ``age_epochs >= start_epoch`` (and
+        ``< end_epoch`` when bounded; Titan-time partition) → UPSERT one rollup row
+        per person under ``cycle_id``. The ActivationStore conn is GUARDED — EVERY
+        ``.execute()``, read OR write, must run on the sole SynthesisWriter thread
+        (G21), so BOTH the SELECT and the UPSERT route through ``submit_sync`` (a
+        direct conn read raises off-thread; caught live on T3)."""
+        if end_epoch is None:
+            where, params = "WHERE age_epochs >= ?", [int(start_epoch)]
+        else:
+            where = "WHERE age_epochs >= ? AND age_epochs < ?"
+            params = [int(start_epoch), int(end_epoch)]
+
         def _read():
             return self._conn.execute(
                 "SELECT person_id, MIN(age_epochs), MAX(age_epochs), COUNT(*), "
                 f"MAX({_EVIDENCE_CASE_SQL}) "
-                "FROM person_interactions WHERE age_epochs >= ? "
-                "GROUP BY person_id",
-                [int(cycle_start_epoch)]).fetchall()
+                f"FROM person_interactions {where} "
+                "GROUP BY person_id", params).fetchall()
         try:
             rows = self._writer.submit_sync(_read)
         except Exception as e:  # noqa: BLE001
@@ -111,8 +130,10 @@ class PresenceRollup:
             logger.warning("[presence_rollup] fold upsert failed (%s)", e)
             return 0
 
-        logger.info("[presence_rollup] folded cycle=%d persons=%d (start_epoch=%d)",
-                    cycle_id, len(folded), cycle_start_epoch)
+        logger.info("[presence_rollup] folded cycle=%d persons=%d "
+                    "(start_epoch=%d end_epoch=%s)",
+                    cycle_id, len(folded), start_epoch,
+                    end_epoch if end_epoch is not None else "open")
         return len(folded)
 
 

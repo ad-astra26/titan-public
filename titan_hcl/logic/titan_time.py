@@ -101,6 +101,12 @@ class CircadianCycleCounter:
         self._cycle_start_epoch: int = 0
         self._armed: bool = False  # seed disarmed → first latch needs a daytime re-arm
         self._last_latch_ts: float = 0.0
+        # wall-clock at which the OPEN cycle began — the basis for the Soul Diary's
+        # cycle-span activity window (Phase C: [cycle_start_ts, now] ≈ the old "full
+        # preceding day"). Distinct from `last_latch_ts` only for the seed cycle 0
+        # (no latch has fired yet, so last_latch_ts=0.0 but the cycle still has a
+        # real wall-clock birth = seed time). Human-time VIEW only (INV-PAM-TITAN-TIME).
+        self._cycle_start_ts: float = 0.0
         self._load_or_seed()
 
     # ── properties (read-only view; Phase C reads these BEFORE calling latch) ──
@@ -111,6 +117,13 @@ class CircadianCycleCounter:
     @property
     def cycle_start_epoch(self) -> int:
         return self._cycle_start_epoch
+
+    @property
+    def cycle_start_ts(self) -> float:
+        """Wall-clock (epoch seconds) when the OPEN cycle began. The Soul Diary
+        captures this BEFORE `latch_if_trough` to window the just-closed cycle's
+        activity `[cycle_start_ts, now]`."""
+        return self._cycle_start_ts
 
     @property
     def armed(self) -> bool:
@@ -126,6 +139,10 @@ class CircadianCycleCounter:
                 self._cycle_start_epoch = int(data["cycle_start_epoch"])
                 self._armed = bool(data["armed"])
                 self._last_latch_ts = float(data.get("last_latch_ts", 0.0))
+                # backward-compatible: pre-Phase-C state has no cycle_start_ts →
+                # fall back to last_latch_ts (the open cycle's birth latch), or 0.0.
+                self._cycle_start_ts = float(
+                    data.get("cycle_start_ts", self._last_latch_ts))
                 logger.info(
                     "[titan_time] cycle counter restored — cycle_id=%d start_epoch=%d armed=%s",
                     self._cycle_id, self._cycle_start_epoch, self._armed)
@@ -139,6 +156,7 @@ class CircadianCycleCounter:
         self._cycle_start_epoch = int(self._age_reader.get_age_epochs())
         self._armed = False
         self._last_latch_ts = 0.0
+        self._cycle_start_ts = time.time()  # cycle 0's real wall-clock birth (seed time)
         self._persist()
         logger.info("[titan_time] cycle counter SEEDED — cycle_id=0 start_epoch=%d (disarmed)",
                     self._cycle_start_epoch)
@@ -150,6 +168,7 @@ class CircadianCycleCounter:
             "cycle_start_epoch": self._cycle_start_epoch,
             "armed": self._armed,
             "last_latch_ts": self._last_latch_ts,
+            "cycle_start_ts": self._cycle_start_ts,
         }
         tmp = self._state_path + ".tmp"
         with open(tmp, "w") as f:
@@ -170,10 +189,12 @@ class CircadianCycleCounter:
             age_epochs = int(self._age_reader.get_age_epochs())
         if phase < self._trough_threshold:
             if self._armed:
+                now = time.time()
                 self._cycle_id += 1
                 self._cycle_start_epoch = int(age_epochs)
                 self._armed = False
-                self._last_latch_ts = time.time()
+                self._last_latch_ts = now
+                self._cycle_start_ts = now  # the newly-OPENED cycle's wall-clock birth
                 self._persist()
                 logger.info(
                     "[titan_time] CYCLE LATCH — new cycle_id=%d opened at age_epochs=%d (phase=%.3f)",

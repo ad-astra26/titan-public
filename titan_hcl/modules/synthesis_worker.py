@@ -88,6 +88,8 @@ from titan_hcl.bus import (
     MAKER_FACT_RECORD,
     MAKER_PRESENCE_VERIFIED,
     PERSON_TURN_PRESENCE,
+    CYCLE_CLOSED,
+    TIMECHAIN_SEALED,
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
@@ -1624,6 +1626,24 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     except Exception as _pr_e:  # noqa: BLE001 — rollup disabled, synthesis unaffected
         logger.warning("[synthesis_worker] PresenceRollup init failed (%s) — "
                        "presence rollup disabled this session", _pr_e)
+
+    # RFP_verifiable_autobiographical_presence_memory §7.C — AutobiographySeal: on
+    # CYCLE_CLOSED (soul_diary's trough latch), final-fold + Merkle-root the closed
+    # cycle + emit a presence_seal fork-main TX (idempotent, local block). Its own
+    # OuterMemoryWriter (cheap; send_queue+src) like presence_capture; shares
+    # store._conn + db_writer (G21) and the presence_rollup for the end-bounded fold.
+    # CHAINED-tracking flips on TIMECHAIN_SEALED{fork=main}. Soft → None.
+    autobiography_seal = None
+    if presence_rollup is not None:
+        try:
+            from titan_hcl.synthesis.autobiography_seal import AutobiographySeal
+            from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter as _OMW_SEAL
+            autobiography_seal = AutobiographySeal(
+                store._conn, db_writer, presence_rollup,
+                _OMW_SEAL(send_queue=send_queue, src="autobiography_seal"))
+        except Exception as _as_e:  # noqa: BLE001 — seal disabled, synthesis unaffected
+            logger.warning("[synthesis_worker] AutobiographySeal init failed (%s) — "
+                           "presence seal disabled this session", _as_e)
 
     # Phase 2 D-P2-4 standing-bundle store — sole writer of
     # data/synthesis.duckdb / association_bundles. CONN-2 FOLD (AUDIT §5.2):
@@ -3864,6 +3884,54 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     except Exception as _ptp_e:  # noqa: BLE001
                         logger.debug("[synthesis_worker] presence capture (person) "
                                      "failed: %s", _ptp_e)
+                continue
+
+            if msg_type == CYCLE_CLOSED:
+                # RFP_verifiable_autobiographical_presence_memory §7.C (SEAL) — a
+                # circadian cycle CLOSED at the trough (soul_diary owns the latch).
+                # Final-fold + Merkle-root the closed cycle's interaction set + emit
+                # ONE presence_seal fork-main TX (Titan's own autobiographical act;
+                # the timechain seals it on its own cadence — two separate TXs).
+                # Idempotent (ledger last_sealed_cycle_id); empty cycle still seals
+                # (INV-PAM-NO-GAPS). Soft.
+                if autobiography_seal is not None:
+                    try:
+                        _cid = payload.get("cycle_id")
+                        _start = payload.get("start_epoch")
+                        _end = payload.get("end_epoch")
+                        if _cid is not None and _start is not None and _end is not None:
+                            _su = payload.get("start_ts")
+                            _eu = payload.get("ts_utc")
+                            _utc_range = ([float(_su), float(_eu)]
+                                          if _su is not None and _eu is not None
+                                          else None)
+                            autobiography_seal.seal_closed_cycle(
+                                int(_cid), int(_start), int(_end),
+                                ts_utc_range=_utc_range)
+                        else:
+                            logger.warning("[synthesis_worker] CYCLE_CLOSED missing "
+                                           "cycle_id/start/end — skipping seal: %s",
+                                           payload)
+                    except Exception as _cc_e:  # noqa: BLE001
+                        logger.warning("[synthesis_worker] CYCLE_CLOSED seal failed: "
+                                       "%s", _cc_e, exc_info=True)
+                continue
+
+            if msg_type == TIMECHAIN_SEALED:
+                # RFP presence §7.C step 5 — a fork block sealed. If it is FORK_MAIN,
+                # every WIRED presence seal emitted at/before its ts is now anchored
+                # (seal_fork seals ALL pending fork-main TXs) → flip CHAINED + record
+                # the block. Cheap no-op for non-main forks + when no WIRED entries.
+                if (autobiography_seal is not None
+                        and str(payload.get("fork", "")) == "main"):
+                    try:
+                        autobiography_seal.note_fork_main_sealed(
+                            int(payload.get("block_height", 0)),
+                            str(payload.get("block_hash", "")),
+                            float(msg.get("ts", 0.0) or 0.0))
+                    except Exception as _ts_e:  # noqa: BLE001
+                        logger.debug("[synthesis_worker] TIMECHAIN_SEALED CHAINED "
+                                     "update failed: %s", _ts_e)
                 continue
 
             if msg_type == KNOWLEDGE_MOMENT:

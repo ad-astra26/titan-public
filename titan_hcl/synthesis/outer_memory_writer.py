@@ -579,6 +579,62 @@ class OuterMemoryWriter:
         self.emit(event)
         return anchor_tx
 
+    def write_presence_seal(
+        self,
+        *,
+        cycle_id: int,
+        age_epoch_range: list,
+        merkle_root: str,
+        person_rollups: list,
+        interaction_count: int,
+        ts_utc_range: Optional[list] = None,
+        significance: float = 0.85,
+        novelty: float = 0.5,
+        coherence: float = 0.8,
+    ) -> str:
+        """RFP_verifiable_autobiographical_presence_memory §7.C (SEAL) — anchor ONE
+        circadian-cycle presence seal as a FORK_MAIN (autobiographical spine) TX: the
+        Merkle root over the closed cycle's interaction tx_hashes + the per-person
+        rollups, keyed by Titan-time (``cycle_id`` + ``age_epoch_range``). A LOCAL
+        immutable timechain block (Option A — no per-cycle Solana memo). An empty
+        cycle still seals (``merkle_root`` = SHA-256(b"") via merkle_root_hex([]),
+        ``person_rollups``=[]) — INV-PAM-NO-GAPS. ``significance`` 0.85 clears the
+        main-fork PoT (0.20); it stays BELOW the 0.9 immediate-seal threshold so the
+        seal rides the normal seal cadence (it does not coordinate block timing).
+
+        Returns the deterministic SHA-256 content-hash (the seal's content-addressed
+        reference; NOT the chain block_hash — Phase D anchors CHAINED on the
+        TIMECHAIN_SEALED block, see autobiography_seal.py).
+
+        Titan-time: ``age_epoch_range`` is the KEY; ``ts_utc_range`` is human-display
+        metadata only (INV-PAM-TITAN-TIME).
+
+        Tags: ["presence_seal", "cycle:<id>", "autobiography"]
+        """
+        content = {
+            "cycle_id": int(cycle_id),
+            "age_epoch_range": [int(age_epoch_range[0]), int(age_epoch_range[1])],
+            "merkle_root": merkle_root,
+            "person_rollups": list(person_rollups),
+            "interaction_count": int(interaction_count),
+        }
+        if ts_utc_range is not None:
+            content["ts_utc_range"] = [float(ts_utc_range[0]), float(ts_utc_range[1])]
+        anchor_tx = _canonical_concept_content_hash(content)
+        tags = ["presence_seal", f"cycle:{int(cycle_id)}", "autobiography"]
+        event = OuterMemoryEvent(
+            fork="main",
+            thought_type="presence_seal",
+            source=self._src,
+            content=content,
+            tags=tags,
+            significance=significance,
+            novelty=novelty,
+            coherence=coherence,
+        )
+        self.emit(event)
+        return anchor_tx
+
     def write_reasoning_composite(
         self,
         *,
