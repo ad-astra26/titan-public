@@ -1279,6 +1279,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # RFP_affective_grounding_loop §7.D (D.2) — a verified Maker-presence
             # (api edge → here) → cross-platform maker_bond → DA affective nudge.
             _bus_constants.MAKER_PRESENCE_VERIFIED,
+            # RFP_verifiable_autobiographical_presence_memory §7.A — a non-Maker chat
+            # turn (agno PostHook) → PresenceCapture records the asserted-identity
+            # autobiographical atom (the Maker rides MAKER_PRESENCE_VERIFIED above).
+            _bus_constants.PERSON_TURN_PRESENCE,
             # Operator-closure telemetry (2026-06-01): recall latency + chi from
             # agno/cognitive (their own evaluator/ring) → synthesis §18 metrics
             # so retrieval.samples + chi reflect the real cross-process loop.
