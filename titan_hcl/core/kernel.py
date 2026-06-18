@@ -460,7 +460,8 @@ class TitanKernel:
     Kernel boot sequence (commit 2, next — see PLAN §4.1 Commit 2):
         await kernel.boot()
           └─ bus._poll_fn hookup, _guardian_loop task, _heartbeat_loop task,
-             _start_trinity_shm_writer thread, _start_spirit_shm_writer hook
+             _start_spirit_shm_writer hook (trinity/topology Python writers
+             retired — Rust daemons own those slots, config-shm Phase D)
 
     This commit (#1 — kernel skeleton) lands __init__ only. Boot + loops
     arrive in commit 2.
@@ -680,26 +681,15 @@ class TitanKernel:
         # [microkernel] memory_hygiene_interval_s — set to 0 to disable).
         loop.create_task(self._memory_hygiene_loop())
 
-        # Microkernel v2 Phase A §A.2 — Trinity shm writer (daemon thread).
-        # Phase C C-S7 Gap 4: under l0_rust_enabled=true, titan-unified-spirit-rs
-        # owns trinity_state.bin. Skip the Python writer to avoid SeqLock
-        # double-writer race per PLAN_microkernel_phase_c_s7_activation_prep.md §2.
-        if self._config.get("microkernel", {}).get("l0_rust_enabled", False):
-            logger.info(
-                "[TitanKernel] trinity_shm_writer skipped — "
-                "Rust unified-spirit-rs owns trinity_state.bin (l0_rust_enabled=true)")
-        else:
-            self._start_trinity_shm_writer()
-
-        # Phase A.S8 — Topology shm writer (30D standalone slot, daemon thread).
-        # Phase C C-S7 Gap 5: under l0_rust_enabled=true, Rust outer-spirit-rs
-        # (or unified-spirit-rs) owns topology_30d.bin. Skip Python writer.
-        if self._config.get("microkernel", {}).get("l0_rust_enabled", False):
-            logger.info(
-                "[TitanKernel] topology_shm_writer skipped — "
-                "Rust trinity-rs owns topology_30d.bin (l0_rust_enabled=true)")
-        else:
-            self._start_topology_shm_writer()
+        # Microkernel v2 Phase A §A.2 — Trinity + topology shm writers.
+        # Phase C/D: l0_rust is permanently true → titan-unified-spirit-rs owns
+        # trinity_state.bin and Rust trinity-rs owns topology_30d.bin (G21
+        # single-writer). The legacy Python writers (_start_trinity_shm_writer /
+        # _start_topology_shm_writer) only ever ran on the dead l0_rust=false
+        # path and were retired here (config-shm Phase D).
+        logger.info(
+            "[TitanKernel] trinity_shm_writer + topology_shm_writer skipped — "
+            "Rust spirit/trinity daemons own trinity_state.bin + topology_30d.bin")
 
         # Microkernel v2 Phase A §A.7 — spirit-fast writer hook (no-op placeholder).
         # Actual 70.47 Hz writes happen inside spirit_worker subprocess (D7).
@@ -1149,158 +1139,6 @@ class TitanKernel:
     # Shm writer threads (Microkernel v2 §A.2 + §A.7)
     # ------------------------------------------------------------------
 
-    def _start_trinity_shm_writer(self) -> None:
-        """Microkernel v2 Phase A §A.2 — Trinity shm writer (daemon thread).
-
-        Reads state_register's 130D felt + 30D topology + 2D journey at
-        ~Schumann/9 cadence (body publish rate), assembles the 162D
-        TITAN_SELF vector, and writes it to
-        /dev/shm/titan_{id}/trinity_state.bin via StateRegistryWriter
-        (SeqLock + persistent mmap).
-
-        Content-hash-gated: shm seq only bumps when the assembled vector
-        actually changes. Under healthy operation, this tracks the natural
-        Schumann-derived body/mind publish cadence without needing fixed
-        timers.
-
-        Fallback behavior: if TRINITY_STATE feature flag is false, the
-        loop still runs (and burns ~nothing) but makes no shm writes —
-        readers will fall back to legacy state_register path.
-
-        Lifted verbatim from v5_core.py:1705-1797 per PLAN §4.1 Commit 2;
-        only rename: self._registry_bank → self.registry_bank (public
-        attribute in kernel).
-        """
-        import numpy as _np
-
-        from titan_hcl.core.state_registry import TRINITY_STATE
-
-        # Poll slightly faster than body.publish_interval (1.15s = Schumann/9)
-        # so we catch each update promptly. Content-hash gates prevents
-        # spurious writes when state hasn't changed.
-        poll_interval_s = 0.5
-        stop_evt = self._shm_writer_stop_evt
-        if stop_evt is None:
-            stop_evt = threading.Event()
-            self._shm_writer_stop_evt = stop_evt
-
-        def _writer_loop() -> None:
-            last_hash: Optional[bytes] = None
-            consecutive_errors = 0
-            # Wait a beat so state_register has its first bus tick absorbed.
-            stop_evt.wait(2.0)
-            while not stop_evt.is_set():
-                try:
-                    if not self.registry_bank.is_enabled(TRINITY_STATE):
-                        # Flag off — sleep and check again. Cheap no-op.
-                        stop_evt.wait(poll_interval_s)
-                        continue
-
-                    # Assemble 162D = 130D felt + 30D topology + 2D journey.
-                    felt_130 = self.state_register.get_full_130dt()
-                    topo_30 = self.state_register.get_full_30d_topology()
-                    snapshot = self.state_register.snapshot()
-                    consciousness = snapshot.get("consciousness", {}) or {}
-                    journey_2 = [
-                        float(consciousness.get("curvature", 0.0)),
-                        float(consciousness.get("density", 0.0)),
-                    ]
-                    # Ensure exact-length lists (get_full_* guarantees this).
-                    values = (list(felt_130)[:130]
-                              + list(topo_30)[:30]
-                              + journey_2[:2])
-                    if len(values) != 162:
-                        # Defensive — should never happen given get_full_* contracts.
-                        consecutive_errors += 1
-                        if consecutive_errors == 1 or consecutive_errors % 10 == 0:
-                            logger.warning(
-                                "[TrinityShmWrite] assembled length %d != 162; skipping",
-                                len(values))
-                        stop_evt.wait(poll_interval_s)
-                        continue
-
-                    arr = _np.asarray(values, dtype=_np.float32)
-                    payload_bytes = arr.tobytes(order="C")
-                    h = hashlib.blake2b(payload_bytes, digest_size=16).digest()
-                    if h != last_hash:
-                        self.registry_bank.writer(TRINITY_STATE).write(arr)
-                        last_hash = h
-                    consecutive_errors = 0
-                except Exception as e:
-                    consecutive_errors += 1
-                    if consecutive_errors == 1 or consecutive_errors % 20 == 0:
-                        logger.warning(
-                            "[TrinityShmWrite] iteration failed (#%d): %s",
-                            consecutive_errors, e, exc_info=True)
-                stop_evt.wait(poll_interval_s)
-
-        t = threading.Thread(
-            target=_writer_loop,
-            daemon=True,
-            name="trinity-shm-writer",
-        )
-        t.start()
-        logger.info(
-            "[TitanKernel] Trinity shm writer thread started "
-            "(poll=%.2fs, gate=microkernel.shm_trinity_enabled)",
-            poll_interval_s,
-        )
-
-    def _start_topology_shm_writer(self) -> None:
-        """Phase A.S8 — Topology shm writer (daemon thread).
-
-        Reads state_register.get_full_30d_topology() at 0.5s poll and writes
-        the 30D topology slice to /dev/shm/titan_{id}/topology_30d.bin via
-        TOPOLOGY_30D RegistrySpec. Content-hash gated — no write when unchanged.
-
-        Mirror of _start_trinity_shm_writer for the standalone topology slot.
-        Always-enabled (no feature flag — outer workers never need flag-off path
-        for this slot; it only provides a fast SHM-readable snapshot for Rust C-S*
-        and any future external reader).
-        """
-        import numpy as _np
-        from titan_hcl.core.state_registry import TOPOLOGY_30D
-
-        poll_interval_s = 0.5
-        stop_evt = self._shm_writer_stop_evt
-        if stop_evt is None:
-            stop_evt = threading.Event()
-            self._shm_writer_stop_evt = stop_evt
-
-        def _writer_loop() -> None:
-            import hashlib as _hashlib
-            last_hash = None
-            consecutive_errors = 0
-            stop_evt.wait(2.0)
-            while not stop_evt.is_set():
-                try:
-                    topo_30 = self.state_register.get_full_30d_topology()
-                    arr = _np.asarray(list(topo_30)[:30], dtype=_np.float32)
-                    if arr.shape != (30,):
-                        stop_evt.wait(poll_interval_s)
-                        continue
-                    payload_bytes = arr.tobytes(order="C")
-                    h = _hashlib.blake2b(payload_bytes, digest_size=16).digest()
-                    if h != last_hash:
-                        self.registry_bank.writer(TOPOLOGY_30D).write(arr)
-                        last_hash = h
-                    consecutive_errors = 0
-                except Exception as e:
-                    consecutive_errors += 1
-                    if consecutive_errors == 1 or consecutive_errors % 20 == 0:
-                        logger.warning(
-                            "[TopologyShmWrite] iteration failed (#%d): %s",
-                            consecutive_errors, e)
-                stop_evt.wait(poll_interval_s)
-
-        t = threading.Thread(
-            target=_writer_loop,
-            daemon=True,
-            name="topology-shm-writer",
-        )
-        t.start()
-        logger.info("[TitanKernel] Topology shm writer thread started (poll=0.5s)")
-
     def _start_spirit_shm_writer(self) -> None:
         """Microkernel v2 Phase A §A.7 — spirit-fast shm writer hook (S3b).
 
@@ -1321,24 +1159,14 @@ class TitanKernel:
         Emits a single INFO log on boot noting the flag state for the
         current kernel process.
         """
-        flag = (
-            self._config.get("microkernel", {}).get("shm_spirit_fast_enabled", False)
+        # Phase C/D: l0_rust permanently true → spirit_worker is a SHIM and
+        # Rust titan-inner-spirit-rs owns inner_spirit_45d.bin. The legacy
+        # spirit_worker-owned branch was retired (config-shm Phase D).
+        logger.info(
+            "[TitanKernel] Spirit-fast shm writer: SHIM mode "
+            "(spirit_worker no-ops; Rust titan-inner-spirit-rs owns "
+            "inner_spirit_45d.bin) — l0_rust_enabled=true"
         )
-        l0_rust = (
-            self._config.get("microkernel", {}).get("l0_rust_enabled", False)
-        )
-        if l0_rust:
-            logger.info(
-                "[TitanKernel] Spirit-fast shm writer: SHIM mode "
-                "(spirit_worker no-ops; Rust titan-inner-spirit-rs owns "
-                "inner_spirit_45d.bin) — l0_rust_enabled=true"
-            )
-        else:
-            logger.info(
-                "[TitanKernel] Spirit-fast shm writer: owned by spirit_worker "
-                "(config microkernel.shm_spirit_fast_enabled=%s)",
-                flag,
-            )
 
     def _write_identity_shm(self) -> None:
         """Microkernel v2 Phase A §A.2 part 2 (S4) — immutable identity shm.
@@ -2470,25 +2298,22 @@ class TitanKernel:
         Refuses if microkernel.shadow_swap_enabled=false OR if another
         swap is currently active.
         """
-        # Phase C C-S7 Gap 8: shadow swap is unsupported under l0_rust=true.
-        # Rust kernel-rs has no BUS_HANDOFF / shadow_swap_orchestrate /
-        # hibernate symbols yet; B.1 + B.2.1 protocol cannot complete.
-        # Per PLAN_microkernel_phase_c_s7_activation_prep.md §2 Gap 8 —
-        # block here, defer Rust BUS_HANDOFF implementation to C-S8 / Phase D.
-        # Operators can still upgrade via systemd restart in l0_rust mode.
-        if self._config.get("microkernel", {}).get("l0_rust_enabled", False):
-            logger.warning(
-                "[TitanKernel] shadow_swap_orchestrate refused — "
-                "l0_rust_enabled=true (Rust kernel has no BUS_HANDOFF "
-                "yet; use systemd restart instead). Per Phase C C-S7 "
-                "PLAN §2 Gap 8.")
-            return {
-                "outcome": "error",
-                "failure_reason": "l0_rust_enabled_shadow_swap_unsupported",
-                "phase": "preflight",
-                "event_id": "",
-                "elapsed_seconds": 0.0,
-            }
+        # Phase C/D: l0_rust is permanently true, and Rust kernel-rs has no
+        # BUS_HANDOFF / shadow_swap_orchestrate / hibernate symbols yet, so the
+        # B.1 + B.2.1 shadow-swap protocol cannot complete — this UNCONDITIONALLY
+        # refuses. Operators upgrade via systemd restart. The protocol body below
+        # is PRESERVED (currently unreachable) for the future Rust BUS_HANDOFF
+        # work that will re-enable it (config-shm Phase D — Maker call 2026-06-18).
+        logger.warning(
+            "[TitanKernel] shadow_swap_orchestrate refused — Rust kernel has no "
+            "BUS_HANDOFF yet; use systemd restart instead.")
+        return {
+            "outcome": "error",
+            "failure_reason": "l0_rust_enabled_shadow_swap_unsupported",
+            "phase": "preflight",
+            "event_id": "",
+            "elapsed_seconds": 0.0,
+        }
 
         # Flag check — refuse if shadow_swap_enabled is false (default)
         flag = (self._config.get("microkernel", {})

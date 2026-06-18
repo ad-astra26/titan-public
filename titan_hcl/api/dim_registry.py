@@ -583,16 +583,12 @@ class DimFiringTracker:
             )
         for _, _, block_name in _BLOCKS:
             self._blocks[block_name] = BlockFiringRecord(block=block_name)
-        # Per-block SHM writer state. Lazy-init on first record_block call
-        # in each worker process (so each block's writer is created in
-        # the worker that owns the tensor — single-writer per slot).
-        # Per-block: None = unattempted, False = init failed (don't retry),
-        # writer instance = ready.
-        self._shm_writers: dict[str, Any] = {}
-        self._shm_init_failed: set[str] = set()
-        # Stats for tests + diagnostics.
-        self._shm_writes_total = 0
-        self._shm_write_failures = 0
+        # NOTE (config-shm Phase D): l0_rust is permanently true (Phase C
+        # canonical) → the Rust trinity daemons own every *_firing.bin slot
+        # write (titan_trinity_daemon::FiringSlotWriter, G21 single-writer).
+        # The legacy Phase-A+B Python slot writer was retired here; this
+        # tracker keeps in-memory state for diagnostics, and the SHM READER
+        # (read_all_blocks_from_shm) reads the Rust-written slots.
 
     def record_block(
         self,
@@ -649,104 +645,6 @@ class DimFiringTracker:
                 except (TypeError, ValueError):
                     rec.last_value = None
                 rec.last_value_ts = ts
-            # Snapshot block payload while still holding the lock so the
-            # SHM write reflects this tick's state atomically.
-            payload = self._block_payload_locked(block, ts)
-        # Phase 2.5.A.2 — write block's SHM slot. Outside the lock to
-        # avoid holding it during mmap I/O. Diagnostic-only — never
-        # raise back to the tensor producer.
-        try:
-            self._publish_block_shm(block, payload)
-        except Exception:
-            self._shm_write_failures += 1
-
-    def _block_payload_locked(self, block: str, ts: float) -> dict:
-        """Build the msgpack-encodable payload for a block's SHM slot.
-        Caller must hold ``self._lock``.
-        """
-        block_start = None
-        block_len = None
-        for start, length, name in _BLOCKS:
-            if name == block:
-                block_start = start
-                block_len = length
-                break
-        if block_start is None or block_len is None:
-            return {}
-        br = self._blocks.get(block)
-        dims_payload = []
-        for i in range(block_len):
-            rec = self._dims.get(block_start + i)
-            if rec is None:
-                dims_payload.append({"v": None, "ts": None})
-            else:
-                dims_payload.append({
-                    "v": rec.last_value,
-                    "ts": rec.last_value_ts,
-                })
-        return {
-            "block": block,
-            "block_calls_total": br.calls_total if br else 0,
-            "block_last_call_ts": br.last_call_ts if br else None,
-            "inputs_state": dict(br.last_inputs_state) if br else {},
-            "dims": dims_payload,
-            "ts": ts,
-        }
-
-    def _publish_block_shm(self, block: str, payload: dict) -> None:
-        """Encode + write block payload to its SHM slot. Lazy-inits the
-        writer on first call in this process. Single-writer per block
-        per G21 (each block's tensor runs in exactly one worker).
-
-        Phase C (microkernel.l0_rust_enabled=true): Rust trinity daemons
-        own the firing slot writes via titan_trinity_daemon::FiringSlotWriter
-        (rFP_phase_c_130d_rust_l1_port.md §4.7). Python tracker no-ops the
-        SHM write to preserve single-writer-per-slot G21 invariant. The
-        Python tracker's in-memory state still updates for diagnostics
-        (record_block path is unchanged) — only the SHM publish is gated.
-
-        Under l0_rust_enabled=false (Phase A+B / T1+T2 today), Python
-        remains the sole writer of *_firing.bin slots.
-        """
-        if _l0_rust_enabled():
-            # Phase C: Rust trinity daemon owns the slot per G21. No-op.
-            return
-        if block in self._shm_init_failed:
-            return
-        writer = self._shm_writers.get(block)
-        if writer is None:
-            try:
-                from titan_hcl.core.state_registry import (
-                    StateRegistryWriter, ensure_shm_root, resolve_titan_id,
-                )
-                from titan_hcl.logic.dim_firing_state_specs import (
-                    DIM_FIRING_SPEC_BY_BLOCK,
-                )
-                spec = DIM_FIRING_SPEC_BY_BLOCK.get(block)
-                if spec is None:
-                    self._shm_init_failed.add(block)
-                    return
-                titan_id = resolve_titan_id()
-                shm_root = ensure_shm_root(titan_id)
-                writer = StateRegistryWriter(spec, shm_root)
-                self._shm_writers[block] = writer
-            except Exception:
-                self._shm_init_failed.add(block)
-                return
-        try:
-            import msgpack
-            blob = msgpack.packb(payload, use_bin_type=True)
-            spec = writer.spec
-            if len(blob) > spec.payload_bytes:
-                # Truncate dims_payload to fit if oversized — diagnostic
-                # only, never block tensor production. Should not happen
-                # at sane block sizes (constants chosen with 4× headroom).
-                self._shm_write_failures += 1
-                return
-            writer.write_variable(blob)
-            self._shm_writes_total += 1
-        except Exception:
-            self._shm_write_failures += 1
 
     def get_dim_record(self, full_index: int) -> Optional[DimFiringRecord]:
         with self._lock:
@@ -768,39 +666,6 @@ class DimFiringTracker:
         """Reset the tracker (test hook)."""
         with self._lock:
             self.__init__()
-
-
-# Phase C gate — read once per process, cached. The microkernel.l0_rust_enabled
-# flag is set at deployment via ~/.titan/microkernel_<TITAN_ID>.toml; it never
-# flips at runtime within a process. Cache avoids load_titan_config() overhead
-# in the per-tick record_block hot path.
-_L0_RUST_ENABLED_CACHE: Optional[bool] = None
-
-
-def _l0_rust_enabled() -> bool:
-    """Read microkernel.l0_rust_enabled from titan config; cached.
-
-    Used by DimFiringTracker._publish_block_shm to gate Phase C single-writer
-    invariant per G21: under l0_rust_enabled=true, the Rust trinity daemons
-    own the *_firing.bin slot writes via titan_trinity_daemon::FiringSlotWriter
-    (rFP_phase_c_130d_rust_l1_port.md §4.7); Python tracker no-ops the SHM
-    publish to avoid double-writing the slot.
-
-    Returns False on config-load failure (defensive — Phase A+B fallback path
-    keeps Python writing the slot).
-    """
-    global _L0_RUST_ENABLED_CACHE
-    if _L0_RUST_ENABLED_CACHE is not None:
-        return _L0_RUST_ENABLED_CACHE
-    try:
-        from titan_hcl.params import load_titan_params as load_titan_config
-        config = load_titan_params()
-        _L0_RUST_ENABLED_CACHE = bool(
-            config.get("microkernel", {}).get("l0_rust_enabled", False)
-        )
-    except Exception:
-        _L0_RUST_ENABLED_CACHE = False
-    return _L0_RUST_ENABLED_CACHE
 
 
 # Process-singleton accessor.
@@ -840,7 +705,8 @@ def read_all_blocks_from_shm() -> dict[str, dict]:
     """Read every block's firing slot via StateRegistryReader.
 
     Returns dict keyed by block name; each value is the msgpack-decoded
-    payload as written by ``DimFiringTracker._publish_block_shm``.
+    payload as written by the Rust trinity ``FiringSlotWriter`` (G21
+    single-writer; in tests the slot is seeded directly via StateRegistryWriter).
     Blocks whose slot is unavailable/empty return an empty dict for that
     block — callers should fall back to spec defaults for those dims.
 

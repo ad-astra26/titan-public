@@ -179,9 +179,11 @@ def test_body_start_fast_path_warms_cache_synchronously():
         for t in refresh_threads:
             assert t.is_alive()
 
-        # No shm writer thread when flag off.
-        assert shm_writer_thread is None
-        assert body_5d_writer is None
+        # Phase C/D: l0_rust is permanently true, so with the Phase-A+B
+        # direct writer off (shm_body_fast_enabled=False) the Phase C
+        # sensor-cache writer (feeds Rust titan-inner-body-rs) starts.
+        assert shm_writer_thread is not None
+        assert body_5d_writer is None  # Phase A+B direct writer not created
     finally:
         stop_threads(stop, refresh_threads, timeout_s=2.0)
 
@@ -317,8 +319,10 @@ def test_mind_start_fast_path_warms_cache_synchronously():
             assert "value" in reading
 
         assert len(refresh_threads) == 5
-        # Writer flag off → no shm writer thread.
-        assert shm_writer_thread is None
+        # Phase C/D: l0_rust permanently true → the Phase C sensor-cache
+        # writer (feeds Rust titan-inner-mind-rs) starts even with the
+        # Phase-A+B direct writer off (shm_mind_fast_enabled=False).
+        assert shm_writer_thread is not None
     finally:
         stop_threads(stop, refresh_threads, timeout_s=2.0)
 

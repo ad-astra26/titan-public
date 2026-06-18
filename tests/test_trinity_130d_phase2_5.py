@@ -695,24 +695,43 @@ class TestPhase25EDashboardEndpoint:
 # ── Chunk 2.5.A.2: SHM cross-process roundtrip ────────────────────────
 
 
-@pytest.mark.skip(reason=(
-    "POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): the per-block SHM "
-    "round-trip needs the live Rust trinity-dim-stats SHM writer "
-    "(`titan-unified-spirit-rs` + flag-on) — under pytest the writer "
-    "subprocess is not started, so `_record_block_writes_to_shm_when_"
-    "titan_id_set` etc. see an empty slot. Per SPEC §7.1 (SHM slot byte "
-    "layouts) + D-SPEC-86 v1.26.0 (Trinity SHM input slots wired), "
-    "this is an integration test gated on the Rust daemon. Live behavior "
-    "verified via /v6/trinity/state pulse_count flowing fleet-wide. "
-    "Re-enable with a `tests/integration/` move + Rust daemon harness."
-))
 class TestPhase25A2SHMRoundtrip:
-    """rFP §2.5.A.2 — verify per-block SHM slot round-trip.
+    """rFP §2.5.A.2 — verify per-block SHM slot round-trip (READER side).
 
-    Each block's tensor producer writes its slot (single-writer per G21);
-    the API process reads via StateRegistryReader and merges into the
-    /v4/debug/dim-sources unified payload.
+    Phase C/D: the Rust trinity daemons are the single-writer of every
+    *_firing.bin slot (G21). The Python API process READS via
+    StateRegistryReader and merges into the /v4/debug/dim-sources payload.
+    These tests seed the slot directly (simulating the Rust FiringSlotWriter)
+    and assert the reader + endpoint + input-state decode — so they need no
+    Rust subprocess. (The legacy Python slot writer was retired in config-shm
+    Phase D; un-skipped here now that the tests self-seed.)
     """
+
+    @staticmethod
+    def _seed_block_slot(block, dims_values, inputs_state,
+                         calls_total=1, last_call_ts=12345.0, ts=12345.0):
+        """Write a block's firing slot directly (simulates the Rust
+        FiringSlotWriter) so the reader/endpoint can be tested without a
+        Rust subprocess. Raises if SHM is unavailable (caller skips)."""
+        from titan_hcl.core.state_registry import (
+            StateRegistryWriter, ensure_shm_root, resolve_titan_id,
+        )
+        from titan_hcl.logic.dim_firing_state_specs import (
+            DIM_FIRING_SPEC_BY_BLOCK,
+        )
+        import msgpack
+        spec = DIM_FIRING_SPEC_BY_BLOCK[block]
+        shm_root = ensure_shm_root(resolve_titan_id())
+        writer = StateRegistryWriter(spec, shm_root)
+        payload = {
+            "block": block,
+            "block_calls_total": calls_total,
+            "block_last_call_ts": last_call_ts,
+            "inputs_state": dict(inputs_state),
+            "dims": [{"v": v, "ts": ts} for v in dims_values],
+            "ts": ts,
+        }
+        writer.write_variable(msgpack.packb(payload, use_bin_type=True))
 
     def setup_method(self):
         import tempfile, os
@@ -735,26 +754,17 @@ class TestPhase25A2SHMRoundtrip:
         _dr._SHM_READERS.clear()
         reset_firing_tracker()
 
-    def test_record_block_writes_to_shm_when_titan_id_set(self):
-        # Skip if test env can't init shm (e.g. missing TITAN_SHM_ROOT
-        # support — don't fail the suite for environment reasons).
+    def test_block_slot_round_trips_through_shm_reader(self):
+        # Seed the slot directly (simulates the Rust FiringSlotWriter),
+        # then read it back via the live Python reader.
         try:
-            from titan_hcl.core.state_registry import (
-                ensure_shm_root, resolve_titan_id,
+            self._seed_block_slot(
+                "inner_body",
+                [0.11, 0.22, 0.33, 0.44, 0.55],
+                {"body_state": "real"},
             )
-            shm_root = ensure_shm_root(resolve_titan_id())
         except Exception:
             pytest.skip("shm root not available in this environment")
-        t = get_firing_tracker()
-        t.record_block(
-            "inner_body",
-            [0.11, 0.22, 0.33, 0.44, 0.55],
-            {"body_state": {"x": 1}},
-            ts=12345.0,
-        )
-        # SHM write should have happened
-        assert t._shm_writes_total >= 1, (
-            f"expected SHM write; failures={t._shm_write_failures}")
         from titan_hcl.api.dim_registry import read_all_blocks_from_shm
         blocks = read_all_blocks_from_shm()
         assert "inner_body" in blocks, (
@@ -767,20 +777,16 @@ class TestPhase25A2SHMRoundtrip:
         assert body["dims"][4]["v"] == pytest.approx(0.55)
 
     def test_endpoint_uses_shm_source_marker_when_available(self):
+        # Seed the slot directly (simulates the Rust writer), then assert
+        # the endpoint reports block_source="shm".
         try:
-            from titan_hcl.core.state_registry import (
-                ensure_shm_root, resolve_titan_id,
+            self._seed_block_slot(
+                "inner_body",
+                [0.7, 0.8, 0.9, 1.0, 0.6],
+                {"body_state": "real"},
             )
-            ensure_shm_root(resolve_titan_id())
         except Exception:
             pytest.skip("shm root not available in this environment")
-        # Write via tracker (acts like a tensor producer would)
-        t = get_firing_tracker()
-        t.record_block(
-            "inner_body",
-            [0.7, 0.8, 0.9, 1.0, 0.6],
-            {"body_state": {"x": 1}},
-        )
         # Call the endpoint
         import asyncio
         from titan_hcl.api.dashboard import get_v4_debug_dim_sources
@@ -794,29 +800,26 @@ class TestPhase25A2SHMRoundtrip:
         body = json.loads(result.body.decode("utf-8"))
         dims = body["data"]["dims"]
         assert len(dims) == 2
-        # block_source should be "shm" because we just wrote via tracker
-        # which also published to SHM
+        # block_source should be "shm" because the slot is populated
         assert dims[0]["block_source"] == "shm"
         assert dims[0]["last_value"] == pytest.approx(0.7)
 
-    def test_block_input_classification_round_trips_through_shm(self):
+    def test_block_input_state_round_trips_through_shm(self):
+        # Seed inputs_state into the slot (the Rust writer carries the
+        # classification the producer computed) and assert the reader
+        # decodes it faithfully.
         try:
-            from titan_hcl.core.state_registry import (
-                ensure_shm_root, resolve_titan_id,
+            self._seed_block_slot(
+                "inner_mind",
+                [0.5] * 15,
+                {
+                    "hormone_levels": "real",
+                    "audio_state": "absent",
+                    "interaction_quality": "default",
+                },
             )
-            ensure_shm_root(resolve_titan_id())
         except Exception:
             pytest.skip("shm root not available in this environment")
-        t = get_firing_tracker()
-        t.record_block(
-            "inner_mind",
-            [0.5] * 15,
-            {
-                "hormone_levels": {"DA": 0.7},
-                "audio_state": None,  # absent
-                "interaction_quality": 0.5,  # default
-            },
-        )
         from titan_hcl.api.dim_registry import read_all_blocks_from_shm
         blocks = read_all_blocks_from_shm()
         assert "inner_mind" in blocks

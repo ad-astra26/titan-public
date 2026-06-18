@@ -354,37 +354,15 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
             "(continuing — SHM slot disabled): %s", _sw_err)
 
     # === BOILERPLATE: flag-gated activation ===
-    # Two flags gate this worker's behavior:
-    #   1. microkernel.l0_rust_enabled — when false, legacy spirit_worker_main
-    #      owns OuterInterface. We enter heartbeat-only noop.
-    #   2. microkernel.outer_interface_worker_enabled — defensive; normally
-    #      guardian skips registration when false, but this in-worker check
-    #      catches the case where the flag was flipped post-registration.
+    # l0_rust is permanently true (Phase C canonical) — the legacy
+    # spirit_worker_main no-op branch was retired (config-shm Phase D).
+    # microkernel.outer_interface_worker_enabled stays a defensive check
+    # (guardian normally skips registration when false, but this catches a
+    # post-registration flip).
     microkernel_cfg = get_params("microkernel") or {}
-    l0_rust = bool(microkernel_cfg.get("l0_rust_enabled", False))
     worker_enabled = bool(microkernel_cfg.get("outer_interface_worker_enabled", True))
     oi_section_enabled = bool(
         (get_params("outer_interface") or {}).get("enabled", True))
-
-    if not l0_rust:
-        logger.info(
-            "[OuterInterfaceWorker] microkernel.l0_rust_enabled=false — "
-            "legacy spirit_worker_main owns OuterInterface in this mode. "
-            "Entering heartbeat-only no-op loop.")
-        # Phase 11 §11.I.2 — flag-off branch transitions SHM slot to booted
-        # immediately (worker is intentionally idle, but must still answer
-        # probes). Legacy MODULE_READY bus emit retired per locked D2.
-        _WORKER_READY = True
-        if _state_writer is not None:
-            try:
-                _state_writer.write_state("booted")
-            except Exception as _swb_err:  # noqa: BLE001
-                logger.warning(
-                    "[OuterInterfaceWorker] Phase 11 write_state(booted) "
-                    "(flag_off l0_rust=false) failed: %s", _swb_err)
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True,
-                        state_writer=_state_writer)
-        return
 
     if not (worker_enabled and oi_section_enabled):
         logger.info(

@@ -283,19 +283,16 @@ def start_inner_spirit_sensor_refresh(
     Schumann spirit rate. Idempotent — safe to call once per host
     worker boot.
 
-    Per SPEC §G1 (Inner-Spirit 45D) + §23.6 collect_spirit_45d. Only
-    runs when `microkernel.l0_rust_enabled = true` (Phase C); under
-    Phase A+B the inline writer in spirit_worker handles the same
-    output via a different path.
+    Per SPEC §G1 (Inner-Spirit 45D) + §23.6 collect_spirit_45d. Phase C
+    is the canonical architecture (l0_rust permanently true) — Rust
+    inner-spirit-rs reads this sensor cache; the legacy Phase A+B inline
+    writer in spirit_worker was retired (D-SPEC-116 / config-shm Phase D).
 
     Returns:
         threading.Thread on success, None on failure (the host worker
         should log_critical when None — Rust inner-spirit-rs will starve
         without this writer).
     """
-    if not get_params("microkernel").get(
-            "l0_rust_enabled", False):
-        return None
 
     try:
         from titan_hcl.logic.inner_spirit_sensor_refresh import (

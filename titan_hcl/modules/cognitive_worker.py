@@ -552,38 +552,8 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             "[CognitiveWorker] Phase 11 ModuleStateWriter init failed: %s",
             _sw_err)
 
-    # === BOILERPLATE: optional flag-gated activation ===
-    # Workers that have a legacy parallel code path (cognitive_worker
-    # under l0_rust=false → legacy spirit_worker_main; future
-    # expression_worker under expression.enabled=false → legacy in
-    # spirit_worker, etc.) check the activation flag here. If the flag
-    # is off, MODULE_READY + heartbeat-only no-op loop so guardian
-    # doesn't restart-loop us. Workers without a parallel legacy path
-    # can DELETE this entire `if not flag_on:` block.
-    # legacy_core.py registration is also gated on the flag so this
-    # check is defensive (registration normally skips us in the off-mode).
-    flag_on = bool(get_params("microkernel").get("l0_rust_enabled", False))
-    if not flag_on:
-        logger.info(
-            "[CognitiveWorker] microkernel.l0_rust_enabled=false — "
-            "legacy spirit_worker_main owns cognitive engines in this mode. "
-            "Entering heartbeat-only no-op loop.")
-        # Phase 11 §11.I.2 — MODULE_READY bus-emit deleted per locked D2;
-        # SHM slot transitions starting → booted (flag-off no-op flavor).
-        _WORKER_READY = True
-        if _STATE_WRITER is not None:
-            try:
-                _STATE_WRITER.write_state("booted")
-                logger.info(
-                    "[CognitiveWorker] Phase 11 §11.I.2 — SHM slot state=booted "
-                    "(flag_off no-op branch)")
-            except Exception as _swb_err:  # noqa: BLE001
-                logger.warning(
-                    "[CognitiveWorker] Phase 11 write_state(booted) failed "
-                    "(flag_off branch): %s", _swb_err)
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True)
-        return
-
+    # l0_rust is permanently true (Phase C canonical) — the legacy
+    # spirit_worker_main no-op branch was retired (config-shm Phase D).
     logger.info(
         "[CognitiveWorker] Booting (titan_id=%s, l0_rust=true) — chunk 8E "
         "skeleton. Bus dispatcher / epoch driver / snapshot publishers "

@@ -684,87 +684,187 @@ def build_catalog(bus, guardian, *, titan_id: str, kernel=None) -> None:
     # + the Rust-owned slots, so it boots after body/mind in the autostart seq.
     # See SPEC §1 glossary + §9.B Python tree (NEW v0.1.8) +
     # PLAN_microkernel_phase_c_s8_cognitive_worker_extraction.md §2.2.
-    if get_params("microkernel").get("l0_rust_enabled", False):
-        cognitive_worker_config = {
-            "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
-            # Microkernel flag passthrough — cognitive_worker_main checks it
-            # defensively even though registration is already gated.
-            "microkernel": get_params("microkernel"),
-            # Banner config for titan_id resolution.
-            "info_banner": get_params("info_banner"),
-            # Engine configs read from titan_params.toml inside the worker
-            # via _load_toml_section helper — no need to thread them here.
-            # titan_vm config kept here for InnerTrinityCoordinator's
-            # internal NervousSystem (lightweight VM context).
-            "titan_vm": get_params("titan_vm"),
-        }
-        from titan_hcl.modules.cognitive_worker import (
-            cognitive_worker_main,
-            _COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
-        )
-        # expression_worker registration (NEW per §4.B Track 3, 2026-05-15).
-        # Sequenced AFTER cognitive_worker because expression_worker
-        # subscribes to KERNEL_EPOCH_TICK from cognitive_worker.
-        from titan_hcl.modules.expression_worker import (
-            expression_worker_main,
-            _EXPRESSION_WORKER_SUBSCRIBE_TOPICS,
-        )
-        guardian.register(ModuleSpec(
-            name="cognitive_worker",
-            layer="L2",  # Microkernel v2 §A.5 — L2 (cognitive engine host)
-            entry_fn=cognitive_worker_main,
-            config=cognitive_worker_config,
-            rss_limit_mb=2000,  # ReasoningEngine + MetaReasoningEngine + V5 NS net
-            autostart=True,     # Required for /v4/* cognitive routes to populate
-            lazy=False,
-            heartbeat_timeout=120.0,  # Cognitive epoch can include LLM calls
-            start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-            # chunk 8M.3 (2026-05-05): broadcast_topics filter — closes the
-            # 8-min-stale-heartbeat backpressure class identified in
-            # rFP_phase_c_observatory_data_pipeline.md §2.4 / §1.4. Without
-            # this filter, broker fanned-out every dst="all" event (incl.
-            # high-rate trinity tensors / filter_down cascades) into
-            # cognitive_worker's queue, blocking guardian_HCL heartbeat
-            # delivery in the reverse direction → 10/25 modules stuck in
-            # state=starting. Mirrors the worker-side topics= passed to
-            # setup_worker_bus inside cognitive_worker_main.
-            broadcast_topics=_COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority. Maker
-            # 2026-05-28: HEAVY worker (269KB, torch reasoning engine cold-load)
-            # → Phase B so it doesn't gate fleet_ready or pile cold-import CPU on
-            # mandatory boot; the boot concurrency cap bounds its spike.
-            boot_priority="post_boot",
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-            dependencies=[
-                _mod_dep('memory'),
-            ],
-        ))
+    # Phase C/D: l0_rust is permanently true (Phase C canonical) → the L2
+    # cognitive/expression/outer_interface/self_reflection engine-host
+    # workers are ALWAYS registered. The legacy l0_rust=false consciousness
+    # path (spirit_worker_main) was retired in D-SPEC-116; the gate was
+    # removed (config-shm Phase D). The whole Phase C microkernel (Rust
+    # trinity daemons + these L2 hosts) is the only architecture.
+    cognitive_worker_config = {
+        "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
+        # Microkernel flag passthrough — cognitive_worker_main checks it
+        # defensively even though registration is already gated.
+        "microkernel": get_params("microkernel"),
+        # Banner config for titan_id resolution.
+        "info_banner": get_params("info_banner"),
+        # Engine configs read from titan_params.toml inside the worker
+        # via _load_toml_section helper — no need to thread them here.
+        # titan_vm config kept here for InnerTrinityCoordinator's
+        # internal NervousSystem (lightweight VM context).
+        "titan_vm": get_params("titan_vm"),
+    }
+    from titan_hcl.modules.cognitive_worker import (
+        cognitive_worker_main,
+        _COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
+    )
+    # expression_worker registration (NEW per §4.B Track 3, 2026-05-15).
+    # Sequenced AFTER cognitive_worker because expression_worker
+    # subscribes to KERNEL_EPOCH_TICK from cognitive_worker.
+    from titan_hcl.modules.expression_worker import (
+        expression_worker_main,
+        _EXPRESSION_WORKER_SUBSCRIBE_TOPICS,
+    )
+    guardian.register(ModuleSpec(
+        name="cognitive_worker",
+        layer="L2",  # Microkernel v2 §A.5 — L2 (cognitive engine host)
+        entry_fn=cognitive_worker_main,
+        config=cognitive_worker_config,
+        rss_limit_mb=2000,  # ReasoningEngine + MetaReasoningEngine + V5 NS net
+        autostart=True,     # Required for /v4/* cognitive routes to populate
+        lazy=False,
+        heartbeat_timeout=120.0,  # Cognitive epoch can include LLM calls
+        start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
+        # chunk 8M.3 (2026-05-05): broadcast_topics filter — closes the
+        # 8-min-stale-heartbeat backpressure class identified in
+        # rFP_phase_c_observatory_data_pipeline.md §2.4 / §1.4. Without
+        # this filter, broker fanned-out every dst="all" event (incl.
+        # high-rate trinity tensors / filter_down cascades) into
+        # cognitive_worker's queue, blocking guardian_HCL heartbeat
+        # delivery in the reverse direction → 10/25 modules stuck in
+        # state=starting. Mirrors the worker-side topics= passed to
+        # setup_worker_bus inside cognitive_worker_main.
+        broadcast_topics=_COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
+        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority. Maker
+        # 2026-05-28: HEAVY worker (269KB, torch reasoning engine cold-load)
+        # → Phase B so it doesn't gate fleet_ready or pile cold-import CPU on
+        # mandatory boot; the boot concurrency cap bounds its spike.
+        boot_priority="post_boot",
+        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
+        dependencies=[
+            _mod_dep('memory'),
+        ],
+    ))
 
-        # expression_worker (L2) — §4.B Track 3 extraction
-        # (SHIPPED 2026-05-15 per rFP_titan_hcl_l2_separation_strategy
-        # §4.B + SPEC §9.B expression_worker block + D-SPEC-NN).
-        # Owns ExpressionManager + 6 composites (SPEAK/ART/MUSIC/SOCIAL/
-        # KIN_SENSE/LONGING) + composite-ledger + expression_state.bin
-        # SHM publisher. Drives evaluate_all on KERNEL_EPOCH_TICK
-        # received from cognitive_worker (Maker Q2 — preserves
-        # adaptive 1-30s consciousness epoch coupling). Absorbs
-        # D8-3 catalyst-producer site #8 (strong_composition) per
-        # the "D8 RETIREMENT PREREQUISITE" block at the top of the
-        # strategy rFP.
+    # expression_worker (L2) — §4.B Track 3 extraction
+    # (SHIPPED 2026-05-15 per rFP_titan_hcl_l2_separation_strategy
+    # §4.B + SPEC §9.B expression_worker block + D-SPEC-NN).
+    # Owns ExpressionManager + 6 composites (SPEAK/ART/MUSIC/SOCIAL/
+    # KIN_SENSE/LONGING) + composite-ledger + expression_state.bin
+    # SHM publisher. Drives evaluate_all on KERNEL_EPOCH_TICK
+    # received from cognitive_worker (Maker Q2 — preserves
+    # adaptive 1-30s consciousness epoch coupling). Absorbs
+    # D8-3 catalyst-producer site #8 (strong_composition) per
+    # the "D8 RETIREMENT PREREQUISITE" block at the top of the
+    # strategy rFP.
+    guardian.register(ModuleSpec(
+        name="expression_worker",
+        layer="L2",
+        entry_fn=expression_worker_main,
+        config={
+            "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
+            "microkernel": get_params("microkernel"),
+            "info_banner": get_params("info_banner"),
+        },
+        rss_limit_mb=400,   # ExpressionManager + 6 composites is light
+        autostart=True,
+        lazy=False,
+        heartbeat_timeout=60.0,
+        broadcast_topics=_EXPRESSION_WORKER_SUBSCRIBE_TOPICS,
+        start_method="spawn" if _spawn_grad else "fork",
+        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
+        boot_priority="post_boot",
+        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
+        dependencies=[
+            _mod_dep('cognitive_worker'),
+        ],
+    ))
+
+    # outer_interface_worker (L2) — Track 2 of
+    # rFP_phase_c_self_improvement_subsystem_migration (SPEC v1.3.1 §9.B).
+    # Hosts OuterInterface (composition_engine + narrator + advisor + decoder),
+    # dynamic word-recipes registry, kin signature/society broadcast surface,
+    # self-exploration cadence driver. Active under l0_rust_enabled=true
+    # AND outer_interface_worker_enabled=true ONLY; legacy spirit_worker_main
+    # owns OuterInterface under l0_rust=false per Maker D3 (b).
+    # NOTE: this registration is the TitanHCL (microkernel v2 split)
+    # mirror of the TitanCore registration in legacy_core.py — both
+    # paths must be kept in sync. See SPEC §9.B v1.3.1 + D-SPEC-38.
+    if get_params("microkernel").get("outer_interface_worker_enabled", True):
+        outer_interface_worker_config = {
+            "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
+            "microkernel": get_params("microkernel"),
+            "info_banner": get_params("info_banner"),
+            "outer_interface":   get_params("outer_interface"),
+            "self_exploration":  get_params("self_exploration"),
+            "action_decoder":    get_params("action_decoder"),
+            "action_narrator":   get_params("action_narrator"),
+            "kin":               get_params("kin"),
+        }
+        from titan_hcl.modules.outer_interface_worker import outer_interface_worker_main
         guardian.register(ModuleSpec(
-            name="expression_worker",
+            name="outer_interface_worker",
             layer="L2",
-            entry_fn=expression_worker_main,
-            config={
-                "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
-                "microkernel": get_params("microkernel"),
-                "info_banner": get_params("info_banner"),
-            },
-            rss_limit_mb=400,   # ExpressionManager + 6 composites is light
+            entry_fn=outer_interface_worker_main,
+            config=outer_interface_worker_config,
+            rss_limit_mb=500,
             autostart=True,
             lazy=False,
             heartbeat_timeout=60.0,
-            broadcast_topics=_EXPRESSION_WORKER_SUBSCRIBE_TOPICS,
+            broadcast_topics=[
+                _bus_constants.REASONING_STATS_UPDATED, _bus_constants.NEUROMOD_STATS_UPDATED,
+                _bus_constants.CHI_UPDATED, _bus_constants.KERNEL_EPOCH_TICK,
+                _bus_constants.EXPRESSION_FIRED, _bus_constants.CONVERSATION_STIMULUS,
+                _bus_constants.SPEAK_REQUEST_PENDING, _bus_constants.GREAT_KIN_PULSE,
+            ],
+            b2_1_swap_critical=False,
+            start_method="spawn" if _spawn_grad else "fork",
+            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
+            boot_priority="post_boot",
+        ))
+
+    # self_reflection_worker (L2) — Track 2 of
+    # rFP_phase_c_self_improvement_subsystem_migration (SPEC v1.3.1 §9.B).
+    # Hosts SelfReasoningEngine + CodingExplorer (+ CodingSandboxHelper child
+    # subprocess via PR_SET_PDEATHSIG) + PredictionEngine (relocated from
+    # cognitive_worker per Track 1 drift correction, commit 51e5cfbf).
+    # Active under l0_rust_enabled=true AND self_reflection_worker_enabled=true
+    # ONLY; legacy spirit_worker_main owns SelfReasoning + CodingExplorer
+    # under l0_rust=false. Closes the last 3 engines blocking D8-3.
+    # NOTE: TitanHCL mirror of legacy_core.py registration — both
+    # paths must be kept in sync. SPEC §9.B v1.3.1 + D-SPEC-38.
+    if get_params("microkernel").get("self_reflection_worker_enabled", True):
+        self_reflection_worker_config = {
+            "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
+            "microkernel": get_params("microkernel"),
+            "info_banner": get_params("info_banner"),
+            "self_reflection":  get_params("self_reflection"),
+            "self_reasoning":   get_params("self_reasoning"),
+            "prediction":       get_params("prediction_engine"),
+            "cgn":              get_params("cgn"),
+        }
+        from titan_hcl.modules.self_reflection_worker import self_reflection_worker_main
+        guardian.register(ModuleSpec(
+            name="self_reflection_worker",
+            layer="L2",
+            entry_fn=self_reflection_worker_main,
+            config=self_reflection_worker_config,
+            rss_limit_mb=800,
+            autostart=True,
+            lazy=False,
+            heartbeat_timeout=90.0,
+            broadcast_topics=[
+                _bus_constants.REASONING_STATS_UPDATED, _bus_constants.META_REASONING_STATS_UPDATED,
+                _bus_constants.EXPERIENCE_STIMULUS, _bus_constants.DREAMING_STATE_UPDATED,
+                _bus_constants.CGN_CROSS_INSIGHT, _bus_constants.KERNEL_EPOCH_TICK,
+                # rFP_meta_reasoning_self_reasoning_resolver_migration / SPEC §9.B
+                # + D-SPEC-70 v1.15.0 — cognitive_worker fires META_INTROSPECT_REQUEST
+                # (fire-and-forget per §8.0.ter D-SPEC-48) per META INTROSPECT action;
+                # self_reflection_worker handler runs sr.introspect(**payload),
+                # persists to data/inner_memory.db.self_insights via _persist_insight(),
+                # writes result to inner_self_insight.bin SHM slot. Closes F-8.
+                _bus_constants.META_INTROSPECT_REQUEST,
+            ],
+            b2_1_swap_critical=True,
             start_method="spawn" if _spawn_grad else "fork",
             # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
             boot_priority="post_boot",
@@ -773,101 +873,6 @@ def build_catalog(bus, guardian, *, titan_id: str, kernel=None) -> None:
                 _mod_dep('cognitive_worker'),
             ],
         ))
-
-        # outer_interface_worker (L2) — Track 2 of
-        # rFP_phase_c_self_improvement_subsystem_migration (SPEC v1.3.1 §9.B).
-        # Hosts OuterInterface (composition_engine + narrator + advisor + decoder),
-        # dynamic word-recipes registry, kin signature/society broadcast surface,
-        # self-exploration cadence driver. Active under l0_rust_enabled=true
-        # AND outer_interface_worker_enabled=true ONLY; legacy spirit_worker_main
-        # owns OuterInterface under l0_rust=false per Maker D3 (b).
-        # NOTE: this registration is the TitanHCL (microkernel v2 split)
-        # mirror of the TitanCore registration in legacy_core.py — both
-        # paths must be kept in sync. See SPEC §9.B v1.3.1 + D-SPEC-38.
-        if get_params("microkernel").get("outer_interface_worker_enabled", True):
-            outer_interface_worker_config = {
-                "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
-                "microkernel": get_params("microkernel"),
-                "info_banner": get_params("info_banner"),
-                "outer_interface":   get_params("outer_interface"),
-                "self_exploration":  get_params("self_exploration"),
-                "action_decoder":    get_params("action_decoder"),
-                "action_narrator":   get_params("action_narrator"),
-                "kin":               get_params("kin"),
-            }
-            from titan_hcl.modules.outer_interface_worker import outer_interface_worker_main
-            guardian.register(ModuleSpec(
-                name="outer_interface_worker",
-                layer="L2",
-                entry_fn=outer_interface_worker_main,
-                config=outer_interface_worker_config,
-                rss_limit_mb=500,
-                autostart=True,
-                lazy=False,
-                heartbeat_timeout=60.0,
-                broadcast_topics=[
-                    _bus_constants.REASONING_STATS_UPDATED, _bus_constants.NEUROMOD_STATS_UPDATED,
-                    _bus_constants.CHI_UPDATED, _bus_constants.KERNEL_EPOCH_TICK,
-                    _bus_constants.EXPRESSION_FIRED, _bus_constants.CONVERSATION_STIMULUS,
-                    _bus_constants.SPEAK_REQUEST_PENDING, _bus_constants.GREAT_KIN_PULSE,
-                ],
-                b2_1_swap_critical=False,
-                start_method="spawn" if _spawn_grad else "fork",
-                # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-                boot_priority="post_boot",
-            ))
-
-        # self_reflection_worker (L2) — Track 2 of
-        # rFP_phase_c_self_improvement_subsystem_migration (SPEC v1.3.1 §9.B).
-        # Hosts SelfReasoningEngine + CodingExplorer (+ CodingSandboxHelper child
-        # subprocess via PR_SET_PDEATHSIG) + PredictionEngine (relocated from
-        # cognitive_worker per Track 1 drift correction, commit 51e5cfbf).
-        # Active under l0_rust_enabled=true AND self_reflection_worker_enabled=true
-        # ONLY; legacy spirit_worker_main owns SelfReasoning + CodingExplorer
-        # under l0_rust=false. Closes the last 3 engines blocking D8-3.
-        # NOTE: TitanHCL mirror of legacy_core.py registration — both
-        # paths must be kept in sync. SPEC §9.B v1.3.1 + D-SPEC-38.
-        if get_params("microkernel").get("self_reflection_worker_enabled", True):
-            self_reflection_worker_config = {
-                "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
-                "microkernel": get_params("microkernel"),
-                "info_banner": get_params("info_banner"),
-                "self_reflection":  get_params("self_reflection"),
-                "self_reasoning":   get_params("self_reasoning"),
-                "prediction":       get_params("prediction_engine"),
-                "cgn":              get_params("cgn"),
-            }
-            from titan_hcl.modules.self_reflection_worker import self_reflection_worker_main
-            guardian.register(ModuleSpec(
-                name="self_reflection_worker",
-                layer="L2",
-                entry_fn=self_reflection_worker_main,
-                config=self_reflection_worker_config,
-                rss_limit_mb=800,
-                autostart=True,
-                lazy=False,
-                heartbeat_timeout=90.0,
-                broadcast_topics=[
-                    _bus_constants.REASONING_STATS_UPDATED, _bus_constants.META_REASONING_STATS_UPDATED,
-                    _bus_constants.EXPERIENCE_STIMULUS, _bus_constants.DREAMING_STATE_UPDATED,
-                    _bus_constants.CGN_CROSS_INSIGHT, _bus_constants.KERNEL_EPOCH_TICK,
-                    # rFP_meta_reasoning_self_reasoning_resolver_migration / SPEC §9.B
-                    # + D-SPEC-70 v1.15.0 — cognitive_worker fires META_INTROSPECT_REQUEST
-                    # (fire-and-forget per §8.0.ter D-SPEC-48) per META INTROSPECT action;
-                    # self_reflection_worker handler runs sr.introspect(**payload),
-                    # persists to data/inner_memory.db.self_insights via _persist_insight(),
-                    # writes result to inner_self_insight.bin SHM slot. Closes F-8.
-                    _bus_constants.META_INTROSPECT_REQUEST,
-                ],
-                b2_1_swap_critical=True,
-                start_method="spawn" if _spawn_grad else "fork",
-                # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-                boot_priority="post_boot",
-                # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-                dependencies=[
-                    _mod_dep('cognitive_worker'),
-                ],
-            ))
 
     # social_worker (L2) — Phase C-S9 (chunks 9A-9K shipped 2026-05-12).
     # Hosts SocialXGateway + ArchetypeDispatcher + SocialPressureMeter +

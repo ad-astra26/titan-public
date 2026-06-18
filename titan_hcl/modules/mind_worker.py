@@ -335,42 +335,40 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     fast_stop_event = threading.Event()
 
     fast_enabled = _read_flag(config, "microkernel.shm_mind_fast_enabled", False)
-    l0_rust_enabled = _read_flag(config, "microkernel.l0_rust_enabled", False)
-    # Phase C C-S5 closure 2026-05-08: under l0_rust_enabled=true the
-    # Rust titan-inner-mind-rs daemon owns inner_mind_15d.bin output but
-    # NEEDS sensor_cache_inner_mind.bin as input. mind_worker still
-    # provides the sensor compute + 23.49 Hz cadence; _start_fast_path's
-    # internal if/elif redirects the write target from inner_mind_15d.bin
-    # (Phase A+B) to sensor_cache_inner_mind.bin (Phase C). Either flag
-    # enables _start_fast_path; the slot identity is decided inside.
-    if fast_enabled or l0_rust_enabled:
-        try:
-            sensor_cache, refresh_threads, shm_writer_thread = _start_fast_path(
-                mood_engine, social_graph, media_state, data_dir, session_db,
-                config, fast_stop_event,
-                lambda: (severity_multipliers, focus_nudges),
-                plugin_cache=plugin_cache,
+    # Phase C/D: l0_rust is permanently true → _start_fast_path always runs.
+    # mind_worker provides the sensor compute + 23.49 Hz cadence; the Rust
+    # titan-inner-mind-rs daemon owns inner_mind_15d.bin output but NEEDS
+    # sensor_cache_inner_mind.bin as input. _start_fast_path's internal
+    # if/elif redirects the write target from inner_mind_15d.bin (Phase A+B,
+    # gated by the separate shm_mind_fast_enabled flag) to
+    # sensor_cache_inner_mind.bin (Phase C — the canonical path).
+    try:
+        sensor_cache, refresh_threads, shm_writer_thread = _start_fast_path(
+            mood_engine, social_graph, media_state, data_dir, session_db,
+            config, fast_stop_event,
+            lambda: (severity_multipliers, focus_nudges),
+            plugin_cache=plugin_cache,
+        )
+        if fast_enabled:
+            logger.info(
+                "[MindWorker] §L1 fast path ON: 5 refresh threads + "
+                "23.49 Hz inner_mind_15d.bin writer (Phase A+B)"
             )
-            if fast_enabled:
-                logger.info(
-                    "[MindWorker] §L1 fast path ON: 5 refresh threads + "
-                    "23.49 Hz inner_mind_15d.bin writer (Phase A+B)"
-                )
-            else:
-                logger.info(
-                    "[MindWorker] Phase C path ON: 5 refresh threads + "
-                    "23.49 Hz sensor_cache_inner_mind.bin writer "
-                    "(l0_rust_enabled=true; Rust titan-inner-mind-rs owns "
-                    "inner_mind_15d.bin output)"
-                )
-        except Exception as exc:
-            logger.warning(
-                "[MindWorker] fast-path init failed (%s); falling back to inline senses",
-                exc,
+        else:
+            logger.info(
+                "[MindWorker] Phase C path ON: 5 refresh threads + "
+                "23.49 Hz sensor_cache_inner_mind.bin writer "
+                "(l0_rust_enabled=true; Rust titan-inner-mind-rs owns "
+                "inner_mind_15d.bin output)"
             )
-            sensor_cache = None
-            refresh_threads = []
-            shm_writer_thread = None
+    except Exception as exc:
+        logger.warning(
+            "[MindWorker] fast-path init failed (%s); falling back to inline senses",
+            exc,
+        )
+        sensor_cache = None
+        refresh_threads = []
+        shm_writer_thread = None
 
     # ── Phase 11 §11.I.2 — SHM slot transition starting → booted ─────
     # MODULE_READY bus emit DELETED per D-SPEC-141 / v1.65.0 locked D2.
@@ -1237,8 +1235,8 @@ def _start_fast_path(mood_engine, social_graph, media_state, data_dir,
         shm_writer_thread = start_shm_writer_thread(
             tick, _MIND_TICK_PERIOD_S, stop_event, "mind_shm_writer",
         )
-    elif get_params("microkernel").get("l0_rust_enabled", False):
-        # Phase C path — Sprint 6 §4.5 FULL Rust formula port:
+    else:
+        # Phase C path (l0_rust permanently true) — Sprint 6 §4.5 FULL Rust formula port:
         # Publish msgpack source dict of RAW INPUTS only. Rust
         # `project_inner_mind_15d` (titan-inner-mind-rs) decodes the
         # inputs and computes the 15D per SPEC §23.5 collect_mind_15d.

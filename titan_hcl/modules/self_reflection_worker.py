@@ -488,30 +488,14 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
             "[SelfReflectionWorker] Phase 11 ModuleStateWriter init failed: %s",
             _sw_err)
 
-    # === BOILERPLATE: two-flag gating ===
+    # === BOILERPLATE: flag-gated activation ===
+    # l0_rust is permanently true (Phase C canonical) — the legacy
+    # spirit_worker_main no-op branch was retired (config-shm Phase D).
     microkernel_cfg = get_params("microkernel") or {}
-    l0_rust = bool(microkernel_cfg.get("l0_rust_enabled", False))
     worker_enabled = bool(microkernel_cfg.get(
         "self_reflection_worker_enabled", True))
     sr_section_enabled = bool(
         (get_params("self_reflection") or {}).get("enabled", True))
-
-    if not l0_rust:
-        logger.info(
-            "[SelfReflectionWorker] microkernel.l0_rust_enabled=false — "
-            "legacy spirit_worker_main owns SelfReasoning + CodingExplorer; "
-            "PredictionEngine stays in cognitive_worker (Track 1 drift state). "
-            "Entering heartbeat-only no-op loop.")
-        # Phase 11 §11.I.2 — slot=booted (no-op branch is "booted, idle")
-        _WORKER_READY = True
-        if _state_writer is not None:
-            try:
-                _state_writer.write_state("booted")
-            except Exception:  # noqa: BLE001
-                pass
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True,
-                        state_writer=_state_writer)
-        return
 
     if not (worker_enabled and sr_section_enabled):
         logger.info(

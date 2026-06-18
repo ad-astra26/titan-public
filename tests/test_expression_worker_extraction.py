@@ -297,18 +297,22 @@ def test_plugin_registers_expression_worker_module_spec():
     assert "rss_limit_mb=400" in text
 
 
-def test_plugin_gates_off_expression_state_publisher_under_l0_rust_true():
-    """G21 single-writer ownership transfer — main plugin's
-    `_expression_state_publish_loop` thread MUST be gated off when
-    `l0_rust_enabled=true` (expression_worker owns the slot). The publish
-    loop + its gate stay in plugin.py (the spawn-side); the load-bearing
-    SKIP-log phrases are split across a logger.info call."""
+def test_plugin_does_not_run_expression_state_publisher_loop():
+    """G21 single-writer ownership transfer — expression_worker owns the
+    expression_state.bin slot. With l0_rust permanently true (Phase C
+    canonical), the main plugin's legacy `_expression_state_publish_loop`
+    parent publisher was RETIRED entirely (config-shm Phase D): the parent
+    never instantiates ExpressionStatePublisher and never writes the slot —
+    it keeps only the low-rate translator-stats bridge to expression_worker."""
     text = PLUGIN_PATH.read_text()
-    assert "publisher SKIPPED under" in text, (
-        "Parent's expression_state.bin publisher must be gated off "
-        "under l0_rust_enabled=true to preserve G21 single-writer")
-    assert "l0_rust_enabled=true" in text
-    assert "owned by expression_worker (G21)" in text
+    # Legacy parent publisher loop is gone (slot is solely expression_worker's).
+    assert "_expression_state_publish_loop" not in text, (
+        "legacy parent expression_state.bin publisher must be retired "
+        "(expression_worker owns the slot, G21 single-writer)")
+    # Parent never owns the slot.
+    assert "self._expression_state_pub = None" in text
+    # The parent keeps only the low-rate translator-stats bridge.
+    assert "expression-translator-stats-bridge" in text
 
 
 # ─── 7. Catalyst-site #8 closure marker ──────────────────────────────

@@ -227,40 +227,38 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     fast_stop_event = threading.Event()
 
     fast_enabled = _read_flag(config, "microkernel.shm_body_fast_enabled", False)
-    l0_rust_enabled = _read_flag(config, "microkernel.l0_rust_enabled", False)
-    # Phase C C-S5 closure 2026-05-08: under l0_rust_enabled=true the
-    # Rust titan-inner-body-rs daemon owns inner_body_5d.bin output but
-    # NEEDS sensor_cache_inner_body.bin as input. body_worker still
-    # provides the sensor compute + 7.83 Hz cadence; _start_fast_path's
-    # internal if/elif redirects the write target from inner_body_5d.bin
-    # (Phase A+B) to sensor_cache_inner_body.bin (Phase C). Either flag
-    # enables _start_fast_path; the slot identity is decided inside.
-    if fast_enabled or l0_rust_enabled:
-        try:
-            sensor_cache, refresh_threads, shm_bank, body_5d_writer, shm_writer_thread = (
-                _start_fast_path(thresholds, config, fast_stop_event,
-                                 lambda: (severity_multipliers, focus_nudges))
+    # Phase C/D: l0_rust is permanently true → _start_fast_path always runs.
+    # body_worker provides the sensor compute + 7.83 Hz cadence; the Rust
+    # titan-inner-body-rs daemon owns inner_body_5d.bin output but NEEDS
+    # sensor_cache_inner_body.bin as input. _start_fast_path's internal
+    # if/elif redirects the write target from inner_body_5d.bin (Phase A+B,
+    # gated by the separate shm_body_fast_enabled flag) to
+    # sensor_cache_inner_body.bin (Phase C — the canonical path).
+    try:
+        sensor_cache, refresh_threads, shm_bank, body_5d_writer, shm_writer_thread = (
+            _start_fast_path(thresholds, config, fast_stop_event,
+                             lambda: (severity_multipliers, focus_nudges))
+        )
+        if fast_enabled:
+            logger.info(
+                "[BodyWorker] §L1 fast path ON: 5 refresh threads + "
+                "7.83 Hz inner_body_5d.bin writer (Phase A+B)"
             )
-            if fast_enabled:
-                logger.info(
-                    "[BodyWorker] §L1 fast path ON: 5 refresh threads + "
-                    "7.83 Hz inner_body_5d.bin writer (Phase A+B)"
-                )
-            else:
-                logger.info(
-                    "[BodyWorker] Phase C path ON: 5 refresh threads + "
-                    "7.83 Hz sensor_cache_inner_body.bin writer "
-                    "(l0_rust_enabled=true; Rust titan-inner-body-rs owns "
-                    "inner_body_5d.bin output)"
-                )
-        except Exception as exc:
-            logger.warning(
-                "[BodyWorker] fast-path init failed (%s); falling back to inline senses",
-                exc,
+        else:
+            logger.info(
+                "[BodyWorker] Phase C path ON: 5 refresh threads + "
+                "7.83 Hz sensor_cache_inner_body.bin writer "
+                "(l0_rust_enabled=true; Rust titan-inner-body-rs owns "
+                "inner_body_5d.bin output)"
             )
-            sensor_cache = None
-            refresh_threads = []
-            shm_writer_thread = None
+    except Exception as exc:
+        logger.warning(
+            "[BodyWorker] fast-path init failed (%s); falling back to inline senses",
+            exc,
+        )
+        sensor_cache = None
+        refresh_threads = []
+        shm_writer_thread = None
 
     # ── Phase 11 §11.I.2 — SHM slot transition starting → booted ─────
     # MODULE_READY bus emit DELETED per D-SPEC-141 / v1.65.0 locked D2.
@@ -1065,8 +1063,8 @@ def _start_fast_path(thresholds: dict, config: dict, stop_event,
         shm_writer_thread = start_shm_writer_thread(
             tick, _BODY_TICK_PERIOD_S, stop_event, "body_shm_writer",
         )
-    elif get_params("microkernel").get("l0_rust_enabled", False):
-        # Phase C path — Step 7 §4.4 schema migration v1→v2:
+    else:
+        # Phase C path (l0_rust permanently true) — Step 7 §4.4 schema v1→v2:
         # Publish msgpack source dict (per-sense {value, severity, velocity})
         # to sensor_cache_inner_body.bin instead of pre-computed 5D tensor.
         # titan-inner-body-rs decodes msgpack + executes per-dim urgency-
