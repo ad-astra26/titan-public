@@ -15,7 +15,6 @@ boot-time import cost.
 Signature:
   - `bus`: DivineBus (guardian_hcl's local hub, broker-attached)
   - `guardian`: Guardian instance whose .register() is called 47 times
-  - `config`: full merged config dict (loaded via load_titan_config())
   - `titan_id`: canonical Titan identifier (T1/T2/T3)
   - `kernel`: optional kernel-like object — historically `self.kernel`
     references were rare and never load-bearing for the ModuleSpec
@@ -74,8 +73,21 @@ def _mod_dep(name: str) -> Dependency:
     )
 
 
-def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
-    """Register the full Titan module catalog with Guardian. See module docstring."""
+def build_catalog(bus, guardian, *, titan_id: str, kernel=None) -> None:
+    """Register the full Titan module catalog with Guardian. See module docstring.
+
+    Config-as-SHM-state (INV-CFG-7 / RFP_config_as_shm_state §7.C / C.6,
+    2026-06-18): the boot ``config`` dict (the legacy ``load_titan_config()``
+    4-layer merge that guardian_hcl threaded in) is RETIRED. Every ModuleSpec's
+    config is now read fresh, per-section, from the in-kernel config daemon's
+    SHM slots via ``get_params("<section>")`` — no merged boot dict is ever
+    materialised or threaded. SHM is live by the time guardian builds the
+    catalog (daemon seeds slots at B3.5, before any python spawn); if it is
+    somehow absent, ``get_params`` falls back to ``_bootstrap_merge`` (same file
+    values), so boot values are correct either way. Workers that need a live
+    value after boot re-read it via the heartbeat config-watch (§7.B).
+    """
+    from titan_hcl.params import get_params
     from titan_hcl.modules.memory_worker import memory_worker_main
     from titan_hcl.modules.llm_worker import llm_worker_main
     from titan_hcl.modules.agno_worker import agno_worker_main
@@ -101,15 +113,15 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # Titan. Backup is on its own pre-existing flag (S6 reference);
     # spirit, memory, timechain, rl, emot_cgn stay fork-mode until
     # they're individually verified import-stable.
-    _spawn_grad = config.get("microkernel", {}).get(
+    _spawn_grad = get_params("microkernel").get(
         "spawn_graduated_workers_enabled", False)
 
     # IMW — Inner Memory Writer Service. Registered FIRST so other modules
     # that write to inner_memory.db can connect on startup.
     # Autostart only when persistence.enabled=true in config.toml.
-    _persistence_cfg = config.get("persistence", {})
+    _persistence_cfg = get_params("persistence")
     _imw_enabled = bool(_persistence_cfg.get("enabled", False))
-    _data_dir_raw = config.get("memory_and_storage", {}).get("data_dir", "./data")
+    _data_dir_raw = get_params("memory_and_storage").get("data_dir", "./data")
     imw_config = {
         **_persistence_cfg,
         "db_path": _persistence_cfg.get("db_path") or (_data_dir_raw.rstrip("/") + "/inner_memory.db"),
@@ -153,13 +165,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         output_verifier_worker_main,
     )
     _ov_subproc_enabled = bool(
-        config.get("microkernel", {}).get(
+        get_params("microkernel").get(
             "a8_output_verifier_subprocess_enabled", False))
     guardian.register(ModuleSpec(
         name="output_verifier",
         layer="L2",  # security/verification gate — L2 service
         entry_fn=output_verifier_worker_main,
-        config=config,
+        config={},  # C.6: reads info_banner/memory_and_storage/network via get_params
         rss_limit_mb=400,    # Ed25519 + regex patterns + signature chain
         autostart=_ov_subproc_enabled,  # Only when flag flipped
         lazy=False,
@@ -200,13 +212,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # reflex_proxy.py).
     from titan_hcl.modules.reflex_worker import reflex_worker_main
     _reflex_subproc_enabled = bool(
-        config.get("microkernel", {}).get(
+        get_params("microkernel").get(
             "a8_reflex_subprocess_enabled", False))
     guardian.register(ModuleSpec(
         name="reflex",
         layer="L3",  # reflex aggregation — L3 service per rFP §A.8.5
         entry_fn=reflex_worker_main,
-        config=config,
+        config={},  # C.6: reads info_banner/reflexes via get_params
         rss_limit_mb=300,    # stateless aggregator; tiny footprint
         autostart=_reflex_subproc_enabled,  # Only when flag flipped
         lazy=False,
@@ -235,13 +247,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # become AgencyProxy + AssessmentProxy (see core/plugin.py:_boot_agency).
     from titan_hcl.modules.agency_worker import agency_worker_main
     _ag_subproc_enabled = bool(
-        config.get("microkernel", {}).get(
+        get_params("microkernel").get(
             "a8_agency_subprocess_enabled", False))
     guardian.register(ModuleSpec(
         name="agency_worker",
         layer="L3",  # impulse decoder + helper execution — L3 service
         entry_fn=agency_worker_main,
-        config=config,
+        config={},  # C.6: reads inference/agency/api/info_banner + helper sections via get_params
         # 8 helpers + LLM client + httpx + venice fallback + audio/art
         # buffers + sandbox subprocess — generous ceiling, the LLM fn
         # itself is light but helper.execute() can briefly spike.
@@ -272,7 +284,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     from titan_hcl.modules.warning_monitor_worker import (
         warning_monitor_worker_main,
     )
-    _wm_cfg = config.get("warning_monitor", {})
+    _wm_cfg = get_params("warning_monitor")
     # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
     # warning_monitor drain at modules/warning_monitor_worker.py:209
     # consumes one broadcast type (SILENT_SWALLOW_REPORT).
@@ -312,7 +324,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         name="health_monitor",
         layer="L3",  # observability + advisory service
         entry_fn=health_monitor_worker_main,
-        config=config,  # full config — plugins resolve sections
+        config={},  # C.6: _discover_plugins resolves solana/health_monitor + per-plugin sections via get_params
         rss_limit_mb=150,
         autostart=True,
         lazy=False,
@@ -330,7 +342,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # Scoped per rFP_observatory_writer_service (drafted 2026-04-21);
     # microkernel-v2-aligned (L3 DB ownership). Default OFF — Maker flips
     # `enabled=true` in [persistence_observatory] when ready for Phase 1.
-    _obs_persistence_cfg = config.get("persistence", {}).get("observatory", {})
+    _obs_persistence_cfg = get_params("persistence").get("observatory", {})
     _obs_writer_enabled = bool(_obs_persistence_cfg.get("enabled", False))
     # Per-instance defaults — namespaced so the two writers don't collide
     # on socket/WAL/journal/metrics paths. Maker can override any of these
@@ -384,7 +396,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ("events_teacher_writer", "events_teacher", "events_teacher.db"),
         ("consciousness_writer", "consciousness", "consciousness.db"),
     ):
-        _w_cfg_section = config.get("persistence", {}).get(_w_subkey, {})
+        _w_cfg_section = get_params("persistence").get(_w_subkey, {})
         _w_enabled = bool(_w_cfg_section.get("enabled", False))
         _w_sock_default = f"data/run/{_w_name}.sock"
         _w_wal_default = f"data/run/{_w_name}.wal"
@@ -419,8 +431,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
 
     # Memory module (FAISS + Kuzu + DuckDB)
     memory_config = {
-        **config.get("inference", {}),
-        **config.get("memory_and_storage", {}),
+        **get_params("inference"),
+        **get_params("memory_and_storage"),
     }
     guardian.register(ModuleSpec(
         name="memory",
@@ -461,7 +473,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         name="llm",
         layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (Agno inference, human-time)
         entry_fn=llm_worker_main,
-        config=config.get("inference", {}),
+        config=get_params("inference"),
         rss_limit_mb=1000,
         autostart=True,  # Changed: Language Teacher needs llm at boot
         lazy=False,
@@ -480,24 +492,24 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # Merged inference + agent config so the worker's _init_worker_plugin_and_agent
     # can resolve provider via §9.F.1 inference module.
     _agno_cfg = {
-        **config.get("inference", {}),
-        **config.get("agent", {}),
+        **get_params("inference"),
+        **get_params("agent"),
     }
     # Surface the [agent] block as a nested key for downstream usage too
-    _agno_cfg["agent"] = config.get("agent", {})
-    _agno_cfg["inference"] = config.get("inference", {})
+    _agno_cfg["agent"] = get_params("agent")
+    _agno_cfg["inference"] = get_params("inference")
     # ζ.0/ζ.1 (D-SPEC-79, 2026-05-18) — propagate [chat] section so the
     # ChatTierClassifier in agno_hooks.PreHook sees [[chat.tiers]] blocks.
     # Without this the worker subprocess only got inference+agent and the
     # classifier fell through to "passthrough" with all features on —
     # which defeated the whole point of ζ.1 feature gating.
-    _agno_cfg["chat"] = config.get("chat", {})
+    _agno_cfg["chat"] = get_params("chat")
     # Phase 8 (D-SPEC-PHASE8) — propagate [synthesis] so agno_worker's
     # delegate_live wiring (config[synthesis][skill][delegate_live]) sees the
     # per-Titan ~/.titan/microkernel_<id>.toml override. Without this the
     # agno tool's match_procedural_skill always reads the config default
     # (False) — the T3 canary's delegate_live=true never takes effect.
-    _agno_cfg["synthesis"] = config.get("synthesis", {})
+    _agno_cfg["synthesis"] = get_params("synthesis")
     guardian.register(ModuleSpec(
         name="agno_worker",
         layer="L2",  # Microkernel v2 §A.5 — L2 module (chat pipeline owner)
@@ -584,8 +596,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # Note: RSS includes inherited parent process memory from fork (~250MB),
     # so limit must account for that baseline.
     body_config = {
-        **config.get("body", {}),
-        "api_port": int(config.get("api", {}).get("port", 7777)),
+        **get_params("body"),
+        "api_port": int(get_params("api").get("port", 7777)),
         # Microkernel v2 Phase A §A.7 / §L1 — shm feature flags. Must
         # be passed through so body_worker's _read_flag() and
         # RegistryBank.is_enabled() can resolve
@@ -593,7 +605,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # as spirit_worker (mirror the comment there). Without this,
         # the body shm fast-path is silently no-op even with the
         # flag flipped true in titan_params.toml.
-        "microkernel": config.get("microkernel", {}),
+        "microkernel": get_params("microkernel"),
     }
     # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
     # body drain at modules/body_worker.py:255-303 consumes 4 broadcasts
@@ -618,11 +630,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
 
     # Mind module (MoodEngine, SocialGraph — ~200MB)
     mind_config = {
-        "data_dir": config.get("memory_and_storage", {}).get("data_dir", "./data"),
+        "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
         # Microkernel v2 Phase A §A.7 / §L1 — shm feature flags
         # (same passthrough pattern as body/spirit; without this,
         # mind shm fast-path is silently no-op).
-        "microkernel": config.get("microkernel", {}),
+        "microkernel": get_params("microkernel"),
     }
     # mind drain at modules/mind_worker.py consumes these broadcasts;
     # MODULE_SHUTDOWN + QUERY are targeted. OUTER_SOURCES_SNAPSHOT dropped
@@ -672,19 +684,19 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # + the Rust-owned slots, so it boots after body/mind in the autostart seq.
     # See SPEC §1 glossary + §9.B Python tree (NEW v0.1.8) +
     # PLAN_microkernel_phase_c_s8_cognitive_worker_extraction.md §2.2.
-    if config.get("microkernel", {}).get("l0_rust_enabled", False):
+    if get_params("microkernel").get("l0_rust_enabled", False):
         cognitive_worker_config = {
-            "data_dir": config.get("memory_and_storage", {}).get("data_dir", "./data"),
+            "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
             # Microkernel flag passthrough — cognitive_worker_main checks it
             # defensively even though registration is already gated.
-            "microkernel": config.get("microkernel", {}),
+            "microkernel": get_params("microkernel"),
             # Banner config for titan_id resolution.
-            "info_banner": config.get("info_banner", {}),
+            "info_banner": get_params("info_banner"),
             # Engine configs read from titan_params.toml inside the worker
             # via _load_toml_section helper — no need to thread them here.
             # titan_vm config kept here for InnerTrinityCoordinator's
             # internal NervousSystem (lightweight VM context).
-            "titan_vm": config.get("titan_vm", {}),
+            "titan_vm": get_params("titan_vm"),
         }
         from titan_hcl.modules.cognitive_worker import (
             cognitive_worker_main,
@@ -744,10 +756,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             layer="L2",
             entry_fn=expression_worker_main,
             config={
-                "data_dir": config.get(
-                    "memory_and_storage", {}).get("data_dir", "./data"),
-                "microkernel": config.get("microkernel", {}),
-                "info_banner": config.get("info_banner", {}),
+                "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
+                "microkernel": get_params("microkernel"),
+                "info_banner": get_params("info_banner"),
             },
             rss_limit_mb=400,   # ExpressionManager + 6 composites is light
             autostart=True,
@@ -773,16 +784,16 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # NOTE: this registration is the TitanHCL (microkernel v2 split)
         # mirror of the TitanCore registration in legacy_core.py — both
         # paths must be kept in sync. See SPEC §9.B v1.3.1 + D-SPEC-38.
-        if config.get("microkernel", {}).get("outer_interface_worker_enabled", True):
+        if get_params("microkernel").get("outer_interface_worker_enabled", True):
             outer_interface_worker_config = {
-                "data_dir": config.get("memory_and_storage", {}).get("data_dir", "./data"),
-                "microkernel": config.get("microkernel", {}),
-                "info_banner": config.get("info_banner", {}),
-                "outer_interface":   config.get("outer_interface", {}),
-                "self_exploration":  config.get("self_exploration", {}),
-                "action_decoder":    config.get("action_decoder", {}),
-                "action_narrator":   config.get("action_narrator", {}),
-                "kin":               config.get("kin", {}),
+                "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
+                "microkernel": get_params("microkernel"),
+                "info_banner": get_params("info_banner"),
+                "outer_interface":   get_params("outer_interface"),
+                "self_exploration":  get_params("self_exploration"),
+                "action_decoder":    get_params("action_decoder"),
+                "action_narrator":   get_params("action_narrator"),
+                "kin":               get_params("kin"),
             }
             from titan_hcl.modules.outer_interface_worker import outer_interface_worker_main
             guardian.register(ModuleSpec(
@@ -816,15 +827,15 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # under l0_rust=false. Closes the last 3 engines blocking D8-3.
         # NOTE: TitanHCL mirror of legacy_core.py registration — both
         # paths must be kept in sync. SPEC §9.B v1.3.1 + D-SPEC-38.
-        if config.get("microkernel", {}).get("self_reflection_worker_enabled", True):
+        if get_params("microkernel").get("self_reflection_worker_enabled", True):
             self_reflection_worker_config = {
-                "data_dir": config.get("memory_and_storage", {}).get("data_dir", "./data"),
-                "microkernel": config.get("microkernel", {}),
-                "info_banner": config.get("info_banner", {}),
-                "self_reflection":  config.get("self_reflection", {}),
-                "self_reasoning":   config.get("self_reasoning", {}),
-                "prediction":       config.get("prediction_engine", {}),
-                "cgn":              config.get("cgn", {}),
+                "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
+                "microkernel": get_params("microkernel"),
+                "info_banner": get_params("info_banner"),
+                "self_reflection":  get_params("self_reflection"),
+                "self_reasoning":   get_params("self_reasoning"),
+                "prediction":       get_params("prediction_engine"),
+                "cgn":              get_params("cgn"),
             }
             from titan_hcl.modules.self_reflection_worker import self_reflection_worker_main
             guardian.register(ModuleSpec(
@@ -867,14 +878,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # owns X-posting under flag-false per Maker D3(b). NOT gated on
     # l0_rust_enabled — independent of broader Phase C migration.
     # See PLAN_microkernel_phase_c_s9_social_worker_extraction.md.
-    if config.get("microkernel", {}).get("social_worker_enabled", False):
+    if get_params("microkernel").get("social_worker_enabled", False):
         social_worker_config = {
-            "data_dir": config.get("memory_and_storage", {}).get("data_dir", "./data"),
-            "microkernel": config.get("microkernel", {}),
-            "info_banner": config.get("info_banner", {}),
+            "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
+            "microkernel": get_params("microkernel"),
+            "info_banner": get_params("info_banner"),
             # social_x section carries: gateway db path, archetype configs,
             # canonical_poller_titan_id, recency-boost tunables, post limits.
-            "social_x": config.get("social_x", {}),
+            "social_x": get_params("social_x"),
         }
         from titan_hcl.modules.social_worker import social_worker_main
         guardian.register(ModuleSpec(
@@ -921,10 +932,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=social_graph_worker_main,
         config={
-            "data_dir": config.get(
-                "memory_and_storage", {}).get("data_dir", "./data"),
-            "info_banner": config.get("info_banner", {}),
-            "social_graph": config.get("social_graph", {}),
+            "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
+            "info_banner": get_params("info_banner"),
+            "social_graph": get_params("social_graph"),
         },
         rss_limit_mb=150,
         autostart=True,
@@ -957,9 +967,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=metabolism_worker_main,
         config={
-            "growth_metrics": config.get("growth_metrics", {}),
-            "network": config.get("network", {}),
-            "info_banner": config.get("info_banner", {}),
+            "growth_metrics": get_params("growth_metrics"),
+            "network": get_params("network"),
+            "info_banner": get_params("info_banner"),
         },
         rss_limit_mb=100,
         autostart=True,
@@ -988,10 +998,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         journey_persistence_worker_main,
     )
     _journey_cfg = {
-        "info_banner": config.get("info_banner", {}),
-        "consciousness_db": config.get(
-            "memory_and_storage", {}
-        ).get("consciousness_db", "./data/consciousness.db"),
+        "info_banner": get_params("info_banner"),
+        "consciousness_db": get_params("memory_and_storage").get("consciousness_db", "./data/consciousness.db"),
     }
     guardian.register(ModuleSpec(
         name="journey_persistence",
@@ -1073,8 +1081,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=life_force_worker_main,
         config={
-            "life_force": config.get("life_force", {}),
-            "info_banner": config.get("info_banner", {}),
+            "life_force": get_params("life_force"),
+            "info_banner": get_params("info_banner"),
         },
         rss_limit_mb=100,
         autostart=True,
@@ -1114,10 +1122,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=studio_worker_main,
         config={
-            "titan_id": config.get("network", {}).get(
+            "titan_id": get_params("network").get(
                 "titan_id"),
-            "expressive": config.get("expressive", {}),
-            "inference": config.get("inference", {}),
+            "expressive": get_params("expressive"),
+            "inference": get_params("inference"),
         },
         rss_limit_mb=200,
         autostart=True,
@@ -1154,7 +1162,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=dream_state_worker_main,
         config={
-            "titan_id": config.get("network", {}).get(
+            "titan_id": get_params("network").get(
                 "titan_id"),
         },
         rss_limit_mb=200,
@@ -1186,14 +1194,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=synthesis_worker_main,
         config={
-            "titan_id": config.get("network", {}).get(
+            "titan_id": get_params("network").get(
                 "titan_id"),
             # G21 / INV-Syn-3: synthesis_worker owns synthesis.duckdb
             # (NOT titan_memory.duckdb — that's memory_worker's R/W
             # territory; sharing it across workers triggers DuckDB's
             # cross-process R/W lock rejection).
             "memory_db_path": os.path.join(
-                config.get("memory_and_storage", {}).get(
+                get_params("memory_and_storage").get(
                     "data_dir", "./data"),
                 "synthesis.duckdb"),
             # Phase 4 FU-2 — Ollama Cloud provider config for the
@@ -1201,13 +1209,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # main [inference] block so synthesis_worker doesn't have to
             # re-merge config. titan_hcl.inference.get_provider("ollama_cloud", cfg)
             # consumes this dict.
-            "inference": dict(config.get("inference", {}) or {}),
+            "inference": dict(get_params("inference") or {}),
             # Phase 5 (D-SPEC-PHASE5) — [synthesis] subtable threaded
             # through so per-Titan overrides (~/.titan/microkernel_<id>.toml
             # [synthesis] block) reach synthesis_worker_main. Currently
             # consumed keys: `fork_gc_live` (bool; default False per
             # Maker decision 2026-05-27 — dry-run until soak validates).
-            "synthesis": dict(config.get("synthesis", {}) or {}),
+            "synthesis": dict(get_params("synthesis") or {}),
         },
         # FU-3 — bumped from 200 to 240. Root-cause: Phase 4 added the
         # Kuzu spine mmap (+~3MB) + consolidation thread + LLM provider
@@ -1373,7 +1381,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         name="felt_teaching",
         layer="L2",
         entry_fn=felt_teaching_worker_main,
-        config=config,
+        config={},  # C.6: reads cgn/info_banner/inference via get_params
         rss_limit_mb=300,    # lean consumer; record_outcome-only (no SHM weight load)
         autostart=True,
         lazy=False,
@@ -1401,7 +1409,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         name="soul_diary",
         layer="L2",
         entry_fn=soul_diary_worker_main,
-        config=config,
+        config={"soul_diary": get_params("soul_diary")},  # C.6: only mint_enabled(config) reads it; provider/network via get_params
         rss_limit_mb=300,    # lean orchestrator + one httpx LLM call/day
         autostart=True,
         lazy=False,
@@ -1427,14 +1435,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # SAVE_NOW critical_data_writer). Spawn-gated on the config flag (default
     # off → byte-identical grounded_route, the agno consume-gate also off).
     _self_learning_enabled = bool(
-        ((config.get("synthesis", {}) or {}).get("self_learning", {}) or {}).get(
+        ((get_params("synthesis") or {}).get("self_learning", {}) or {}).get(
             "enabled", False))
     from titan_hcl.modules.self_learning_worker import self_learning_worker_main
     guardian.register(ModuleSpec(
         name="self_learning",
         layer="L2",
         entry_fn=self_learning_worker_main,
-        config=config,
+        config={"synthesis": get_params("synthesis")},  # C.6: _cfg override seam reads config[synthesis][self_learning]
         rss_limit_mb=250,    # numpy policy + a small duckdb; no LLM, no SHM weight load
         autostart=_self_learning_enabled,   # only when the flag is flipped on
         lazy=False,
@@ -1472,9 +1480,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L3",
         entry_fn=observatory_worker_main,
         config={
-            "titan_id": config.get("network", {}).get(
+            "titan_id": get_params("network").get(
                 "titan_id"),
-            "frontend": config.get("frontend", {}),
+            "frontend": get_params("frontend"),
         },
         rss_limit_mb=150,
         autostart=True,
@@ -1505,7 +1513,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=meditation_worker_main,
         config={
-            "titan_id": config.get("network", {}).get(
+            "titan_id": get_params("network").get(
                 "titan_id"),
         },
         rss_limit_mb=150,
@@ -1603,7 +1611,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=interface_advisor_worker_main,
         config={
-            "titan_id": config.get("network", {}).get(
+            "titan_id": get_params("network").get(
                 "titan_id"),
         },
         rss_limit_mb=100,
@@ -1643,16 +1651,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     from titan_hcl.modules.neuromod_worker import neuromod_worker_main
     from titan_hcl.modules.hormonal_worker import hormonal_worker_main
 
-    _state_worker_config = {
-        # Pass-through full config — workers read their own
-        # [neuromodulators] / [hormonal_pressure] / [neural_nervous_system]
-        # sections + microkernel.shm_*_enabled flags via _build_*_system.
-        **config,
-        # data_dir helper used by hormonal_worker to load/save persisted state.
-        "data_dir": config.get("memory_and_storage", {}).get(
-            "data_dir", "./data"),
-    }
-    _mk = config.get("microkernel", {}) or {}
+    # C.6 (2026-06-18): the ns / neuromod / hormonal workers read their own
+    # [neuromodulators] / [hormonal_pressure] / [neural_nervous_system] /
+    # [neuromodulator_dna] / [impulse] sections + microkernel.shm_*_enabled +
+    # memory_and_storage.data_dir directly via get_params (verified: zero reads
+    # of the passed config dict). The old full-config pass-through is retired.
+    _state_worker_config = {}
+    _mk = get_params("microkernel") or {}
 
     # ns_module / neuromod_module / hormonal_module — state-slot owners
     # per SPEC §7.1 row 574. Each consumes:
@@ -1776,8 +1781,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
 
     # Language module (composition, teaching, vocabulary — higher cognitive)
     language_config = {
-        **config.get("language", {}),
-        "data_dir": config.get("memory_and_storage", {}).get("data_dir", "./data"),
+        **get_params("language"),
+        "data_dir": get_params("memory_and_storage").get("data_dir", "./data"),
     }
     # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
     # See legacy_core.py for full type list; mirror exactly here.
@@ -1823,11 +1828,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # Per rFP §11 migration: deploys with enabled=false by default.
     # Worker starts (for observability + pre-load); critique logic is
     # gated on config['enabled'] inside the teacher's sampling check.
-    _meta_teacher_cfg = config.get("meta_teacher", {})
+    _meta_teacher_cfg = get_params("meta_teacher")
     meta_teacher_config = {
         **_meta_teacher_cfg,
-        "inference": config.get("inference", {}),
-        "data_dir": config.get("memory_and_storage", {}).get(
+        "inference": get_params("inference"),
+        "data_dir": get_params("memory_and_storage").get(
             "data_dir", "./data"),
     }
     guardian.register(ModuleSpec(
@@ -1863,11 +1868,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # CGN Cognitive Kernel (shared V(s) + per-consumer Q(s,a) + HAOV + Sigma)
     cgn_config = {
         "state_dir": "data/cgn",
-        "db_path": config.get("memory_and_storage", {}).get("data_dir", "./data") + "/inner_memory.db",
+        "db_path": get_params("memory_and_storage").get("data_dir", "./data") + "/inner_memory.db",
         "shm_path": "/dev/shm/cgn_live_weights.bin",
         "online_consolidation_every": 50,
         "shm_write_on_every_outcome": True,
-        **config.get("cgn", {}),
+        **get_params("cgn"),
     }
     # rFP_worker_broadcast_topics_completion §4.A.4 (Batch 4):
     # See legacy_core.py for full type list; mirror exactly here.
@@ -1907,7 +1912,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     ))
 
     # Knowledge Worker (4th CGN consumer — knowledge acquisition + Stealth Sage)
-    _data_dir = config.get("memory_and_storage", {}).get("data_dir", "./data")
+    _data_dir = get_params("memory_and_storage").get("data_dir", "./data")
     # KP-v2: flatten [knowledge_pipeline] (router/cache/health paths, circuit-
     # breaker tuning, near-dup thresholds, telegram_alerts_enabled kill-switch)
     # plus the nested [knowledge_pipeline.budgets] table (per-backend MB/day).
@@ -1918,15 +1923,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         "cgn_state_dir": "data/cgn",
         "shm_path": "/dev/shm/cgn_live_weights.bin",
         # SearXNG + Stealth Sage
-        **config.get("stealth_sage", {}),
+        **get_params("stealth_sage"),
         # Inference (for LLM distillation)
-        **{k: v for k, v in config.get("inference", {}).items()
+        **{k: v for k, v in get_params("inference").items()
            if k.startswith("ollama_cloud") or k == "inference_provider"},
         # Twitter API (for X research path)
-        "twitterapi_io_key": config.get(
-            "twitter_social", {}).get("twitterapi_io_key", ""),
+        "twitterapi_io_key": get_params("twitter_social").get("twitterapi_io_key", ""),
         # Knowledge Pipeline v2 (router/cache/health/budgets/alerts)
-        **config.get("knowledge_pipeline", {}),
+        **get_params("knowledge_pipeline"),
     }
     # rFP_worker_broadcast_topics_completion §4.A.4 (Batch 4):
     # See legacy_core.py for full type list; mirror exactly here.
@@ -1957,7 +1961,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
 
     # TimeChain — Proof of Thought memory chain
     timechain_config = {
-        **config.get("timechain", {}),
+        **get_params("timechain"),
     }
     # rFP_worker_broadcast_topics_completion §4.A.4 (Batch 4 — heaviest):
     # See legacy_core.py for full 23-type list; mirror exactly here.
@@ -2005,13 +2009,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # spawn-vs-fork capability. When spawn_reference_worker_enabled=true,
     # this worker boots via spawn (fresh interpreter, ~200 MB RSS savings).
     # Default fork preserves byte-identical pre-S6 behavior.
-    _spawn_ref = config.get("microkernel", {}).get(
+    _spawn_ref = get_params("microkernel").get(
         "spawn_reference_worker_enabled", False)
     guardian.register(ModuleSpec(
         name="backup",
         layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (on-chain anchoring + 3-2-1 cold storage)
         entry_fn=backup_orchestrator_main,  # RFP_backup_redesign_spine Phase D (was backup_worker_main)
-        config=config,  # full config — reads [backup]/[network]/[info_banner]/[mainnet_budget]/[memory_and_storage]
+        config={},  # C.6: reads backup/network/info_banner/mainnet_budget/memory_and_storage via get_params
         rss_limit_mb=500,     # Phase 5 / 5G (2026-05-19): reverted 1200 → 500 after streaming
                               # encoders shipped (5A). Previously bumped 800 → 1200 was an anti-pattern
                               # (per `feedback_no_rss_band_aid_understand_root_cause`) masking the real
@@ -2073,7 +2077,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",  # Microkernel v2 §A.5 — L2 CGN consumer (emotional grounding)
         entry_fn=emot_cgn_worker_main,
         config={
-            **config.get("emot_cgn", {}),
+            **get_params("emot_cgn"),
             "titan_id": _emot_titan_id,
             "shm_state_path":
                 f"/dev/shm/titan_{_emot_titan_id}/emot_state.bin",
@@ -2142,7 +2146,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # titan_hcl/api/api_main.py:entry which sets setproctitle('titan_hcl_api')
     # before delegating to the unchanged api_subprocess_main body (INV-PROC-1).
     from titan_hcl.api.api_main import entry as api_main_entry
-    api_cfg = config.get("api", {})
+    api_cfg = get_params("api")
     # Pass relevant config sub-tree to the subprocess; it doesn't need
     # the full plugin config (most state comes via kernel_rpc anyway).
     # rFP_observatory_data_loading_v1 §3.3 (2026-04-26): added `network`
@@ -2153,13 +2157,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         "api": api_cfg,
         # microkernel block forwarded for any subprocess-side flag
         # checks (e.g., during reload).
-        "microkernel": config.get("microkernel", {}),
+        "microkernel": get_params("microkernel"),
         # network block carries vault_program_id, RPC URLs, premium_rpc
         # — used by vault PDA derivation + /health vault check.
-        "network": config.get("network", {}),
+        "network": get_params("network"),
         # mainnet/devnet flag and other env-related settings the api
         # endpoints may need (frontend mode toggles).
-        "frontend": config.get("frontend", {}),
+        "frontend": get_params("frontend"),
     }
     guardian.register(ModuleSpec(
         # Phase 6 / D-SPEC-135: bus subscriber name remains "api" so

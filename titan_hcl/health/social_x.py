@@ -105,7 +105,6 @@ class SocialXHealthCheck(HealthCheckPlugin):
         # `load_titan_config(force_reload=True)` to get the 3-layer merge.
         # Layer-1+2 fallbacks (user_name, db_path) can come from either.
         try:
-            from titan_hcl.config_loader import load_titan_config
             full_cfg = load_titan_params(force_reload=True)
         except Exception:
             full_cfg = {}

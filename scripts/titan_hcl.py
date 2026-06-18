@@ -404,7 +404,10 @@ async def run(health_only: bool = False, server_only: bool = False,
     # connection — that's the proxy-reply transport, separate from the
     # orchestrator bus constructed here (broker fans by client name; the
     # two connections coexist on the same Unix socket without conflict).
-    from titan_hcl.config_loader import load_titan_config as _load_cfg
+    # RFP_config_as_shm_state §7.C/C.6: SHM-assembled whole config (config-as-
+    # state, INV-CFG-7), NOT the retired config_loader merge. Used for the bus
+    # client + Orchestrator [guardian]; build_catalog reads its own sections.
+    from titan_hcl.params import load_titan_params as _load_cfg
     from titan_hcl.core.state_registry import resolve_titan_id as _resolve_id
     from titan_hcl.bus import (
         MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN, MODULE_CRASHED,
@@ -467,7 +470,7 @@ async def run(health_only: bool = False, server_only: bool = False,
     # start_all, so it MUST own the canonical state writer).
     os.environ["TITAN_HCL_STATE_WRITER_CANONICAL"] = "1"
 
-    build_catalog(_orch_bus, _orchestrator, _orch_cfg, titan_id=_orch_titan_id)
+    build_catalog(_orch_bus, _orchestrator, titan_id=_orch_titan_id)
     logging.info(
         "[titan_hcl] module catalog built — %d modules registered",
         len(_orchestrator._modules))

@@ -22,9 +22,13 @@ def test_module_catalog_imports():
 def test_build_catalog_signature_is_phase6_canonical():
     sig = inspect.signature(mc.build_catalog)
     params = list(sig.parameters.keys())
-    assert params[:3] == ["bus", "guardian", "config"], (
-        f"Phase 6 contract: build_catalog(bus, guardian, config, *, titan_id, kernel=None). "
+    # C.6 (RFP_config_as_shm_state §7.C, 2026-06-18): the boot `config` param
+    # is retired — build_catalog reads each section from SHM via get_params.
+    assert params[:2] == ["bus", "guardian"], (
+        f"Contract: build_catalog(bus, guardian, *, titan_id, kernel=None). "
         f"Got: {params}")
+    assert "config" not in sig.parameters, (
+        "C.6: build_catalog must NOT take a boot config dict — reads get_params")
     assert "titan_id" in sig.parameters
     assert "kernel" in sig.parameters
     # kernel must have a default (callers like guardian_hcl pass kernel=None)

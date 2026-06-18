@@ -108,9 +108,18 @@ def _build_catalog_with_all_flags_on() -> Orchestrator:
         "action_narrator": {},
         "kin": {},
     }
-    # build_catalog is a top-level function — invoke it directly.
+    # build_catalog is a top-level function — invoke it directly. Since C.6
+    # (RFP_config_as_shm_state §7.C) it reads each section from SHM via
+    # get_params (no boot config dict); in this no-daemon test we patch
+    # get_params to serve the all-flags-on cfg above.
     from titan_hcl.module_catalog import build_catalog
-    build_catalog(bus, orch, cfg, titan_id="test")
+    import titan_hcl.params as _params
+    _orig = _params.get_params
+    _params.get_params = lambda section: dict(cfg.get(section, {}))
+    try:
+        build_catalog(bus, orch, titan_id="test")
+    finally:
+        _params.get_params = _orig
     return orch
 
 

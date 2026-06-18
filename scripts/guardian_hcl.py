@@ -203,10 +203,15 @@ def run() -> int:
     logger = logging.getLogger(__name__)
 
     # ── Load config + titan_id ───────────────────────────────────────
-    from titan_hcl.config_loader import load_titan_config
+    # RFP_config_as_shm_state §7.C/C.6: the boot config is assembled from the
+    # in-kernel daemon's SHM slots (config-as-state, INV-CFG-7), NOT the retired
+    # config_loader 4-layer file merge. Used locally for the bus client +
+    # Orchestrator/Supervisor [guardian] section; build_catalog no longer takes
+    # it (each ModuleSpec reads its own sections via get_params).
+    from titan_hcl.params import load_titan_params
     from titan_hcl.core.state_registry import resolve_titan_id
 
-    config = load_titan_config()
+    config = load_titan_params()
     titan_id = resolve_titan_id()
     logger.info("[guardian_hcl] booting for titan_id=%s pid=%d", titan_id, os.getpid())
 
@@ -283,7 +288,7 @@ def run() -> int:
 
         # ── Module catalog (51 ModuleSpec registrations) ─────────────
         from titan_hcl.module_catalog import build_catalog
-        build_catalog(bus, orchestrator, config, titan_id=titan_id)
+        build_catalog(bus, orchestrator, titan_id=titan_id)
         logger.info(
             "[guardian_hcl] module catalog built — %d modules registered "
             "(metadata only; titan_hcl owns spawn)",

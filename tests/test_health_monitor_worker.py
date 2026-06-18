@@ -196,9 +196,10 @@ def test_social_x_check_missing_api_key_pipeline_down(monkeypatch):
     # Force secrets-layer to be empty so the plugin truly has no api_key.
     # (Without this, the plugin's secrets-merge fallback would pick up the
     # dev VM's real ~/.titan/secrets.toml[stealth_sage].twitterapi_io_key.)
-    import titan_hcl.config_loader as _cl
-    monkeypatch.setattr(_cl, "load_titan_config",
-                         lambda **kw: {})
+    # C.5/C.6: the plugin resolves secrets via params.load_titan_params (SHM
+    # whole-config), not the retired config_loader.load_titan_config.
+    import titan_hcl.health.social_x as _sx
+    monkeypatch.setattr(_sx, "load_titan_params", lambda **kw: {})
     sx = SocialXHealthCheck({"api_key": "", "user_name": "u"})
     # Use a fake DB path to keep posting layer deterministic + isolated.
     with tempfile.TemporaryDirectory() as tmp:
@@ -653,9 +654,9 @@ def test_social_worker_handle_heal_request_no_gateway_replies_failure():
 def test_social_worker_handle_heal_request_refresh_success(monkeypatch):
     # Phase 1.10: handler now uses gateway._load_config() as canonical
     # resolution. Mock returns the gateway-merged dict shape.
-    import titan_hcl.config_loader as _cl
-    monkeypatch.setattr(_cl, "load_titan_config",
-                         lambda **kw: {})
+    import titan_hcl.modules.social_worker as _sw
+    monkeypatch.setattr(_sw, "get_params", lambda section: {})
+    monkeypatch.setattr(_sw, "load_titan_params", lambda **kw: {})
     from titan_hcl.modules.social_worker import _handle_heal_request
     sq = queue.Queue()
     gw = MagicMock()
@@ -693,9 +694,9 @@ def test_social_x_plugin_resolves_api_key_from_stealth_sage_secrets(
     """Phase 1.5 fix: api_key in [stealth_sage].twitterapi_io_key (the live
     production location) MUST resolve through load_titan_config secrets
     merge when not passed via ctor."""
-    import titan_hcl.config_loader as _cl
+    import titan_hcl.health.social_x as _sx
     monkeypatch.setattr(
-        _cl, "load_titan_config",
+        _sx, "load_titan_params",
         lambda **kw: {"stealth_sage": {
             "twitterapi_io_key": "FAKE_TEST_TOKEN_NOT_REAL_AAA"}})
     sx = SocialXHealthCheck()  # no config — forces secrets path
@@ -704,9 +705,9 @@ def test_social_x_plugin_resolves_api_key_from_stealth_sage_secrets(
 
 def test_social_x_plugin_ctor_config_overrides_secrets(monkeypatch):
     """Ctor-passed config takes precedence over secrets layer."""
-    import titan_hcl.config_loader as _cl
+    import titan_hcl.health.social_x as _sx
     monkeypatch.setattr(
-        _cl, "load_titan_config",
+        _sx, "load_titan_params",
         lambda **kw: {"stealth_sage": {
             "twitterapi_io_key": "FAKE_TEST_TOKEN_NOT_REAL_BBB"}})
     sx = SocialXHealthCheck({"api_key": "FROM_CTOR"})
@@ -717,13 +718,13 @@ def test_social_worker_handle_heal_resolves_from_stealth_sage(monkeypatch):
     """Phase 1.10 fallback: when gateway._load_config raises, handler
     falls through to load_titan_config + stealth_sage.twitterapi_io_key
     resolution chain (mirrors gateway's own production fallback)."""
-    import titan_hcl.config_loader as _cl
-    monkeypatch.setattr(
-        _cl, "load_titan_config",
-        lambda **kw: {"stealth_sage": {
-            "twitterapi_io_key": "FAKE_TEST_TOKEN_NOT_REAL_CCC"},
-            "twitter_social": {
-                "webshare_static_url": "http://proxy.example:80"}})
+    # C.5/C.6: the heal fallback reads params.get_params per-section, not the
+    # retired config_loader.load_titan_config.
+    import titan_hcl.modules.social_worker as _sw
+    _whole = {"stealth_sage": {"twitterapi_io_key": "FAKE_TEST_TOKEN_NOT_REAL_CCC"},
+              "twitter_social": {"webshare_static_url": "http://proxy.example:80"}}
+    monkeypatch.setattr(_sw, "get_params", lambda section: dict(_whole.get(section, {})))
+    monkeypatch.setattr(_sw, "load_titan_params", lambda **kw: dict(_whole))
     from titan_hcl.modules.social_worker import _handle_heal_request
     sq = queue.Queue()
     gw = MagicMock()
@@ -749,9 +750,9 @@ def test_social_worker_handle_heal_resolves_from_stealth_sage(monkeypatch):
 def test_social_worker_handle_heal_request_missing_api_key_replies_failure(
         monkeypatch):
     # Phase 1.10: all 3 resolution layers empty → expect api_key_missing.
-    import titan_hcl.config_loader as _cl
-    monkeypatch.setattr(_cl, "load_titan_config",
-                         lambda **kw: {})
+    import titan_hcl.modules.social_worker as _sw
+    monkeypatch.setattr(_sw, "get_params", lambda section: {})
+    monkeypatch.setattr(_sw, "load_titan_params", lambda **kw: {})
     from titan_hcl.modules.social_worker import _handle_heal_request
     sq = queue.Queue()
     gw = MagicMock()
@@ -778,7 +779,7 @@ def test_discover_plugins_loads_social_x_on_all_titans():
     config = {"social_x": {"api_key": "K", "user_name": "u"}}
     # All 3 Titans should load social_x.
     for tid in ("T1", "T2", "T3"):
-        plugins = _discover_plugins(tid, config)
+        plugins = _discover_plugins(tid)  # C.6: reads sections via get_params
         names = {p.name for p in plugins}
         assert "social_x" in names, f"social_x missing on {tid}"
 
@@ -797,6 +798,6 @@ def test_discover_plugins_applies_on_canonical_poller_still_filters():
     # health_monitor_worker logic itself — kept here as contract sentinel.)
     config = {"social_x": {"canonical_poller_titan_id": "T1",
                             "api_key": "K", "user_name": "u"}}
-    plugins = _discover_plugins("T1", config)
+    plugins = _discover_plugins("T1")  # C.6: reads sections via get_params
     names = {p.name for p in plugins}
     assert "social_x" in names

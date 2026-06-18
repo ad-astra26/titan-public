@@ -86,8 +86,7 @@ _JOURNAL_ROTATED = "events.jsonl.1"
 # ── Plugin discovery ─────────────────────────────────────────────────
 
 
-def _discover_plugins(titan_id: str,
-                       config: dict) -> list[HealthCheckPlugin]:
+def _discover_plugins(titan_id: str) -> list[HealthCheckPlugin]:
     """Import every `titan_hcl.health.*` submodule, find every
     concrete HealthCheckPlugin subclass, filter by applies_on, instantiate.
 
@@ -105,7 +104,7 @@ def _discover_plugins(titan_id: str,
         "canonical_poller_titan_id", "T1")
     is_canonical_poller = (canonical_poller == ""
                            or canonical_poller == titan_id)
-    mainnet_cluster = ((config or {}).get("solana") or {}).get(
+    mainnet_cluster = (get_params("solana") or {}).get(
         "cluster", "")
     is_mainnet = mainnet_cluster == "mainnet-beta"
 
@@ -146,11 +145,12 @@ def _discover_plugins(titan_id: str,
             # Per-plugin config dict — config.toml [health_monitor.<name>]
             # AND fall through to top-level [<owning_section>] for legacy
             # keys (social_x reads from [social_x] for db/key resolution).
-            plugin_cfg = (((config or {}).get("health_monitor") or {})
+            # C.6: each section read fresh from its SHM slot via get_params.
+            plugin_cfg = ((get_params("health_monitor") or {})
                           .get(cls.name) or {})
-            # Pass the FULL config too — plugins may need to resolve
-            # owning-section keys (e.g. social_x reads [social_x]).
-            merged_cfg = dict((config or {}).get(cls.name, {}))
+            # Pull the plugin's own top-level [<cls.name>] section too —
+            # plugins may need owning-section keys (e.g. social_x reads [social_x]).
+            merged_cfg = dict(get_params(cls.name) or {})
             merged_cfg.update(plugin_cfg)
             # Special: social_x plugin needs the [social_x] section
             # for api_key/user_name/db_path resolution.
@@ -633,7 +633,7 @@ def health_monitor_worker_main(recv_queue, send_queue, name: str,
     hb_thread.start()
 
     # === Plugin discovery + state load ===
-    plugins = _discover_plugins(titan_id, config)
+    plugins = _discover_plugins(titan_id)
     state_path = _state_dir() / _STATE_FILE
     journal_path = _state_dir() / _JOURNAL_FILE
     saved_state = _load_state(state_path)

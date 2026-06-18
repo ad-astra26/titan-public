@@ -253,8 +253,16 @@ def _build_catalog_with_all_flags_on() -> Orchestrator:
         "action_narrator": {},
         "kin": {},
     }
+    # C.6 (RFP_config_as_shm_state §7.C): build_catalog reads each section from
+    # SHM via get_params (no boot config dict). Patch it to serve cfg here.
     from titan_hcl.module_catalog import build_catalog
-    build_catalog(bus, orch, cfg, titan_id="test")
+    import titan_hcl.params as _params
+    _orig = _params.get_params
+    _params.get_params = lambda section: dict(cfg.get(section, {}))
+    try:
+        build_catalog(bus, orch, titan_id="test")
+    finally:
+        _params.get_params = _orig
     return orch
 
 
