@@ -2111,8 +2111,9 @@ class TitanKernel:
         """Read-only view of the loaded config.
 
         Plugin + upper-layer read access. Kernel owns the canonical dict;
-        mutation is discouraged. For hot-reload flows (CONFIG_RELOAD bus
-        message), mutation happens via dedicated reload paths, not here.
+        mutation is discouraged. Hot config changes flow via SHM now (the
+        kernel config daemon re-seeds per-section slots on a config edit;
+        workers re-apply on heartbeat) — see RFP_config_as_shm_state.
         """
         return self._config
 

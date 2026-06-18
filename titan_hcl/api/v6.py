@@ -388,8 +388,8 @@ _T = (
      None, "commands.reload", (), ("kernel",), False, "/v4/reload"),
     ("/v6/admin/reload-api", "POST", "post_v4_reload_api", "admin", "admin",
      None, "commands.reload_api", (), ("kernel",), False, "/v4/reload-api"),
-    ("/v6/admin/reload-config", "POST", "post_v4_reload_config", "admin", "admin",
-     None, "commands.reload_config", (), ("kernel",), False, "/v4/reload-config"),
+    # /v6/admin/reload-config RETIRED — RFP_config_as_shm_state §7.C/C.1 (2026-06-18):
+    # config is SHM-state, the kernel daemon hot-reseeds slots on a config edit (no endpoint).
     ("/v6/admin/restart-module/{name}", "POST", "post_v4_restart_module", "admin", "admin",
      None, "commands.restart_module", (), ("guardian",), False, "/v4/admin/restart-module/{name}"),
     ("/v6/admin/reload-module/{name}", "POST", "post_v4_reload_module", "admin", "admin",

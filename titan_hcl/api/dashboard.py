@@ -4687,36 +4687,14 @@ async def post_v4_reload_api(request: Request):
         return _error(str(e))
 
 
-# ---------------------------------------------------------------------------
-# POST /v4/reload-config — Hot-reload titan_params.toml without restart
-# ---------------------------------------------------------------------------
-async def post_v4_reload_config(request: Request):
-    """Reload titan_params.toml into running spirit worker. No consciousness gap."""
-    titan_state = _get_plugin(request)
-    plugin = titan_state  # backward-compat alias for Category C callsites
-    try:
-        import tomllib
-        with open("titan_hcl/titan_params.toml", "rb") as f:
-            new_params = tomllib.load(f)
-        from ..bus import make_msg
-        titan_state.bus.publish(make_msg(bus.CONFIG_RELOAD, "api", "spirit", new_params))
-        # §G5.2 item 5 (D-SPEC-112) — re-publish the trinity-restoring sidecar so
-        # the 6 Rust trinity daemons pick up updated [trinity_restoring] gains
-        # on their next ~1 s retry-load (no restart). Surface failures.
-        try:
-            from titan_hcl.logic.trinity_restoring_publisher import (
-                publish_trinity_restoring_cfg,
-            )
-            publish_trinity_restoring_cfg()
-        except Exception as _e:
-            logger.exception(
-                "[Dashboard] /v4/reload-config: trinity_restoring republish failed: %s",
-                _e,
-            )
-        return _ok({"status": "config_reloaded", "sections": list(new_params.keys())})
-    except Exception as e:
-        logger.error("[Dashboard] /v4/reload-config error: %s", e)
-        return _error(str(e))
+# POST /v4/reload-config — RETIRED (RFP_config_as_shm_state §7.C/C.1, 2026-06-18).
+# Config is SHM-state: the in-kernel config daemon hot-reseeds per-section slots on any
+# config.toml / titan_params.toml / secrets.toml edit (mtime watch); workers re-apply on
+# their heartbeat (params.poll_config_reloads). The old endpoint published a dead
+# CONFIG_RELOAD (no subscriber) + re-read titan_params.toml directly. Its one live
+# side-effect — the trinity-restoring sidecar republish — is re-homed as a
+# register_config_reload("trinity_restoring", …) hot callback in the kernel-spawned
+# orchestrator process (scripts/titan_hcl.py), firing on a trinity_restoring slot bump.
 
 
 # ---------------------------------------------------------------------------

@@ -576,7 +576,10 @@ RELOAD = "RELOAD"          # Request worker module reload
 # after restart instead of a separate COMPLETE signal. Kept for future
 # two-phase reload protocol (request → confirm distinct from ready).
 RELOAD_COMPLETE = "RELOAD_COMPLETE"  # Worker confirms reload success
-CONFIG_RELOAD = "CONFIG_RELOAD"  # Hot-reload titan_params.toml without restart
+# CONFIG_RELOAD retired — RFP_config_as_shm_state §7.C/C.1 (2026-06-18). Config is
+# SHM-state now: the in-kernel config daemon hot-reseeds per-section slots on a config
+# edit (mtime watch); workers re-apply on heartbeat. There was no subscriber — the old
+# publish targeted a dead dst="spirit". No bus reload message exists anymore.
 
 # Microkernel v2 Phase A §A.4 (S5) — kernel→api WebSocket bridge
 # Replaces direct plugin.event_bus.emit() calls when the API runs as a

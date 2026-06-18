@@ -539,13 +539,10 @@ class CommandRegistry:
             new_raw = pattern.sub(replacement, raw, count=1)
             config_path.write_text(new_raw, encoding="utf-8")
 
-            # Signal hot-reload
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.post(f"{self.titan_url}/maker/reload-config",
-                                      headers={"X-Titan-Internal-Key": _get_internal_key()})
-            except Exception:
-                pass  # Best-effort reload
+            # Hot-reload is automatic now (RFP_config_as_shm_state §7.C): the in-kernel
+            # config daemon watches config.toml's mtime and re-seeds the affected SHM
+            # section slots within ~1s; workers re-apply on their heartbeat. No reload
+            # signal is sent (the old POST /maker/reload-config had no route — it 404'd).
 
             return f"Updated [{section_name}] {key} = {_mask_sensitive(key, new_val)}"
 

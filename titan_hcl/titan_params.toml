@@ -3161,9 +3161,10 @@ reasoning = "data/reasoning_cgn/state_snapshot.json"
 # All flags default FALSE except layer_tagging_enabled. Code lands
 # byte-identical to pre-microkernel behavior until Maker flips a flag.
 # Flag flips are done per-Titan (T2 first, T3, T1 last per meta_teacher
-# soak) via CONFIG_RELOAD (no restart needed for most flags).
+# soak) by editing config — the kernel config daemon hot-reseeds the slot;
+# no restart needed for `hot` flags (RFP_config_as_shm_state).
 #
-# Rollback at any time: flip flag back to false + CONFIG_RELOAD.
+# Rollback at any time: flip flag back to false (daemon hot-reseeds).
 # ═══════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3569,7 +3570,7 @@ spawn_reference_worker_enabled = true
 # Enables /v4/maker/shadow-swap endpoint + kernel.shadow_swap_orchestrate.
 # Default OFF — endpoint refuses with "shadow_swap_enabled_flag_off" until
 # Maker flips to true (per-Titan, T2 first soak per cautious deploy plan).
-# CONFIG_RELOAD honors this flag (kernel reads on each orchestrator call).
+# The kernel config daemon hot-reseeds this flag's slot on a config edit.
 shadow_swap_enabled = true    # FLIPPED 2026-04-26 — B.1 first deploy test on T1
 
 # ── Phase B.2 — Bus IPC Migration (workers outlive kernel swap) ────

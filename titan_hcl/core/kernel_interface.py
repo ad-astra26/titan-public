@@ -120,8 +120,9 @@ class KernelView(Protocol):
     @property
     def config(self) -> dict:
         """Read-only view of the full merged config (config.toml +
-        ~/.titan/secrets.toml). Mutation is discouraged; use the
-        CONFIG_RELOAD bus message path for dynamic updates.
+        ~/.titan/secrets.toml). Mutation is discouraged; dynamic updates
+        flow via SHM (the kernel config daemon re-seeds slots on a config
+        edit; workers re-apply on heartbeat) — see RFP_config_as_shm_state.
         """
         ...
 

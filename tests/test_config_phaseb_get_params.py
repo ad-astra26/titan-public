@@ -104,3 +104,24 @@ def test_reload_callback_fires_on_version_bump(shm):
 def test_poll_never_raises_without_slot(shm):
     params.register_config_reload("nonexistent", lambda d: None)
     assert params.poll_config_reloads() == []  # no slot → no fire, no raise
+
+
+def test_trinity_restoring_rehome_fires_publisher_on_bump(shm):
+    """C.1 (§7.C): the trinity-restoring sidecar republish — formerly triggered by the
+    now-retired /v4/reload-config endpoint — is re-homed as a heartbeat config-watch
+    callback. This is the EXACT wiring scripts/titan_hcl.py installs at boot: a
+    trinity_restoring slot version bump must re-run the publisher (so the 6 Rust trinity
+    daemons pick up edited [trinity_restoring] gains with no restart)."""
+    w = _write_slot(shm, "trinity_restoring", {"body": {"k_drive": 0.5}})
+    calls = []
+    params.register_config_reload("trinity_restoring", lambda _new: calls.append(1))
+
+    params.poll_config_reloads()  # establish baseline version
+    calls.clear()
+    assert params.poll_config_reloads() == []  # no edit → no republish
+    assert calls == []
+
+    # operator edits [trinity_restoring].body.k_drive → daemon bumps the slot
+    w.write_variable(msgpack.packb({"body": {"k_drive": 0.9}}, use_bin_type=True))
+    assert params.poll_config_reloads() == ["trinity_restoring"]
+    assert calls == [1]  # sidecar republished

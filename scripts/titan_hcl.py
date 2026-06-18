@@ -541,10 +541,21 @@ async def run(health_only: bool = False, server_only: bool = False,
             publish_trinity_restoring_cfg,
         )
         publish_trinity_restoring_cfg()
+        # RFP_config_as_shm_state §7.C/C.1 — re-home the trinity-restoring republish as a
+        # hot config callback (replaces the retired /v4/reload-config endpoint). This
+        # long-lived kernel-spawned orchestrator process is the natural host (trinity_restoring
+        # schema owner=kernel): when the config daemon bumps the trinity_restoring slot on a
+        # config edit, the heartbeat config-watch re-runs publish_trinity_restoring_cfg, so the
+        # 6 Rust trinity daemons pick up the new gains within ~1s — no restart.
+        from titan_hcl import params as _params
+        _params.register_config_reload(
+            "trinity_restoring", lambda _new: publish_trinity_restoring_cfg()
+        )
+        _params.start_config_watch()
     except Exception as _e:
         logging.exception(
-            "[trinity_restoring] publish failed; daemons will run on crate "
-            "DEFAULT_* gains until next CONFIG_RELOAD: %s",
+            "[trinity_restoring] publish/watch setup failed; daemons will run on crate "
+            "DEFAULT_* gains until the next restart: %s",
             _e,
         )
 
