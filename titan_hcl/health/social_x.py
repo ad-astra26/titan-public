@@ -162,6 +162,19 @@ class SocialXHealthCheck(HealthCheckPlugin):
 
     def _check_pipeline(self) -> HealthResult:
         """Hit twitterapi.io with X-API-Key only — no session, no mutation."""
+        # Master hibernation (2026-06-18): while the account is on X review hold,
+        # don't spend even the user/info probe credit. Sentinel = data/.x_hibernate.
+        import os
+        try:
+            _sentinel = os.path.join(os.path.dirname(__file__), "..", "..",
+                                     "data", ".x_hibernate")
+            if os.path.exists(_sentinel):
+                return HealthResult(
+                    plugin=self.name, layer="pipeline", status="OK",
+                    reason="hibernated (X review hold — probe skipped)",
+                    details={"hibernated": True}, heal_recommended=False)
+        except Exception:
+            pass
         if not self._api_key:
             return HealthResult(
                 plugin=self.name, layer="pipeline", status="DOWN",

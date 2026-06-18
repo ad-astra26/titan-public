@@ -104,6 +104,32 @@ def test_default_write_enabled(gw, monkeypatch):
     assert gw._write_block_reason() == ""          # default ON, not suspended
 
 
+# ── Master hibernation: zero twitterapi.io spend on a dead account ──────────
+
+def test_hibernation_sentinel_blocks_all_calls(gw, tmp_path, monkeypatch):
+    sent = tmp_path / ".x_hibernate"
+    monkeypatch.setattr(gw, "x_api_hibernated", lambda: sent.exists())
+    # not hibernated → a write block reason is empty (default)
+    monkeypatch.setattr(gw_mod, "get_params", lambda s=None: {})
+    assert gw._write_block_reason() == ""
+    # hibernated → both reads and writes refuse before any API call
+    sent.write_text("")
+    assert "hibernated" in gw._write_block_reason()
+    r = gw._call_x_api("twitter/user/mentions", "GET", {})
+    assert r.get("status") == "disabled"
+    rw = gw._call_x_api("twitter/create_tweet_v2", "POST", {"tweet_text": "x"})
+    assert rw.get("status") == "disabled"
+
+
+def test_hibernation_via_config_flag(gw, monkeypatch):
+    monkeypatch.setattr(gw_mod, "get_params", lambda s=None: {
+        "api_enabled": False} if s == "social_x" else {})
+    # config api_enabled=false (no sentinel) → hibernated
+    import os
+    monkeypatch.setattr(os.path, "exists", lambda p: False)
+    assert gw.x_api_hibernated() is True
+
+
 # ── Fix 4 (single-owner poll): deterministic single owner of the account ────
 
 def test_single_account_owner_for_mention_poll():

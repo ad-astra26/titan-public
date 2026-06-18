@@ -1061,6 +1061,8 @@ class SocialXGateway:
         under [twitter_social].auth_session. Returns empty string on failure.
         """
         import httpx
+        if self.x_api_hibernated():
+            return ""   # account hibernated → never spend a login credit
         try:
             from titan_hcl.params import load_titan_params as load_titan_config
             full_cfg = load_titan_params()
@@ -1192,10 +1194,36 @@ class SocialXGateway:
         except Exception:
             return True
 
+    def x_api_hibernated(self) -> bool:
+        """Master hibernation — when True, the SOLE twitterapi.io caller refuses
+        EVERY call (reads AND writes), so the subsystem costs ZERO credits. Used
+        while the shared @your_x_handle account is on a months-long X review hold:
+        no point polling mentions / searching / probing for a dead account.
+
+        Flipped by EITHER a sentinel file `data/.x_hibernate` (live, no restart,
+        no config-schema churn — `touch` to hibernate, `rm` to wake) OR config
+        `[social_x].api_enabled = false`. Default = NOT hibernated."""
+        import os
+        try:
+            sentinel = os.path.join(os.path.dirname(__file__), "..", "..",
+                                    "data", ".x_hibernate")
+            if os.path.exists(sentinel):
+                return True
+        except Exception:
+            pass
+        try:
+            return not bool((get_params("social_x") or {}).get(
+                "api_enabled", True))
+        except Exception:
+            return False
+
     def _write_block_reason(self) -> str:
-        """Non-empty reason if writes are currently blocked (kill-switch OR an
-        active auto-suspension), else "". Checked at every write entry so a
-        blocked write costs ZERO twitterapi.io credits."""
+        """Non-empty reason if writes are currently blocked (hibernation OR
+        kill-switch OR an active auto-suspension), else "". Checked at every
+        write entry so a blocked write costs ZERO twitterapi.io credits — and
+        short-circuits BEFORE compose/media-upload."""
+        if self.x_api_hibernated():
+            return "X API hibernated (account on X review hold)"
         if not self._write_enabled():
             return "write_enabled=false (kill-switch)"
         if self._write_suspended_until > time.time():
@@ -1338,6 +1366,12 @@ class SocialXGateway:
                 self._cache_stats["misses"] += 1
         else:
             self._cache_stats["writes_skipped_no_cache"] += 1
+
+        # ── Master hibernation: refuse ALL twitterapi.io calls (reads+writes) ──
+        # while the account is dead (X review hold). Zero credits, sole caller.
+        if self.x_api_hibernated():
+            return {"status": "disabled",
+                    "message": "X API hibernated (account on X review hold)"}
 
         # ── Circuit breaker check (per-domain: write=POST, read=GET) ──
         is_write = (method == "POST")
