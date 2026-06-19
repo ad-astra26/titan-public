@@ -1242,11 +1242,19 @@ class TitanHCL:
         logger.info("[TitanHCL] IMPULSE received: #%d posture=%s urgency=%.2f",
                     impulse_id, posture, payload.get("urgency", 0))
 
+        # Failure-replay revisit (EEL-B2 / mastery §7.P9) BYPASSES the spontaneous-
+        # impulse rate limit: it is a DELIBERATE, self-throttled background action
+        # (the synthesis driver already gates cadence via failure_replay_interval_s +
+        # one-problem-per-tick + the chat-pause), NOT a spirit-driven spontaneous
+        # impulse the InterfaceAdvisor exists to throttle. Without this skip the
+        # limit=1 oracle dropped every revisit (soak finding 2026-06-19: agency
+        # received the revisit IMPULSE but rate-limited it → the corrector never ran).
+        _is_revisit = isinstance(payload.get("_revisit"), dict)
         # Rate check via SHM-rate-oracle (v1.8.5 §4.H, D-SPEC-59).
         # InterfaceAdvisor lives in interface_advisor_worker subprocess;
         # parent reads SHM snapshot sub-µs + (on within-limits) emits
         # IMPULSE_RECEIVED to worker so it records the timestamp + republishes.
-        if self._interface_advisor_reader:
+        if self._interface_advisor_reader and not _is_revisit:
             feedback = self._interface_advisor_reader.check(IMPULSE, source="spirit")
             if feedback:
                 # Phase D (D-SPEC-116): the RATE_LIMIT→spirit notify emit was
