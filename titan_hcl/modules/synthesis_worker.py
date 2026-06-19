@@ -814,7 +814,12 @@ def _failure_revisit_loop(failed_store: Any, stop_event: threading.Event,
                         "helper": fa.get("helper") or "",
                     },
                 }
-                _send(send_queue, bus.IMPULSE, name, "agency", payload)
+                # dst="all" (broadcast) — the plugin's `_agency_loop` consumes
+                # IMPULSE broadcasts (exactly like ns_module's ImpulseEngine);
+                # dst="agency" would route to the reply_only agency_worker, which
+                # DROPS non-QUERY messages → the corrector would never run (soak
+                # finding 2026-06-19: the revisit stuck in_progress).
+                _send(send_queue, bus.IMPULSE, name, "all", payload)
                 logger.info(
                     "[synthesis_worker][fail-replay] dispatched revisit problem=%s "
                     "helper=%s goal_class=%s (revisit #%d)",
