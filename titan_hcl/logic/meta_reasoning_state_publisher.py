@@ -163,6 +163,9 @@ class MetaReasoningStatePublisher(BaseStatePublisher):
                             meta_cgn_payload[_k] = _rich[_k]
         except Exception:
             pass
+        _div = audit.get("diversity", {}) or {}
+        if not isinstance(_div, dict):
+            _div = {}
         return {
             "total_meta_chains": int(audit.get("total_meta_chains", 0) or 0),
             "total_introspect_picks": int(
@@ -172,6 +175,23 @@ class MetaReasoningStatePublisher(BaseStatePublisher):
             "monoculture_score": float(
                 monoc.get("dominant_share_500", 0.0) or 0.0),
             "primitive_distribution": prim_dist,
+            # RFP_cgn_loop_closure (G6) — grounded-V Option-β selection + M3
+            # matrix-seed live counters + chain diversity, surfaced SHM-direct
+            # (G18) so the working /v6/cognition/meta-reasoning readout carries
+            # them (schema v3). These already exist in get_audit_stats() but were
+            # never copied into the slot, so _g_sel_fires was unobservable.
+            "grounded_v_selection_enabled": bool(
+                audit.get("grounded_v_selection_enabled", False)),
+            "grounded_v_selection_fires": int(
+                audit.get("grounded_v_selection_fires", 0) or 0),
+            "matrix_seed_enabled": bool(audit.get("matrix_seed_enabled", False)),
+            "matrix_seed_fires": int(audit.get("matrix_seed_fires", 0) or 0),
+            "diversity": {
+                "unique_prims_ema_50chains": round(float(
+                    _div.get("unique_prims_ema_50chains", 0.0) or 0.0), 3),
+                "current_epsilon": round(float(
+                    _div.get("current_epsilon", 0.0) or 0.0), 3),
+            },
             "last_chain_id": int(audit.get("last_chain_id", 0) or 0),
             "last_chain_reason": str(audit.get("last_chain_reason", "") or ""),
             "last_chain_succeeded": bool(audit.get("last_chain_succeeded", False)),
@@ -218,6 +238,12 @@ class MetaReasoningStatePublisher(BaseStatePublisher):
             "total_introspect_executions": 0,
             "monoculture_score": 0.0,
             "primitive_distribution": {},
+            "grounded_v_selection_enabled": False,
+            "grounded_v_selection_fires": 0,
+            "matrix_seed_enabled": False,
+            "matrix_seed_fires": 0,
+            "diversity": {"unique_prims_ema_50chains": 0.0,
+                          "current_epsilon": 0.0},
             "last_chain_id": 0,
             "last_chain_reason": "",
             "last_chain_succeeded": False,
