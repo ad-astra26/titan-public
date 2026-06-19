@@ -286,16 +286,45 @@ class GeneralizedHAOVTracker:
         return h
 
     def hypothesize_from_impasse(self, impasse: dict) -> Optional[GeneralizedHypothesis]:
-        """SOAR bridge: generate hypothesis targeting stuck area."""
+        """SOAR bridge: generate a hypothesis targeting a stuck area.
+
+        RFP_cgn_loop_closure §7.D-A1: a *plateau* impasse is ABOUT a specific
+        concept — detect_impasse records it as ``impasse["concept"]`` — but this
+        bridge historically dropped it, so the verified rule was contentless
+        ("consumer plateaued") with no handle on WHICH concept. Carry the
+        concept into ``action_context`` (topic+concept, mirroring the causal
+        path at cgn.py:673) AND a concept-specific ``rule_name`` so the rule is a
+        genuine concept-grounding rule: ``suggest()`` returns a concept-tagged
+        ``action_context`` when it applies the rule, and ``get_cross_insights``
+        shares "consumer plateaued on concept X" with peers (the cross-consumer
+        enrichment, §7.D-C).
+
+        NOTE (verification is intentionally unchanged): impasse-sourced rules are
+        verified IN-PROCESS by ``verify_impasse_resolution`` via
+        ``_local_haov_verify`` (cgn_worker), which keys on ``impasse_type`` and
+        ignores ``topic`` — they never reach the knowledge domain verifier
+        (Phase-1a routing). So this enriches the rule's CONTENT for apply +
+        cross-consumer sharing, NOT its verification. ``stuck``/``declining``
+        impasses are consumer-wide (no concept) → unchanged.
+        """
         imp_type = impasse.get("type", "stuck")
         severity = impasse.get("severity", 0.5)
+        concept = impasse.get("concept")
+
+        action_context = {"impasse_type": imp_type}
+        if concept:
+            action_context["topic"] = str(concept)
+            action_context["concept"] = str(concept)
+            rule_name = f"{self._consumer}_plateau_{concept}"
+        else:
+            rule_name = f"{self._consumer}_impasse_{imp_type}"
 
         return self.hypothesize(
-            action_context={"impasse_type": imp_type},
+            action_context=action_context,
             observation={
                 "effect": f"resolve_{imp_type}",
                 "magnitude": severity,
-                "rule_name": f"{self._consumer}_impasse_{imp_type}",
+                "rule_name": rule_name,
                 "source": "soar_impasse",
             },
         )
