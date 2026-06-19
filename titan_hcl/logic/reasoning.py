@@ -1325,7 +1325,13 @@ class ReasoningEngine:
         self._rr_horizon_entire = float(_rr.get("mech_a_horizon_entire", 0.4))
         self._rr_horizon_last_k = float(_rr.get("mech_a_horizon_last_k", 0.6))
         self._rr_horizon_k = int(_rr.get("mech_a_horizon_k", 3))
-        self._rr_cgn_threshold = float(_rr.get("cgn_emission_threshold", 0.55))
+        # §7.D-A2: default 0.55 STARVED reasoning_strategy (live commits hover
+        # ~0.47 < 0.55 → the payload was NEVER produced → consumer formed=0). CGN
+        # is fully IQL — the value learner needs the WHOLE commit-reward
+        # distribution, not a pre-filter to high-reward strategies; COMMIT is
+        # already the success gate. Default 0.0 = ground every commit (reward is
+        # the IQL training signal, not a threshold). Still config-overridable.
+        self._rr_cgn_threshold = float(_rr.get("cgn_emission_threshold", 0.0))
 
         # Mechanism A — sequence-quality EMA store
         self.seq_quality_store = SequenceQualityStore(
@@ -1817,11 +1823,12 @@ class ReasoningEngine:
                 if self._total_chains % 20 == 0:
                     logger.warning("[Reasoning/StepPersist] %s", e)
 
-        # rFP α §2b — CGN reasoning_strategy emission prep.
-        # On COMMIT with outcome_score > cgn_emission_threshold (default 0.55),
-        # attach a payload to the conclusion dict. The CALLER (spirit_worker)
-        # is responsible for actually emitting on the bus — reasoning engine
-        # has no bus handle. META-CGN observes via normal CGN→META flow (D16).
+        # rFP α §2b / §7.D-A2 — CGN reasoning_strategy emission prep.
+        # On every COMMIT (outcome_score >= cgn_emission_threshold, default 0.0),
+        # attach a payload (incl. the 30D state_embedding_tier1) to the conclusion
+        # dict. The CALLER (cognitive_worker, post-D8-3 spirit retirement — NOT
+        # spirit_worker) emits the IQL-complete CGN_TRANSITION on the bus
+        # (cognitive_worker:~4382). META-CGN observes via normal CGN→META (D16).
         if action == "COMMIT" and self._rr_enabled:
             try:
                 if reward >= self._rr_cgn_threshold:

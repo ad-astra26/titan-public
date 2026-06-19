@@ -4378,11 +4378,25 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                                 # this restoration matches the current fleet
                                 # convention to keep the migration regression
                                 # closure scope-tight.
+                                # §7.D-A2 IQL-complete wiring: CGN is fully IQL
+                                # (cgn_iql_enabled) — the transition MUST carry the
+                                # informative `state` (the 30D tier1 embedding the
+                                # producer already computed) + `action` so the
+                                # per-consumer ConsumerQNet/V actually trains.
+                                # Previously the state rode only in outcome_context
+                                # → the IQL learner saw no state (reasoning_strategy
+                                # stayed formed=0). reasoning_strategy is
+                                # consumer-only (action_dims=1, ["observe"]) → idx 0.
+                                _rs_state = _cgn_payload.get(
+                                    "state_embedding_tier1") or []
                                 _send_msg(
                                     send_queue, "CGN_TRANSITION", name, "cgn", {
-                                        "type": "experience",  # (b) complete transition → record_experience → observe_for (DEFERRED G1)
+                                        "type": "experience",  # complete transition → record_experience → observe_for + IQL train
                                         "consumer": "reasoning_strategy",
                                         "concept_id": _cgn_concept,
+                                        "state": _rs_state,
+                                        "action": 0,
+                                        "action_params": [0.0, 0.0, 0.0, 0.0],
                                         "reward": float(_cgn_payload.get(
                                             "outcome_score", 0.0)),
                                         "outcome_context": _cgn_payload,

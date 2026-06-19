@@ -1117,7 +1117,7 @@ threshold_cross_bonus = 0.1           # one-shot per chain
 threshold_cross_point = 0.6           # confidence value that triggers bonus
 
 # CGN emission (rFP §2b)
-cgn_emission_threshold = 0.55         # outcome_score threshold for reasoning_strategy emit
+cgn_emission_threshold = 0.0          # §7.D-A2: ground reasoning_strategy on EVERY commit (live commits ~0.47 < old 0.55 → starved formed=0). CGN fully IQL → value learner needs the whole commit-reward distribution; COMMIT is already the success gate. reward = IQL signal, not a filter. hot-reload.
 cgn_state_embedding_dim = 30          # tier1 dim (D15 lock)
 
 # Step-snapshot persistence (D3+D18 — warm-start path for Mechanism B)
