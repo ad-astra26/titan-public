@@ -400,13 +400,27 @@ def _maybe_emit_autonomous_experience(
         if verdict is None:
             return  # judge LLM miss → stays untrained (no false-positive reward)
         solved = bool(verdict.get("solved"))
-        # Apply the source weight HERE (the v1.1 direct path does NOT apply
-        # `*_reward_weight` — only the join path does), so task_completion stays a
-        # live, user-tunable trust dial on LLM-judge-backed autonomous experience
-        # (down-weight it < 1 relative to chat-oracle rewards). autonomous_oracle
-        # (the deterministic P9 case) applies its own weight when P9 emits it.
-        weight = float(sl.get("task_completion_reward_weight", 1.0))
-        reward = (float(verdict.get("confidence", 1.0)) if solved else -0.5) * weight
+        # ── Unified failure-replay (EEL-B2 / P9) — is this a REVISIT of a stored
+        # past failure? (the IMPULSE→intent carried `_revisit`). A solved revisit is
+        # the highest-signal experience → BOOSTED reward; a known_target verdict is a
+        # deterministic oracle (rank-3 `autonomous_oracle`). RFP_emergent_mastery §7.P9.
+        revisit = intent.get("_revisit") if isinstance(intent, dict) else None
+        is_revisit = isinstance(revisit, dict)
+        known_target = (revisit or {}).get("known_target")
+        gc = (revisit or {}).get("goal_class") or gc
+        task_shape = action_name  # the means signature for the corrected skill cell
+        # Source + magnitude. (The v1.1 direct path applies `*_reward_weight` HERE —
+        # the join path does it instead; so weighting stays a live trust dial.)
+        if is_revisit and solved:
+            source = "autonomous_oracle" if known_target else "task_completion"
+            wkey = ("autonomous_oracle_reward_weight" if known_target
+                    else "task_completion_reward_weight")
+            reward = float(sl.get("failure_replay_solved_reward", 1.0)) * float(
+                sl.get(wkey, 1.0))
+        else:
+            source = "task_completion"
+            weight = float(sl.get("task_completion_reward_weight", 1.0))
+            reward = (float(verdict.get("confidence", 1.0)) if solved else -0.5) * weight
         send_queue.put({
             "type": bus.SELF_LEARN_REWARD, "src": name, "dst": "self_learning",
             "payload": {
@@ -414,18 +428,54 @@ def _maybe_emit_autonomous_experience(
                 "action": int(action_idx),
                 "reward": float(reward),
                 "goal_class": gc,
-                "source": "task_completion",
+                "source": source,
             },
             "ts": time.time(),
         })
-        logger.info("[AgencyWorker][P8] autonomous %s → solved=%s reward=%+.2f "
+        logger.info("[AgencyWorker][P8%s] autonomous %s → solved=%s reward=%+.2f "
                     "attempts=%d (engagement-independent IQL experience)",
-                    action_name, solved, reward, attempts)
-        if not solved:
-            # P9 (failed-attempts store) not built yet → the NEGATIVE reward IS
-            # emitted (not a stub); log the unresolved problem for P9 to later mine.
-            logger.info("[AgencyWorker][P8] unresolved after %d attempts (P9 enqueue "
-                        "pending P9 build): %s", attempts, problem[:80])
+                    "/revisit" if is_revisit else "", action_name, solved, reward,
+                    attempts)
+        if is_revisit:
+            # Report the revisit outcome → synthesis (Sink 1: anchor the corrected
+            # skill cell + mark resolved; or bump/abandon). The boosted IQL reward
+            # (Sink 2) already rode the SELF_LEARN_REWARD emit above.
+            send_queue.put({
+                "type": bus.FAILED_ATTEMPT_REVISIT_RESULT, "src": name,
+                "dst": "synthesis",
+                "payload": {
+                    "problem_id": revisit.get("problem_id"),
+                    "solved": solved,
+                    "oracle_id": source,
+                    "goal_class": gc,
+                    "task_shape": task_shape,
+                    "evidence": evidence[:2000],
+                    "correction": str(verdict.get("correction") or ""),
+                },
+                "ts": time.time(),
+            })
+        elif not solved:
+            # A NEW autonomous failure the corrector couldn't solve → queue it into
+            # the synthesis-owned failed_attempts store for an idle revisit (replaces
+            # the old "P9 enqueue pending" stub). The NEGATIVE reward already fired.
+            intent_seed = {k: intent.get(k) for k in (
+                "posture", "source_layer", "source_dims", "deficit_values")
+                if isinstance(intent, dict) and intent.get(k) is not None}
+            send_queue.put({
+                "type": bus.FAILED_ATTEMPT_ENQUEUE, "src": name, "dst": "synthesis",
+                "payload": {
+                    "problem": problem,
+                    "goal_class": gc,
+                    "action": action_name,
+                    "helper": str(helper or ""),
+                    "intent_seed": intent_seed,
+                    "features": list(feats.to_vector().tolist()),
+                    "attempt_history": [{"evidence": evidence[:2000],
+                                         "correction": str(verdict.get("correction") or "")}],
+                    "why_failed": str(verdict.get("correction") or "unsolved after retries"),
+                },
+                "ts": time.time(),
+            })
     except Exception as e:  # noqa: BLE001 — never break the agency loop
         logger.debug("[AgencyWorker][P8] autonomous experience skipped: %s", e)
 

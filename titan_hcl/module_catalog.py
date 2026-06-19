@@ -1278,6 +1278,11 @@ def build_catalog(bus, guardian, *, titan_id: str, kernel=None) -> None:
             # RFP_synthesis_self_learning_meta_reasoning v1.1 (S2) — the self_learning
             # worker's distilled macro-strategy → write the Reasoning node under Self.
             _bus_constants.SELF_LEARN_MACRO_READY,
+            # Unified failure-replay loop (EEL-B2 / mastery §7.P9) — agency's P8.2
+            # corrector → enqueue a new failure / report a revisit outcome. Synthesis
+            # owns the failed_attempts store + the revisit driver (INV-Syn-19).
+            _bus_constants.FAILED_ATTEMPT_ENQUEUE,
+            _bus_constants.FAILED_ATTEMPT_REVISIT_RESULT,
             # §7.D-knowledge (DK.1) — memory_worker anchored a confirmed research
             # finding → seed the declarative `Engram` concept (sole spine writer).
             _bus_constants.RESEARCH_CONCEPT_SEED,

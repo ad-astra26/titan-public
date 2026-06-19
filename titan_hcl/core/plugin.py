@@ -1270,15 +1270,28 @@ class TitanHCL:
                 logger.debug(
                     "[TitanHCL] IMPULSE_RECEIVED emit failed: %s", e)
 
-        # Convert IMPULSE to INTENT (enriched with context)
+        # Convert IMPULSE to INTENT (enriched with context). `**payload` carries the
+        # generative fields (posture/source_layer/source_dims/deficit_values) AND, for
+        # a failure-replay revisit, the `_revisit` marker the agency P8 path reads.
         intent = {
             **payload,
             "trinity_snapshot": payload.get("trinity_snapshot", {}),
         }
 
-        # Expression Translation Layer — try learned mapping first
+        # Failure-replay revisit (EEL-B2 / mastery §7.P9): FORCE the same helper that
+        # originally failed so the corrector re-runs THIS problem, and bypass the
+        # expression translator (it must not re-route the deliberate revisit).
+        _revisit = intent.get("_revisit")
+        if isinstance(_revisit, dict) and _revisit.get("helper"):
+            intent["_learned_selection"] = {
+                "helper": _revisit["helper"],
+                "reasoning": "failure-replay revisit",
+            }
+
+        # Expression Translation Layer — try learned mapping first (skipped when a
+        # revisit already forced the helper above).
         learned_selection = None
-        if self._expression_translator:
+        if self._expression_translator and not intent.get("_learned_selection"):
             try:
                 available = self._agency._registry.list_helper_names() \
                     if hasattr(self._agency._registry, 'list_helper_names') else []

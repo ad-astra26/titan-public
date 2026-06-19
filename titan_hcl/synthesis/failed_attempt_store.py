@@ -107,6 +107,7 @@ class FailedAttemptStore:
                 "  goal_class      TEXT    NOT NULL,"
                 "  action          TEXT,"                          # the routing action that failed (tool/research/…)
                 "  helper          TEXT,"                          # the agency helper to re-run
+                "  intent_seed     TEXT,"                          # JSON of the intent's generative fields (posture/source_layer/source_dims/deficit_values) so a revisit reconstructs the SAME problem
                 "  features        TEXT,"                          # JSON φ vector at the original attempt
                 "  attempt_history TEXT,"                          # JSON list of {evidence, verdict, correction}
                 "  why_failed      TEXT,"
@@ -136,6 +137,7 @@ class FailedAttemptStore:
         goal_class: str,
         action: str = "",
         helper: str = "",
+        intent_seed: Optional[dict] = None,
         features: Optional[list] = None,
         attempt_history: Optional[list] = None,
         why_failed: str = "",
@@ -153,6 +155,7 @@ class FailedAttemptStore:
         now = float(ts) if ts is not None else float(self._clock())
         feats_json = json.dumps(features) if features is not None else None
         hist_json = json.dumps(attempt_history) if attempt_history is not None else None
+        seed_json = json.dumps(intent_seed) if intent_seed is not None else None
         with self._lock:
             row = self._db.execute(
                 "SELECT status FROM failed_attempts WHERE problem_id = ?", [pid]
@@ -160,13 +163,13 @@ class FailedAttemptStore:
             if row is None:
                 self._db.execute(
                     "INSERT INTO failed_attempts "
-                    "(problem_id, problem, goal_class, action, helper, features, "
-                    " attempt_history, why_failed, known_target, status, "
+                    "(problem_id, problem, goal_class, action, helper, intent_seed, "
+                    " features, attempt_history, why_failed, known_target, status, "
                     " enqueue_count, revisit_count, created_at, last_attempt_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,1,0,?,?)",
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,0,?,?)",
                     [pid, problem, goal_class, action or None, helper or None,
-                     feats_json, hist_json, why_failed or None, known_target,
-                     ST_PENDING, now, now],
+                     seed_json, feats_json, hist_json, why_failed or None,
+                     known_target, ST_PENDING, now, now],
                 )
             else:
                 # Re-touch: bump the count, refresh the evidence, REOPEN if terminal.
@@ -190,7 +193,7 @@ class FailedAttemptStore:
         with self._lock:
             rows = self._db.execute(
                 "SELECT problem_id, problem, goal_class, action, helper, features, "
-                "known_target, revisit_count FROM failed_attempts "
+                "known_target, revisit_count, intent_seed FROM failed_attempts "
                 "WHERE status = ? ORDER BY last_attempt_at ASC NULLS FIRST, created_at ASC "
                 "LIMIT ?",
                 [ST_PENDING, int(limit)],
@@ -210,6 +213,7 @@ class FailedAttemptStore:
                     "action": r[3] or "", "helper": r[4] or "",
                     "features": json.loads(r[5]) if r[5] else None,
                     "known_target": r[6], "revisit_count": int(r[7] or 0),
+                    "intent_seed": json.loads(r[8]) if r[8] else None,
                 })
             return out
 
@@ -220,17 +224,20 @@ class FailedAttemptStore:
         Returns False if the row is gone/already terminal (never re-resolve)."""
         now = float(ts) if ts is not None else float(self._clock())
         with self._lock:
-            cur = self._db.execute(
+            # DuckDB rowcount is unreliable → gate on the current status explicitly
+            # (never re-resolve a terminal row).
+            row = self._db.execute(
+                "SELECT status FROM failed_attempts WHERE problem_id = ?", [problem_id]
+            ).fetchone()
+            if row is None or row[0] in (ST_RESOLVED, ST_ABANDONED):
+                return False
+            self._db.execute(
                 "UPDATE failed_attempts SET status = ?, resolved_at = ?, "
-                "last_attempt_at = ?, skill_id = ? WHERE problem_id = ? "
-                "AND status NOT IN (?, ?)",
-                [ST_RESOLVED, now, now, skill_id or None, problem_id,
-                 ST_RESOLVED, ST_ABANDONED],
+                "last_attempt_at = ?, skill_id = ? WHERE problem_id = ?",
+                [ST_RESOLVED, now, now, skill_id or None, problem_id],
             )
-        changed = bool(getattr(cur, "rowcount", 0) or 0)
-        if changed:
             self._resolved += 1
-        return changed
+        return True
 
     @on_writer
     def bump_attempt(self, problem_id: str, *, correction: str = "",

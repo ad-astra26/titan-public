@@ -756,6 +756,62 @@ def _publish_affective_nudge(send_queue: Any, name: str, shm_bank: Any,
         nudge.rate, nudge.mu_before, nudge.n, dev_age)
 
 
+def _failure_revisit_loop(failed_store: Any, stop_event: threading.Event,
+                          name: str, send_queue: Any) -> None:
+    """Unified failure-replay DRIVER (EEL-B2 / mastery §7.P9). Idle, off-hot-path,
+    OWN cadence. Per tick it claims ONE unresolved past failure and publishes a
+    `bus.IMPULSE` carrying a `_revisit` marker → plugin._agency_loop → the agency
+    P8.2 corrector re-runs THAT problem; the outcome fans out to both reward sinks.
+
+    🔒 GATE IS NON-METABOLIC (Maker 2026-06-19): failure→learning is the highest-
+    value emergent learning and MUST fire on live Titans, not starve like the
+    metabolically-gated IDK. The resource discipline is the per-tick BOUND (one
+    problem) + the cadence — NEVER a load/chi gate (the skill-score drain learned
+    this when its cpu_load>0.75 gate STARVED skill formation) and NEVER the IQL
+    policy's choice (the policy only RECEIVES the reward; it gets no vote here).
+    Gated only on the config kill-switch (+ oml_autonomous_experience_enabled, since
+    the corrector IS the P8 autonomous machinery — so a revisit never strands an
+    in_progress row when the corrector is off). Save/resume keeps every row durable.
+    """
+    stop_event.wait(15.0)   # let the box settle past cold-boot flap
+    _impulse_seq = 0
+    while not stop_event.is_set():
+        try:
+            sl = get_params("synthesis").get("self_learning", {}) or {}
+            interval = float(sl.get("failure_replay_interval_s", 180.0))
+            enabled = (bool(sl.get("failure_replay_enabled", True))
+                       and bool(sl.get("oml_autonomous_experience_enabled", True)))
+            if not enabled:
+                stop_event.wait(interval)
+                continue
+            claimed = failed_store.next_unresolved(limit=1)   # ONE-at-a-time bound
+            for fa in claimed:
+                seed = dict(fa.get("intent_seed") or {})
+                _impulse_seq += 1
+                payload = {
+                    **seed,
+                    "posture": seed.get("posture", "meditate"),
+                    "impulse_id": _impulse_seq,
+                    "urgency": 0.5,
+                    "_revisit": {
+                        "problem_id": fa["problem_id"],
+                        "known_target": fa.get("known_target"),
+                        "goal_class": fa["goal_class"],
+                        "helper": fa.get("helper") or "",
+                    },
+                }
+                _send(send_queue, bus.IMPULSE, name, "agency", payload)
+                logger.info(
+                    "[synthesis_worker][fail-replay] dispatched revisit problem=%s "
+                    "helper=%s goal_class=%s (revisit #%d)",
+                    fa["problem_id"], fa.get("helper") or "?", fa["goal_class"],
+                    int(fa.get("revisit_count", 0)) + 1)
+            stop_event.wait(interval)
+        except Exception as e:  # noqa: BLE001 — a driver hiccup never kills synthesis
+            logger.debug("[synthesis_worker][fail-replay] driver tick skipped: %s", e)
+            stop_event.wait(60.0)
+
+
 def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                             interval_s: float, name: str,
                             send_queue: Any = None, shm_bank: Any = None,
@@ -2861,6 +2917,34 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             getattr(_affective_runtime.net, "trained_steps", 0)
             if _affective_runtime is not None else "-")
 
+    # Unified failure-replay loop (EEL-B2 / mastery §7.P9) — the synthesis-owned
+    # `failed_attempts` store + the idle revisit DRIVER. Sole-writer (INV-Syn-19,
+    # shares store._conn + db_writer). Soft: a wiring failure disables failure-replay
+    # only; the rest of synthesis is unaffected. The DRIVER's gate is non-metabolic
+    # by design (see _failure_revisit_loop docstring).
+    failed_attempt_store: Optional[Any] = None
+    try:
+        from titan_hcl.synthesis.failed_attempt_store import FailedAttemptStore
+        _sl_cfg = get_params("synthesis").get("self_learning", {}) or {}
+        failed_attempt_store = FailedAttemptStore(
+            duckdb_conn=store._conn,
+            writer=db_writer,
+            max_revisits=int(_sl_cfg.get("failure_replay_max_revisits", 3)),
+        )
+        _fr_thread = threading.Thread(
+            target=_failure_revisit_loop,
+            args=(failed_attempt_store, stop_event, name, send_queue),
+            daemon=True, name=f"synthesis-fail-replay-{name}")
+        _fr_thread.start()
+        logger.info(
+            "[synthesis_worker] failure-replay store + driver ready "
+            "(EEL-B2/P9; enabled=%s, NON-metabolic gate)",
+            bool(_sl_cfg.get("failure_replay_enabled", True)))
+    except Exception as _fr_err:  # noqa: BLE001
+        failed_attempt_store = None
+        logger.warning("[synthesis_worker] failure-replay wiring failed (loop off; "
+                       "rest unaffected): %s", _fr_err)
+
     # RFP_synthesis_self_learning_meta_reasoning v1.1 (§1.2 C1 / INV-OML-11) — the
     # ReasoningStore: every per-use reasoning episode graphed under SELF → LEARNING
     # → REASONING (DuckDB scalars + FAISS signature + Kuzu node), written at
@@ -4276,6 +4360,75 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 except Exception as _mf_err:
                     logger.debug("[synthesis_worker] maker_fact write failed: %s",
                                  _mf_err)
+                continue
+
+            if msg_type == bus.FAILED_ATTEMPT_ENQUEUE:
+                # Unified failure-replay (EEL-B2/P9): agency's P8.2 corrector EXHAUSTED
+                # on a new autonomous problem → queue it for an idle revisit. Synthesis
+                # is the sole writer (INV-Syn-19/INV-OML-8).
+                if failed_attempt_store is None:
+                    continue
+                try:
+                    failed_attempt_store.enqueue(
+                        problem=str(payload.get("problem", "")),
+                        goal_class=str(payload.get("goal_class", "")),
+                        action=str(payload.get("action", "") or ""),
+                        helper=str(payload.get("helper", "") or ""),
+                        intent_seed=payload.get("intent_seed"),
+                        features=payload.get("features"),
+                        attempt_history=payload.get("attempt_history"),
+                        why_failed=str(payload.get("why_failed", "") or ""),
+                        known_target=payload.get("known_target"),
+                    )
+                except Exception as _fae_err:  # noqa: BLE001
+                    logger.debug("[synthesis_worker][fail-replay] enqueue failed: %s",
+                                 _fae_err)
+                continue
+
+            if msg_type == bus.FAILED_ATTEMPT_REVISIT_RESULT:
+                # Unified failure-replay (EEL-B2/P9): the agency corrector reported a
+                # revisit outcome. On SOLVED → SINK 1 (EEL-G3): anchor a POSITIVE
+                # corrected skill cell (a competence that never existed live) + mark
+                # the row resolved. Else → bump (back to pending) / abandon after
+                # max_revisits. (SINK 2 — the boosted IQL reward — already rode the
+                # agency's SELF_LEARN_REWARD emit.)
+                if failed_attempt_store is None:
+                    continue
+                _pid = str(payload.get("problem_id", "") or "")
+                if not _pid:
+                    continue
+                _solved = bool(payload.get("solved"))
+                try:
+                    if _solved:
+                        _skill_id = ""
+                        if procedural_skill_store is not None:
+                            try:
+                                from titan_hcl.synthesis.skill_store import (
+                                    compute_skill_id)
+                                _o = str(payload.get("oracle_id", "") or "")
+                                _g = str(payload.get("goal_class", "") or "")
+                                _ts = str(payload.get("task_shape", "") or "")
+                                if _o and _g and _ts:
+                                    procedural_skill_store.enqueue_score_event(
+                                        oracle_id=_o, goal_class=_g, task_shape=_ts,
+                                        success=True)
+                                    _skill_id = compute_skill_id(_o, _g)
+                            except Exception as _sk_err:  # noqa: BLE001
+                                logger.debug("[synthesis_worker][fail-replay] skill "
+                                             "anchor failed: %s", _sk_err)
+                        failed_attempt_store.mark_resolved(_pid, skill_id=_skill_id)
+                        logger.info("[synthesis_worker][fail-replay] RESOLVED %s → "
+                                    "skill=%s (EEL-G3 corrected skill anchored)",
+                                    _pid, _skill_id or "-")
+                    else:
+                        _status = failed_attempt_store.bump_attempt(
+                            _pid, correction=str(payload.get("correction", "") or ""),
+                            verdict="unsolved")
+                        logger.info("[synthesis_worker][fail-replay] revisit unsolved "
+                                    "%s → %s", _pid, _status)
+                except Exception as _far_err:  # noqa: BLE001
+                    logger.debug("[synthesis_worker][fail-replay] result handler "
+                                 "failed: %s", _far_err)
                 continue
 
             if msg_type == SELF_LEARN_MACRO_READY:
