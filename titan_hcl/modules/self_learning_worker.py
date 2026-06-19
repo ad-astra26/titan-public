@@ -247,6 +247,21 @@ _DEFAULTS = {
     "p8_max_attempts": 3,            # solve-until-correct bound: 1 = judge-once (no retry); 3 = up to 2 corrections
     "autonomous_oracle_reward_weight": 1.0,   # deterministic autonomous oracle (P9 known-target / self-test)
     "task_completion_reward_weight": 1.0,     # the LLM task-completion judge
+    # ── P9 / EEL-B2 — unified failure-replay loop (RFP_emergent_mastery §7.P9) ──
+    # Idle revisit of a previously-FAILED problem (the synthesis-owned `failed_
+    # attempts` store) → the P8.2 corrector → on solve a TWO-SINK reward (a positive
+    # skill cell = EEL-G3 + a boosted IQL reward = P9). GATE IS NON-METABOLIC by
+    # design (Maker 2026-06-19): failure→learning is the best emergent learning and
+    # must FIRE on live Titans, not starve like the metabolically-gated IDK. The
+    # driver is config-on + bounded ONE-per-tick (resource discipline = a per-tick
+    # bound, NOT a load/chi gate — the skill_score drain learned this when its
+    # cpu_load>0.75 gate STARVED skill formation); the IQL policy gets NO vote on
+    # whether the loop runs (it only receives the reward). Read by SYNTHESIS (the
+    # driver daemon + result handler) and AGENCY (the `_revisit` reward branch).
+    "failure_replay_enabled": True,           # master kill-switch ONLY (off ⇒ no daemon)
+    "failure_replay_interval_s": 180.0,       # revisit-driver tick cadence
+    "failure_replay_max_revisits": 3,         # revisits before a problem is abandoned (→ P10 hook)
+    "failure_replay_solved_reward": 1.0,      # IQL reward for a solved-after-failing (≥ a first-pass solve; rank-3)
     # ── P7 — clean-baseline reset (uncollapse) ──────────────────────────────
     # One-shot reset trigger: if this sentinel file exists at worker boot, the
     # collapsed routing policy + IQL nets + level + replay buffer are CLEARED →

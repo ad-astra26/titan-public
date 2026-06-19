@@ -295,6 +295,19 @@ SELF_LEARN_MACRO_READY = "SELF_LEARN_MACRO_READY"
 # so its reward flows back through the normal join (exploration never on a live
 # user turn — INV-OML-9). Payload: {goal_class, prompt_hint, ts}.
 SELF_LEARN_EXPLORE_REQUEST = "SELF_LEARN_EXPLORE_REQUEST"
+# ── Unified failure-replay loop (EEL B2 / mastery P9; RFP_emergent_mastery §7.P9) ──
+# agency_worker (P8.2 solve-until-correct EXHAUSTED) → synthesis_worker. A problem
+# the corrector couldn't solve, queued into the synthesis-owned `failed_attempts`
+# store (synthesis sole writer, INV-Syn-19/INV-OML-8) for an idle revisit. Payload:
+# {problem, goal_class, action, helper, features (list), attempt_history, why_failed,
+#  known_target?}.
+FAILED_ATTEMPT_ENQUEUE = "FAILED_ATTEMPT_ENQUEUE"
+# agency_worker (a `_revisit` intent ran through the corrector) → synthesis_worker.
+# The revisit outcome. On solved=True synthesis anchors a POSITIVE corrected skill
+# cell (Sink 1, EEL-G3) + marks the store row resolved; else it bumps/abandons.
+# (Sink 2 — the boosted IQL reward — rode the existing SELF_LEARN_REWARD emit.)
+# Payload: {problem_id, solved, oracle_id, goal_class, task_shape, evidence}.
+FAILED_ATTEMPT_REVISIT_RESULT = "FAILED_ATTEMPT_REVISIT_RESULT"
 # ── Phase D / §7.D-knowledge (DK.1) — the sovereign LLM-Wiki research→declarative-
 # concept COMPOUNDING loop, continuous-at-confirm (INV-OML-12). Two hops, each
 # worker does what it owns:
