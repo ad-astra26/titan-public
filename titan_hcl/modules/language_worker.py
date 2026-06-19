@@ -3034,32 +3034,17 @@ def _handle_teacher_response(
                 neuromod_gate=payload.get("neuromod_gate", ""),
             )
 
-            # 5b. Reasoning → Language reverse feedback
-            # When reasoning-sourced teaching succeeds, send confidence
-            # feedback back to CGN reasoning consumer via CGN_TRANSITION
-            if mode in ("reasoning", "embodied_reasoning") and (
-                    words_acquired > 0 or words_recognized > 1):
-                _rf_reward = 0.1 * words_acquired + 0.02 * words_recognized
-                try:
-                    _send_msg(send_queue, "CGN_TRANSITION", name, "cgn", {
-                        "type": "outcome",
-                        "consumer": "reasoning",
-                        "concept_id": f"lang_grounding_{original[:30]}",
-                        "reward": min(0.5, _rf_reward),
-                        "outcome_context": {
-                            "source": "language_reverse_feedback",
-                            "mode": mode,
-                            "words_acquired": words_acquired,
-                            "words_recognized": words_recognized,
-                            "original_word": original[:50],
-                        },
-                    })
-                    logger.debug("[REVERSE_FEEDBACK] %s: %.2f reward → "
-                                 "reasoning (acq=%d rec=%d)",
-                                 mode, _rf_reward,
-                                 words_acquired, words_recognized)
-                except Exception:
-                    pass
+            # 5b. Reasoning → Language reverse feedback — RETIRED §7.D-A2.
+            # This emitted to the CGN "reasoning" consumer, which is ARC-geometric
+            # (grid ops: rotate/flip/translate/…, reward_source=arc_episode_score)
+            # and read ONLY by the ARC standalone session — NOT the live reasoning
+            # faculty. It was also type="outcome" (the two-phase pattern that never
+            # matched record_outcome → it had been dead, reasoning consumer_freq=0).
+            # Per the repurpose decision, the live reasoning faculty is represented
+            # by `meta` (meta-reasoning chains) + `reasoning_strategy` (now wired
+            # IQL-complete from the chain commits), so this cross-domain, IQL-blind,
+            # never-matching emit is removed rather than re-homed into
+            # reasoning_strategy (which would pollute its 30D chain-state space).
 
             logger.info("[TEACHER] Session complete: mode=%s", mode)
 

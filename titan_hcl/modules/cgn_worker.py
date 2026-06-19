@@ -383,6 +383,12 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     register_shutdown_save(name, lambda: cgn._save_state())
 
     # ── Pre-register "reasoning" consumer for ARC (runs as standalone script) ──
+    # §7.D-A2 NOTE: this consumer is ARC-GEOMETRIC (grid ops below) and fed ONLY
+    # by the ARC standalone session (arc/session.py get_haov("reasoning")). It is
+    # dormant on the live fleet BY DESIGN — the live reasoning faculty is
+    # represented by `meta` (meta-reasoning chains) + `reasoning_strategy` (wired
+    # IQL-complete from chain commits). Not a wiring bug; do not "wake" it without
+    # ARC. (The stray language reverse-feedback emit was retired, not re-homed.)
     if "reasoning" not in cgn._consumers:
         cgn.register_consumer(CGNConsumerConfig(
             name="reasoning",
