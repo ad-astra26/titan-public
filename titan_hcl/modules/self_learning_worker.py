@@ -262,6 +262,7 @@ _DEFAULTS = {
     "failure_replay_interval_s": 180.0,       # revisit-driver tick cadence
     "failure_replay_max_revisits": 3,         # revisits before a problem is abandoned (→ P10 hook)
     "failure_replay_solved_reward": 1.0,      # IQL reward for a solved-after-failing (≥ a first-pass solve; rank-3)
+    "failure_replay_chat_quiet_s": 45.0,      # PAUSE the driver while /chat served a turn within this window (resource contention; the real gate, NOT metabolism)
     # ── P7 — clean-baseline reset (uncollapse) ──────────────────────────────
     # One-shot reset trigger: if this sentinel file exists at worker boot, the
     # collapsed routing policy + IQL nets + level + replay buffer are CLEARED →

@@ -421,6 +421,7 @@
 "synthesis.self_learning.failure_replay_interval_s" = {type="float", constraint=">0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_max_revisits" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_solved_reward" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.failure_replay_chat_quiet_s" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "twitter_social.auth_session" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=true}
 "twitter_social.email" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
 "twitter_social.password" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=true}

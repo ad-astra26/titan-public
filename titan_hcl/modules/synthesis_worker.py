@@ -757,19 +757,23 @@ def _publish_affective_nudge(send_queue: Any, name: str, shm_bank: Any,
 
 
 def _failure_revisit_loop(failed_store: Any, stop_event: threading.Event,
-                          name: str, send_queue: Any) -> None:
+                          name: str, send_queue: Any,
+                          chat_activity: Optional[dict] = None) -> None:
     """Unified failure-replay DRIVER (EEL-B2 / mastery §7.P9). Idle, off-hot-path,
     OWN cadence. Per tick it claims ONE unresolved past failure and publishes a
     `bus.IMPULSE` carrying a `_revisit` marker → plugin._agency_loop → the agency
     P8.2 corrector re-runs THAT problem; the outcome fans out to both reward sinks.
 
-    🔒 GATE IS NON-METABOLIC (Maker 2026-06-19): failure→learning is the highest-
-    value emergent learning and MUST fire on live Titans, not starve like the
-    metabolically-gated IDK. The resource discipline is the per-tick BOUND (one
-    problem) + the cadence — NEVER a load/chi gate (the skill-score drain learned
-    this when its cpu_load>0.75 gate STARVED skill formation) and NEVER the IQL
-    policy's choice (the policy only RECEIVES the reward; it gets no vote here).
-    Gated only on the config kill-switch (+ oml_autonomous_experience_enabled, since
+    🔒 GATE (Maker 2026-06-19): the real blocker for ANY background-learning loop is
+    resource contention with LIVE /chat serving users — so this driver PAUSES while
+    chat is active (a chat post-turn event seen within `failure_replay_chat_quiet_s`)
+    and RESUMES when quiet; the problem stays pending+durable, never dropped. It is
+    NOT metabolically gated (the metabolism mechanic is not fully wired — relying on
+    it now would be improper; it returns in a future redesign), NOT a load/chi gate
+    (the skill-score drain learned that when its cpu_load>0.75 gate STARVED skill
+    formation), and the IQL policy gets NO vote on whether to revisit (it only
+    RECEIVES the reward). The per-tick BOUND (one problem) is the work discipline.
+    Also gated on the config kill-switch (+ oml_autonomous_experience_enabled, since
     the corrector IS the P8 autonomous machinery — so a revisit never strands an
     in_progress row when the corrector is off). Save/resume keeps every row durable.
     """
@@ -784,6 +788,16 @@ def _failure_revisit_loop(failed_store: Any, stop_event: threading.Event,
             if not enabled:
                 stop_event.wait(interval)
                 continue
+            # PAUSE while live chat is serving users (resource contention) — resume
+            # when quiet. `chat_activity["ts"]` is stamped by the chat post-turn
+            # handler (TURN_REASONING_RECORD). The poll-back is short so we resume
+            # promptly once the box goes quiet (the work, not the cadence, waits).
+            quiet_s = float(sl.get("failure_replay_chat_quiet_s", 45.0))
+            if chat_activity is not None:
+                _since = time.time() - float(chat_activity.get("ts", 0.0) or 0.0)
+                if _since < quiet_s:
+                    stop_event.wait(min(quiet_s, 15.0))
+                    continue
             claimed = failed_store.next_unresolved(limit=1)   # ONE-at-a-time bound
             for fa in claimed:
                 seed = dict(fa.get("intent_seed") or {})
@@ -2922,6 +2936,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # shares store._conn + db_writer). Soft: a wiring failure disables failure-replay
     # only; the rest of synthesis is unaffected. The DRIVER's gate is non-metabolic
     # by design (see _failure_revisit_loop docstring).
+    # Shared chat-activity clock: the message loop stamps `ts` on every chat
+    # post-turn event (TURN_REASONING_RECORD); the driver reads it to PAUSE while
+    # users are actively chatting (resource contention) and RESUME when quiet.
+    # Defined unconditionally (the message-loop handler stamps it even if the driver
+    # wiring below fails) so the chat-pause signal is always available.
+    _chat_activity = {"ts": 0.0}
     failed_attempt_store: Optional[Any] = None
     try:
         from titan_hcl.synthesis.failed_attempt_store import FailedAttemptStore
@@ -2934,6 +2954,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         _fr_thread = threading.Thread(
             target=_failure_revisit_loop,
             args=(failed_attempt_store, stop_event, name, send_queue),
+            kwargs={"chat_activity": _chat_activity},
             daemon=True, name=f"synthesis-fail-replay-{name}")
         _fr_thread.start()
         logger.info(
@@ -4272,6 +4293,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 continue
 
             if msg_type == TURN_REASONING_RECORD:
+                # Failure-replay chat-pause signal: a chat turn just completed →
+                # stamp the shared clock so the background revisit driver yields the
+                # box to live users (resource contention) and resumes when quiet.
+                _chat_activity["ts"] = time.time()
                 # §7.B (C1′ + B.2): a NON-verifiable turn (direct/research/IDK; no
                 # oracle). (1) graph a Reasoning(kind='turn') record (reward=NULL,
                 # a deref-able thought — INV-OML-11); (2) enqueue the FRESH (prompt,
