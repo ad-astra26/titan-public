@@ -1467,10 +1467,26 @@ def _drive_self_prediction_check(state_refs: dict, send_queue, name: str,
         confirmed = bool(v.get("confirmed", False))
         reward = 0.5 if confirmed else -0.1
         # (1) self_model CGN_TRANSITION — the missing HAOV producer (rFP §1.3).
+        # §7.D-A2: CGN is fully IQL → carry an informative `state` (30D: neuromods
+        # + prediction-target hash + prediction error = the pre-verification
+        # context) + `action` (the self-modelling op being verified =
+        # "predict_transition", idx 1) so self_model's ConsumerQNet/V actually
+        # train. Previously state/action were absent → IQL-blind.
+        _sm_state = [0.0] * 30
+        _sm_nm = neuromods or {}
+        for _i, _k in enumerate(
+                ("DA", "5-HT", "NE", "ACh", "Endorphin", "GABA")):
+            _sm_state[_i] = float(
+                _sm_nm.get(_k, _sm_nm.get(_k.replace("-", ""), 0.5)))
+        _sm_state[6] = (hash(str(target)) % 1000) / 1000.0
+        _sm_state[7] = float(v.get("error", 0) or 0.0)
         _send_msg(send_queue, "CGN_TRANSITION", name, "cgn", {
-            "type": "experience",  # (b) self-pred is simultaneous → record_experience → observe_for (DEFERRED G1)
+            "type": "experience",  # (b) self-pred is simultaneous → record_experience → observe_for + IQL train
             "consumer": "self_model",
             "concept_id": f"self_pred_{target}",
+            "state": _sm_state,
+            "action": 1,  # "predict_transition" (action_dims=6)
+            "action_params": [0.0, 0.0, 0.0, 0.0],
             "reward": reward,
             "outcome_context": {
                 "source": "self_prediction",
