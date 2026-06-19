@@ -1066,6 +1066,16 @@ class ConceptGroundingNetwork:
                         "rule": h.rule,
                         "confidence": round(h.confidence, 4),
                         "effect": h.predicted_effect,
+                        # §7.D-B (G7 apply): carry the concept A1 puts in
+                        # action_context (plateau/causal/concept-grounding rules)
+                        # so the cross-process C2/C3 apply can match on the actual
+                        # concept instead of parsing the rule name — and so
+                        # concept-bearing impasse rules (effect=resolve_*) are no
+                        # longer skipped as contentless. Empty for concept-less
+                        # impasse rules (stuck/declining) → matcher still skips.
+                        "concept": str((h.action_context or {}).get("topic")
+                                       or (h.action_context or {}).get("concept")
+                                       or ""),
                     })
 
         return insights

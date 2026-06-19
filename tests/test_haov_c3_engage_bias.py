@@ -59,3 +59,27 @@ def test_set_verified_concepts_caps_at_16():
     assert len(g._verified_haov_concepts) == 16
     g.set_verified_haov_concepts(None)
     assert g._verified_haov_concepts == []
+
+
+_src = SocialXGateway._matched_haov_source
+
+
+def test_concept_bearing_impasse_rule_is_applied():
+    """§7.D-B: an A1 concept-bearing plateau rule (effect=resolve_plateau but it
+    carries a `concept` from action_context, delivered by C1) is NO LONGER
+    skipped — it matches on the concept and credits its source consumer."""
+    concepts = [{"source": "haov_verified", "source_consumer": "knowledge",
+                 "rule": "knowledge_plateau_quantum", "effect": "resolve_plateau",
+                 "concept": "quantum", "confidence": 0.8}]
+    assert _bias(concepts, "tell me about quantum computing") > 0.0
+    assert _src(concepts, "tell me about quantum computing") == (
+        "knowledge", "knowledge_plateau_quantum")
+
+
+def test_conceptless_impasse_rule_still_skipped():
+    """A concept-LESS impasse rule (stuck/declining) stays a contentless
+    complaint → still skipped (zero bias)."""
+    concepts = [{"rule": "knowledge_impasse_stuck", "effect": "resolve_stuck",
+                 "concept": "", "confidence": 0.8}]
+    assert _bias(concepts, "tell me about quantum computing") == 0.0
+    assert _src(concepts, "tell me about quantum computing") is None

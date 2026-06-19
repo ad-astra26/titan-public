@@ -470,13 +470,18 @@ class SocialXGateway:
         tl = text.lower()
         best = 0.0
         for c in concepts:
-            # Derive a teachable token from the verified rule; skip impasse rules.
+            # §7.D-B: prefer the delivered `concept` (A1 puts the plateau/causal
+            # concept in action_context → C1 now carries it); skip pure impasse
+            # rules ONLY when they carry no concept (contentless complaints).
+            concept = str(c.get("concept", "")).strip()
             effect = str(c.get("effect", ""))
-            if effect.startswith("resolve_"):
+            if effect.startswith("resolve_") and not concept:
                 continue
             rule = str(c.get("rule", ""))
-            tok = (rule.split("_", 1)[-1] if "_" in rule else rule).replace(
-                "arc_", "").replace("pattern_", "").replace("_", " ").strip()
+            tok = (concept.replace("_", " ").strip() if concept else
+                   (rule.split("_", 1)[-1] if "_" in rule else rule).replace(
+                       "arc_", "").replace("pattern_", "").replace(
+                           "_", " ").strip())
             if len(tok) >= 3 and tok in tl:
                 best = max(best, float(c.get("confidence", 0.0)))
         return round(min(0.2, best * 0.2), 4)
@@ -493,11 +498,14 @@ class SocialXGateway:
         tl = text.lower()
         best_c, best_conf = None, -1.0
         for c in concepts:
-            if str(c.get("effect", "")).startswith("resolve_"):
+            concept = str(c.get("concept", "")).strip()
+            if str(c.get("effect", "")).startswith("resolve_") and not concept:
                 continue
             rule = str(c.get("rule", ""))
-            tok = (rule.split("_", 1)[-1] if "_" in rule else rule).replace(
-                "arc_", "").replace("pattern_", "").replace("_", " ").strip()
+            tok = (concept.replace("_", " ").strip() if concept else
+                   (rule.split("_", 1)[-1] if "_" in rule else rule).replace(
+                       "arc_", "").replace("pattern_", "").replace(
+                           "_", " ").strip())
             if len(tok) >= 3 and tok in tl:
                 conf = float(c.get("confidence", 0.0))
                 if conf > best_conf:
