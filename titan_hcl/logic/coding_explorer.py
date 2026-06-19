@@ -553,7 +553,7 @@ class CodingExplorer:
                               else "emergent")
             self._trigger_source_counts[_source_bucket] = (
                 self._trigger_source_counts.get(_source_bucket, 0) + 1)
-            self._record_result(result)
+            self._record_result(result, neuromods)
             return result
 
         t0 = time.time()
@@ -582,7 +582,7 @@ class CodingExplorer:
         )
 
         # ── 5. Record to CGN + DB ──────────────────────────────────
-        self._record_result(result)
+        self._record_result(result, neuromods)
 
         # ── 6. Cross-pollinate with ARC ────────────────────────────
         if self._arc_cross and reward > 0 and self._send_queue:
@@ -787,8 +787,13 @@ class CodingExplorer:
 
     # ── Recording & Persistence ──────────────────────────────────────
 
-    def _record_result(self, result: CodingExerciseResult):
-        """Persist exercise result to DB and send CGN transition."""
+    def _record_result(self, result: CodingExerciseResult,
+                       neuromods: dict = None):
+        """Persist exercise result to DB and send CGN transition.
+
+        §7.D-A2: neuromods is threaded in so the CGN_TRANSITION can carry a real
+        IQL state (the pre-action neuromodulatory + task context).
+        """
         # Layer B — anchor time-fallback clock on every recorded exercise
         # (includes planning-only branch, which also constitutes coding activity)
         self._last_exercise_ts = time.time()
@@ -814,18 +819,34 @@ class CodingExplorer:
             swallow_warn('[CodingExplorer] DB insert failed', e,
                          key="logic.coding_explorer.db_insert_failed", throttle=100)
 
-        # CGN transition (outcome)
+        # CGN transition — §7.D-A2: IQL-complete single-shot. Was type="outcome"
+        # (the Gap-2 two-phase pattern that NEVER matched record_outcome → coding
+        # formed=0 fleet-wide); now "experience" → record_experience self-matches.
+        # CGN is fully IQL → carry an informative `state` (30D: neuromods + concept
+        # hash + task difficulty — the pre-action context) + `action` (the chosen
+        # exercise action, action_dims=6) so ConsumerQNet/V actually train.
         if self._send_queue:
             try:
+                _state = np.zeros(30, dtype=np.float32)
+                _nm = neuromods or {}
+                for _i, _k in enumerate(
+                        ("DA", "5-HT", "NE", "ACh", "Endorphin", "GABA")):
+                    _state[_i] = float(
+                        _nm.get(_k, _nm.get(_k.replace("-", ""), 0.5)))
+                _state[6] = (hash(result.concept) % 1000) / 1000.0
+                _state[7] = float(result.difficulty)
                 self._send_queue.put_nowait({
                     "type": "CGN_TRANSITION",
                     "src": "spirit",
                     "dst": "cgn",
                     "ts": time.time(),
                     "payload": {
-                        "type": "outcome",
+                        "type": "experience",
                         "consumer": "coding",
                         "concept_id": result.concept,
+                        "state": _state.tolist(),
+                        "action": int(result.action_index),
+                        "action_params": [0.0, 0.0, 0.0, 0.0],
                         "reward": result.reward,
                         "outcome_context": {
                             "action": result.action,
