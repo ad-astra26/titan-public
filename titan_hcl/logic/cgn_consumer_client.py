@@ -470,20 +470,9 @@ class CGNConsumerClient:
         self._check_and_reload()
 
         try:
-            # Build concept features from user-provided features
-            cf = features or {}
-            concept_f = {
-                "concept_id": cf.get("user_id", "inference"),
-                "confidence": cf.get("familiarity", 0.0),
-                "encounter_count": cf.get("interaction_count", 0),
-                "production_count": cf.get("mention_count", 0),
-                "age_epochs": cf.get("relationship_age_epochs", 0),
-                "cross_modal_conf": max(0.0, min(1.0,
-                    (cf.get("social_valence", 0.0) + 1.0) / 2.0)),
-                "embedding": np.array(
-                    cf.get("social_felt_tensor", [0.5] * 130),
-                    dtype=np.float32),
-            }
+            # Build concept features from user-provided features (shared with
+            # record_experience so inference state == training state, §7.D-A2)
+            concept_f = self._concept_features_from(features)
 
             state_vec = self._build_state_vector(concept_f, sensory_ctx)
             state_input = state_vec.reshape(1, -1)  # (1, 30)
@@ -570,6 +559,55 @@ class CGNConsumerClient:
         except Exception as e:
             swallow_warn(f'[CGNClient:{self._name}] record_outcome failed', e,
                          key="logic.cgn_consumer_client.record_outcome_failed", throttle=100)
+
+    def _concept_features_from(self, features: dict) -> dict:
+        """Single source of truth for the concept-feature dict that feeds
+        _build_state_vector — shared by infer_action (inference) and
+        record_experience (training) so the IQL state is IDENTICAL on both
+        sides (§7.D-A2; divergence would mistrain the learner)."""
+        cf = features or {}
+        return {
+            "concept_id": cf.get("user_id", "inference"),
+            "confidence": cf.get("familiarity", 0.0),
+            "encounter_count": cf.get("interaction_count", 0),
+            "production_count": cf.get("mention_count", 0),
+            "age_epochs": cf.get("relationship_age_epochs", 0),
+            "cross_modal_conf": max(0.0, min(1.0,
+                (cf.get("social_valence", 0.0) + 1.0) / 2.0)),
+            "embedding": np.array(
+                cf.get("social_felt_tensor", [0.5] * 130),
+                dtype=np.float32),
+        }
+
+    def record_experience(self, sensory_ctx: dict, features: dict,
+                          action: int, reward: float,
+                          concept_id: str = None) -> None:
+        """§7.D-A2: record a COMPLETE (state, action, reward) IQL transition,
+        with the state built from the SAME (sensory_ctx, features) that
+        infer_action used — so the learner's training state matches the
+        inference state exactly. Emits type="experience" → cgn_worker
+        record_experience self-matches single-shot (no two-phase never-match).
+        For consumers that infer_action a decision then learn its outcome
+        (e.g. social: perception → engage action → post-success reward)."""
+        if self._send_queue is None:
+            return
+        try:
+            concept_f = self._concept_features_from(features)
+            state_vec = self._build_state_vector(concept_f, sensory_ctx)
+            _cid = concept_id or (features or {}).get("user_id", "experience")
+            self.send_transition({
+                "type": "experience",
+                "consumer": self._name,
+                "concept_id": _cid,
+                "state": state_vec.tolist(),
+                "action": int(action),
+                "action_params": [0.0, 0.0, 0.0, 0.0],
+                "reward": float(reward),
+            })
+        except Exception as e:
+            swallow_warn(f'[CGNClient:{self._name}] record_experience failed', e,
+                         key="logic.cgn_consumer_client.record_experience_failed",
+                         throttle=100)
 
     # ── State vector building (copied from cgn.py _build_state_vector) ──
 

@@ -932,6 +932,16 @@ class PostDispatchOrchestrator:
                     if _owner and _owner != self._titan_id:
                         continue
                 cgn_action: dict = {}
+                cgn_client = None
+                # §7.D-A2: keep the inference inputs so we can record the matching
+                # IQL transition after the reply (state must equal what was inferred).
+                _social_sctx = {"epoch": 0, "neuromods": neuromods}
+                _social_feats = {
+                    "familiarity": min(1.0, m.get("relevance_score", 0.3)),
+                    "interaction_count": 0,
+                    "social_valence": 0.0,
+                    "mention_count": 1,
+                }
                 try:
                     from titan_hcl.logic.cgn_consumer_client import (
                         CGNConsumerClient,
@@ -939,17 +949,7 @@ class PostDispatchOrchestrator:
                     cgn_client = CGNConsumerClient(
                         "social", state_dir="data/cgn")
                     cgn_action = cgn_client.infer_action(
-                        sensory_ctx={
-                            "epoch": 0,  # epoch from PostContext build
-                            "neuromods": neuromods,
-                        },
-                        features={
-                            "familiarity": min(
-                                1.0, m.get("relevance_score", 0.3)),
-                            "interaction_count": 0,
-                            "social_valence": 0.0,
-                            "mention_count": 1,
-                        })
+                        sensory_ctx=_social_sctx, features=_social_feats)
                 except Exception:
                     pass
                 rctx = ReplyContext(
@@ -974,6 +974,28 @@ class PostDispatchOrchestrator:
                     self._gateway.mark_mention_replied(
                         m["tweet_id"], rr.tweet_id)
                     reply_count += 1
+                    # §7.D-A2: close the social CGN-IQL loop — social INFERRED an
+                    # engage action above but never recorded the outcome, so its
+                    # consumer learned nothing (formed=0, fed=0). Record the
+                    # (perception state, inferred action, reward) as a single-shot
+                    # experience (state built identically to inference via the
+                    # shared helper). ⚠ Reward here is PROXIMAL — relevance-weighted
+                    # successful engagement; the TRUE reward is the delayed
+                    # `engagement_reciprocity` (replies/likes), which needs a
+                    # tweet_id-keyed deferred-reward path (documented refinement,
+                    # RFP §7.D-A2 social). This first wire gives the social IQL real
+                    # state→action coverage; the delayed reward sharpens the policy.
+                    if cgn_client is not None:
+                        try:
+                            _rel = float(m.get("relevance_score", 0.3) or 0.3)
+                            cgn_client.record_experience(
+                                _social_sctx, _social_feats,
+                                action=int(cgn_action.get("action_index", 1)),
+                                reward=0.2 + 0.5 * _rel,
+                                concept_id="social_"
+                                + str(m.get("author_handle", ""))[:30])
+                        except Exception:
+                            pass
                     logger.info(
                         "[PostDispatch] Replied to @%s (score=%.2f): %s",
                         m["author_handle"], m["relevance_score"],
