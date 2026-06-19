@@ -169,7 +169,18 @@ def _grow_linear_out(layer: "nn.Linear", new_out: int) -> "nn.Linear":
 
 
 class TransitionBuffer:
-    """Shared buffer with per-consumer sub-views. FIFO eviction."""
+    """Shared buffer with per-consumer sub-views. FAIR per-consumer eviction.
+
+    §7.D-A2 (formation-layer): the old global-FIFO eviction let a high-rate
+    consumer (meta ~8242 lifetime) crowd low-rate ones (emotional/language/
+    self_model) out of the shared buffer, so `get_consumer_transitions` returned
+    < 10 for them and `detect_impasse` (≥10) + the causal generator never fired —
+    dormancy that no amount of correct per-consumer wiring could fix. Eviction now
+    drops the OLDEST transition of the MOST-REPRESENTED consumer, so every
+    consumer retains roughly `max_size / n_active_consumers` recent transitions —
+    well above the formation thresholds — regardless of others' volume. Parameter-
+    free (emergence over a hand-tuned per-consumer cap).
+    """
 
     def __init__(self, max_size: int = 2000):
         self.max_size = max_size
@@ -178,7 +189,18 @@ class TransitionBuffer:
     def add(self, transition: CGNTransition) -> None:
         self._buffer.append(transition)
         if len(self._buffer) > self.max_size:
-            self._buffer = self._buffer[-self.max_size:]
+            # Fair eviction: remove the oldest transition belonging to whichever
+            # consumer currently has the most in the buffer (never a low-rate
+            # consumer while a higher-rate one has any). Preserves chronological
+            # order for the survivors.
+            counts: Dict[str, int] = {}
+            for t in self._buffer:
+                counts[t.consumer] = counts.get(t.consumer, 0) + 1
+            dominant = max(counts, key=counts.get)
+            for i, t in enumerate(self._buffer):
+                if t.consumer == dominant:
+                    del self._buffer[i]
+                    break
 
     def get_consumer_transitions(self, consumer: str,
                                  max_count: int = 1000) -> List[CGNTransition]:
