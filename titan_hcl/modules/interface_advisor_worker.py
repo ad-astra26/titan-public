@@ -132,6 +132,33 @@ def _heartbeat_loop(send_queue, name: str,
 
 
 @with_error_envelope(module_name="interface_advisor", subsystem="entry", severity=_phase11_sev.FATAL)
+def _decay_republish_needed(
+        live_rates: dict, last_pub_rates: dict, pending_unpublished: bool) -> bool:
+    """Decide whether the idle tick must republish the rate snapshot to SHM.
+
+    BUG-IMPULSE-RATE-STUCK (2026-06-20): the sliding window only "slides" when
+    SHM is republished — `get_stats()` lazily prunes expired entries at publish
+    time. Under sparse traffic a STALE non-zero SHM rate makes the PARENT block
+    the next IMPULSE (`current_rate+1 > limit`), so NO IMPULSE_RECEIVED reaches
+    the worker → it never re-prunes → the rate sticks at its last value FOREVER
+    (limit=1 ⇒ exactly one impulse ever passes, then permanent false rate-limit).
+
+    The decision MUST fire on the 1→0 transition (the decaying entry just
+    expired). The first (buggy) fix gated on ``any(live_rates.values())`` — but
+    `get_stats()` already pruned to 0 by the time we check, so the very flush
+    that writes the 0 was skipped → SHM stayed stale at 1. Correct rule:
+    republish whenever the freshly-pruned ``live_rates`` DIFFER from what we
+    last published (including → empty/0), or a throttled record is pending.
+    Idle-at-zero stays silent (live == last == {} ⇒ no write).
+    """
+    if pending_unpublished:
+        return True
+    # Normalize: a key with value 0 is equivalent to absent (both = "no rate").
+    live_nz = {k: v for k, v in (live_rates or {}).items() if v}
+    last_nz = {k: v for k, v in (last_pub_rates or {}).items() if v}
+    return live_nz != last_nz
+
+
 def interface_advisor_worker_main(recv_queue, send_queue, name: str,
                                   config: dict) -> None:
     """L2 module entry — Guardian supervised.
@@ -216,36 +243,34 @@ def interface_advisor_worker_main(recv_queue, send_queue, name: str,
     rate_limit_count = 0
     last_publish_ts = time.time()
     pending_unpublished = False  # set when a record was throttled-skip-published
+    last_pub_rates: dict = {}    # last non-zero rate snapshot flushed to SHM
+                                 # (drives the idle decay-flush; see
+                                 # _decay_republish_needed / BUG-IMPULSE-RATE-STUCK)
 
     try:
         while True:
             try:
                 msg = recv_queue.get(timeout=1.0)
             except Empty:
-                # No activity → republish SHM on the idle tick for TWO reasons:
-                #  (1) a throttled record is pending (eventual consistency —
-                #      single IMPULSE_RECEIVED still reaches SHM within
-                #      ≤INTERFACE_ADVISOR_RATE_REFRESH_CADENCE_S + 1s); and
-                #  (2) WINDOW DECAY (BUG-IMPULSE-RATE-STUCK, 2026-06-20): the
-                #      sliding window only "slides" when SHM is republished —
-                #      get_stats() lazily prunes expired entries at publish
-                #      time. Under sparse traffic a STALE non-zero SHM rate
-                #      makes the PARENT block the next IMPULSE (current_rate+1 >
-                #      limit) so NO IMPULSE_RECEIVED is emitted → the worker
-                #      never re-prunes → the rate sticks at its last value
-                #      FOREVER (live: limit=1 → exactly one impulse ever
-                #      passes, then permanent false rate-limit; 144 received /
-                #      0 executed in 12h). Republishing while any window is
-                #      non-empty decays the SHM rate to 0 within window_s,
-                #      restoring the autonomous-impulse path. No write once all
-                #      rates are 0 (idle-at-zero is silent).
+                # No activity → on the idle tick, flush the rate snapshot to SHM
+                # whenever the freshly-pruned rates DIFFER from what we last
+                # published (incl. the 1→0 decay transition), or a throttled
+                # record is pending. This is what makes the "sliding" window
+                # actually slide under sparse traffic: get_stats() lazily prunes
+                # expired entries, and we MUST write the resulting 0 to SHM — else
+                # a stale non-zero rate makes the PARENT block every subsequent
+                # IMPULSE forever (BUG-IMPULSE-RATE-STUCK, 2026-06-20; see
+                # _decay_republish_needed for the full mechanic + the prior
+                # any()-gating bug). Idle-at-zero stays silent (no diff → no write).
                 now = time.time()
                 if (now - last_publish_ts
                         >= INTERFACE_ADVISOR_RATE_REFRESH_CADENCE_S):
                     live_rates = publisher.advisor.get_stats().get(
                         "current_rates", {}) or {}
-                    if pending_unpublished or any(live_rates.values()):
+                    if _decay_republish_needed(
+                            live_rates, last_pub_rates, pending_unpublished):
                         publisher.publish()
+                        last_pub_rates = dict(live_rates)
                         last_publish_ts = now
                         pending_unpublished = False
                 continue

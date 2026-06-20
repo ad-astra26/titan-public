@@ -218,6 +218,26 @@ def test_reader_get_current_rate(titan_id):
     assert reader.get_current_rate("NEVER_PUBLISHED") == 0
 
 
+def test_decay_republish_needed_one_to_zero_transition():
+    """BUG-IMPULSE-RATE-STUCK regression: the idle-tick decision MUST fire on the
+    1→0 transition (decaying entry expired → live pruned to 0) so the worker
+    flushes the 0 to SHM. The first fix gated on any(live.values()) and SKIPPED
+    exactly this flush → SHM stayed stale at 1 → permanent false rate-limit."""
+    from titan_hcl.modules.interface_advisor_worker import _decay_republish_needed
+    # THE bug case: live pruned to empty, but last published was non-zero → flush.
+    assert _decay_republish_needed({}, {"IMPULSE": 1}, False) is True
+    assert _decay_republish_needed({"IMPULSE": 0}, {"IMPULSE": 1}, False) is True
+    # New rate appeared → flush.
+    assert _decay_republish_needed({"IMPULSE": 1}, {}, False) is True
+    # Pending throttled record → always flush.
+    assert _decay_republish_needed({}, {}, True) is True
+    # No change → silent (no SHM spam).
+    assert _decay_republish_needed({"IMPULSE": 1}, {"IMPULSE": 1}, False) is False
+    # Idle-at-zero → silent (0 normalized == absent).
+    assert _decay_republish_needed({}, {}, False) is False
+    assert _decay_republish_needed({"IMPULSE": 0}, {}, False) is False
+
+
 def test_window_decay_flushes_to_shm_on_idle_republish(titan_id):
     """BUG-IMPULSE-RATE-STUCK (2026-06-20): a non-zero SHM rate MUST decay
     to 0 once the sliding window expires, even with NO new IMPULSE_RECEIVED.
