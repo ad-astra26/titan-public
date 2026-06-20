@@ -16,6 +16,10 @@ _ALLOWED_PREFIXES = (
     "/health", "/v6/trinity", "/v6/nervous-system", "/v6/metabolism",
     "/v6/cognition", "/v6/language", "/v6/dreaming", "/v6/expression",
     "/v6/social", "/v6/timechain", "/v6/backup", "/v6/reflexes", "/v6/manifest",
+    # /v6/readiness is the kernel WORKER-module roster (module_count / modules[name,state,pid]
+    # / module_state_summary). /v6/nervous-system is the 11 cognitive AXES, not the workers —
+    # the Diagnostics subsystem card + the Phase 2b L2 tree need the worker roster (readiness).
+    "/v6/readiness",
 )
 
 

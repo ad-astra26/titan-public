@@ -33,7 +33,7 @@ class _FakeKernel:
     def __call__(self, method, url, *, body=None, headers=None, timeout=5.0):
         self.calls.append({"method": method, "url": url, "body": body,
                            "headers": headers or {}})
-        if url.endswith("/v6/nervous-system"):
+        if url.endswith("/v6/readiness"):  # worker roster (NOT nervous-system = axes)
             payload = {"modules": [{"name": m} for m in self.modules]}
             return 200, json.dumps(payload).encode()
         if url.endswith("/health"):

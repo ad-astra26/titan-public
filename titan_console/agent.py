@@ -177,8 +177,11 @@ _MODULE_OPS = {
 
 
 def _module_in_roster(ctx: Context, name: str) -> bool:
-    """True iff `name` is a live kernel module (per /v6/nervous-system `modules[].name`)."""
-    status, payload = proxy.proxy_readout(ctx, "/v6/nervous-system")
+    """True iff `name` is a live kernel WORKER module (per /v6/readiness `modules[].name`).
+
+    NOTE: the worker roster is /v6/readiness — NOT /v6/nervous-system (that returns the 11
+    cognitive axes REFLEX/FOCUS/… , no workers). Verified live 2026-06-20."""
+    status, payload = proxy.proxy_readout(ctx, "/v6/readiness")
     if status != 200 or not isinstance(payload, dict):
         return False
     return any(isinstance(m, dict) and m.get("name") == name
