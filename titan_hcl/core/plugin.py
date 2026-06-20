@@ -1295,6 +1295,10 @@ class TitanHCL:
                 "helper": _revisit["helper"],
                 "reasoning": "failure-replay revisit",
             }
+            # Fix #2 (EEL-B2/P9): the faithful-replay of the original helper input
+            # params (intent.helper_params) is merged in `handle_intent` (agency-side,
+            # restart-module-deployable) rather than here, so this main-process path
+            # needs no redeploy.
 
         # Expression Translation Layer — try learned mapping first (skipped when a
         # revisit already forced the helper above).

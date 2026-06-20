@@ -224,6 +224,21 @@ def test_non_revisit_bail_emits_no_result():
     assert _results(sq) == []
 
 
+# ── Fix #2 (EEL-B2/P9): a research-helper exhaustion enqueues the ORIGINAL input
+#    params (helper_params) so a revisit faithfully replays the real attempt.
+def test_enqueue_carries_helper_params_for_faithful_replay():
+    sq = _FakeSendQ()
+    agency = _FakeAgency([{"result": "x"}, {"result": "y"}, {"result": "z"}])
+    judge = _FakeJudge([{"solved": False, "correction": "nope", "confidence": 0.2}])
+    ar = {"helper": "web_search", "action_type": "research", "result": "out",
+          "reasoning": "r", "helper_params": {"query": "what is the TVL of Jupiter?"}}
+    _emit(sq, judge, agency, helper="web_search", ar=ar)
+    enq = [m for m in sq.items if m["type"] == bus.FAILED_ATTEMPT_ENQUEUE]
+    assert len(enq) == 1
+    assert enq[0]["payload"]["intent_seed"].get("helper_params") == {
+        "query": "what is the TVL of Jupiter?"}
+
+
 def test_kill_switch_off_emits_nothing(monkeypatch):
     import titan_hcl.modules.agency_worker as aw
     monkeypatch.setattr(aw, "get_params", lambda s: (

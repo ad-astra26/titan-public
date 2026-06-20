@@ -475,6 +475,13 @@ def _maybe_emit_autonomous_experience(
             intent_seed = {k: intent.get(k) for k in (
                 "posture", "source_layer", "source_dims", "deficit_values")
                 if isinstance(intent, dict) and intent.get(k) is not None}
+            # Fix #2 (EEL-B2/P9): carry the original helper's RE-POSE input params
+            # (query/file/code/…) so a revisit FAITHFULLY replays the original
+            # attempt instead of a posture-paraphrase → research/code_knowledge
+            # revisits can actually SOLVE, not just abandon. RFP §7.P9.
+            _hp = action_result.get("helper_params") if isinstance(action_result, dict) else None
+            if _hp:
+                intent_seed["helper_params"] = _hp
             send_queue.put({
                 "type": bus.FAILED_ATTEMPT_ENQUEUE, "src": name, "dst": "synthesis",
                 "payload": {

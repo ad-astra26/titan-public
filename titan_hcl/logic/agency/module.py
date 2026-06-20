@@ -204,7 +204,14 @@ class AgencyModule:
         learned = intent.get("_learned_selection")
         if learned and learned.get("helper"):
             helper_name = learned["helper"]
-            params = learned.get("params", {})
+            params = dict(learned.get("params", {}))
+            # Fix #2 (EEL-B2 / mastery §7.P9): a failure-replay revisit replays the
+            # ORIGINAL research-helper input params (query/file/…, captured at enqueue
+            # in intent.helper_params) so the re-run faithfully re-attempts the real
+            # query/inspection — not a posture-paraphrase. `code` was deliberately not
+            # captured → coding_sandbox still regenerates corrected code below.
+            if isinstance(intent.get("_revisit"), dict) and intent.get("helper_params"):
+                params.update(intent["helper_params"])
             reasoning = learned.get("reasoning", "learned")
         else:
             # Select helper via LLM (or fallback)
@@ -251,7 +258,7 @@ class AgencyModule:
                       "error": str(e)}
 
         return self._build_result(impulse_id, posture, helper_name, result,
-                                  reasoning, trinity_snapshot)
+                                  reasoning, trinity_snapshot, helper_params=params)
 
     async def _select_helper(
         self,
@@ -449,6 +456,7 @@ class AgencyModule:
         result: Optional[dict],
         reasoning: str,
         trinity_snapshot: dict,
+        helper_params: Optional[dict] = None,
     ) -> dict:
         """Build ACTION_RESULT payload."""
         self._action_counter += 1
@@ -470,6 +478,16 @@ class AgencyModule:
             "error": error,
             "reasoning": reasoning,
             "trinity_before": trinity_snapshot,
+            # Failure-replay fix #2 (EEL-B2/P9): the RESEARCH helper's RE-POSE input
+            # fields, so a revisit faithfully replays the ORIGINAL attempt (the real
+            # query/file the search/inspection used) instead of a posture-paraphrase.
+            # JSON-safe subset only (excludes the big trinity_snapshot). NB `code` is
+            # deliberately EXCLUDED — for coding_sandbox the revisit must REGENERATE
+            # corrected code (the solve-until-correct loop), never replay the code
+            # that already failed. RFP §7.P9.
+            "helper_params": {k: v for k, v in (helper_params or {}).items()
+                              if k in ("query", "what", "file", "page",
+                                       "refinement", "topic", "url", "max_results")},
             "ts": time.time(),
         }
 
