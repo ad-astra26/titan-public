@@ -425,6 +425,10 @@ def _maybe_emit_autonomous_experience(
             verdict = judge.judge(problem=problem, action=action_name, evidence=evidence)
 
         if verdict is None:
+            logger.warning(
+                "[AgencyWorker][P8] judge returned None for action=%s "
+                "(unparseable/empty verdict) — autonomous outcome left unscored",
+                action_name)
             return  # judge LLM miss → stays untrained (no false-positive reward)
         solved = bool(verdict.get("solved"))
         # Unified failure-replay (EEL-B2 / P9): a solved revisit is the highest-signal
@@ -518,7 +522,11 @@ def _maybe_emit_autonomous_experience(
                 "ts": time.time(),
             })
     except Exception as e:  # noqa: BLE001 — never break the agency loop
-        logger.debug("[AgencyWorker][P8] autonomous experience skipped: %s", e)
+        # WARNING (was DEBUG): a swallowed exception here silently drops the
+        # autonomous IQL reward AND (P1) the skill-score emit — exactly the kind of
+        # invisible learning-path failure we must surface, not hide (2026-06-20).
+        logger.warning("[AgencyWorker][P8] autonomous experience skipped: %s",
+                       e, exc_info=True)
     finally:
         # BACKSTOP (EEL-B2/P9): a revisit that bailed before scoring (non-routing
         # helper, judge LLM miss, degenerate corrector run, or any exception) STILL
