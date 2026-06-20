@@ -3,6 +3,7 @@ import pytest
 from titan_hcl.logic.expression_composites import (
     ExpressionComposite, ExpressionManager,
     create_speak, create_art, create_music, create_social,
+    create_kin_sense, create_longing,
 )
 
 
@@ -33,6 +34,24 @@ class TestExpressionComposite:
             {"CREATIVITY": 2.0, "REFLECTION": 2.0, "EMPATHY": 2.0},
             vocabulary_confidence=0.1)
         assert result["should_fire"] is False
+
+    def test_maturity_gate_blocks_then_unblocks(self):
+        """REGRESSION (2026-06-20): KIN_SENSE(gate=50) / LONGING(gate=80) never
+        fired because expression_worker fed developmental_age=0 forever (the
+        KERNEL_EPOCH_TICK payload never carried it). The gate logic itself is
+        correct — high urge fires ONLY once developmental_age >= the gate. The
+        worker fix feeds the real π-cluster count (12330 live) from the
+        dream_state SHM slot so a mature Titan can finally seek kin / feel longing."""
+        for create, gate in ((create_kin_sense, 50), (create_longing, 80)):
+            comp = create()
+            assert comp.maturity_gate == gate
+            hi = {"DA": 3.0, "EMPATHY": 3.0, "REFLECTION": 3.0, "ENDORPHIN": 3.0,
+                  "OXYTOCIN": 3.0, "CORTISOL": 3.0, "CREATIVITY": 3.0}
+            # Immature → gated off regardless of urge.
+            assert comp.evaluate(hi, developmental_age=0)["should_fire"] is False
+            # Mature (real live value 12330) → gate passes; fires if urge>=thr.
+            res = comp.evaluate(hi, developmental_age=12330)
+            assert res["should_fire"] is True, f"{comp.name} should fire when mature"
 
     def test_hormonal_depletion_eventually_pauses(self):
         """Per design (expression_composites.py:124-127): no fixed cooldown.

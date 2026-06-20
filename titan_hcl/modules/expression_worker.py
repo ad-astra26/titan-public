@@ -649,6 +649,22 @@ def expression_worker_main(recv_queue, send_queue, name: str,
             "will see empty hormone dict and never fire: %s",
             _hrerr, exc_info=True)
 
+    # === developmental_age (π-clusters) SHM reader ===
+    # BUG (2026-06-20): nobody injects developmental_age into KERNEL_EPOCH_TICK,
+    # so the cached `_developmental_age` stayed 0 FOREVER → the maturity-gated
+    # composites KIN_SENSE (gate=50) and LONGING (gate=80) could NEVER fire even
+    # on a 12330-π-cluster Titan. The real value lives in the dream_state SHM slot
+    # (same source the dashboard /v4/pi-heartbeat reads). Read it directly (G18).
+    dev_age_reader = None
+    try:
+        from titan_hcl.logic.dream_state_reader import DreamStateReader
+        dev_age_reader = DreamStateReader(titan_id=titan_id)
+    except Exception as _darerr:
+        logger.warning(
+            "[ExpressionWorker] DreamStateReader (developmental_age) BOOT "
+            "FAILED — maturity-gated composites stay gated at age 0: %s",
+            _darerr)
+
     # === MODULE-SPECIFIC: SHM publisher init (reuses existing
     # expression_state.bin slot per logic/expression_state_publisher.py;
     # cleanly transfers G21 single-writer ownership from main plugin to
@@ -920,9 +936,22 @@ def expression_worker_main(recv_queue, send_queue, name: str,
             # Drive evaluate_all on each cognitive epoch (per Maker Q2).
             payload = msg.get("payload", {}) or {}
             try:
-                _developmental_age = int(
-                    payload.get("developmental_age", _developmental_age)
-                    or _developmental_age)
+                # developmental_age PRIMARY source = dream_state SHM slot (the real
+                # π-cluster count); the KERNEL_EPOCH_TICK payload does NOT carry it
+                # (no publisher injects it → it stayed 0 forever, permanently gating
+                # KIN_SENSE/LONGING). Fall back to payload, then last cached value.
+                _da = 0
+                if dev_age_reader is not None:
+                    try:
+                        _da = int(dev_age_reader.read().get(
+                            "developmental_age", 0) or 0)
+                    except Exception:
+                        _da = 0
+                if not _da:
+                    _da = int(payload.get("developmental_age", _developmental_age)
+                              or _developmental_age)
+                if _da:
+                    _developmental_age = _da
             except Exception:
                 pass
 
