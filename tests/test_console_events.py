@@ -345,6 +345,13 @@ def test_notify_maker_app_sink_enqueues_system_event(tmp_path, monkeypatch):
     titan_dir.mkdir()
     (titan_dir / "secrets.toml").write_text(f'[api]\ninternal_key = "{_INTERNAL_KEY}"\n')
     (titan_dir / "devices.json").write_text('[{"device_id":"dev-1"}]')
+    # The internal key resolves through params.get_params -> _bootstrap_merge, which
+    # reads params._SECRETS_PATH. That path is frozen via os.path.expanduser AT IMPORT
+    # TIME, so a monkeypatched HOME does NOT redirect it — without this it reads the live
+    # box secrets (e.g. mainnet T1's real key). Repoint it like the sibling params tests
+    # (test_params_secrets / test_user_id_hash) so the suite stays hermetic.
+    from titan_hcl import params as _params
+    monkeypatch.setattr(_params, "_SECRETS_PATH", str(titan_dir / "secrets.toml"))
     captured = {}
 
     class _Resp:
