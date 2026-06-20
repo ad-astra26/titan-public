@@ -291,6 +291,12 @@ def test_dispatch_static_fallback(tmp_path):
 
 
 def test_config_list_real_repo():
+    # titan_hcl/config.toml is gitignored (runtime config, .gitignore:140) → it is
+    # ABSENT in a fresh git worktree / clone / CI checkout and present only where the
+    # console actually runs. Skip rather than hard-fail when it's missing; the assertions
+    # still validate real-config parsing wherever the file exists (dev box, live VPS).
+    if not (_REPO / "titan_hcl" / "config.toml").exists():
+        pytest.skip("titan_hcl/config.toml absent (gitignored runtime config)")
     out = config_api.list_config(_REPO)
     assert out["entries"], "expected config entries from titan_hcl/config.toml"
     assert any(e["help"] for e in out["entries"]), "expected inline-comment help"
