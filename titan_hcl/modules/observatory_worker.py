@@ -299,8 +299,19 @@ def _build_and_record_snapshot(shm_bank, obs_db) -> None:
     life_pl = shm_bank.read_life_force_state() or {}
     energy_state = life_pl.get("state", "HIGH") or "HIGH"
 
+    # Sovereignty — the ONE canonical S = 0.7·E + 0.3·V, read (never recomputed)
+    # from the synthesis metrics snapshot via the single sovereignty_readout
+    # module (INV-SDA-3; G18 file read, no RPC). Replaces the prior
+    # `chi_total * 100`, which surfaced χ-coherence under the sovereignty label
+    # — a second, competing definition the home "Sovereignty Horizon" then
+    # plotted. χ remains surfaced on its own axis (/synthesis χ-budget); the
+    # vital time-series now carries the real S so the home hero + horizon read
+    # the canonical metric. Zeroed dict (no replies yet) → 0.0, the honest read.
+    from titan_hcl.synthesis.sovereignty_readout import read_rolling_sovereignty
+    sovereignty_s = float(read_rolling_sovereignty().get("s", 0.0) or 0.0)
+
     obs_db.record_vital_snapshot(
-        sovereignty_pct=chi_total * 100,
+        sovereignty_pct=sovereignty_s * 100,
         life_force_pct=metabolic_health * 100,
         sol_balance=sol_balance,
         energy_state=energy_state,

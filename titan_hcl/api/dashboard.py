@@ -587,13 +587,16 @@ async def get_status(request: Request):
 
         uptime = time.time() - 0.0 if hasattr(plugin, "_start_time") else 0
 
-        # Sovereignty — cached fallback can return _CacheGetter; type-guard.
-        from titan_hcl.api.state_accessor import _CacheGetter, _CallableValue
-        gatekeeper = titan_state.gatekeeper
-        sovereignty = 0.0
-        if gatekeeper:
-            _sov_raw = getattr(gatekeeper, "sovereignty_score", 0)
-            sovereignty = float(_sov_raw) if isinstance(_sov_raw, (int, float)) else 0.0
+        # Sovereignty — the ONE canonical S = 0.7·E + 0.3·V, read (never
+        # recomputed) from the synthesis metrics snapshot via the single
+        # sovereignty_readout module (INV-SDA-3; G18 file read). The legacy
+        # `gatekeeper.sovereignty_score` is retired (the gatekeeper/offline-RL is
+        # gone — see consciousness.py [4]); reading it here surfaced a dead,
+        # always-0 second definition under the sovereignty label. `s` ∈ [0,1];
+        # this field keeps the [0,1] ratio scale its consumers (channels, banner)
+        # already expect.
+        from titan_hcl.synthesis.sovereignty_readout import read_rolling_sovereignty
+        sovereignty = float(read_rolling_sovereignty().get("s", 0.0) or 0.0)
 
         data = {
             "sovereign_name": "Titan",
