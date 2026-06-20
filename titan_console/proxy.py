@@ -77,3 +77,30 @@ def proxy_chat(ctx: Context, message: str, *, session: str | None = None,
         return status, json.loads(body.decode())
     except (ValueError, UnicodeDecodeError):
         return status, {"raw": body.decode("utf-8", "replace")}
+
+
+def proxy_admin(ctx: Context, kernel_path: str, *, method: str = "POST",
+                payload: dict | None = None, timeout: float = 30.0) -> tuple[int, dict]:
+    """POST a kernel ADMIN call (module reload/restart/enable, reload-api) using the api
+    internal_key — the L2/L3 ops surface for RFP_titan_mobile_app §7.2b.
+
+    The kernel admin endpoints (`/v6/admin/*`, `/v4/reload-api`, guardian enable) are POST
+    and authenticate the co-located console via X-Titan-Internal-Key — the SAME owner bypass
+    `proxy_chat` uses (`ctx.internal_key`). This is NOT a generalized proxy: `dispatch()` only
+    ever calls it with explicit, `_safe_id`-validated paths built from the §7.2b matrix.
+    """
+    if not ctx.internal_key:
+        return 503, {"error": "admin ops unavailable — no internal_key configured "
+                     "(set api.internal_key in ~/.titan/secrets.toml)."}
+    headers = {"Content-Type": "application/json",
+               "X-Titan-Internal-Key": ctx.internal_key}
+    body = json.dumps(payload).encode() if payload is not None else None
+    status, resp = ctx.http(method, f"{ctx.api_base}{kernel_path}",
+                            body=body, headers=headers, timeout=timeout)
+    if status == 0:
+        return 503, {"titan_down": True,
+                     "detail": "api_hcl:7777 unreachable — admin op cannot reach the kernel"}
+    try:
+        return status, json.loads(resp.decode())
+    except (ValueError, UnicodeDecodeError):
+        return status, {"raw": resp.decode("utf-8", "replace")}

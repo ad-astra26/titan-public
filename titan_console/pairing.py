@@ -270,11 +270,18 @@ def confirm_device(ctx: Context, pairing_token: str, code: str,
     except ValueError as e:
         return 403, {"error": str(e)}
     devices = _read_json(_devices_path(ctx), [])
+    existing = next((d for d in devices if d.get("device_id") == pend["device_id"]), None)
+    # `primary` (RFP_titan_mobile_app §7.2b decision-a): the device authorized to trigger a
+    # VPS reboot. The FIRST device ever paired becomes primary (the Maker's own phone);
+    # a re-pair of an already-primary device preserves the flag. Never auto-demotes.
+    first_device = not devices
+    was_primary = bool(existing and existing.get("primary"))
     devices = [d for d in devices if d.get("device_id") != pend["device_id"]]  # re-pair replaces
     devices.append({
         "device_id": pend["device_id"], "pubkey": pend["device_pubkey"],
         "label": pend.get("label", "phone"), "fingerprint": pend.get("fingerprint", ""),
         "paired_at": now, "authorized_by": authorized_by,
+        "primary": was_primary or first_device,
     })
     _write_json(_devices_path(ctx), devices)
     # clear the pending session (single-use)
@@ -297,6 +304,16 @@ def registered_device_ids(ctx: Context) -> list[str]:
     """All paired device ids (for fan-out — e.g. HealthMonitor enqueues to every phone)."""
     return [d["device_id"] for d in _read_json(_devices_path(ctx), [])
             if d.get("device_id")]
+
+
+def is_primary_device(ctx: Context, device_id: str) -> bool:
+    """Whether `device_id` carries the `primary` flag (RFP §7.2b decision-a).
+
+    Only a primary device may trigger a VPS reboot. Fail-closed: an unknown /
+    unflagged device is NOT primary.
+    """
+    d = _find_device(ctx, device_id)
+    return bool(d and d.get("primary"))
 
 
 def device_record(ctx: Context, device_id: str) -> dict | None:

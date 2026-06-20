@@ -22,6 +22,13 @@ Routes (all under /console; live cognition is proxied under /console/api):
   POST /console/config/set        {key,value}        (token-gated)
   POST /console/chat              {message,session}  (token-gated)
   POST /console/backup/config     {enabled,backend,…} off-site copy config (token-gated)
+  GET  /console/ops/processes     dry-run process scan (orphan-helper reapables)  (§7.2b)
+  GET  /console/agent-status      console self-status (uptime/version/reachable)   (§7.2b)
+  POST /console/ops/module/<action>/<name>  L2 reload|restart|enable → kernel admin (§7.2b)
+  POST /console/ops/reload-api    L3 zero-downtime api reload → kernel /v4/reload-api(§7.2b)
+  POST /console/ops/reboot        {confirm_phrase}  VPS reboot (primary device only)(§7.2b)
+  POST /console/ops/processes/reap{pids:[…]}   kill allow-listed orphan helpers     (§7.2b)
+  POST /console/ops/prune-arweave-devnet {keep,confirm}  prune devnet Arweave cache  (§7.2b)
   GET  /*                         static SPA (dist_dir), index.html fallback
 """
 from __future__ import annotations
@@ -29,6 +36,7 @@ from __future__ import annotations
 import hmac
 import json
 import posixpath
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -156,6 +164,42 @@ def _backup_options(ctx: Context) -> dict:
     }
 
 
+# RFP_titan_mobile_app §7.2b — a module name must be a safe identifier AND live in the
+# kernel roster. The kernel is the source of truth for which modules exist.
+_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# action → (kernel path template, method, optional query). reload/restart/enable mirror
+# the verified kernel admin endpoints (RFP §7.2b matrix, 2026-06-20).
+_MODULE_OPS = {
+    "reload":  ("/v6/admin/reload-module/{name}", "POST", None),
+    "restart": ("/v6/admin/restart-module/{name}", "POST", "spawn=true"),
+    "enable":  ("/v6/system/guardian/enable/{name}", "POST", None),
+}
+
+
+def _module_in_roster(ctx: Context, name: str) -> bool:
+    """True iff `name` is a live kernel module (per /v6/nervous-system `modules[].name`)."""
+    status, payload = proxy.proxy_readout(ctx, "/v6/nervous-system")
+    if status != 200 or not isinstance(payload, dict):
+        return False
+    return any(isinstance(m, dict) and m.get("name") == name
+               for m in payload.get("modules", []))
+
+
+def _handle_module_op(ctx: Context, action: str, name: str) -> tuple:
+    """Validate + proxy an L2 module op (reload/restart/enable) to the kernel (§7.2b)."""
+    if action not in _MODULE_OPS:
+        return 404, {"error": f"unknown module action: {action}"}
+    if not _MODULE_NAME_RE.match(name or ""):
+        return 400, {"error": f"invalid module name: {name!r}"}
+    if not _module_in_roster(ctx, name):
+        return 404, {"error": f"unknown module (not in kernel roster): {name}"}
+    template, kmethod, kquery = _MODULE_OPS[action]
+    kernel_path = template.format(name=name)
+    if kquery:
+        kernel_path = f"{kernel_path}?{kquery}"
+    return proxy.proxy_admin(ctx, kernel_path, method=kmethod)
+
+
 def dispatch(ctx: Context, method: str, path: str, query: dict,
              body: bytes, headers: dict, is_local: bool = True) -> tuple:
     """Pure router. Returns (status_int, payload) where payload is dict|bytes.
@@ -193,7 +237,10 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
     if path in _PAIR_OPERATOR:
         if not _operator_ok():
             return 401, {"error": "operator token required for pairing control"}
-    elif method == "POST" and path in _MUTATIONS and not device_authed:
+    elif method == "POST" and (path in _MUTATIONS or path.startswith("/console/ops/")) \
+            and not device_authed:
+        # Every /console/ops/* POST is a privileged §7.2b op — gate it like a mutation
+        # even on localhost (the prefix covers the variable /module/<action>/<name> routes).
         if not _operator_ok():
             return 401, {"error": "missing or invalid X-Console-Token (or device signature)"}
 
@@ -291,6 +338,17 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             except ValueError as e:
                 return 400, {"error": str(e)}
             return 200, {"items": items, "cursor": cursor}
+        if path == "/console/ops/processes":
+            # Advanced ops: ALWAYS-dry-run process scan (§7.2b decision-b). Device-authed.
+            if not device_authed:
+                return 401, {"error": "valid device signature required"}
+            return 200, ops.scan_processes(ctx)
+        if path == "/console/agent-status":
+            # Console self-status — the app polls this to detect the console coming back
+            # after a VPS reboot (§7.2b worked example). Device-authed.
+            if not device_authed:
+                return 401, {"error": "valid device signature required"}
+            return 200, ops.agent_status(ctx)
         if path.startswith("/console/api/"):
             v6 = path[len("/console/api"):]  # → "/v6/..."
             if query:
@@ -422,6 +480,40 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             if not device_authed:
                 return 401, {"error": "valid device signature required"}
             return 200, presence.set_settings(ctx, data)
+        if path.startswith("/console/ops/module/"):
+            # L2 worker op: /console/ops/module/<action>/<name> (§7.2b matrix). Auth handled
+            # by the /console/ops/ mutation gate above; name is roster-checked in the helper.
+            rest = path[len("/console/ops/module/"):].split("/", 1)
+            if len(rest) != 2 or not rest[1]:
+                return 400, {"error": "expected /console/ops/module/<action>/<name>"}
+            return _handle_module_op(ctx, rest[0], rest[1])
+        if path == "/console/ops/reload-api":
+            # L3 api zero-downtime reload (§7.2b). Proxies the kernel's /v4/reload-api.
+            return proxy.proxy_admin(ctx, "/v4/reload-api", method="POST")
+        if path == "/console/ops/reboot":
+            # Host VPS reboot — the most destructive op. §7.2b decision-a: device-authed
+            # (mutation gate) AND a *primary* device AND a typed confirm phrase. A
+            # non-primary or operator-token-only caller is refused here.
+            device_id = headers.get("x-device-id", "")
+            if not (device_authed and pairing.is_primary_device(ctx, device_id)):
+                return 403, {"error": "reboot requires a primary paired device"}
+            return 200, ops.reboot(ctx, confirm_phrase=str(data.get("confirm_phrase", "")))
+        if path == "/console/ops/processes/reap":
+            # Kill specific orphan-helper PIDs the app picked from a prior dry-run scan.
+            # ops.reap_processes re-classifies each PID at kill time (allowlist, fail-closed).
+            pids = data.get("pids")
+            if not isinstance(pids, list) or not pids:
+                return 400, {"error": "body must carry a non-empty 'pids' list "
+                             "(confirm specific PIDs from /console/ops/processes)"}
+            return 200, ops.reap_processes(ctx, pids=pids)
+        if path == "/console/ops/prune-arweave-devnet":
+            keep = data.get("keep", 5)
+            try:
+                keep = int(keep)
+            except (TypeError, ValueError):
+                return 400, {"error": "keep must be an integer"}
+            return 200, ops.prune_arweave_devnet(ctx, keep=keep,
+                                                 confirm=bool(data.get("confirm")))
         if ctx.dev_enabled and path == "/console/dev/log":
             return dev_endpoints.ingest_log(ctx, body)
         return 404, {"error": f"no such console route: {path}"}
