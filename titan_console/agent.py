@@ -488,8 +488,10 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
                 return 400, {"error": "expected /console/ops/module/<action>/<name>"}
             return _handle_module_op(ctx, rest[0], rest[1])
         if path == "/console/ops/reload-api":
-            # L3 api zero-downtime reload (§7.2b). Proxies the kernel's /v4/reload-api.
-            return proxy.proxy_admin(ctx, "/v4/reload-api", method="POST")
+            # L3 api reload (§7.2b). Canonical kernel path is /v6/admin/reload-api
+            # (post_v4_reload_api → commands.reload_api, v6.py:389); the /v4/ alias
+            # 308-redirects and a redirected POST silently no-ops the body.
+            return proxy.proxy_admin(ctx, "/v6/admin/reload-api", method="POST")
         if path == "/console/ops/reboot":
             # Host VPS reboot — the most destructive op. §7.2b decision-a: device-authed
             # (mutation gate) AND a *primary* device AND a typed confirm phrase. A

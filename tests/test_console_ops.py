@@ -177,7 +177,9 @@ def test_reload_api_proxies_v4(tmp_path):
     status, _ = dispatch(ctx, "POST", path, {}, b"",
                          _signed(seed, "dev-1", "POST", path))
     assert status == 200
-    assert any(c["url"].endswith("/v4/reload-api") for c in fake.calls)
+    # Canonical non-redirecting kernel path (the /v4/ alias 308-redirects → POST no-op).
+    assert any(c["url"].endswith("/v6/admin/reload-api") for c in fake.calls)
+    assert not any(c["url"].endswith("/v4/reload-api") for c in fake.calls)
 
 
 def test_admin_proxy_503_without_internal_key(tmp_path):
