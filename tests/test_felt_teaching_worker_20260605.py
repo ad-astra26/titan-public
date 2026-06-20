@@ -6,12 +6,13 @@ Covers `titan_hcl/modules/felt_teaching_worker.py`:
   • _FeltTeachingStore — the worker's OWN store (status lifecycle, dedup, recurrence,
     mark_matured); separate from synthesis.duckdb (G21)
   • LanguageTeacher.build_felt_perturbation — prompt-build only
-  • _process_candidate — drives CGN via record_outcome (PROPOSE-ONLY); status lifecycle;
-    frame_dependent when the Object is already in the grounded-view (F⊗C, never overwrite);
-    dedup against the own store; reward bounded
+  • _process_candidate — drives CGN via record_felt_experience (PROPOSE-ONLY, a complete
+    value-net "experience" transition; INV-Syn-ENG-4); status lifecycle; frame_dependent
+    when the Object is already in the grounded-view (F⊗C, never overwrite); dedup against
+    the own store; reward bounded
 
-The worker drives CGN through CGNConsumerClient.record_outcome / emit_cross_insight ONLY
-(the fakes expose exactly those) — proving propose-only by construction.
+The worker drives CGN through CGNConsumerClient.record_felt_experience / emit_cross_insight
+ONLY (the fakes expose exactly those) — proving propose-only by construction.
 """
 from __future__ import annotations
 
@@ -29,16 +30,22 @@ from titan_hcl.logic.language_teacher import LanguageTeacher
 
 
 class _FakeClient:
-    """CGN consumer surface the worker is allowed to use — record_outcome (feed
-    evidence) + emit_cross_insight (peer learning). NO grounding-write method exists,
-    so any non-propose-only attempt would AttributeError (propose-only by construction)."""
+    """CGN consumer surface the worker is allowed to use — record_felt_experience
+    (complete value-net "experience" transition; INV-Syn-ENG-4) + emit_cross_insight
+    (peer learning). NO grounding-write method exists, so any non-propose-only attempt
+    would AttributeError (propose-only by construction)."""
 
     def __init__(self):
-        self.outcomes = []
+        self.experiences = []
         self.insights = []
 
-    def record_outcome(self, concept_id, reward, outcome_context=None):
-        self.outcomes.append((concept_id, reward, outcome_context or {}))
+    def record_felt_experience(self, *, concept_id, neuromods, reward,
+                               action=0, encounter_type="teaching",
+                               outcome_context=None, metadata=None):
+        # Mirror the production capture: (concept_id, reward, outcome_context) is
+        # the propose-only evidence; neuromods builds the 30D state internally.
+        self.experiences.append((concept_id, reward, outcome_context or {},
+                                 neuromods or {}))
 
     def emit_cross_insight(self, reward, ctx=None):
         self.insights.append((reward, ctx or {}))
@@ -106,8 +113,8 @@ def test_build_felt_perturbation_shape():
 def test_process_grounding_drives_cgn(store):
     client = _FakeClient()
     _process_candidate(_payload(), store, client, LanguageTeacher(), None, set())
-    assert len(client.outcomes) == 1
-    concept_id, reward, ctx = client.outcomes[0]
+    assert len(client.experiences) == 1
+    concept_id, reward, ctx, _nm = client.experiences[0]
     assert concept_id == "microbe"
     assert 0.0 <= reward <= 1.0
     assert ctx["source_engram"] == "glacier_x" and ctx["source_version"] == 2
@@ -122,7 +129,7 @@ def test_process_frame_dependent_scopes_to_frame(store):
     grounded_view = {"microbe"}                     # already grounded (race/stale gap)
     _process_candidate(_payload(), store, client, LanguageTeacher(), None,
                        grounded_view)
-    _cid, _r, ctx = client.outcomes[0]
+    _cid, _r, ctx, _nm = client.experiences[0]
     assert ctx["frame"] == "biology"               # F⊗C — domain-scoped, never base
     assert store.status_of("microbe", "glacier_x", 2) == "frame_dependent"
 
@@ -131,20 +138,20 @@ def test_process_dedups_against_own_store(store):
     client = _FakeClient()
     _process_candidate(_payload(), store, client, LanguageTeacher(), None, set())
     _process_candidate(_payload(), store, client, LanguageTeacher(), None, set())
-    assert len(client.outcomes) == 1               # 2nd is skipped (already grounding)
+    assert len(client.experiences) == 1            # 2nd is skipped (already grounding)
 
 
 def test_process_empty_label_noop(store):
     client = _FakeClient()
     _process_candidate(_payload(label="   "), store, client, LanguageTeacher(),
                        None, set())
-    assert client.outcomes == []
+    assert client.experiences == []
 
 
 def test_process_reward_persisted_matches(store):
     client = _FakeClient()
     _process_candidate(_payload(), store, client, LanguageTeacher(), None, set())
-    _cid, reward, _ctx = client.outcomes[0]
+    _cid, reward, _ctx, _nm = client.experiences[0]
     row = store._conn.execute(
         "SELECT reward, felt_state_json FROM felt_candidates").fetchone()
     assert row[0] == reward

@@ -7,14 +7,18 @@ teaches inner (Spirit/CGN) felt-grounding:
   Object with no CGN felt-grounding, seeded with the felt-state it was lived under)
     → LanguageTeacher.build_felt_perturbation (prompt-build; LLM via this worker's own
       provider — best-effort)
-    → CGNConsumerClient.record_outcome("felt_teaching", object_label, reward,
-      outcome_context)  (the path language_worker uses; cgn_worker → cgn.record_outcome
-      → value_net micro-update + CGNTransition buffered for IQL)
+    → CGNConsumerClient.send_transition({"type":"experience", …, "outcome_context":…})
+      (cgn_worker → cgn.record_experience → buffers a complete (state, action, reward)
+      transition then self-matches via record_outcome → value_net Sigma micro-update +
+      concept-journey growth + felt-centroid materialization fed from
+      outcome_context.felt_state)
     + emit_cross_insight (peer consumers learn from it).
 
 `felt_teaching` is a FULL CGN consumer + IQL/value-net contributor — yet still
-PROPOSE-ONLY: it feeds evidence THROUGH record_outcome; CGN's value_net + cross-consumer
-maturity (≥2 distinct consumers) own the actual grounding. It NEVER writes a grounding
+PROPOSE-ONLY: it feeds a complete experience transition; CGN's value_net + cross-consumer
+maturity (≥2 distinct consumers) own the actual grounding. (record_outcome alone was a
+no-op — this consumer never grounds, so its match loop never found a pending transition;
+the experience path is what actually reaches IQL — fixed 2026-06-20, INV-Syn-ENG-4.) It NEVER writes a grounding
 or emits CGN_CONCEPT_GROUNDED. The reward is conservatively bounded so one humble voice
 cannot skew the shared V(s) (CGN's freq_scale de-weights any dominant consumer).
 
@@ -50,6 +54,7 @@ from titan_hcl import bus
 from titan_hcl.bus import CGN_CONCEPT_GROUNDED, ENGRAM_FELT_CANDIDATE
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _sev
+from titan_hcl.logic.cgn_types import normalize_neuromods
 from titan_hcl.synthesis.felt_bridge import normalize_label
 
 logger = logging.getLogger("felt_teaching")
@@ -328,7 +333,8 @@ def felt_teaching_worker_main(recv_queue, send_queue, name: str,
 
 def _process_candidate(payload, store, client, teacher, provider,
                        grounded_view) -> None:
-    """Process one ENGRAM_FELT_CANDIDATE → drive CGN via record_outcome (propose-only)."""
+    """Process one ENGRAM_FELT_CANDIDATE → drive CGN via a complete "experience"
+    transition (propose-only value-net contributor; INV-Syn-ENG-4)."""
     label = normalize_label(payload.get("object_label"))
     if not label:
         return
@@ -377,8 +383,19 @@ def _process_candidate(payload, store, client, teacher, provider,
     if perturbation:
         outcome_context["perturbation"] = perturbation[:240]
 
-    # PROPOSE-ONLY — feed evidence THROUGH record_outcome; CGN owns grounding.
-    client.record_outcome(label, reward, outcome_context)
+    # PROPOSE-ONLY value-net contributor (INV-Syn-ENG-4). record_outcome alone is
+    # a NO-OP here — this consumer never ground()s, so cgn.record_outcome's match
+    # loop (cgn.py:594) finds no pending transition → the reward AND the per-concept
+    # felt centroid (cgn.py:620) were both silently dropped. record_felt_experience
+    # sends a COMPLETE "experience" transition (felt_state → 30D state) carrying
+    # outcome_context → cgn.record_experience buffers (s,a,r) + self-matches via
+    # record_outcome → Sigma V(s) update + concept-journey + felt-centroid. Still
+    # propose-only: action 0 is the single "teach" gesture; no CGN_CONCEPT_GROUNDED.
+    client.record_felt_experience(
+        concept_id=label, neuromods=normalize_neuromods(felt_state),
+        reward=reward, outcome_context=outcome_context,
+        metadata={"action_name": "teach_felt", "encounter_type": "teaching",
+                  "domain_hint": domain_hint, "recurrence": int(recurrence)})
     try:
         client.emit_cross_insight(reward, {"concept_id": label,
                                            "domain_hint": domain_hint})

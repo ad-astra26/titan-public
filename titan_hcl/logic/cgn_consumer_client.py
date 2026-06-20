@@ -609,6 +609,50 @@ class CGNConsumerClient:
                          key="logic.cgn_consumer_client.record_experience_failed",
                          throttle=100)
 
+    def record_felt_experience(self, *, concept_id: str, neuromods: dict,
+                               reward: float, action: int = 0,
+                               encounter_type: str = "teaching",
+                               outcome_context: dict = None,
+                               metadata: dict = None) -> None:
+        """Propose-only value-net contribution from a felt/affective consumer
+        (INV-Syn-ENG-4). For consumers whose signal IS the felt state (e.g.
+        felt_teaching): builds the 30D state from `neuromods` (the [0:5] slots) +
+        `reward` as concept confidence ([20]) + `encounter_type` ([29]), then
+        sends ONE complete "experience" transition that CARRIES `outcome_context`.
+
+        Unlike record_experience (which builds the state from social/relationship
+        `features`), the felt signal itself is the state — and crucially the
+        transition carries outcome_context, so cgn.record_experience →
+        record_outcome runs the FULL path AND the central per-concept felt-centroid
+        materialization (cgn.py reads outcome_context["felt_state"]); a bare
+        record_outcome is a no-op for a consumer that never ground()s.
+
+        Still propose-only: it never writes a grounding / emits CGN_CONCEPT_GROUNDED
+        — CGN's value_net + cross-consumer maturity own the grounding decision."""
+        if self._send_queue is None:
+            return
+        try:
+            state = self._build_state_vector(
+                {"confidence": float(reward)},
+                {"neuromods": neuromods or {}, "encounter_type": encounter_type})
+            self.send_transition({
+                "type": "experience",
+                "consumer": self._name,
+                "concept_id": concept_id,
+                "state": state.tolist(),
+                "action": int(action),
+                "action_params": [0.0, 0.0, 0.0, 0.0],
+                "reward": float(reward),
+                "timestamp": time.time(),
+                "metadata": metadata or {},
+                "outcome_context": outcome_context or {},
+            })
+        except Exception as e:
+            swallow_warn(
+                f'[CGNClient:{self._name}] record_felt_experience failed', e,
+                key="logic.cgn_consumer_client.record_felt_experience_failed",
+                throttle=100)
+
     # ── State vector building (copied from cgn.py _build_state_vector) ──
 
     def _build_state_vector(self, concept: dict,
