@@ -194,6 +194,7 @@ class CausalCandidate:
     reward_sum: float = 0.0
     first_seen_idx: int = 0
     last_seen_idx: int = 0
+    last_obs_tick: int = 0  # decay-tick count at last observation (staleness gate)
     promoted: bool = False  # set True after maybe_promote returns this candidate
 
     @property
@@ -247,6 +248,7 @@ class CausalGenerator:
         magnitude_threshold: float = 0.05,
         anti_pattern_enabled: bool = True,
         staleness_decay_per_tick: float = 0.999,
+        stale_grace_ticks: int = 30,
     ) -> None:
         self._consumer = consumer
         self._window_size = max(1, int(window_size))
@@ -254,6 +256,9 @@ class CausalGenerator:
         self._magnitude_threshold = float(magnitude_threshold)
         self._anti_pattern_enabled = bool(anti_pattern_enabled)
         self._staleness_decay = float(staleness_decay_per_tick)
+        # Decay-ticks of NO observation a candidate tolerates before it starts
+        # bleeding — the staleness grace window (see decay_stale).
+        self._stale_grace_ticks = max(0, int(stale_grace_ticks))
 
         # Sliding window of recent (action_sig, effect_sig, is_anti) keys.
         # Eviction = decrement candidate count when oldest entry leaves.
@@ -265,10 +270,10 @@ class CausalGenerator:
         # Monotonic transition counter for first/last-seen indices.
         self._idx: int = 0
 
-        # _idx as of the previous decay_stale() tick — the staleness horizon.
-        # A candidate observed since this point is "moving" and exempt from
-        # decay (see decay_stale).
-        self._last_decay_idx: int = 0
+        # Count of decay_stale() ticks so far (wall-clock-paced, ~1/min).
+        # Candidates record this at each observation; decay_stale exempts any
+        # candidate within _stale_grace_ticks of its last observation.
+        self._decay_tick: int = 0
 
         # Stats — surfaced via get_stats(), used by arch_map causal-generator.
         self._stats: Dict[str, int] = {
@@ -327,29 +332,32 @@ class CausalGenerator:
         previous decay tick — "unmoving" patterns, regardless of window
         position.  Returns the count evicted (window-count fell below 1).
 
-        🔑 The staleness GATE (last_seen_idx > previous-tick idx ⇒ exempt) is
-        load-bearing.  Without it, decay ran on ACTIVELY-fed candidates too,
-        and a slow consumer observed at ~the decay cadence (e.g.
-        reasoning_strategy ~1 obs/min vs the 60 s decay tick) had its single
-        recurring key decremented as fast as it accumulated — note
-        `int(n * 0.999) == n - 1` for any n < 1000, so the intended 0.1 %
-        bleed is really a hard −1 per tick.  The key stayed pinned at
-        observed_n ≈ 1, never reached min_n, and the consumer formed 0 causal
-        candidates (root-caused live via CausalDBG, 2026-06-20).  Now
-        actively-fed candidates are exempt and accumulate via the window
-        mechanism; only genuinely-quiet candidates bleed (≈ observed_n ticks
-        to evict).
+        🔑 STALENESS GRACE WINDOW — root-caused live via CausalDBG (2026-06-20):
+        the woken consumers were fed but formed 0 causal candidates because
+        decay ran on EVERY candidate every tick, including actively-fed ones,
+        and `int(n * 0.999) == n - 1` for every integer n < 1000 — so the
+        intended 0.1 %/tick slow-bleed was really a hard −1 per tick.  A
+        consumer observed at ~the decay cadence (reasoning_strategy ~1 obs/min,
+        or worse emotional ~0.3 obs/min ⇒ ~3 ticks between observations) had
+        its single recurring key decremented as fast (or faster) than it
+        accumulated → pinned below min_n → 0 candidates.  meta promoted fine
+        only because it is the high-rate consumer that outruns the decay.
+
+        Fix: a candidate is EXEMPT from decay while it has been observed within
+        the last `_stale_grace_ticks` decay ticks (default 30 ≈ 30 min).  Any
+        meaningfully-recurring key (re-seen well inside the grace window) keeps
+        its integer window-count and climbs to min_n; only genuinely-quiet keys
+        (silent past the grace window) bleed and evict.  observed_n stays an
+        exact integer window-count for all live candidates.
         """
+        self._decay_tick += 1
         if self._staleness_decay >= 1.0:
-            self._last_decay_idx = self._idx
             return 0
-        moved_since = self._last_decay_idx
-        self._last_decay_idx = self._idx
         evicted = 0
         for key in list(self._candidates.keys()):
             cand = self._candidates[key]
-            if cand.last_seen_idx > moved_since:
-                continue  # observed since the last tick — still moving, exempt
+            if self._decay_tick - cand.last_obs_tick < self._stale_grace_ticks:
+                continue  # observed within the grace window — exempt
             cand.observed_n = int(cand.observed_n * self._staleness_decay)
             if cand.observed_n < 1:
                 self._candidates.pop(key, None)
@@ -437,6 +445,7 @@ class CausalGenerator:
         cand.observed_n += 1
         cand.reward_sum += reward
         cand.last_seen_idx = self._idx
+        cand.last_obs_tick = self._decay_tick  # refresh staleness grace
 
         # If this candidate had previously been promoted but its count climbed
         # back up to threshold, allow re-promotion (e.g., after staleness
@@ -477,6 +486,7 @@ class CausalGeneratorRegistry:
             magnitude_threshold=float(cfg.get("magnitude_threshold", 0.05)),
             anti_pattern_enabled=bool(cfg.get("anti_pattern_enabled", True)),
             staleness_decay_per_tick=float(cfg.get("staleness_decay_per_tick", 0.999)),
+            stale_grace_ticks=int(cfg.get("stale_grace_ticks", 30)),
         )
         self._generators[consumer] = gen
         return gen

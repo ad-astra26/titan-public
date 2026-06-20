@@ -266,17 +266,16 @@ def test_positive_observe_with_negative_reward_skipped():
 
 
 def test_decay_stale_evicts_low_count_candidates():
+    # stale_grace_ticks=0 → decay every tick (exercise the bleed mechanics).
     g = CausalGenerator("test", window_size=10, min_n=5,
                        magnitude_threshold=0.05,
-                       staleness_decay_per_tick=0.5)  # aggressive for testability
+                       staleness_decay_per_tick=0.5,  # aggressive for testability
+                       stale_grace_ticks=0)
     for _ in range(2):
         g.observe(_t(0, metadata={"action_name": "rare"}), reward=0.10)
     stats_before = g.get_stats()
     assert stats_before["candidates_active"] == 1
-    # First tick is a grace tick: the candidate was observed since idx 0, so
-    # the staleness gate exempts it.  From the 2nd tick it bleeds: 2*0.5=1
-    # (survives), 1*0.5=0 (<1 -> evicts).
-    g.decay_stale()  # grace — exempt (moving since last tick)
+    # No grace: 2*0.5=1 (survives), 1*0.5=0 (<1 -> evicts).
     g.decay_stale()  # 2 -> 1
     g.decay_stale()  # 1 -> 0 -> evict
     stats_after = g.get_stats()
@@ -284,16 +283,16 @@ def test_decay_stale_evicts_low_count_candidates():
 
 
 def test_active_candidate_survives_decay_at_observation_cadence():
-    """Regression (2026-06-20, live CausalDBG): a slow consumer observed at
-    ~the decay-tick cadence must still reach min_n.  Before the staleness
-    gate, decay ran on the actively-fed candidate every tick and
+    """Regression (2026-06-20, live CausalDBG): a consumer observed at ~the
+    decay-tick cadence must still reach min_n.  Before the staleness grace
+    window, decay ran on the actively-fed candidate every tick and
     int(n*0.999)==n-1 cancelled each observation's +1 — the key was pinned at
     observed_n≈1 and the consumer formed 0 causal candidates.  Interleaving
     one observation per decay tick (the live failure pattern) must now
-    promote."""
+    promote (default grace=30 exempts the recurring key)."""
     g = CausalGenerator("reasoning_strategy", window_size=30, min_n=5,
                         magnitude_threshold=0.05,
-                        staleness_decay_per_tick=0.999)
+                        staleness_decay_per_tick=0.999)  # default grace=30
     promoted = None
     for _ in range(8):
         # constant key: action_0 (no action_name) + strong_positive bucket
@@ -305,6 +304,47 @@ def test_active_candidate_survives_decay_at_observation_cadence():
     assert promoted is not None, \
         "active recurring key must promote despite a decay tick per observation"
     assert g.get_stats()["promoted_total"] >= 1
+
+
+def test_slow_consumer_recurring_key_climbs_across_multi_tick_gaps():
+    """Regression (2026-06-20): a SLOW consumer (e.g. emotional ~0.3 obs/min)
+    has ~3 decay ticks between observations.  A single-tick exemption is NOT
+    enough — the non-grace ticks would bleed the int count faster than the
+    +1/observation could rebuild it.  The grace WINDOW (default 30 ticks)
+    exempts the recurring key across the whole gap, so it still climbs to
+    min_n and promotes."""
+    g = CausalGenerator("emotional", window_size=40, min_n=6,
+                        magnitude_threshold=0.05,
+                        staleness_decay_per_tick=0.999)  # default grace=30
+    promoted = None
+    for _ in range(10):
+        g.observe(_t(5, metadata={}), reward=0.36)  # constant key
+        for _ in range(3):  # 3 decay ticks per observation gap
+            g.decay_stale()
+        p = g.maybe_promote()
+        if p is not None:
+            promoted = p
+    assert promoted is not None, \
+        "slow recurring key must still climb to min_n within the grace window"
+
+
+def test_genuinely_quiet_candidate_evicts_after_grace_window():
+    """A key that goes silent PAST the grace window must still bleed and evict
+    (the GC the decay exists for) — the grace only protects recently-observed
+    candidates, not abandoned ones."""
+    g = CausalGenerator("test", window_size=10, min_n=5,
+                        magnitude_threshold=0.05,
+                        staleness_decay_per_tick=0.5,  # fast bleed once stale
+                        stale_grace_ticks=3)
+    for _ in range(2):
+        g.observe(_t(0, metadata={"action_name": "rare"}), reward=0.10)
+    assert g.get_stats()["candidates_active"] == 1
+    # Ticks 1,2 within grace (gap < 3) → exempt; tick 3: gap 3 >= 3 → bleed 2->1.
+    g.decay_stale(); g.decay_stale(); g.decay_stale()
+    assert g.get_stats()["candidates_active"] == 1
+    # Tick 4: 1->0 → evict.
+    g.decay_stale(); g.decay_stale()
+    assert g.get_stats()["candidates_active"] == 0
 
 
 def test_decay_no_op_when_decay_factor_is_one():
@@ -371,7 +411,8 @@ def test_registry_observe_for_routes_negative_to_anti_pattern():
 def test_registry_decay_stale_all_aggregates():
     reg = CausalGeneratorRegistry(
         defaults={"min_n": 5, "window_size": 10, "magnitude_threshold": 0.05,
-                  "staleness_decay_per_tick": 0.4},  # aggressive
+                  "staleness_decay_per_tick": 0.4,  # aggressive
+                  "stale_grace_ticks": 0},  # decay every tick
     )
     # Seed two consumers with sub-threshold candidates
     for _ in range(2):

@@ -518,6 +518,7 @@
 "cgn.causal_generator.per_consumer.self_model.window_size" = {type="int", constraint=">=0", reload="hot", owner=["cgn"], sensitive=false}
 "cgn.causal_generator.per_consumer.social.min_n" = {type="int", constraint=">=0", reload="hot", owner=["cgn"], sensitive=false}
 "cgn.causal_generator.per_consumer.social.window_size" = {type="int", constraint=">=0", reload="hot", owner=["cgn"], sensitive=false}
+"cgn.causal_generator.stale_grace_ticks" = {type="int", constraint=">=0", reload="hot", owner=["cgn"], sensitive=false}
 "cgn.causal_generator.staleness_decay_per_tick" = {type="float", constraint="0..1", reload="hot", owner=["cgn"], sensitive=false}
 "cgn.causal_generator.window_size" = {type="int", constraint=">=0", reload="hot", owner=["cgn"], sensitive=false}
 "cgn.cgn_iql_adv_clip" = {type="float", constraint=">0", reload="hot", owner=["cgn"], sensitive=false}

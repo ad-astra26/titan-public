@@ -1684,7 +1684,8 @@ window_size = 30                      # rolling transitions per consumer
 min_n = 5                             # promotion threshold
 magnitude_threshold = 0.05            # below this = noise, no candidate formed
 anti_pattern_enabled = true           # enable "negative effect" hypotheses
-staleness_decay_per_tick = 0.999      # multiplicative decay per cgn_worker tick
+staleness_decay_per_tick = 0.999      # multiplicative decay per cgn_worker tick (only past the grace window)
+stale_grace_ticks = 30                 # decay ticks (~min) of silence a candidate tolerates before bleeding — protects slow but recurring consumers
 
 [cgn.causal_generator.per_consumer]
 # Per-consumer overrides — language has dense transitions, social is sparse +

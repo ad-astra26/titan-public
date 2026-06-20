@@ -336,6 +336,8 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 "anti_pattern_enabled": bool(_cg_cfg.get("anti_pattern_enabled", True)),
                 "staleness_decay_per_tick": float(
                     _cg_cfg.get("staleness_decay_per_tick", 0.999)),
+                "stale_grace_ticks": int(
+                    _cg_cfg.get("stale_grace_ticks", 30)),
             },
             "per_consumer": dict(_cg_cfg.get("per_consumer", {}) or {}),
         }
@@ -647,8 +649,8 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # Slower cadence than the HAOV test pump; once per minute.  Only candidates
     # that got NO observation since the previous tick are bled (the staleness
     # gate — see CausalGenerator.decay_stale); actively-fed candidates are
-    # exempt.  The decay is int-multiplicative, so int(n*0.999)==n-1 — a quiet
-    # candidate evicts in ≈ observed_n ticks (≈ minutes), not 16 h.  No-op when
+    # exempt.  Decay is true multiplicative (factor ~0.999/tick → ~16 h before a
+    # genuinely-quiet candidate decays below 1 and evicts).  No-op when
     # cgn.causal_generator.enabled = false.
     CAUSAL_DECAY_INTERVAL_S = float(
         config.get("causal_decay_interval_s", 60.0))
