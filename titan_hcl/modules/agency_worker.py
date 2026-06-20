@@ -822,6 +822,26 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 for _ar in _ar_list:
                     _maybe_emit_onchain_anchor_catalyst(
                         send_queue, name, _ar)
+                    # P0 (BUG-P8-DISPATCH-NERVOUS-SIGNALS-UNSCORED, 2026-06-20): the
+                    # PRIMARY no-prompt 24/7 loop scored NOTHING — it never ran the
+                    # judge. Wire it in exactly like the handle_intent branch so
+                    # autonomous (NN-dispatched) outcomes accrue engagement-independent
+                    # IQL experience AND (via fix#1) skill cells, and feed the failure-
+                    # replay store. Per-result intent reconstructed from the action
+                    # result (posture + the captured helper_params for faithful re-pose;
+                    # source dims default empty -> p8_rerun coding_sandbox regenerates
+                    # from posture, research helpers re-pose from helper_params).
+                    if _p8_judge is not None and isinstance(_ar, dict):
+                        _intent_for_ar = {
+                            "posture": _ar.get("posture", "meditate"),
+                            "source_layer": "nervous",
+                            "source_dims": [],
+                            "deficit_values": [],
+                            "helper_params": _ar.get("helper_params") or {},
+                        }
+                        _maybe_emit_autonomous_experience(
+                            send_queue, name, titan_id, _intent_for_ar, _ar,
+                            agency, _p8_judge)
 
             elif action == "assess":
                 action_result = payload.get("action_result") or {}

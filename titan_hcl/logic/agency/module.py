@@ -629,6 +629,7 @@ class AgencyModule:
                         result=result,
                         reasoning=f"autonomy-first: {system} urgency={urgency:.3f}",
                         trinity_snapshot=trinity_snapshot,
+                        helper_params=params,  # P0/fix#2: carry query/target so a revisit faithfully re-poses this no-prompt attempt
                     )
                     results.append(action_result)
                     dispatched = True
