@@ -789,6 +789,13 @@ async def get_v6_readiness(request: Request) -> JSONResponse:
                     unhealthy_count += 1
     finally:
         bank.close()
+    # Per-module hot-op capability (RFP_titan_mobile_app §7.2b): tell the app the ONE correct
+    # L2 action per worker — reload (in-place, light) vs restart (kill-respawn) — so it never
+    # offers both. Sourced from the canonical kernel allowlists (single source of truth).
+    for _m in modules_payload:
+        _n = str(_m.get("name"))
+        _m["can_reload"] = _n in _dash._RELOAD_MODULE_ALLOWLIST
+        _m["can_restart"] = _n in _dash._RESTART_MODULE_ALLOWLIST
     # Single-read authoritative name→pid map (INV-PROC-7 part b / §11.I.5). Live
     # slot pid wins over the roster pid (slot is worker-written, freshest);
     # roster pid covers modules whose live slot wasn't read this pass. Only
