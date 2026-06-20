@@ -172,6 +172,58 @@ def test_judge_miss_emits_nothing():
     assert _rewards(sq) == []
 
 
+# ── Unified failure-replay (EEL-B2 / mastery §7.P9) — a REVISIT must ALWAYS emit
+#    exactly one terminal RESULT so the stored problem progresses, never strands.
+def _results(sq):
+    return [m for m in sq.items if m["type"] == bus.FAILED_ATTEMPT_REVISIT_RESULT]
+
+
+_REVISIT_INTENT = {"posture": "meditate",
+                   "_revisit": {"problem_id": "fa_x", "goal_class": "autonomous:research",
+                                "helper": "code_knowledge"}}
+
+
+def test_revisit_solved_emits_resolved_result():
+    sq = _FakeSendQ()
+    _emit(sq, _FakeJudge([{"solved": True, "correction": "", "confidence": 0.8}]),
+          _FakeAgency(), intent=dict(_REVISIT_INTENT))
+    res = _results(sq)
+    assert len(res) == 1 and res[0]["payload"]["solved"] is True
+    assert res[0]["payload"]["problem_id"] == "fa_x"
+    # solved revisit → boosted reward at rank-3 source
+    assert _rewards(sq)[0]["payload"]["source"] == "task_completion"
+
+
+def test_revisit_judge_miss_still_emits_unsolved_result():
+    # The judge LLM miss path emitted NOTHING before — a revisit would strand
+    # in_progress. The backstop must now emit an unsolved RESULT (→ bump→abandon).
+    sq = _FakeSendQ()
+    _emit(sq, _FakeJudge([None]), _FakeAgency(), intent=dict(_REVISIT_INTENT))
+    res = _results(sq)
+    assert len(res) == 1 and res[0]["payload"]["solved"] is False
+    assert res[0]["payload"]["problem_id"] == "fa_x"
+    assert _rewards(sq) == []   # no false-positive reward, but the problem progresses
+
+
+def test_revisit_non_routing_helper_still_emits_unsolved_result():
+    sq = _FakeSendQ()
+    intent = {"posture": "meditate",
+              "_revisit": {"problem_id": "fa_y", "goal_class": "g", "helper": "memo_inscribe"}}
+    _emit(sq, _FakeJudge([{"solved": True, "confidence": 1.0}]), _FakeAgency(),
+          helper="memo_inscribe",
+          ar={"helper": "memo_inscribe", "result": "x", "reasoning": "r"}, intent=intent)
+    res = _results(sq)
+    assert len(res) == 1 and res[0]["payload"]["solved"] is False   # backstop fired
+    assert _rewards(sq) == []
+
+
+def test_non_revisit_bail_emits_no_result():
+    # A NON-revisit bail must NOT emit a revisit result (only revisits do).
+    sq = _FakeSendQ()
+    _emit(sq, _FakeJudge([None]), _FakeAgency())   # normal autonomous, judge miss
+    assert _results(sq) == []
+
+
 def test_kill_switch_off_emits_nothing(monkeypatch):
     import titan_hcl.modules.agency_worker as aw
     monkeypatch.setattr(aw, "get_params", lambda s: (

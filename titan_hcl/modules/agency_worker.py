@@ -364,6 +364,33 @@ def _maybe_emit_autonomous_experience(
     verifiable tool lane — features present, no stash/join). The kill-switch +
     retry-bound are read FRESH (hot-reloadable cost control). Never raises (must not
     break the agency loop)."""
+    # ── Unified failure-replay (EEL-B2 / mastery §7.P9) — is this a REVISIT of a
+    # stored past failure? Read it up-front so EVERY exit path (incl. silent bails
+    # and exceptions) still emits exactly ONE terminal RESULT → the stored problem
+    # always PROGRESSES (resolve / bump→abandon) and never strands `in_progress`.
+    revisit = intent.get("_revisit") if isinstance(intent, dict) else None
+    is_revisit = isinstance(revisit, dict)
+    _result_sent = False
+
+    def _send_revisit_result(*, solved, oracle_id="task_completion", goal_class="",
+                             task_shape="", evidence="", correction=""):
+        nonlocal _result_sent
+        try:
+            send_queue.put({
+                "type": bus.FAILED_ATTEMPT_REVISIT_RESULT, "src": name,
+                "dst": "synthesis",
+                "payload": {
+                    "problem_id": revisit.get("problem_id"),
+                    "solved": bool(solved), "oracle_id": oracle_id,
+                    "goal_class": goal_class, "task_shape": task_shape,
+                    "evidence": str(evidence)[:2000], "correction": str(correction),
+                },
+                "ts": time.time(),
+            })
+            _result_sent = True
+        except Exception as _rr:  # noqa: BLE001
+            logger.debug("[AgencyWorker][P8/revisit] result emit failed: %s", _rr)
+
     try:
         if not isinstance(action_result, dict):
             return
@@ -400,12 +427,9 @@ def _maybe_emit_autonomous_experience(
         if verdict is None:
             return  # judge LLM miss → stays untrained (no false-positive reward)
         solved = bool(verdict.get("solved"))
-        # ── Unified failure-replay (EEL-B2 / P9) — is this a REVISIT of a stored
-        # past failure? (the IMPULSE→intent carried `_revisit`). A solved revisit is
-        # the highest-signal experience → BOOSTED reward; a known_target verdict is a
-        # deterministic oracle (rank-3 `autonomous_oracle`). RFP_emergent_mastery §7.P9.
-        revisit = intent.get("_revisit") if isinstance(intent, dict) else None
-        is_revisit = isinstance(revisit, dict)
+        # Unified failure-replay (EEL-B2 / P9): a solved revisit is the highest-signal
+        # experience → BOOSTED reward; a known_target verdict is a deterministic oracle
+        # (rank-3 `autonomous_oracle`). `revisit`/`is_revisit` are read at the top.
         known_target = (revisit or {}).get("known_target")
         gc = (revisit or {}).get("goal_class") or gc
         task_shape = action_name  # the means signature for the corrected skill cell
@@ -440,20 +464,10 @@ def _maybe_emit_autonomous_experience(
             # Report the revisit outcome → synthesis (Sink 1: anchor the corrected
             # skill cell + mark resolved; or bump/abandon). The boosted IQL reward
             # (Sink 2) already rode the SELF_LEARN_REWARD emit above.
-            send_queue.put({
-                "type": bus.FAILED_ATTEMPT_REVISIT_RESULT, "src": name,
-                "dst": "synthesis",
-                "payload": {
-                    "problem_id": revisit.get("problem_id"),
-                    "solved": solved,
-                    "oracle_id": source,
-                    "goal_class": gc,
-                    "task_shape": task_shape,
-                    "evidence": evidence[:2000],
-                    "correction": str(verdict.get("correction") or ""),
-                },
-                "ts": time.time(),
-            })
+            _send_revisit_result(
+                solved=solved, oracle_id=source, goal_class=gc,
+                task_shape=task_shape, evidence=evidence,
+                correction=str(verdict.get("correction") or ""))
         elif not solved:
             # A NEW autonomous failure the corrector couldn't solve → queue it into
             # the synthesis-owned failed_attempts store for an idle revisit (replaces
@@ -478,6 +492,16 @@ def _maybe_emit_autonomous_experience(
             })
     except Exception as e:  # noqa: BLE001 — never break the agency loop
         logger.debug("[AgencyWorker][P8] autonomous experience skipped: %s", e)
+    finally:
+        # BACKSTOP (EEL-B2/P9): a revisit that bailed before scoring (non-routing
+        # helper, judge LLM miss, degenerate corrector run, or any exception) STILL
+        # emits an unsolved RESULT so the stored problem bumps→abandons and never
+        # strands `in_progress`. Soak finding 2026-06-20: code_knowledge/research
+        # revisits ran the corrector but bailed silently → no RESULT → stuck.
+        if is_revisit and not _result_sent:
+            _send_revisit_result(
+                solved=False, goal_class=str((revisit or {}).get("goal_class") or ""),
+                correction="revisit-unscoreable")
 
 
 @with_error_envelope(module_name="agency_worker", subsystem="entry", severity=_phase11_sev.FATAL)
