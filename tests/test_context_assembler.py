@@ -16,7 +16,7 @@ from titan_hcl.synthesis.context_assembler import (
     render_grounded_block,
 )
 from titan_hcl.synthesis.cited_use import SurfacedItem, CitedUseDetector
-from titan_hcl.synthesis.sovereignty_score import compute_sovereignty_score, VCB_SOURCE
+from titan_hcl.synthesis.sovereignty_score import compute_sovereignty_score
 
 
 # ── content_hash: normalisation ────────────────────────────────────────────
@@ -44,20 +44,32 @@ def test_each_partition_tagged_at_its_source():
     assert by_source["vcb"].content == "vocab word raffinesse"
 
 
-def test_vcb_item_drives_sovereignty_v_term():
-    """The whole point of P4: a cited vcb-sourced item lifts V above 0."""
-    out = assemble(vcb=[{"content": "Jirka plays go-karts on Saturdays"}])
-    assert len(out) == 1
-    surfaced = [it.to_surfaced() for it in out]
-    assert surfaced[0].source == VCB_SOURCE
-    score = compute_sovereignty_score(
-        response_text="We talked about how Jirka plays go-karts on Saturdays.",
-        surfaced_items=surfaced,
-        cited_item_ids=[surfaced[0].item_id],
+def test_vcb_grounds_E_recall_verifies_V():
+    """Refined P3 sovereignty: a cited `vcb` (inner-state) item grounds E
+    ("was it his") but is NOT timechain-anchored → V=0; a cited `recall` item
+    (tx_hash spine) is independently verifiable → it lifts V."""
+    resp = "We talked about how Jirka plays go-karts on Saturdays."
+    # vcb: grounds E, not V.
+    vcb_out = assemble(vcb=[{"content": "Jirka plays go-karts on Saturdays"}])
+    vcb_surf = [it.to_surfaced() for it in vcb_out]
+    assert vcb_surf[0].source == "vcb"
+    vcb_score = compute_sovereignty_score(
+        response_text=resp, surfaced_items=vcb_surf,
+        cited_item_ids=[vcb_surf[0].item_id],
     )
-    assert score.vcb_cited_count == 1
-    assert score.v == 1.0          # the only cited item is inner-state
-    assert score.s > 0.0           # V-term now contributes (was structurally 0)
+    assert vcb_score.verified_cited_count == 0
+    assert vcb_score.v == 0.0
+    assert vcb_score.e > 0.0 and vcb_score.s > 0.0   # E-term contributes
+    # recall: timechain-anchored → verifies V.
+    rec_out = assemble(recall=[{"content": "Jirka plays go-karts on Saturdays"}])
+    rec_surf = [it.to_surfaced() for it in rec_out]
+    assert rec_surf[0].source == "recall"
+    rec_score = compute_sovereignty_score(
+        response_text=resp, surfaced_items=rec_surf,
+        cited_item_ids=[rec_surf[0].item_id],
+    )
+    assert rec_score.verified_cited_count == 1
+    assert rec_score.v == 1.0
 
 
 # ── de-dup across partitions (G6) ──────────────────────────────────────────

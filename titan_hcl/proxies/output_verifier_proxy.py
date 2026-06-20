@@ -9,7 +9,7 @@ QUERY/RESPONSE round-trips against the output_verifier worker.
 When flag is false (default), parent retains a local OutputVerifier
 instance — no proxy is created, no behavior change.
 
-Stats attributes (sovereignty_score, verified_count, rejected_count)
+Stats attributes (verified_count, rejected_count)
 are kept cached locally and refreshed when OUTPUT_VERIFIER_STATS
 broadcasts arrive. While the cache is empty (worker hasn't booted yet
 or initial broadcast pending), they default to 0 — kernel.py:1082's
@@ -50,7 +50,7 @@ class OutputVerifierProxy:
         output_verifier_state.bin (Session 3 publisher).
 
     Attributes (cached, updated by OUTPUT_VERIFIER_STATS broadcast):
-        sovereignty_score, verified_count, rejected_count
+        verified_count, rejected_count
     """
 
     def __init__(self, bus: DivineBus, request_timeout_s: float = 5.0):
@@ -59,7 +59,9 @@ class OutputVerifierProxy:
         self._timeout = min(float(request_timeout_s), 5.0)
         self._reply_queue = bus.subscribe("output_verifier_proxy", reply_only=True)
         # Cached stats — updated from OUTPUT_VERIFIER_STATS broadcasts.
-        self.sovereignty_score: float = 0.0
+        # (The legacy always-0 `sovereignty_score` field was removed — sovereignty
+        # is the ONE synthesis S, INV-SDA-3; the OVG owns output_integrity, not a
+        # second sovereignty number.)
         self.verified_count: int = 0
         self.rejected_count: int = 0
 
@@ -297,7 +299,7 @@ class OutputVerifierProxy:
         """SHM read of output_verifier_state.bin (Session 3 publisher).
         Preamble G18 — state transport is SHM, never bus.
 
-        Most callers should use the cached attribute access (sovereignty_score
+        Most callers should use the cached attribute access (verified_count
         etc.) which refreshes via OUTPUT_VERIFIER_STATS broadcasts.
         """
         try:
@@ -320,7 +322,6 @@ class OutputVerifierProxy:
     def update_cached_stats(self, payload: dict) -> None:
         """Called by parent's bus subscription when OUTPUT_VERIFIER_STATS arrives."""
         try:
-            self.sovereignty_score = float(payload.get("sovereignty_score", 0.0) or 0.0)
             self.verified_count = int(payload.get("verified_count", 0) or 0)
             self.rejected_count = int(payload.get("rejected_count", 0) or 0)
         except Exception:

@@ -15,10 +15,19 @@ Terms (both in [0,1]):
     divided by the count of salient response tokens. High E = most of the reply's
     vocabulary came from Titan's recalled/known substrate, not LLM construction.
 
-  • **V — inner-state share.** Of the cited substrate items, the fraction sourced
-    from VCB inner-titan state (`SurfacedItem.source == "vcb"`) vs all cited items.
-    High V = the reply leaned on Titan's *own current inner state*, not just
-    external recall.
+  • **V — verification share.** Of the cited substrate, the fraction that is
+    *independently checked* — "truth he can prove," not just produce. A cited
+    item counts as verified when its `source` is on the timechain `tx_hash`
+    spine (`TX_ANCHORED_SOURCES` — recall / self-recall / concept-spine /
+    self-skill / procedural-skill, all anchored, audit-able). Two reply-level
+    signals refine it: if the turn's tool/sandbox/oracle returned a *passing*
+    verdict (`oracle_verified`), the answer itself was computed/checked → V=1.0
+    (a sandbox-proven answer is fully provable even if it cited no substrate);
+    and if the reply *failed* the OVG consistency gate (`consistency_ok=False`),
+    it contradicted verified ground truth and is **not** verified → V=0.
+    High V = the reply leaned on truth Titan can prove (chain / oracle), not on
+    unverifiable LLM construction. (Inner-state "vcb" grounding still counts
+    toward E — "was it his" — it is just not "was it proven".)
 
   S = clamp(w_e·E + w_v·V, 0, 1). Default weights 0.7 / 0.3 (RFP §6 D; tweakable
   in ONE place). Pure + deterministic — no LLM call, no I/O, never raises. Computed
@@ -38,7 +47,7 @@ __all__ = [
     "SovereigntyScore",
     "WEIGHT_E",
     "WEIGHT_V",
-    "VCB_SOURCE",
+    "TX_ANCHORED_SOURCES",
     "compute_sovereignty_score",
 ]
 
@@ -47,10 +56,19 @@ __all__ = [
 WEIGHT_E = 0.7
 WEIGHT_V = 0.3
 
-# The source tag that marks a surfaced item as VCB inner-titan state (the V
-# numerator). Kept as a constant so the producer (agno surfaced-item
-# registration) and this consumer never drift on the string.
-VCB_SOURCE = "vcb"
+# Surfaced-item `source` tags that are on the timechain `tx_hash` spine — i.e.
+# anchored, audit-able, independently verifiable substrate (the V numerator's
+# per-item signal). Kept as a constant so the producer (agno / context_assembler
+# surfaced-item registration) and this consumer never drift on the strings.
+# `vcb` (live inner state) and `memory`/`agno_chat` (un-anchored) are NOT here:
+# they ground E ("was it his") but do not, alone, make a claim *provable*.
+TX_ANCHORED_SOURCES = frozenset({
+    "recall",
+    "synthesis_self_recall",
+    "synthesis_concept_spine",
+    "synthesis_self_skill",
+    "synthesis_procedural_skill",
+})
 
 
 @dataclass(frozen=True)
@@ -59,9 +77,9 @@ class SovereigntyScore:
 
     s: float                  # clamp(w_e·E + w_v·V, 0, 1) — the metric
     e: float                  # substrate-cited token share
-    v: float                  # inner-state (VCB) share of cited substrate
+    v: float                  # verification share (timechain/oracle; OVG-gated)
     cited_count: int          # |cited substrate items|
-    vcb_cited_count: int      # |cited items with source == VCB_SOURCE|
+    verified_cited_count: int # |cited items whose source is tx_hash-anchored|
     response_token_count: int # |salient response tokens| (E denominator)
 
 
@@ -73,6 +91,9 @@ def compute_sovereignty_score(
     detector: Optional[CitedUseDetector] = None,
     w_e: float = WEIGHT_E,
     w_v: float = WEIGHT_V,
+    tx_anchored_sources: frozenset = TX_ANCHORED_SOURCES,
+    oracle_verified: bool = False,
+    consistency_ok: bool = True,
 ) -> SovereigntyScore:
     """Compute the per-reply sovereignty score `S = w_e·E + w_v·V`.
 
@@ -102,7 +123,8 @@ def compute_sovereignty_score(
 
     cited_items = [it for it in items if it.item_id in cited_ids]
     cited_count = len(cited_items)
-    vcb_cited = sum(1 for it in cited_items if it.source == VCB_SOURCE)
+    verified_cited = sum(1 for it in cited_items
+                         if it.source in tx_anchored_sources)
 
     # E — union of cited items' salient tokens that actually appear in the
     # response (union so a token shared by two cited items is counted once),
@@ -115,8 +137,16 @@ def compute_sovereignty_score(
     else:
         e = 0.0
 
-    # V — fraction of cited substrate that is VCB inner-titan state.
-    v = (vcb_cited / cited_count) if cited_count else 0.0
+    # V — verification share. Timechain-anchored cited fraction, lifted to 1.0
+    # when the answer was oracle/sandbox-verified this turn, zeroed when the
+    # reply failed the OVG consistency gate (module docstring).
+    if not consistency_ok or not n_resp:
+        # contradicted ground truth, or an empty reply that grounded nothing.
+        v = 0.0
+    elif oracle_verified:
+        v = 1.0
+    else:
+        v = (verified_cited / cited_count) if cited_count else 0.0
 
     e = _clamp01(e)
     v = _clamp01(v)
@@ -125,7 +155,7 @@ def compute_sovereignty_score(
     return SovereigntyScore(
         s=s, e=e, v=v,
         cited_count=cited_count,
-        vcb_cited_count=vcb_cited,
+        verified_cited_count=verified_cited,
         response_token_count=n_resp,
     )
 

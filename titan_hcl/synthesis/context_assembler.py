@@ -13,9 +13,12 @@ Three substrate partitions feed a routed chat turn's grounded context:
     timechain-anchored verified experience.
 
 Before P4 only ``"recall"`` items were registered as surfaced items, so the
-sovereignty **V** term (``vcb_cited / cited``) and the **E** term could never
-credit VCB or memory content — V was structurally pinned at 0. The assembler
-itemises ALL surfaced substrate, tags each at its source (the
+sovereignty **E** term (cited-substrate share) and **V** term could never
+credit VCB or memory content. The assembler itemises ALL surfaced substrate so
+E ("was it his") credits every own-substrate source, while the refined **V**
+("was it proven") counts only the timechain-anchored ``TX_ANCHORED_SOURCES``
+(recall + synthesis spine) — see ``compute_sovereignty_score``. It tags each
+item at its source (the
 ``SurfacedItem.source`` the ``CitedUseDetector`` / ``compute_sovereignty_score``
 consume), and de-duplicates by a normalised content hash so a fact surfaced by
 two paths is delivered **and** counted exactly once (gate G6 — no content

@@ -3742,11 +3742,27 @@ def create_post_hook(plugin):
                             from titan_hcl.synthesis.sovereignty_score import (
                                 compute_sovereignty_score,
                             )
+                            # V=verification (RFP_synthesis_decision_authority
+                            # P3, refined): timechain-anchored cited share, +
+                            # the turn's tool/sandbox/oracle verdict. The
+                            # ToolBackstop (`_bs`, run earlier this PostHook when
+                            # the turn was checkable) is the reply-level oracle
+                            # signal: executed+success ⇒ the answer was proven
+                            # (V→1.0); executed+failure ⇒ checked and WRONG, not
+                            # verified (consistency_ok=False ⇒ V→0). Read via
+                            # locals() so an un-fired backstop is simply absent.
+                            _bs_obj = locals().get("_bs")
+                            _bs_exec = bool(_bs_obj is not None
+                                            and getattr(_bs_obj, "executed", False))
+                            _bs_ok = bool(_bs_exec
+                                          and getattr(_bs_obj, "success", False))
                             _km_sov = compute_sovereignty_score(
                                 response_text=response_text,
                                 surfaced_items=_km_items,
                                 cited_item_ids=_km_cited,
                                 detector=_km_det,
+                                oracle_verified=_bs_ok,
+                                consistency_ok=not (_bs_exec and not _bs_ok),
                             )
                             _km_s_reply = _km_sov.s
                             _km_e_reply = _km_sov.e
