@@ -81,6 +81,18 @@ def test_features_non_routing_helper_is_none():
     assert feats is None and idx is None
 
 
+def test_to_vector_with_ndarray_msl_context():
+    """REGRESSION (2026-06-20): to_vector did `list(self.msl_context or ())` which
+    raises 'truth value of an array is ambiguous' when msl_context is a numpy array
+    — the LIVE shape from read_msl_context. This silently broke EVERY autonomous P8
+    emit (no SELF_LEARN_REWARD / skill cell). Must accept ndarray / None / empty."""
+    import numpy as np
+    for ctx in (np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]), np.array([]), None):
+        feats, _ = autonomous_features_for_helper("code_knowledge", msl_context=ctx)
+        v = feats.to_vector()
+        assert len(v.tolist()) == 30
+
+
 # ── the orchestration (fakes for judge / agency / send_queue) ───────────────
 class _FakeJudge:
     def __init__(self, verdicts):

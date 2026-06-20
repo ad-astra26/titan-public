@@ -448,7 +448,12 @@ class OuterFeatures:
     msl_concept_confidence: float = 0.0
 
     def to_vector(self) -> np.ndarray:
-        ctx = list(self.msl_context or ())
+        # NB: `self.msl_context or ()` raises "truth value of an array is ambiguous"
+        # when msl_context is a numpy array (the LIVE shape from read_msl_context) —
+        # which silently broke EVERY autonomous P8 emit (no SELF_LEARN_REWARD / skill
+        # cell) until it was caught 2026-06-20. Use an explicit None-check that
+        # accepts list OR ndarray OR None.
+        ctx = list(self.msl_context) if self.msl_context is not None else []
         if len(ctx) < MSL_CONTEXT_DIM:
             ctx = ctx + [0.0] * (MSL_CONTEXT_DIM - len(ctx))
         else:
