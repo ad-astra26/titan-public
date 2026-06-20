@@ -81,7 +81,12 @@ _DEFAULTS = {
     "baseline_alpha": 0.05,
     "pending_ttl_s": 1800.0,           # drop un-joined decisions older than this
     "explore_interval_s": 120.0,       # idle EXPLORE tick cadence
-    "explore_chi_floor": 0.30,         # metabolic floor for exploration (INV-OML-9)
+    "explore_chi_floor": 0.30,         # DEPRECATED 2026-06-20 — no longer gates
+                                       # exploration (metabolism not design-complete;
+                                       # Maker). Kept for schema/config compat; re-
+                                       # wire only when metabolism is complete.
+    "explore_chat_quiet_s": 15.0,      # background explore yields to a /chat turn
+                                       # seen within this window (no CPU contention)
     "explore_replay_batch": 16,        # experience-replay batch size
     "explore_balanced": True,          # replay BALANCED across actions (deadlock fix, step 1)
     # ── Active idle action-space exploration (deadlock fix step 2, §7.C/§24.6).
@@ -290,7 +295,8 @@ _DEFAULTS = {
 # silently dropped on a contended join, so both are registered explicitly.
 _REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3,
                        "idk_oracle": 3, "autonomous_oracle": 3, "task_completion": 0}
-_SURVIVAL_STATES = frozenset({"SURVIVAL", "STARVATION"})
+# (_SURVIVAL_STATES removed 2026-06-20 — survival/starvation no longer gates the
+#  mastery explore tick; metabolism is not design-complete. See _explore_tick.)
 
 
 def _graduated_source_weight(src: str, base_weight: float, level_norm: float,
@@ -1054,6 +1060,17 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
                             _mastery.readout()["grade"])
             _level_writer = StateRegistryWriter(
                 MASTERY_LEVEL_STATE_SPEC, ensure_shm_root(titan_id))
+            # Boot-time publish: push the restored (or fresh) mastery to SHM
+            # NOW, so the /v6/mastery readout is correct the instant the worker
+            # is up — not blank until the first explore tick fires (which is
+            # activity-gated and may be minutes away on a quiet/dreaming box).
+            # This is the readout fix for "mastery=0 after every restart".
+            try:
+                _level_writer.write(
+                    mastery_readout_to_flat(_mastery.readout()))
+            except Exception as _bpe:  # noqa: BLE001
+                logger.debug("[self_learning] boot mastery publish skipped: %s",
+                             _bpe)
         except Exception as e:  # noqa: BLE001
             logger.warning("[self_learning] MasteryLevel init failed: %s", e)
             _mastery = None
@@ -1105,6 +1122,10 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
     last_heartbeat = 0.0
     last_explore = time.time()
     last_prune = time.time()
+    # Chat-activity gate for the BACKGROUND explore tick: stamped each time a
+    # SELF_LEARN_DECISION arrives (one per live agno chat turn). The heavy IQL
+    # pass is skipped while a turn is in flight so it never contends with /chat.
+    last_chat_activity = 0.0
     processed = 0
     trained = 0
     errors = 0
@@ -1131,12 +1152,17 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
             store.prune_pending(cfg["pending_ttl_s"])
             last_prune = now
 
-        # Idle EXPLORE tick — metabolically gated (INV-OML-9), top of loop.
+        # Background EXPLORE tick — activity-gated (NOT metabolically gated; see
+        # _explore_tick docstring + SPEC §25.6). Skipped during dreaming/
+        # meditation and while a /chat turn is active; survival/chi-floor dropped.
         if now - last_explore >= float(cfg["explore_interval_s"]):
+            _chat_active = (
+                now - last_chat_activity < float(cfg.get("explore_chat_quiet_s", 15.0)))
             try:
                 _explore_tick(cfg, store, policy, _shm_writer, _life, send_queue, name,
                               _outer_reason, _outer_meta,
-                              mastery=_mastery, level_writer=_level_writer)
+                              mastery=_mastery, level_writer=_level_writer,
+                              chat_active=_chat_active)
             except Exception as e:  # noqa: BLE001
                 logger.debug("[self_learning] explore tick soft-fail: %s", e)
             last_explore = now
@@ -1185,6 +1211,9 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
             continue
 
         if msg_type == SELF_LEARN_DECISION:
+            # A live agno chat turn just decided → mark chat active so the
+            # background explore tick yields to it (see the explore call site).
+            last_chat_activity = now
             try:
                 store.stash_decision(
                     tx=payload.get("parent_tool_call_tx"),
@@ -1703,24 +1732,36 @@ def _update_mastery_level(cfg, store, policy, transitions, mastery, level_writer
 
 def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
                   outer_reason=None, outer_meta=None, *,
-                  mastery=None, level_writer=None) -> None:
-    """Idle EXPLORE (L3) — metabolically gated (INV-OML-9). Passes:
+                  mastery=None, level_writer=None, chat_active=False) -> None:
+    """Idle EXPLORE (L3) — the BACKGROUND mastery learning pass. Passes:
     (1) balanced experience-replay (deadlock fix step 1 — minority actions at
     parity); (2) active structural exploration (step 2 — the verifiable structural
     oracle, the G5/GB8 closer); (3) Phase-C piece 6 — ONE outer meta-reasoning
     deliberation (the continuous deliberative learner). The LLM-judge counterfactual
-    layer rides the `explore_request` hook (Phase 2 consumer)."""
-    # Metabolic floor: never explore in survival/starvation or while dreaming.
+    layer rides the `explore_request` hook (Phase 2 consumer).
+
+    Activity gate (Maker 2026-06-20 — the metabolism is NOT design-complete, so
+    survival/starvation + chi-floor must NOT block mastery learning; see
+    SPEC §25.6 + RFP_emergent_mastery_curriculum). The background pass is skipped
+    only to avoid contending with three OTHER active cognitive processes:
+      • dreaming / circadian meditation — `life.is_dreaming()` (the soul-diary
+        meditation runs at the dream/trough boundary, so this one flag covers
+        both dreaming AND meditation);
+      • an active /chat turn — `chat_active` (a SELF_LEARN_DECISION seen within
+        `explore_chat_quiet_s`), so the heavy IQL pass never steals CPU from a
+        live user turn. (The CHAT-TIME mastery learning — the per-turn
+        `_handle_reward` buffering — is unaffected and keeps running.)
+    The DROPPED gates (survival/starvation state + chi-floor) are intentionally
+    gone: a not-design-complete metabolism silently starving the learner is the
+    same failure class as the affective dev-gate (removed 2026-06-16)."""
+    if chat_active:
+        return
     if life is not None:
         try:
             if life.is_dreaming():
                 return
-            if life.get_state() in _SURVIVAL_STATES:
-                return
-            if life.get_chi_total() < float(cfg["explore_chi_floor"]):
-                return
         except Exception:  # noqa: BLE001
-            return  # can't confirm metabolic headroom → conservatively skip
+            pass  # can't read dream state → proceed (do not starve the learner)
     # (1) experience-replay learning.
     if bool(cfg.get("oml_iql_enabled", True)):
         # FULL-IQL consolidation (P2) — REPLACES the REINFORCE replay. Build

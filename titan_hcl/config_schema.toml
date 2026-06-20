@@ -398,6 +398,7 @@
 "synthesis.self_learning.baseline_alpha" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.explore_chi_floor" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.explore_chat_quiet_s" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.explore_interval_s" = {type="float", constraint=">0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.macro_min_wins" = {type="int", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.policy_lr" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
