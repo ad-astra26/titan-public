@@ -41,7 +41,7 @@ from .titan_status import titan_status
 
 _MUTATIONS = {"/console/restart", "/console/clean-hdd", "/console/config/set",
               "/console/chat", "/console/backup/config", "/console/app/heartbeat",
-              "/console/events/respond"}
+              "/console/events/respond", "/console/context", "/console/presence/settings"}
 # Pairing CONTROL routes are operator-only (mint/confirm/inspect device pairings).
 # /console/pair/submit is deliberately NOT here — it's the unauthenticated bootstrap,
 # gated by the single-use pairing token inside pairing.submit_device.
@@ -244,6 +244,17 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
                 return 401, {"error": "valid device signature required"}
             rec = pairing.device_record(ctx, headers.get("x-device-id", ""))
             return (200, rec) if rec else (404, {"error": "device not registered"})
+        if path == "/console/presence":
+            # The Maker's latest uploaded context (RFP_titan_mobile_app Phase 3 / AG6). Device-
+            # authed (mirrors /console/device/me) — never anonymous. Flat readout, no cognition.
+            if not device_authed:
+                return 401, {"error": "valid device signature required"}
+            return 200, presence.read_latest(ctx)
+        if path == "/console/presence/settings":
+            # Per-sensor opt-in flags + cadence (console-local store, NOT config.toml).
+            if not device_authed:
+                return 401, {"error": "valid device signature required"}
+            return 200, presence.get_settings(ctx)
         if path == "/console/events":
             # Device drains its outbound queue (RFP event-channel AG-EVT-6). The non-local
             # gate already enforces a device signature remotely; require it on localhost too
@@ -394,6 +405,23 @@ def dispatch(ctx: Context, method: str, path: str, query: dict,
             except ValueError as e:
                 return 400, {"error": str(e)}
             return 200, {"ok": True}
+        if path == "/console/context":
+            # Phone uploads opt-in-gated context samples (RFP_titan_mobile_app Phase 3 / AG6).
+            # Device-authed (in _MUTATIONS). Each field is gated by its per-sensor flag; nothing
+            # un-opted-in is stored. STOPS at persistence — no cognition (AG8).
+            if not device_authed:
+                return 401, {"error": "valid device signature required"}
+            device_id = headers.get("x-device-id", "")
+            try:
+                res = presence.ingest(ctx, device_id, data.get("samples"))
+            except ValueError as e:
+                return 400, {"error": str(e)}
+            return 200, res
+        if path == "/console/presence/settings":
+            # Phone sets its per-sensor opt-in flags / cadence (console-local store). Device-authed.
+            if not device_authed:
+                return 401, {"error": "valid device signature required"}
+            return 200, presence.set_settings(ctx, data)
         if ctx.dev_enabled and path == "/console/dev/log":
             return dev_endpoints.ingest_log(ctx, body)
         return 404, {"error": f"no such console route: {path}"}
