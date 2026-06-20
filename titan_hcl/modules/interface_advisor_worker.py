@@ -222,19 +222,32 @@ def interface_advisor_worker_main(recv_queue, send_queue, name: str,
             try:
                 msg = recv_queue.get(timeout=1.0)
             except Empty:
-                # No activity → check if there's pending unpublished state
-                # from a throttled record + the throttle window has elapsed.
-                # This guarantees eventual SHM consistency under sparse
-                # traffic (single IMPULSE_RECEIVED still reaches SHM
-                # within ≤INTERFACE_ADVISOR_RATE_REFRESH_CADENCE_S + 1s
-                # idle-wait).
-                if pending_unpublished and (
-                    time.time() - last_publish_ts
-                    >= INTERFACE_ADVISOR_RATE_REFRESH_CADENCE_S
-                ):
-                    publisher.publish()
-                    last_publish_ts = time.time()
-                    pending_unpublished = False
+                # No activity → republish SHM on the idle tick for TWO reasons:
+                #  (1) a throttled record is pending (eventual consistency —
+                #      single IMPULSE_RECEIVED still reaches SHM within
+                #      ≤INTERFACE_ADVISOR_RATE_REFRESH_CADENCE_S + 1s); and
+                #  (2) WINDOW DECAY (BUG-IMPULSE-RATE-STUCK, 2026-06-20): the
+                #      sliding window only "slides" when SHM is republished —
+                #      get_stats() lazily prunes expired entries at publish
+                #      time. Under sparse traffic a STALE non-zero SHM rate
+                #      makes the PARENT block the next IMPULSE (current_rate+1 >
+                #      limit) so NO IMPULSE_RECEIVED is emitted → the worker
+                #      never re-prunes → the rate sticks at its last value
+                #      FOREVER (live: limit=1 → exactly one impulse ever
+                #      passes, then permanent false rate-limit; 144 received /
+                #      0 executed in 12h). Republishing while any window is
+                #      non-empty decays the SHM rate to 0 within window_s,
+                #      restoring the autonomous-impulse path. No write once all
+                #      rates are 0 (idle-at-zero is silent).
+                now = time.time()
+                if (now - last_publish_ts
+                        >= INTERFACE_ADVISOR_RATE_REFRESH_CADENCE_S):
+                    live_rates = publisher.advisor.get_stats().get(
+                        "current_rates", {}) or {}
+                    if pending_unpublished or any(live_rates.values()):
+                        publisher.publish()
+                        last_publish_ts = now
+                        pending_unpublished = False
                 continue
 
             if msg is None:

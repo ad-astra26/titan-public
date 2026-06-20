@@ -218,6 +218,37 @@ def test_reader_get_current_rate(titan_id):
     assert reader.get_current_rate("NEVER_PUBLISHED") == 0
 
 
+def test_window_decay_flushes_to_shm_on_idle_republish(titan_id):
+    """BUG-IMPULSE-RATE-STUCK (2026-06-20): a non-zero SHM rate MUST decay
+    to 0 once the sliding window expires, even with NO new IMPULSE_RECEIVED.
+
+    Reproduces the live deadlock: with limit=1 the parent reader.check()
+    blocks every impulse after the first (current_rate+1 > 1), so no
+    IMPULSE_RECEIVED ever reaches the worker again → the worker never
+    re-prunes → SHM sticks at rate=1 forever (144 received / 0 executed in
+    12h). The fix: the worker's idle Empty tick republishes while any
+    window is non-empty; publish() → get_stats() lazily prunes expired
+    entries, decaying the SHM rate to 0 and re-opening the impulse path.
+    """
+    advisor = InterfaceAdvisor(window=0.5)  # 0.5s window for a fast test
+    pub = InterfaceAdvisorStatePublisher(titan_id, advisor=advisor)
+    reader = InterfaceAdvisorStateReader(titan_id=titan_id)
+
+    # One impulse recorded → SHM rate=1; parent now blocks (limit=1).
+    pub.record_and_publish("IMPULSE", source="spirit")
+    time.sleep(0.15)  # clear reader 0.1s cache
+    assert reader.get_current_rate("IMPULSE") == 1
+    assert reader.check("IMPULSE", source="spirit") is not None  # 1+1>1
+
+    # Window expires. The idle-tick republish (a bare publish() — exactly
+    # what the worker Empty branch now calls) must decay SHM rate to 0.
+    time.sleep(0.6)  # > window (0.5s)
+    pub.publish()
+    time.sleep(0.15)  # clear reader cache
+    assert reader.get_current_rate("IMPULSE") == 0
+    assert reader.check("IMPULSE", source="spirit") is None  # passes again
+
+
 # ── Worker harness ─────────────────────────────────────────────────
 
 
