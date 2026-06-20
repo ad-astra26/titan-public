@@ -166,6 +166,47 @@ def test_non_routing_helper_emits_nothing():
     assert _rewards(sq) == []
 
 
+# ── P1 (BUG-AUTONOMOUS-SUCCESS-NO-SKILL-CELL, 2026-06-20) ────────────────────
+def _skill_scores(sq):
+    return [m for m in sq.items if m["type"] == bus.AUTONOMOUS_SKILL_SCORE]
+
+
+def test_p1_autonomous_success_emits_skill_score():
+    """A FRESH (non-revisit) autonomous SUCCESS must emit AUTONOMOUS_SKILL_SCORE
+    so synthesis forms a skill cell — not just the routing SELF_LEARN_REWARD."""
+    sq = _FakeSendQ()
+    _emit(sq, _FakeJudge([{"solved": True, "correction": "", "confidence": 0.9}]),
+          _FakeAgency())
+    ss = _skill_scores(sq)
+    assert len(ss) == 1
+    p = ss[0]["payload"]
+    assert ss[0]["dst"] == "synthesis"
+    assert p["oracle_id"] == "task_completion"
+    assert p["goal_class"] == "autonomous:tool" and p["task_shape"] == "tool"
+    assert p["success"] is True
+
+
+def test_p1_autonomous_failure_emits_skill_score_false():
+    """A fresh autonomous FAILURE also records the competence signal (success=False)
+    so the cell's time_cost = (succ/(succ+fail))^2 reflects real autonomous outcomes."""
+    sq = _FakeSendQ()
+    agency = _FakeAgency([{"result": "x"}, {"result": "y"}, {"result": "z"}])
+    _emit(sq, _FakeJudge([{"solved": False, "correction": "wrong", "confidence": 0.2}]),
+          agency)
+    ss = _skill_scores(sq)
+    assert len(ss) == 1 and ss[0]["payload"]["success"] is False
+
+
+def test_p1_non_routing_helper_no_skill_score():
+    """Non-routing helpers (memo_inscribe, art_generate…) bail before scoring →
+    no skill score (mirrors the no-reward behavior)."""
+    sq = _FakeSendQ()
+    _emit(sq, _FakeJudge([{"solved": True, "confidence": 1.0}]), _FakeAgency(),
+          helper="memo_inscribe",
+          ar={"helper": "memo_inscribe", "result": "x", "reasoning": "r"})
+    assert _skill_scores(sq) == []
+
+
 def test_judge_miss_emits_nothing():
     sq = _FakeSendQ()
     _emit(sq, _FakeJudge([None]), _FakeAgency())   # judge LLM miss → untrained

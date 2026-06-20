@@ -460,6 +460,26 @@ def _maybe_emit_autonomous_experience(
                     "attempts=%d (engagement-independent IQL experience)",
                     "/revisit" if is_revisit else "", action_name, solved, reward,
                     attempts)
+        # P1 (BUG-AUTONOMOUS-SUCCESS-NO-SKILL-CELL, 2026-06-20): a FRESH (non-revisit)
+        # autonomous routing outcome must ALSO feed procedural skill formation, not only
+        # the routing IQL above — else skill cells accrue ONLY from chat tool-use (audit
+        # 2026-06-20). Emit a skill score event → synthesis (sole writer) enqueues it,
+        # mirroring the revisit Sink-1 anchor. Gated to NON-revisit: revisits already
+        # enqueue via their FAILED_ATTEMPT_REVISIT_RESULT → Sink 1 (no double-count).
+        # success=solved so the cell's time_cost = (succ/(succ+fail))^2 reflects real
+        # autonomous competence (failures already also ride FAILED_ATTEMPT_ENQUEUE below
+        # for an idle revisit — orthogonal: this records the competence signal).
+        if not is_revisit:
+            send_queue.put({
+                "type": bus.AUTONOMOUS_SKILL_SCORE, "src": name, "dst": "synthesis",
+                "payload": {
+                    "oracle_id": "task_completion",
+                    "goal_class": gc,
+                    "task_shape": task_shape,
+                    "success": solved,
+                },
+                "ts": time.time(),
+            })
         if is_revisit:
             # Report the revisit outcome → synthesis (Sink 1: anchor the corrected
             # skill cell + mark resolved; or bump/abandon). The boosted IQL reward

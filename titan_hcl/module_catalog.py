@@ -1283,6 +1283,10 @@ def build_catalog(bus, guardian, *, titan_id: str, kernel=None) -> None:
             # owns the failed_attempts store + the revisit driver (INV-Syn-19).
             _bus_constants.FAILED_ATTEMPT_ENQUEUE,
             _bus_constants.FAILED_ATTEMPT_REVISIT_RESULT,
+            # P1 (2026-06-20) — agency's FRESH (non-revisit) autonomous P8 outcome →
+            # enqueue a skill_score_event so autonomous tool-use forms skill cells
+            # (not only chat). Synthesis sole-writer (INV-Syn-19).
+            _bus_constants.AUTONOMOUS_SKILL_SCORE,
             # §7.D-knowledge (DK.1) — memory_worker anchored a confirmed research
             # finding → seed the declarative `Engram` concept (sole spine writer).
             _bus_constants.RESEARCH_CONCEPT_SEED,

@@ -308,6 +308,13 @@ FAILED_ATTEMPT_ENQUEUE = "FAILED_ATTEMPT_ENQUEUE"
 # (Sink 2 — the boosted IQL reward — rode the existing SELF_LEARN_REWARD emit.)
 # Payload: {problem_id, solved, oracle_id, goal_class, task_shape, evidence}.
 FAILED_ATTEMPT_REVISIT_RESULT = "FAILED_ATTEMPT_REVISIT_RESULT"
+# agency_worker (a FRESH, non-revisit autonomous routing-helper outcome was P8-judged)
+# → synthesis_worker. P1 (BUG-AUTONOMOUS-SUCCESS-NO-SKILL-CELL, 2026-06-20): a fresh
+# autonomous (no-chat) outcome must ALSO feed procedural skill formation, not only the
+# routing IQL (SELF_LEARN_REWARD) — otherwise skill cells accrue ONLY from chat tool-use.
+# Synthesis (sole writer, INV-Syn-19) enqueues a skill_score_event mirroring the revisit
+# Sink-1 anchor. Payload: {oracle_id, goal_class, task_shape, success}.
+AUTONOMOUS_SKILL_SCORE = "AUTONOMOUS_SKILL_SCORE"
 # ── Phase D / §7.D-knowledge (DK.1) — the sovereign LLM-Wiki research→declarative-
 # concept COMPOUNDING loop, continuous-at-confirm (INV-OML-12). Two hops, each
 # worker does what it owns:

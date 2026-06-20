@@ -4461,6 +4461,26 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                  "failed: %s", _far_err)
                 continue
 
+            if msg_type == bus.AUTONOMOUS_SKILL_SCORE:
+                # P1 (BUG-AUTONOMOUS-SUCCESS-NO-SKILL-CELL, 2026-06-20): a FRESH
+                # (non-revisit) autonomous routing outcome from agency's P8 judge →
+                # enqueue a skill_score_event so autonomous tool-use forms skill cells
+                # (not only chat tool-use). Mirrors the revisit Sink-1 enqueue; synthesis
+                # is the sole writer (INV-Syn-19). Idempotent on the event content-hash.
+                if procedural_skill_store is not None:
+                    try:
+                        _o = str(payload.get("oracle_id", "") or "")
+                        _g = str(payload.get("goal_class", "") or "")
+                        _ts = str(payload.get("task_shape", "") or "")
+                        if _o and _g and _ts:
+                            procedural_skill_store.enqueue_score_event(
+                                oracle_id=_o, goal_class=_g, task_shape=_ts,
+                                success=bool(payload.get("success")))
+                    except Exception as _ass_err:  # noqa: BLE001
+                        logger.debug("[synthesis_worker][P1] autonomous skill "
+                                     "score enqueue failed: %s", _ass_err)
+                continue
+
             if msg_type == SELF_LEARN_MACRO_READY:
                 # S2 (INV-OML-11): the self_learning worker distilled a winning
                 # macro-strategy → persist it as a `Reasoning(kind='macro_strategy')`
