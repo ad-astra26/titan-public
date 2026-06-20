@@ -644,9 +644,11 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     _last_haov_pump_ts = 0.0
 
     # H.4 Phase 1 (v1) — staleness-decay tick for causal-generator candidates.
-    # Slower cadence than the HAOV test pump; once per minute is plenty for
-    # multiplicative slow-bleed (factor ~0.999/tick → 1000 ticks ≈ 16-17 hours
-    # before a stale candidate decays below 1 and evicts).  No-op when
+    # Slower cadence than the HAOV test pump; once per minute.  Only candidates
+    # that got NO observation since the previous tick are bled (the staleness
+    # gate — see CausalGenerator.decay_stale); actively-fed candidates are
+    # exempt.  The decay is int-multiplicative, so int(n*0.999)==n-1 — a quiet
+    # candidate evicts in ≈ observed_n ticks (≈ minutes), not 16 h.  No-op when
     # cgn.causal_generator.enabled = false.
     CAUSAL_DECAY_INTERVAL_S = float(
         config.get("causal_decay_interval_s", 60.0))

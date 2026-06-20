@@ -273,11 +273,38 @@ def test_decay_stale_evicts_low_count_candidates():
         g.observe(_t(0, metadata={"action_name": "rare"}), reward=0.10)
     stats_before = g.get_stats()
     assert stats_before["candidates_active"] == 1
-    # Apply decay enough times to drop count below 1: 2 * 0.5 = 1; 1 * 0.5 = 0
-    g.decay_stale()
-    g.decay_stale()
+    # First tick is a grace tick: the candidate was observed since idx 0, so
+    # the staleness gate exempts it.  From the 2nd tick it bleeds: 2*0.5=1
+    # (survives), 1*0.5=0 (<1 -> evicts).
+    g.decay_stale()  # grace — exempt (moving since last tick)
+    g.decay_stale()  # 2 -> 1
+    g.decay_stale()  # 1 -> 0 -> evict
     stats_after = g.get_stats()
     assert stats_after["candidates_active"] == 0
+
+
+def test_active_candidate_survives_decay_at_observation_cadence():
+    """Regression (2026-06-20, live CausalDBG): a slow consumer observed at
+    ~the decay-tick cadence must still reach min_n.  Before the staleness
+    gate, decay ran on the actively-fed candidate every tick and
+    int(n*0.999)==n-1 cancelled each observation's +1 — the key was pinned at
+    observed_n≈1 and the consumer formed 0 causal candidates.  Interleaving
+    one observation per decay tick (the live failure pattern) must now
+    promote."""
+    g = CausalGenerator("reasoning_strategy", window_size=30, min_n=5,
+                        magnitude_threshold=0.05,
+                        staleness_decay_per_tick=0.999)
+    promoted = None
+    for _ in range(8):
+        # constant key: action_0 (no action_name) + strong_positive bucket
+        g.observe(_t(0, metadata={}), reward=0.49)
+        g.decay_stale()
+        p = g.maybe_promote()
+        if p is not None:
+            promoted = p
+    assert promoted is not None, \
+        "active recurring key must promote despite a decay tick per observation"
+    assert g.get_stats()["promoted_total"] >= 1
 
 
 def test_decay_no_op_when_decay_factor_is_one():

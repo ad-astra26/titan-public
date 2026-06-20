@@ -265,6 +265,11 @@ class CausalGenerator:
         # Monotonic transition counter for first/last-seen indices.
         self._idx: int = 0
 
+        # _idx as of the previous decay_stale() tick — the staleness horizon.
+        # A candidate observed since this point is "moving" and exempt from
+        # decay (see decay_stale).
+        self._last_decay_idx: int = 0
+
         # Stats — surfaced via get_stats(), used by arch_map causal-generator.
         self._stats: Dict[str, int] = {
             "observed": 0,
@@ -318,17 +323,33 @@ class CausalGenerator:
     # ── staleness decay ───────────────────────────────────────────────
 
     def decay_stale(self) -> int:
-        """Apply multiplicative decay to candidate window-counts.
+        """Bleed out candidates that got NO fresh observation since the
+        previous decay tick — "unmoving" patterns, regardless of window
+        position.  Returns the count evicted (window-count fell below 1).
 
-        Used by the cgn_worker tick to slow-bleed candidates that aren't
-        getting fresh observations.  Returns the number of candidates that
-        decayed below 1 and were evicted.
+        🔑 The staleness GATE (last_seen_idx > previous-tick idx ⇒ exempt) is
+        load-bearing.  Without it, decay ran on ACTIVELY-fed candidates too,
+        and a slow consumer observed at ~the decay cadence (e.g.
+        reasoning_strategy ~1 obs/min vs the 60 s decay tick) had its single
+        recurring key decremented as fast as it accumulated — note
+        `int(n * 0.999) == n - 1` for any n < 1000, so the intended 0.1 %
+        bleed is really a hard −1 per tick.  The key stayed pinned at
+        observed_n ≈ 1, never reached min_n, and the consumer formed 0 causal
+        candidates (root-caused live via CausalDBG, 2026-06-20).  Now
+        actively-fed candidates are exempt and accumulate via the window
+        mechanism; only genuinely-quiet candidates bleed (≈ observed_n ticks
+        to evict).
         """
         if self._staleness_decay >= 1.0:
+            self._last_decay_idx = self._idx
             return 0
+        moved_since = self._last_decay_idx
+        self._last_decay_idx = self._idx
         evicted = 0
         for key in list(self._candidates.keys()):
             cand = self._candidates[key]
+            if cand.last_seen_idx > moved_since:
+                continue  # observed since the last tick — still moving, exempt
             cand.observed_n = int(cand.observed_n * self._staleness_decay)
             if cand.observed_n < 1:
                 self._candidates.pop(key, None)
