@@ -34,6 +34,15 @@ logger = logging.getLogger(__name__)
 
 _EFFECT_THRESHOLDS = (0.30, 0.05)  # strong / moderate boundary
 
+# §7.D-A2 DIAGNOSTIC (temporary, low-risk): the newly-wired consumers are now
+# fed (transitions_observed rises) but form 0 causal candidates, while meta
+# promotes fine — and the candidate math says reasoning_strategy's single
+# recurring key SHOULD promote. Log the LIVE causal state for these consumers
+# (throttled) so we read the real cause (effect_sig variance / observed_n /
+# eviction) instead of inferring. Remove once root-caused.
+_CAUSAL_DEBUG_CONSUMERS = frozenset({
+    "reasoning_strategy", "emotional", "coding", "self_model"})
+
 
 def _bucket_reward(reward: float) -> Optional[str]:
     """Return reward-magnitude bucket label, or None if below noise floor."""
@@ -465,7 +474,31 @@ class CausalGeneratorRegistry:
             gen.observe(transition, reward)
         elif reward < 0:
             gen.observe_negative(transition, reward)
-        return gen.maybe_promote()
+        promoted = gen.maybe_promote()
+        # §7.D-A2 diagnostic (throttled, behavior-neutral): why don't the
+        # newly-wired consumers form candidates despite a feed? Log the live
+        # causal state every 20th observation for the target consumers.
+        if consumer in _CAUSAL_DEBUG_CONSUMERS:
+            try:
+                gen._dbg_n = getattr(gen, "_dbg_n", 0) + 1
+                if gen._dbg_n % 20 == 0:
+                    cands = gen._candidates
+                    top = (max(cands.values(), key=lambda c: c.observed_n)
+                           if cands else None)
+                    md = transition.metadata or {}
+                    logger.info(
+                        "[CausalDBG] %s obs=%d reward=%.3f act_sig=%s "
+                        "n_cands=%d top_key=%s top_obs_n=%s min_n=%d "
+                        "win=%d/%d md_keys=%s promoted=%s",
+                        consumer, gen._stats.get("observed", 0), reward,
+                        action_signature(transition), len(cands),
+                        (f"{top.action_sig}|{top.effect_sig}" if top else "-"),
+                        (top.observed_n if top else "-"), gen._min_n,
+                        len(gen._window), gen._window.maxlen,
+                        list(md.keys())[:6], (promoted is not None))
+            except Exception:
+                pass
+        return promoted
 
     def decay_stale_all(self) -> int:
         """Per-tick staleness decay across all known generators."""
