@@ -308,6 +308,8 @@ _T = (
      None, None, (), ("backup_worker",), True, "/v4/backup/manifest"),
     ("/v6/backup/trigger", "POST", "post_v4_backup_trigger", "backup", "mutation",
      None, "commands.backup_trigger", (), ("backup_worker",), False, "/v4/backup/trigger"),
+    ("/v6/admin/backup/clear-halt", "POST", "post_v6_backup_clear_halt", "backup", "mutation",
+     None, None, (), ("backup_worker",), False, "/v4/admin/backup/clear-halt"),
 
     # ── timechain ────────────────────────────────────────────────────────
     ("/v6/timechain/status", "GET", "get_v4_timechain_status", "timechain", "readout",

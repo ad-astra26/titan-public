@@ -6329,6 +6329,51 @@ async def post_v4_backup_trigger(request: Request):
         return _error(str(e))
 
 
+async def post_v6_backup_clear_halt(request: Request):
+    """Operator clear of the §24.12 backup HALT (INV-BR-4) — recover a halted
+    backup pipeline WITHOUT box access. Publishes BACKUP_CLEAR_HALT to the backup
+    worker, which lifts the halt + (re)arms the force-baseline token so the NEXT
+    ship rebases to a CLEAN baseline (the suspect chain is never appended to).
+
+    ⚠ A halt means the §24.12 weekly restore-test FAILED (restore-from-Arweave may
+    be at risk) — INVESTIGATE the cause before clearing. Clearing does NOT itself
+    spend; the rebased baseline only settles on Arweave when the wallet/Irys is
+    funded.
+
+    Body JSON (all optional):
+      - force_baseline (default true): (re)arm the one-shot force-baseline token.
+      - trigger_now   (default false): also fire a baseline ship immediately
+        (settles only if funded).
+    Internal-key gated (admin mutation).
+    """
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        force_baseline = bool(body.get("force_baseline", True))
+        trigger_now = bool(body.get("trigger_now", False))
+        from ..bus import make_msg
+        titan_state.bus.publish(make_msg(
+            bus.BACKUP_CLEAR_HALT, "api", "backup",
+            {"force_baseline": force_baseline, "trigger_now": trigger_now,
+             "requested_at": int(__import__('time').time())},
+        ))
+        logger.warning(
+            "[Dashboard] /v6/admin/backup/clear-halt fired "
+            "(force_baseline=%s trigger_now=%s)", force_baseline, trigger_now)
+        return _ok({"queued": True, "force_baseline": force_baseline,
+                    "trigger_now": trigger_now,
+                    "note": "Halt clear published to backup worker; check "
+                            "/v6/backup/status for halted=false (runs async)"})
+    except Exception as e:
+        logger.error("[Dashboard] /v6/admin/backup/clear-halt error: %s", e)
+        return _error(str(e))
+
+
 async def get_v4_backup_status(request: Request):
     """Backup health summary: last successful per type, master invariant, mode."""
     titan_state = _get_plugin(request)

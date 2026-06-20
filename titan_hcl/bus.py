@@ -2519,6 +2519,10 @@ def get_drop_stats() -> dict:
 
 # Backup / save lifecycle
 BACKUP_TRIGGER_MANUAL = "BACKUP_TRIGGER_MANUAL"
+# Operator clear of the §24.12 backup HALT (INV-BR-4) via /v6/admin/backup/clear-halt
+# — lifts the halt + (re)arms the force-baseline token so the next ship rebases to a
+# clean baseline. Payload: {"force_baseline": bool, "trigger_now": bool}.
+BACKUP_CLEAR_HALT = "BACKUP_CLEAR_HALT"
 
 # Bus protocol — supervision transfer
 BUS_HANDOFF_ACK = "BUS_HANDOFF_ACK"

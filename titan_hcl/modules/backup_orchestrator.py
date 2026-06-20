@@ -484,6 +484,10 @@ def backup_orchestrator_main(recv_queue, send_queue, name: str, config: dict) ->
                 _send_heartbeat(send_queue, name, state_writer=_state_writer)
                 _dispatch_backup_offloop(state, _handle_manual, msg)
                 last_heartbeat = time.time()
+            elif msg_type == bus.BACKUP_CLEAR_HALT:
+                _send_heartbeat(send_queue, name, state_writer=_state_writer)
+                _handle_clear_halt(state, msg, send_queue, name)
+                last_heartbeat = time.time()
             # Ignore other msg types — don't complain (bus delivers many)
         except Exception as e:
             logger.error("[BackupWorker] Handler error (%s): %s", msg_type, e,
@@ -1212,6 +1216,47 @@ def _notify_maker_success(titan_id: str, backup, duration_s: float, mode: str) -
                          format_backup_success(btype.replace("_package", ""),
                                                  size_mb, tx, duration_s),
                          cooldown_s=cooldown)
+
+
+def _handle_clear_halt(state: dict, msg: dict, send_queue, name: str) -> None:
+    """Handle BACKUP_CLEAR_HALT (operator recovery via /v6/admin/backup/clear-halt).
+
+    Lifts the §24.12 halt + (re)arms the force-baseline token so the NEXT ship
+    rebases to a CLEAN baseline (INV-BR-4/INV-BKP-5). Runs INLINE — it is a
+    single atomic state-file write, not a backup cascade. When
+    payload.trigger_now, also dispatches a manual baseline ship OFF-loop (which
+    only actually settles when the wallet/Irys is funded — clearing the halt does
+    NOT itself spend). Emits a BACKUP_CLEAR_HALT_RESULT reply for the api.
+    """
+    payload = msg.get("payload", {}) or {}
+    rid = msg.get("rid")
+    force_baseline = bool(payload.get("force_baseline", True))
+    trigger_now = bool(payload.get("trigger_now", False))
+    backup = state["backup"]
+    result = {"ok": False}
+    try:
+        result = backup.clear_halt(force_baseline=force_baseline)
+        result["ok"] = True
+        logger.warning("[BackupWorker] BACKUP_CLEAR_HALT applied: %s (trigger_now=%s)",
+                       result, trigger_now)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[BackupWorker] BACKUP_CLEAR_HALT failed: %s", e, exc_info=True)
+        result = {"ok": False, "error": str(e)}
+    if rid is not None:
+        try:
+            send_queue.put({
+                "type": bus.BACKUP_CLEAR_HALT + "_RESULT", "src": name,
+                "dst": msg.get("src", "api"), "rid": rid,
+                "payload": result, "ts": time.time()})
+        except Exception:  # noqa: BLE001
+            pass
+    if trigger_now and result.get("ok"):
+        # Ship a fresh baseline now (rebases via the just-armed force-baseline
+        # token). Off-loop, single-flight — settles only if funded.
+        _dispatch_backup_offloop(
+            state, _handle_manual,
+            {"type": bus.BACKUP_TRIGGER_MANUAL, "src": msg.get("src", "api"),
+             "payload": {"type": "personality"}})
 
 
 def _handle_manual(state: dict, msg: dict) -> None:

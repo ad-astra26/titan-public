@@ -2092,6 +2092,40 @@ class RebirthBackup:
             return True
         return False
 
+    # ── Operator admin surface (BACKUP_CLEAR_HALT / /v6/admin/backup/clear-halt) ──
+    def halt_status(self) -> dict:
+        """Read-only snapshot of the §24.12 halt state (INV-BR-4) for the admin
+        readout. Cheap; no I/O."""
+        return {
+            "halted": bool(self._halted),
+            "halt_reason": self._halt_reason or "",
+            "halt_failed_event_id": getattr(self, "_halt_failed_event_id", None),
+            "force_baseline_pending": bool(self._force_baseline_pending),
+        }
+
+    def clear_halt(self, *, force_baseline: bool = True) -> dict:
+        """Operator clear of the §24.12 backup HALT (INV-BR-4), exposed via the
+        admin route so recovery is possible without box access. Mirrors
+        `_clear_backups_halt` but is unconditional (clears even a flag set this
+        boot) and, when `force_baseline=True`, (re)arms the one-shot
+        force-baseline token (INV-BKP-5) so the NEXT ship rebases to a CLEAN
+        baseline — the suspect chain is never appended to. Persists immediately.
+        Returns a before/after status dict. INVESTIGATE the failure BEFORE
+        calling this — a halt means restore-from-Arweave may be at risk."""
+        prior = self.halt_status()
+        self._halted = False
+        self._halt_reason = ""
+        if force_baseline:
+            self._force_baseline_pending = True
+        self._save_backup_state()
+        logger.warning(
+            "[Backup] §24.12 HALT CLEARED by operator (was_halted=%s reason=%r "
+            "failed_event=%s) — force_baseline_pending=%s; next ship rebases to a "
+            "clean baseline.",
+            prior["halted"], prior["halt_reason"],
+            str(prior["halt_failed_event_id"])[:12], self._force_baseline_pending)
+        return {"prior": prior, "now": self.halt_status()}
+
     def _build_memo_fetch(self):
         """Live memo_fetch (Solana sig → SPL-Memo text) for verify_zk_chain=True."""
         async def _fetch(sig: str):

@@ -2055,6 +2055,7 @@ def build_catalog(bus, guardian, *, titan_id: str, kernel=None) -> None:
         broadcast_topics=[
             _bus_constants.MEDITATION_COMPLETE,
             _bus_constants.BACKUP_TRIGGER_MANUAL,
+            _bus_constants.BACKUP_CLEAR_HALT,
         ],
         # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
         boot_priority="post_boot",
