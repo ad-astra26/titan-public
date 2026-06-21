@@ -227,3 +227,71 @@ def test_last_used_epoch_updates():
             "SELECT success_count, last_used_epoch FROM research_recipes "
             "WHERE goal_class='g' AND source='s'").fetchone()
         assert int(row[0]) == 2 and float(row[1]) == 99.0
+
+
+# ── P3 (BUG-RESEARCH-LANE-NOT-IN-SKILLSTORE, 2026-06-20) ─────────────────────
+# The synthesis RESEARCH_CONFIRMED handler mints a positive ProceduralSkill from a
+# user-CONFIRMED research turn, keyed on the QUERY-shape (so match_procedural_skill
+# recalls it for future like goals). EEL §1.3: "the research query-shape ... accrues
+# +1s → becomes a positive skill Titan delegates."
+
+def test_research_confirmation_keys_query_shape_and_mints_delegatable_skill(tmp_path):
+    import duckdb
+    from titan_hcl.synthesis.goal_class import goal_class, task_shape_for_goal
+    from titan_hcl.synthesis.skill_store import (
+        ProceduralSkillStore, compute_skill_id)
+
+    # The exact keys the handler derives from a RESEARCH_CONFIRMED payload:
+    user_prompt = "What's the current TVL of Jupiter on Solana?"   # the QUERY
+    acquired_source = "searxng-search"
+    gc = goal_class(user_prompt)
+    ts = task_shape_for_goal("informational", acquired_source, user_prompt)
+    # keyed on the query-shape (defi-lookup) — NOT the answer-content
+    assert gc == "defi-lookup"
+    assert ts == "informational|searxng-search|defi"
+
+    store = ProceduralSkillStore(
+        duckdb_conn=duckdb.connect(":memory:"),
+        faiss_path=str(tmp_path / "skills.faiss"),
+        snapshot_path=str(tmp_path / "skills_snapshot.json"),
+        embedder=None)
+    store.enqueue_score_event(
+        oracle_id="web_api_oracle", goal_class=gc, task_shape=ts,
+        success=True, parent_tool_call_tx="node_42")
+    summary = store.drain_score_events()
+    assert summary["drained"] == 1 and summary["promoted"] == 1
+
+    sid = compute_skill_id("web_api_oracle", gc)
+    sk = store.read_skill(sid)
+    assert sk is not None and sk["promoted"] is True
+    assert sk["cells"][0]["polarity"] == "positive"
+    # delegatable — recallable for a future like research goal
+    assert sid in [r["skill_id"] for r in store.read_for_match()]
+
+
+def test_research_confirmation_idempotent_on_node_id(tmp_path):
+    # A replayed RESEARCH_CONFIRMED (same node_id + same ts) never double-counts
+    # (event_id is content-hashed on oracle/goal/task/parent_tool_call_tx/ts —
+    # which is why the handler passes the payload ts, not clock time).
+    import duckdb
+    from titan_hcl.synthesis.skill_store import ProceduralSkillStore
+    store = ProceduralSkillStore(
+        duckdb_conn=duckdb.connect(":memory:"),
+        faiss_path=str(tmp_path / "skills.faiss"),
+        snapshot_path=str(tmp_path / "skills_snapshot.json"),
+        embedder=None)
+    for _ in range(3):  # same node + same ts (a true bus replay) 3×
+        store.enqueue_score_event(
+            oracle_id="web_api_oracle", goal_class="defi-lookup",
+            task_shape="informational|searxng-search|defi", success=True,
+            parent_tool_call_tx="node_42", ts=100.0)
+    summary = store.drain_score_events()
+    assert summary["drained"] == 1   # 2 replays deduped on event_id
+
+    # but a DISTINCT confirmation (different node + ts) of the same query-shape
+    # accrues a separate +1 (EEL §1.3 "accrues +1s") — not deduped away
+    store.enqueue_score_event(
+        oracle_id="web_api_oracle", goal_class="defi-lookup",
+        task_shape="informational|searxng-search|defi", success=True,
+        parent_tool_call_tx="node_99", ts=200.0)
+    assert store.drain_score_events()["drained"] == 1

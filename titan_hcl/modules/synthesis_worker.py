@@ -4481,6 +4481,42 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                      "score enqueue failed: %s", _ass_err)
                 continue
 
+            if msg_type == bus.RESEARCH_CONFIRMED:
+                # P3 (BUG-RESEARCH-LANE-NOT-IN-SKILLSTORE, 2026-06-20): the user
+                # CONFIRMED a researched answer → the informational oracle fired
+                # (§1.0; INV-EEL-2 oracle-verified). Mint a positive ProceduralSkill
+                # cell so the research QUERY-shape becomes delegatable (EEL §1.3:
+                # "the research query-shape ... accrues +1s → becomes a positive
+                # skill"). Keyed on goal_class(user_prompt) — the QUERY, not the
+                # answer-content (DK.5 only has content) — so match_procedural_skill
+                # (semantic recall on the incoming goal_text) recalls it for future
+                # like goals. Per confirmed use (accrues +1s). Synthesis sole-writer
+                # (INV-Syn-19); idempotent on the event content-hash (parent=node_id).
+                # Additive: memory_worker still promotes the FACT off the same event.
+                if procedural_skill_store is not None:
+                    try:
+                        _q = str(payload.get("user_prompt", "") or "")
+                        _src = str(payload.get("acquired_source", "") or "")
+                        if _q and _src:
+                            from titan_hcl.synthesis.goal_class import (
+                                goal_class as _gcf, task_shape_for_goal as _tsf)
+                            # pass the event ts so a REPLAYED RESEARCH_CONFIRMED
+                            # (same node_id + ts) dedups on the content-hash event_id,
+                            # while genuinely distinct confirmations still accrue +1s.
+                            _ets = payload.get("ts")
+                            procedural_skill_store.enqueue_score_event(
+                                oracle_id="web_api_oracle",
+                                goal_class=_gcf(_q),
+                                task_shape=_tsf("informational", _src, _q),
+                                success=True,
+                                parent_tool_call_tx=str(
+                                    payload.get("node_id", "") or ""),
+                                ts=float(_ets) if _ets is not None else None)
+                    except Exception as _rcs_err:  # noqa: BLE001
+                        logger.debug("[synthesis_worker][P3] research skill enqueue "
+                                     "failed: %s", _rcs_err)
+                continue
+
             if msg_type == SELF_LEARN_MACRO_READY:
                 # S2 (INV-OML-11): the self_learning worker distilled a winning
                 # macro-strategy → persist it as a `Reasoning(kind='macro_strategy')`

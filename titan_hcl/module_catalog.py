@@ -1290,6 +1290,12 @@ def build_catalog(bus, guardian, *, titan_id: str, kernel=None) -> None:
             # §7.D-knowledge (DK.1) — memory_worker anchored a confirmed research
             # finding → seed the declarative `Engram` concept (sole spine writer).
             _bus_constants.RESEARCH_CONCEPT_SEED,
+            # P3 (BUG-RESEARCH-LANE-NOT-IN-SKILLSTORE, 2026-06-20) — the user CONFIRMED
+            # a researched answer (the informational oracle, INV-EEL-2). Mint a positive
+            # ProceduralSkill cell keyed on the QUERY-shape so the research lane becomes
+            # delegatable (EEL §1.3). Synthesis sole-writer (INV-Syn-19); additive to
+            # memory_worker's fact-promotion handling of the same event.
+            _bus_constants.RESEARCH_CONFIRMED,
             # §7.B (C1′) — agno PostHook's non-verifiable turn (direct/research/IDK)
             # → graph a Reasoning(kind='turn') record (reward=NULL, judged later).
             _bus_constants.TURN_REASONING_RECORD,
