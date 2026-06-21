@@ -324,6 +324,15 @@ class RebirthBackup:
             self._meditation_count, epoch, promoted, total_nodes, today, weekday,
         )
 
+        # devnet retention (2026-06-21): sweep orphaned arweave_devnet bundles
+        # BEFORE staging a ship, so a near-full devnet box frees space instead of
+        # deadlocking (ship fails at staging → never reaches the post-baseline
+        # prune → stays full). No-op on mainnet (4 guards inside). Non-fatal.
+        try:
+            self._sweep_orphan_devnet_bundles()
+        except Exception as e:
+            logger.warning("[Backup] orphan-sweep failed (non-fatal): %s", e)
+
         # SPEC §24 — Unified backup pipeline (Phase 5.5, 2026-05-16; D-SPEC-123
         # follow-up 2026-05-23: legacy fallback DISABLED — Maker decision).
         # When [backup].unified_v2_enabled = true (default false), route this
@@ -1670,6 +1679,74 @@ class RebirthBackup:
             (manifest.current_baseline_event_id or "?")[:8])
         return len(pruned)
 
+    def _sweep_orphan_devnet_bundles(self) -> int:
+        """devnet-ONLY orphan retention (2026-06-21): delete `data/arweave_devnet/`
+        bundles referenced by NO manifest. These are unreachable orphans left by
+        failed/superseded ships (a ship `put`s the bundle then fails/supersedes
+        before its manifest event persists) — the manifest-based
+        `_prune_old_local_backups` can never reach them, so they accumulate
+        unbounded and fill the devnet box (root-caused 2026-06-21: 156 orphans/Titan
+        = 96G). The keep-set is every `devnet_` tx referenced by any `data/**/*.json`
+        (manifests + soul_diary_chain + timechain arweave_manifest = the resurrection
+        pointers). Idempotent + cheap; safe to call every backup tick.
+
+        🔒 NEVER touches mainnet — FOUR independent guards, any one fails → no-op:
+          (1) `data/genesis_record.json` present ⇒ mainnet-born ⇒ return 0
+              (mainnet uses REAL Arweave; those bundles are sovereign, never pruned);
+          (2) `_rebase_params()` cadence != 'weekly' ⇒ not devnet ⇒ return 0;
+          (3) `data/arweave_devnet/` only EXISTS on devnet (mainnet has no local
+              cache) ⇒ absent ⇒ return 0;
+          (4) an empty keep-set means the json scan failed ⇒ refuse to delete blind.
+        """
+        # GUARD 1 — mainnet birth certificate ⇒ sovereign Arweave, never sweep.
+        if os.path.exists(os.path.join("data", "genesis_record.json")):
+            return 0
+        # GUARD 2 — cadence discriminator (devnet/local == weekly).
+        cadence, _ = self._rebase_params()
+        if cadence != "weekly":
+            return 0
+        cache = os.path.join("data", "arweave_devnet")
+        # GUARD 3 — the local devnet cache dir only exists on devnet.
+        if not os.path.isdir(cache):
+            return 0
+        import glob
+        import re
+        keep: set = set()
+        for f in glob.glob(os.path.join("data", "**", "*.json"), recursive=True):
+            try:
+                with open(f, errors="ignore") as fh:
+                    keep.update(re.findall(r"devnet_[0-9a-fA-F]+", fh.read()))
+            except OSError:
+                continue
+        # GUARD 4 — empty keep-set ⇒ scan failed ⇒ refuse to delete blind.
+        if not keep:
+            logger.warning(
+                "[Backup] orphan-sweep ABORT — keep-set empty (json scan found no "
+                "referenced tx); refusing to delete any bundle")
+            return 0
+        deleted = 0
+        freed = 0
+        for b in glob.glob(os.path.join(cache, "devnet_*.data")):
+            tx = os.path.basename(b)[:-len(".data")]
+            if tx in keep:
+                continue
+            for suffix in (".data", ".tags.json"):
+                p = os.path.join(cache, tx + suffix)
+                if os.path.exists(p):
+                    try:
+                        freed += os.path.getsize(p)
+                        os.remove(p)
+                    except OSError as e:
+                        logger.warning(
+                            "[Backup] orphan-sweep: could not delete %s: %s", p, e)
+            deleted += 1
+        if deleted:
+            logger.info(
+                "[Backup] orphan-sweep (devnet): deleted %d orphan bundle(s), "
+                "freed %.2f GB (keep-set=%d referenced)",
+                deleted, freed / 1e9, len(keep))
+        return deleted
+
     async def _precheck_diff_base(self, manifest):
         """RFP Phase B integrity precheck — runs BEFORE the tier build in BOTH ship
         paths. Returns (force_event_type, force_trigger, known_arcs).
@@ -2446,6 +2523,7 @@ class RebirthBackup:
             return None
         _baseline_resolver = self._make_diff_base_resolver(base_dir, _known_arcs)
 
+        _owns_scratch = scratch_dir is None
         if scratch_dir is None:
             import tempfile
             scratch_dir = tempfile.mkdtemp(
@@ -2456,10 +2534,21 @@ class RebirthBackup:
         if byte_budget is not None:
             _kw["byte_budget"] = int(byte_budget)
         worker = BackupWorker(**_kw)
-        staged = worker.plan_build(
-            manifest=manifest, personality_specs=p_specs, timechain_specs=t_specs,
-            soul_specs=s_specs, scratch_dir=scratch_dir,
-            force_event_type=_force_et, force_trigger=_force_trig)
+        try:
+            staged = worker.plan_build(
+                manifest=manifest, personality_specs=p_specs, timechain_specs=t_specs,
+                soul_specs=s_specs, scratch_dir=scratch_dir,
+                force_event_type=_force_et, force_trigger=_force_trig)
+        except BaseException:
+            # plan_build raised (e.g. ENOSPC mid-stage) → `staged` never returns,
+            # so the caller's finally can't rmtree it. Clean the scratch dir WE
+            # created here to stop the /tmp staging leak (a key contributor to the
+            # devnet disk-full deadlock, 2026-06-21). Don't touch a caller-supplied
+            # (Orchestrator-owned) scratch_dir.
+            if _owns_scratch and os.path.isdir(scratch_dir):
+                import shutil
+                shutil.rmtree(scratch_dir, ignore_errors=True)
+            raise
         return worker, staged, _baseline_resolver, _known_arcs
 
     def _build_staged_event_v2(self, weekday: int):
