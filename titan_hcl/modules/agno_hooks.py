@@ -597,8 +597,14 @@ def _emit_research_confirmed(plugin, node) -> None:
         if _bus is None:
             return
         _felt = node.get("neuromod_context")
+        # dst="all" (type-filtered broadcast — the _synth_bus_emit idiom), NOT
+        # dst="memory": BOTH memory_worker (fact promotion) AND synthesis_worker
+        # (P3 — research query-shape → ProceduralSkill, BUG-RESEARCH-LANE) subscribe
+        # to RESEARCH_CONFIRMED; the bus is dst-routed, so a targeted dst="memory"
+        # never reaches synthesis. (Caught live 2026-06-21: subscription alone gave
+        # 0 skill cells until the emit broadcast.)
         _bus.publish(_mk(
-            _bus_mod.RESEARCH_CONFIRMED, "pre_hook", "memory", {
+            _bus_mod.RESEARCH_CONFIRMED, "pre_hook", "all", {
                 "node_id": node.get("id"),
                 "user_prompt": str(node.get("user_prompt", "") or ""),
                 "agent_response": str(node.get("agent_response", "") or ""),
