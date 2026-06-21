@@ -1359,14 +1359,37 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
                 expression_fired_count += 1
                 # kin_sense trigger bridge — translate to MEDITATION_REQUEST self-emit.
                 if str(payload.get("composite", "")).upper() == "KIN_SENSE":
-                    logger.info(
-                        "[MeditationWorker] EXPRESSION_FIRED(KIN_SENSE) "
-                        "bridge → MEDITATION_REQUEST self-emit")
-                    _send(send_queue, MEDITATION_REQUEST, name, "meditation", {
-                        "source": "kin_sense",
-                        "reason": "kin_sense_expression",
-                        "ts": time.time(),
-                    })
+                    # CADENCE GATE (BUG-MEDITATION-KIN-SENSE-BRIDGE-STORM, 2026-06-21).
+                    # This bridge (47a2fc00, 2026-05-21) was DORMANT for a month
+                    # because KIN_SENSE never fired (developmental_age stuck 0). When
+                    # e0a93c03f fed the REAL developmental_age (12330), KIN_SENSE began
+                    # firing ~5×/min — and the un-gated bridge stormed a FULL meditation
+                    # (+studio render +backup ship) on EVERY fire (~1700×/day vs the
+                    # ~4×/day onset-v2 design). KIN_SENSE may INVITE meditation, but it
+                    # must respect the same sparse cadence floor as the emergent onset
+                    # driver: skip if already meditating, or within the min_interval
+                    # TIME floor (mirrors _emergent_check :1087/:1097-1101). last_ts=0
+                    # (never meditated) → since=inf → allowed (seeds the first).
+                    _snap = publisher.snapshot()["tracker"]
+                    _last_ts = float(_snap.get("last_ts", 0.0) or 0.0)
+                    _since = (time.time() - _last_ts) if _last_ts > 0 else float("inf")
+                    if publisher.is_in_meditation() or _since < _med_min_interval_s:
+                        logger.debug(
+                            "[MeditationWorker] EXPRESSION_FIRED(KIN_SENSE) "
+                            "suppressed — cadence floor (in_meditation=%s "
+                            "since_last=%.0fs < floor=%.0fs)",
+                            publisher.is_in_meditation(), _since,
+                            _med_min_interval_s)
+                    else:
+                        logger.info(
+                            "[MeditationWorker] EXPRESSION_FIRED(KIN_SENSE) "
+                            "bridge → MEDITATION_REQUEST self-emit "
+                            "(since_last=%.0fs)", _since)
+                        _send(send_queue, MEDITATION_REQUEST, name, "meditation", {
+                            "source": "kin_sense",
+                            "reason": "kin_sense_expression",
+                            "ts": time.time(),
+                        })
 
             elif msg_type == KERNEL_EPOCH_TICK:
                 kernel_tick_count += 1
