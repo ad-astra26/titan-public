@@ -5,7 +5,7 @@ DO NOT EDIT BY HAND. Edit the TOML, then run:
     python scripts/generate_phase_c_constants.py
 
 SPEC version: 1.11.5
-Source SHA-256: e7d91d67329f6c0f61091ebd1956d8e61118c27381260bef1334cef068f57334
+Source SHA-256: a2cbbaf951e53a5f13683e6038fb616e1fd88346ec793d57c060ba18b744c0d3
 
 Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 `arch_map phase-c verify`.
@@ -15,7 +15,7 @@ from typing import Final
 
 # ── SPEC version metadata ──────────────────────────────────────────────
 SPEC_VERSION: Final[str] = "1.11.5"
-SPEC_SOURCE_SHA256: Final[str] = "e7d91d67329f6c0f61091ebd1956d8e61118c27381260bef1334cef068f57334"
+SPEC_SOURCE_SHA256: Final[str] = "a2cbbaf951e53a5f13683e6038fb616e1fd88346ec793d57c060ba18b744c0d3"
 
 
 # ── KERNEL ────────────────────────────────────────────────────────────────
@@ -479,8 +479,7 @@ CGN_ENGINE_STATE_MAX_BYTES: Final[int] = 8192
 REASONING_STATE_SCHEMA_VERSION: Final[int] = 1
 # Max bytes for reasoning_state.bin payload. Typical ≈ 800-1500 bytes. Bounded 4KB cap.
 REASONING_STATE_MAX_BYTES: Final[int] = 4096
-# Schema version for meta_reasoning_state.bin slot. v2 (D-SPEC-91, v1.30.0) — additive extension: {total_meta_chains: int, total_introspect_picks: int, total_introspect_executions: int, monoculture_score: float, primitive_distribution: dict[str→float], last_chain_id: int, last_chain_reason: str, last_chain_succeeded: bool, subsystem_signals_status: dict, meta_cgn: dict, schema_version: int, ts: float}. meta_cgn = {status, graduation: {progress, rolled_back_count}, primitives_well_sampled, haov: {by_status: {confirmed}}, updates_applied, ready_to_graduate, primitive_v_summary: dict[str→float], failsafe: {status, last_check_ts, recent_failures}}. failsafe nested under meta_cgn matching MetaCGNConsumer.get_stats() native shape + /v4/meta-cgn/failsafe-status drill path. v1 readers tolerate missing meta_cgn key (defaults to empty dict). Owned by cognitive_worker (MetaReasoningEngine lives there). Reader: api_subprocess StateAccessor.spirit.get_coordinator overlay (meta_reasoning key) feeding /v4/meta-cgn + /v4/meta-cgn/failsafe-status + /v4/meta-cgn/graduation-readiness dashboard endpoints.
-# v3 (RFP_cgn_loop_closure G6, 2026-06-19) — additive: grounded_v_selection_enabled: bool, grounded_v_selection_fires: int, matrix_seed_enabled: bool, matrix_seed_fires: int, diversity: {unique_prims_ema_50chains: float, current_epsilon: float}. Surfaces the §7.B grounded-V Option-β + §5.4 M3 matrix-seed live counters + chain diversity SHM-direct (G18) so /v6/cognition/meta-reasoning carries them (previously only in get_audit_stats(), never copied to the slot → _g_sel_fires unobservable). v2 readers tolerate the missing keys (defaults).
+# Schema version for meta_reasoning_state.bin slot. v2 (D-SPEC-91, v1.30.0) — additive extension: {total_meta_chains: int, total_introspect_picks: int, total_introspect_executions: int, monoculture_score: float, primitive_distribution: dict[str→float], last_chain_id: int, last_chain_reason: str, last_chain_succeeded: bool, subsystem_signals_status: dict, meta_cgn: dict, schema_version: int, ts: float}. meta_cgn = {status, graduation: {progress, rolled_back_count}, primitives_well_sampled, haov: {by_status: {confirmed}}, updates_applied, ready_to_graduate, primitive_v_summary: dict[str→float], failsafe: {status, last_check_ts, recent_failures}}. failsafe nested under meta_cgn matching MetaCGNConsumer.get_stats() native shape + /v4/meta-cgn/failsafe-status drill path. v1 readers tolerate missing meta_cgn key (defaults to empty dict). Owned by cognitive_worker (MetaReasoningEngine lives there). Reader: api_subprocess StateAccessor.spirit.get_coordinator overlay (meta_reasoning key) feeding /v4/meta-cgn + /v4/meta-cgn/failsafe-status + /v4/meta-cgn/graduation-readiness dashboard endpoints. v3 (RFP_cgn_loop_closure G6, 2026-06-19) — additive: grounded_v_selection_enabled: bool, grounded_v_selection_fires: int, matrix_seed_enabled: bool, matrix_seed_fires: int, diversity: {unique_prims_ema_50chains: float, current_epsilon: float}. Surfaces the §7.B grounded-V Option-β + §5.4 M3 matrix-seed live counters + chain diversity SHM-direct (G18) so /v6/cognition/meta-reasoning carries them (previously only in get_audit_stats(), never copied to the slot → _g_sel_fires unobservable). v2 readers tolerate the missing keys (defaults).
 META_REASONING_STATE_SCHEMA_VERSION: Final[int] = 3
 # Max bytes for meta_reasoning_state.bin payload. Typical ≈ 1-2KB (subsystem signals + primitive distribution). Bounded 4KB cap.
 META_REASONING_STATE_MAX_BYTES: Final[int] = 4096
