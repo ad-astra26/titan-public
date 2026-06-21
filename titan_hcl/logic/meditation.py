@@ -13,6 +13,7 @@ import time
 
 import httpx
 
+from titan_hcl.params import get_params
 from titan_hcl.utils.crypto import generate_state_hash
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,6 @@ def _eel_weak_delta() -> float:
     """EEL A2 — the weak-confirm magnitude (silence default) from
     `titan_params.toml [eel.confirm]`. Bootstrap default 0.3 (INV-EEL-4)."""
     try:
-        from titan_hcl.params import get_params
         return float(get_params("eel").get("confirm", {}).get("delta_weak", 0.3))
     except Exception:
         return 0.3
