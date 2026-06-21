@@ -18,6 +18,7 @@ import asyncio
 import time
 import time as _time_for_cache  # legacy alias retained for the pre-hook cache TTL helpers
 from titan_hcl import bus
+from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
 
