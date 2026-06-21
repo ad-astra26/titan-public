@@ -33,9 +33,18 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import numpy as np
+import msgpack
 from titan_hcl.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
+
+# INV-LOOP-7 (RFP_cgn_loop_closure §7.D): the verified-causal prior. A confirmed
+# HAOV action-rule nudges the learned policy's action choice by at most
+# _HAOV_PRIOR_CAP·confidence (never an override — the policy always dominates),
+# and an applied nudge emits CGN_HAOV_RULE_APPLIED → used_for_action. The emit is
+# throttled per consumer to bound bus + cgn-side SHM-write load.
+_HAOV_PRIOR_CAP = 0.2
+_HAOV_EMIT_MIN_INTERVAL_S = 1.0
 
 
 @dataclass
@@ -265,6 +274,12 @@ class CGNConsumerClient:
         self._action_names: List[str] = []
         self._config_loaded = False
 
+        # INV-LOOP-7 — this consumer's own verified action-rules, delivered in
+        # the SHM weights `extra` blob by cgn_worker and refreshed on reload.
+        # Each entry: (action_idx, confidence, predicted_magnitude, rule_name).
+        self._verified_action_rules: List[tuple] = []
+        self._last_haov_emit_ts: float = 0.0
+
         # SHM reader — torch-free (just mmap'd bytes + numpy).
         # Microkernel v2 §A.2 part 2 (S4): pass titan_id + config so the
         # dual-mode resolver picks per-titan + 24B header when flag on.
@@ -359,11 +374,87 @@ class CGNConsumerClient:
                         n = self._action_net.action_dims
                         self._action_names = [f"action_{i}" for i in range(n)]
                     self._config_loaded = True
+                # INV-LOOP-7 — refresh this consumer's verified action-rules
+                # from the same SHM read (the `extra` blob).
+                self._parse_verified_action_rules(result.get("extra"))
                 return True
         except Exception as e:
             swallow_warn(f'[CGNClient:{self._name}] SHM load failed', e,
                          key="logic.cgn_consumer_client.shm_load_failed", throttle=100)
         return False
+
+    def _parse_verified_action_rules(self, extra: Optional[bytes]) -> None:
+        """INV-LOOP-7 — decode this consumer's verified action-rules from the
+        SHM `extra` blob (msgpack {consumer: [[action_idx, conf, mag, rule]]}).
+        cgn_worker only includes action-bearing rules with confidence > 0.5;
+        we keep our own slice. Failures degrade to no prior (never raises)."""
+        if not extra:
+            self._verified_action_rules = []
+            return
+        try:
+            allrules = msgpack.unpackb(extra, raw=False)
+            mine = (allrules.get(self._name) or []) if isinstance(allrules, dict) else []
+            self._verified_action_rules = [
+                (int(r[0]), float(r[1]), float(r[2]), str(r[3]))
+                for r in mine
+                if isinstance(r, (list, tuple)) and len(r) >= 4
+            ]
+        except Exception as e:
+            self._verified_action_rules = []
+            swallow_warn(f'[CGNClient:{self._name}] verified-rule parse failed', e,
+                         key="logic.cgn_consumer_client.verified_rule_parse_failed",
+                         throttle=100)
+
+    def _apply_verified_prior(self, probs: "np.ndarray") -> tuple:
+        """INV-LOOP-7 — bounded verified-causal prior on the learned policy.
+
+        Adds at most _HAOV_PRIOR_CAP·confidence to each rule-endorsed action's
+        softmax probability, then re-argmaxes. The boost is bounded so the
+        learned policy always dominates (anti-collapse). Returns
+        (chosen_index, endorsing_rule_or_None) where the rule is
+        (rule_name, confidence) iff the FINAL chosen action is rule-endorsed.
+        """
+        if not self._verified_action_rules:
+            return int(np.argmax(probs)), None
+        boosted = probs.astype(np.float64, copy=True)
+        n = boosted.shape[0]
+        best_for_action: Dict[int, tuple] = {}
+        for (a_idx, conf, mag, rname) in self._verified_action_rules:
+            if 0 <= a_idx < n:
+                boosted[a_idx] += min(_HAOV_PRIOR_CAP, _HAOV_PRIOR_CAP * conf)
+                # keep the highest-confidence rule per action for attribution
+                prev = best_for_action.get(a_idx)
+                if prev is None or conf > prev[1]:
+                    best_for_action[a_idx] = (rname, conf)
+        chosen = int(np.argmax(boosted))
+        return chosen, best_for_action.get(chosen)
+
+    def _emit_haov_applied(self, rule_name: str) -> None:
+        """INV-LOOP-7 — credit the verified rule's source consumer (self) so
+        cgn_worker bumps used_for_action. Throttled per consumer."""
+        if self._send_queue is None:
+            return
+        now = time.time()
+        if now - self._last_haov_emit_ts < _HAOV_EMIT_MIN_INTERVAL_S:
+            return
+        try:
+            self._send_queue.put_nowait({
+                "type": "CGN_HAOV_RULE_APPLIED",
+                "src": self._module_name,
+                "dst": "cgn",
+                "ts": now,
+                "payload": {
+                    "source_consumer": self._name,
+                    "applying_consumer": self._name,
+                    "rule": rule_name,
+                    "count": 1,
+                },
+            })
+            self._last_haov_emit_ts = now
+        except Exception as e:
+            swallow_warn(f'[CGNClient:{self._name}] HAOV-applied emit failed', e,
+                         key="logic.cgn_consumer_client.haov_applied_emit_failed",
+                         throttle=100)
 
     def _check_and_reload(self):
         """Check /dev/shm version, reload if new. Very cheap (<0.1ms)."""
@@ -481,7 +572,10 @@ class CGNConsumerClient:
 
             temperature = 0.5
             probs = _np_softmax(action_logits, temperature).squeeze(0)
-            best_idx = int(np.argmax(probs))
+            # INV-LOOP-7 — apply the bounded verified-causal prior; the learned
+            # policy (probs) stays the q_values/confidence source of truth, the
+            # prior only (bounded) nudges which action is chosen.
+            best_idx, endorsing = self._apply_verified_prior(probs)
             best_name = (self._action_names[best_idx]
                          if best_idx < len(self._action_names)
                          else f"action_{best_idx}")
@@ -492,11 +586,15 @@ class CGNConsumerClient:
                 for i in range(min(len(self._action_names), probs.shape[0]))
             }
 
+            if endorsing is not None:
+                self._emit_haov_applied(endorsing[0])
+
             return {
                 "action_name": best_name,
                 "action_index": best_idx,
                 "confidence": round(confidence, 4),
                 "q_values": q_values,
+                "haov_applied": (endorsing[0] if endorsing is not None else None),
             }
         except Exception as e:
             swallow_warn(f'[CGNClient:{self._name}] infer_action() failed', e,

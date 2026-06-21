@@ -1347,6 +1347,36 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
+def _serialize_verified_action_rules(cgn, top_k: int = 8) -> bytes:
+    """INV-LOOP-7 (RFP_cgn_loop_closure §7.D) — pack each consumer's verified,
+    ACTION-BEARING HAOV rules (confidence > 0.5, an ``action`` in action_context)
+    into the SHM weights `extra` blob so the consumer process can apply them as a
+    bounded prior on its learned policy. Impasse/concept-only rules (no ``action``)
+    are excluded — those still flow via the C2/C3 text channel. Compact msgpack
+    {consumer: [[action_idx, conf, predicted_magnitude, rule_name], ...]}; top-K
+    per consumer by conf·magnitude. Returns b"" if nothing qualifies."""
+    try:
+        import msgpack
+        out: dict = {}
+        for name, tracker in getattr(cgn, "_haov_trackers", {}).items():
+            rules = []
+            for h in getattr(tracker, "_verified_rules", []):
+                ac = h.action_context or {}
+                if h.confidence > 0.5 and "action" in ac:
+                    rules.append([int(ac["action"]),
+                                  round(float(h.confidence), 4),
+                                  round(float(h.predicted_magnitude), 4),
+                                  str(h.rule)])
+            if rules:
+                rules.sort(key=lambda r: r[1] * r[2], reverse=True)
+                out[name] = rules[:top_k]
+        return msgpack.packb(out, use_bin_type=True) if out else b""
+    except Exception as e:
+        swallow_warn('[CGNWorker] verified-rule serialize failed', e,
+                     key="modules.cgn_worker.verified_rule_serialize_failed", throttle=100)
+        return b""
+
+
 def _write_full_shm(cgn, shm_writer):
     """Write complete weight snapshot to /dev/shm."""
     try:
@@ -1356,7 +1386,8 @@ def _write_full_shm(cgn, shm_writer):
         }
         shm_writer.write_full(
             cgn._value_net.state_dict(),
-            consumer_nets)
+            consumer_nets,
+            extra=_serialize_verified_action_rules(cgn))
     except Exception as e:
         swallow_warn('[CGNWorker] SHM write failed', e,
                      key="modules.cgn_worker.shm_write_failed", throttle=100)
