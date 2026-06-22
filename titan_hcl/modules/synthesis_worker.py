@@ -1471,11 +1471,26 @@ def _export_loop(store: "ActivationStore",
     # HOLDS THE GIL → starves the recompute/heartbeat thread even from this
     # separate export thread (the historical ~34s/pass flap mode). The spine
     # snapshot is an eventually-consistent cross-process READ cache, so a longer
-    # cadence is safe. Export at most every _spine_min_interval_s (4 export
-    # cycles, ≥240s floor); the other exports keep the ~interval_s cadence.
-    # P2b (follow-on) will dirty-gate (engram write-counter) + incrementalize.
-    _spine_min_interval_s = max(interval_s * 4.0, 240.0)
+    # cadence is safe. Export at most every `synthesis.spine_export.min_interval_s`
+    # (config-homed, default = max(interval_s*4, 240s)); the other exports keep
+    # the ~interval_s cadence. INV-OPT-4 kill-switch: `synthesis.spine_export
+    # .throttle_enabled=false` exports every pass (pre-P2a cadence). Both keys are ALSO the A/B
+    # lever for the P2b GIL-coupling load test (set the interval high to suppress
+    # the spine export and watch whether the enrichment cold-read stall follows).
+    # P2b (follow-on, CONTINGENT on that test) will dirty-gate + incrementalize.
+    _spine_default_interval_s = max(interval_s * 4.0, 240.0)
     _spine_last_export = 0.0   # monotonic ts of the last spine export (0 = force first)
+
+    def _spine_throttle_cfg() -> tuple[bool, float]:
+        """Per-pass config read (hot-reload + A/B lever). Soft-fails to the
+        default cadence so a config glitch never freezes the export thread."""
+        try:
+            _se = (get_params("synthesis") or {}).get("spine_export", {}) or {}
+            _en = bool(_se.get("throttle_enabled", True))
+            _iv = float(_se.get("min_interval_s", _spine_default_interval_s))
+            return _en, max(_iv, 0.0)
+        except Exception:  # noqa: BLE001
+            return True, _spine_default_interval_s
     while not stop_event.is_set():
         t0 = time.monotonic()
         timings: dict[str, int] = {}
@@ -1507,11 +1522,13 @@ def _export_loop(store: "ActivationStore",
             nonlocal bundles
             bundles = bundle_store.export_snapshot(bundle_snapshot_path) or 0
         _timed("bundle", _bundle)                                  # own internal lock
-        # P2a throttle — spine export only every _spine_min_interval_s (the 9s
-        # GIL-held json.dump is the heartbeat-starvation risk; skip it on the
+        # P2a throttle — spine export only every spine_export_min_interval_s (the
+        # 9s GIL-held json.dump is the heartbeat-starvation risk; skip it on the
         # other passes). First pass (_spine_last_export==0) always exports.
+        # Throttle disabled (kill-switch) → export every pass.
+        _throttle_on, _spine_min_interval_s = _spine_throttle_cfg()
         _now_spine = time.monotonic()
-        if _now_spine - _spine_last_export >= _spine_min_interval_s:
+        if (not _throttle_on) or (_now_spine - _spine_last_export >= _spine_min_interval_s):
             _timed("spine", lambda: spine_exporter_holder["fn"]())  # Engram spine → JSON
             _spine_last_export = _now_spine
         _timed("fork_activation", lambda: fork_activation_updater_holder["fn"]())

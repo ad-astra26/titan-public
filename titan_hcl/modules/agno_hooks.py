@@ -65,9 +65,10 @@ def _ph_feature(stage: str) -> str:
 # Phase 2 Chunk γ (D-SPEC-78, 2026-05-18) — PreHook TTL cache.
 # ─────────────────────────────────────────────────────────────────────
 #
-# The PreHook makes multiple sync HTTP calls to `127.0.0.1:7777/v4/*`
-# endpoints whose data changes slowly (CGN grounding rate, social-action
-# learned tone). Each call is 1-5s on T1 swap-pressured hosts; on warm
+# The PreHook makes multiple sync HTTP calls to this Titan's own api
+# (`_local_api_base()` + `/v6/*` — port is per-Titan config, NOT hardcoded)
+# for endpoints whose data changes slowly (CGN grounding rate, social-action
+# learned tone). Each call is 1-5s on swap-pressured hosts; on warm
 # hosts ~100-500ms. Cumulative cost per chat: 1.2-6s.
 #
 # This module-level cache shares results across PreHook invocations on
@@ -108,6 +109,34 @@ def _pre_hook_cache_set_with_ttl(key: str, value, *, ttl_s: float) -> None:
     """Cache value with custom TTL (for values that change at different rates
     than the default 30s — e.g. directives change rarely, 5 min TTL)."""
     _pre_hook_cache[key] = (value, _time_for_cache.time() + ttl_s)
+
+
+def _local_api_base() -> str:
+    """Base URL of THIS Titan's own api process for in-process PreHook calls
+    (CGN grounding / social-action). The port is per-Titan config — T1=7777,
+    T3=7778, etc. — so it MUST be resolved from config, never hardcoded:
+    a hardcoded 7777 silently 3s-timed-out every CGN call on any box whose api
+    port differs (RFP_synthesis_agno_hot_path_optimization §8 — feeds the
+    enrichment cold-read stall). Defaults match config.toml [api] (127.0.0.1:7777)."""
+    try:
+        _api = get_params("api") or {}
+        host = _api.get("host") or "127.0.0.1"
+        if host in ("0.0.0.0", ""):   # bind-all host → loop back to localhost
+            host = "127.0.0.1"
+        port = int(_api.get("port", 7777))
+    except Exception:  # noqa: BLE001 — never let config break the hot path
+        host, port = "127.0.0.1", 7777
+    return f"http://{host}:{port}"
+
+
+def _enrichment_cache_enabled() -> bool:
+    """INV-OPT-4 kill-switch for the P1 PreHook enrichment cache (`enrich:*`
+    keys). Default ON (Maker flag rule); `chat.enrichment_cache_enabled=false`
+    forces a fresh read every turn (the pre-P1 behavior) without a restart."""
+    try:
+        return bool((get_params("chat") or {}).get("enrichment_cache_enabled", True))
+    except Exception:  # noqa: BLE001
+        return True
 
 
 # ── Titan-owned recent-conversation store (RFP_agno_memory_bypass §1b, D-SPEC-159) ──
@@ -2617,7 +2646,9 @@ def create_pre_hook(plugin):
                 # source of the enrichment tail-stall under DB-lock contention
                 # (correlated with synthesis export:spine). Cache even empty so
                 # no-composition turns don't re-hit.
-                own_language_context = _pre_hook_cache_get("enrich:own_language")
+                own_language_context = (
+                    _pre_hook_cache_get("enrich:own_language")
+                    if _enrichment_cache_enabled() else None)   # INV-OPT-4 kill-switch
                 if own_language_context is None:
                     own_language_context = ""
                     import sqlite3 as _sl
@@ -2692,7 +2723,7 @@ def create_pre_hook(plugin):
                     import httpx as _cgn_httpx
                     import asyncio as _cgn_asyncio
                     _cgn_resp = await _cgn_asyncio.to_thread(
-                        lambda: _cgn_httpx.get("http://127.0.0.1:7777/v6/language/grounding", timeout=3))
+                        lambda: _cgn_httpx.get(_local_api_base() + "/v6/language/grounding", timeout=3))
                     if _cgn_resp.status_code == 200:
                         _cgn = _cgn_resp.json().get("data", {})
                         _grounded = _cgn.get("grounded", 0)
@@ -2789,7 +2820,7 @@ def create_pre_hook(plugin):
                             }
                             _cgn_resp = await _cgn_asyncio.to_thread(
                                 lambda: _cgn_httpx.get(
-                                    "http://127.0.0.1:7777/v6/cognition/cgn-social-action",
+                                    _local_api_base() + "/v6/cognition/cgn-social-action",
                                     params=_cgn_params, timeout=3))
                             if _cgn_resp.status_code == 200:
                                 _cgn_data = _cgn_resp.json().get("data", {})
@@ -2934,7 +2965,9 @@ def create_pre_hook(plugin):
                 # within 90s). The CGN_KNOWLEDGE_USAGE emission below STILL fires
                 # every turn from the (cached) topics — behavior preserved
                 # (INV-OPT-1); only the DB reads are skipped on a hit.
-                _en_cached = _pre_hook_cache_get("enrich:experience_sources")
+                _en_cached = (
+                    _pre_hook_cache_get("enrich:experience_sources")
+                    if _enrichment_cache_enabled() else None)   # INV-OPT-4 kill-switch
                 if _en_cached is not None:
                     _en_lines, _en_knowledge_topics = _en_cached[0], list(_en_cached[1])
                 else:

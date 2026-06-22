@@ -88,6 +88,9 @@
 "chat.concurrent_chat_enabled" = {type="bool", constraint="", reload="restart_required", owner=["agno_worker"], sensitive=false}
 "chat.default_model_class" = {type="str", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
 "chat.default_tier" = {type="str", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+# RFP_synthesis_agno_hot_path_optimization INV-OPT-4 — kill-switch for the P1 PreHook
+# enrichment cache (enrich:* keys: own_language, experience_sources). Default ON.
+"chat.enrichment_cache_enabled" = {type="bool", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
 "chat.features.known" = {type="list", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
 "chat.tiers[].detect.max_chars" = {type="int", constraint=">=0", reload="hot", owner=["agno_worker"], sensitive=false}
 "chat.tiers[].detect.regex_any" = {type="list", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
@@ -398,6 +401,11 @@
 # in test_config_schema_phase0. (synthesis.skill.delegate_live stays in [params] — it
 # has a DNA default in titan_params.toml.)
 "synthesis.fork_gc_live" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+# RFP_synthesis_agno_hot_path_optimization P2a/INV-OPT-4 — spine-export throttle
+# (the 9s GIL-held json.dump). throttle_enabled=false ⇒ export every pass (kill-switch);
+# min_interval_s is the cadence floor + the P2b GIL-coupling A/B lever. Default ON.
+"synthesis.spine_export.throttle_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.spine_export.min_interval_s" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.recall.augment_chat" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 # secrets-only key (lives in ~/.titan/secrets.toml, no config/params placeholder) — declared manually; the generator only sees params+config.
 "synthesis.user_id_hash_salt" = {type="str", constraint="", reload="restart_required", owner=["synthesis"], sensitive=true}

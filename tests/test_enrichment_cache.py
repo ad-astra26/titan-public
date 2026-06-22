@@ -77,3 +77,56 @@ def test_default_ttl_helper_still_works():
     _clear()
     _pre_hook_cache_set("cgn_grounding", "g")
     assert _pre_hook_cache_get("cgn_grounding") == "g"
+
+
+# ── INV-OPT-4 kill-switch: chat.enrichment_cache_enabled ──────────────────────
+def test_enrichment_cache_enabled_default_on(monkeypatch):
+    # No config / key absent → default ON (Maker flag rule).
+    monkeypatch.setattr(agno_hooks, "get_params", lambda s: {} if s == "chat" else {})
+    assert agno_hooks._enrichment_cache_enabled() is True
+
+
+def test_enrichment_cache_kill_switch_off(monkeypatch):
+    # =false forces a fresh read each turn (the get-site passes None on a hit).
+    monkeypatch.setattr(
+        agno_hooks, "get_params",
+        lambda s: {"enrichment_cache_enabled": False} if s == "chat" else {})
+    assert agno_hooks._enrichment_cache_enabled() is False
+
+
+def test_enrichment_cache_enabled_soft_fails_on(monkeypatch):
+    # A config glitch must never disable the cache silently — soft-fail ON.
+    def _boom(_s):
+        raise RuntimeError("shm read failed")
+    monkeypatch.setattr(agno_hooks, "get_params", _boom)
+    assert agno_hooks._enrichment_cache_enabled() is True
+
+
+# ── CGN port-7777 hardcode fix: _local_api_base resolves the configured port ──
+def test_local_api_base_default():
+    # Bare default matches config.toml [api] (127.0.0.1:7777).
+    assert agno_hooks._local_api_base() in (
+        "http://127.0.0.1:7777",)  # no monkeypatch → real get_params, T1 default
+
+
+def test_local_api_base_uses_configured_port(monkeypatch):
+    # T3 runs on 7778 — the call MUST follow config, not a hardcoded 7777.
+    monkeypatch.setattr(
+        agno_hooks, "get_params",
+        lambda s: {"host": "127.0.0.1", "port": 7778} if s == "api" else {})
+    assert agno_hooks._local_api_base() == "http://127.0.0.1:7778"
+
+
+def test_local_api_base_bindall_host_loops_back(monkeypatch):
+    # host 0.0.0.0 (bind-all) is not dialable → loop back to 127.0.0.1.
+    monkeypatch.setattr(
+        agno_hooks, "get_params",
+        lambda s: {"host": "0.0.0.0", "port": 7778} if s == "api" else {})
+    assert agno_hooks._local_api_base() == "http://127.0.0.1:7778"
+
+
+def test_local_api_base_soft_fails_to_default(monkeypatch):
+    def _boom(_s):
+        raise RuntimeError("config unavailable")
+    monkeypatch.setattr(agno_hooks, "get_params", _boom)
+    assert agno_hooks._local_api_base() == "http://127.0.0.1:7777"
