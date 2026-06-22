@@ -625,16 +625,33 @@ def _heartbeat_loop(send_queue, name: str,
     until the recv-loop probe handler transitions it to "running".
     """
     _hb_last = time.monotonic()
+    # RFP_worker_telemetry §7.C/C5 — point the freeze-watchdog dump at the
+    # telemetry freeze sink so the all-thread stack at a freeze is PERSISTED
+    # (ingested into freeze_dumps, survives the kill) instead of only going to
+    # the transient journal. None → telemetry off → keep the default stderr dump.
+    _freeze_fp = None
+    try:
+        _hb_tel = _synth_tel()
+        if _hb_tel is not None:
+            _freeze_fp = _hb_tel.freeze_dump_file()
+    except Exception:  # noqa: BLE001 — never let telemetry break the watchdog
+        _freeze_fp = None
     while not stop_event.is_set():
         # Freeze-watchdog (2026-06-05): re-arm a faulthandler all-thread stack
         # dump at the TOP of every beat. A healthy next beat (≤30s) cancels +
         # re-arms it; if THIS process freezes (a thread holds the GIL, or
         # heartbeat() blocks on _write_lock) the loop cannot re-arm within
-        # HB_FREEZE_DUMP_S → faulthandler dumps EVERY thread's stack to stderr
-        # → the journal, naming the exact frozen op BEFORE the 60s guardian kill.
+        # HB_FREEZE_DUMP_S → faulthandler dumps EVERY thread's stack. The dump
+        # goes to the telemetry freeze sink (→ freeze_dumps, §7.C/C5) when
+        # available, else stderr → the journal, naming the exact frozen op
+        # BEFORE the 60s guardian kill.
         try:
             faulthandler.cancel_dump_traceback_later()
-            faulthandler.dump_traceback_later(HB_FREEZE_DUMP_S, repeat=False)
+            if _freeze_fp is not None:
+                faulthandler.dump_traceback_later(
+                    HB_FREEZE_DUMP_S, repeat=False, file=_freeze_fp)
+            else:
+                faulthandler.dump_traceback_later(HB_FREEZE_DUMP_S, repeat=False)
         except Exception:  # never let the watchdog break the heartbeat
             pass
         _hb_gap = time.monotonic() - _hb_last
@@ -1566,6 +1583,16 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     global _WORKER_READY
     _WORKER_READY = False
 
+    # RFP_worker_telemetry §7.C/C3 — record this boot FIRST (before the flusher's
+    # first 30s memory-sample) so prev-run uptime + downtime are derived from the
+    # PRIOR run's marks, not this one. Correlates a stall→DISABLE→restart.
+    try:
+        _boot_tel = _synth_tel()
+        if _boot_tel is not None:
+            _boot_tel.record_boot("synthesis_boot")
+    except Exception:  # noqa: BLE001
+        pass
+
     from titan_hcl.core.state_registry import resolve_titan_id
 
     titan_id = resolve_titan_id(
@@ -2307,13 +2334,31 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             # 30s heartbeat (RFP §7.D flap fix — pure-Python tuple cosine held the
             # GIL across ~10^5 dot products → shm_pid_dead).
             out = []
+            _recon_t0 = time.monotonic()   # RFP_worker_telemetry §7.B/GB1
+            _recon_n = 0
             for c in cands:
                 if c.embedding is None:
                     vec = synth_vector_store.get_vector("conversation", c.tx_hash)
                     if vec is not None:
+                        _recon_n += 1
                         c = _dc.replace(
                             c, embedding=_np_emb.asarray(vec, dtype=_np_emb.float32))
                 out.append(c)
+            # RFP_worker_telemetry §7.B/GB1 — time the worker-side FAISS pass.
+            # The synthesis worker's heavy FAISS op is reconstruct (get_vector per
+            # candidate, O(candidates) on the loop thread), NOT knn — knn lives in
+            # EngineRecall in OTHER processes, so timing it here would open a 2nd
+            # writer to telemetry_synthesis.db (breaks INV-TEL-4 single-writer).
+            try:
+                _t = _synth_tel()
+                if _t is not None:
+                    _t.record_stage(
+                        "faiss_reconstruct",
+                        (time.monotonic() - _recon_t0) * 1000.0,
+                        feature="recall", candidates=len(cands),
+                        reconstructed=_recon_n)
+            except Exception:  # noqa: BLE001
+                pass
             return out
 
         # Tunables (RFP §7.D / D2-D3): cosine clustering over the sidecar source;
@@ -3153,6 +3198,24 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # name_fn reuses the consolidation proposer (propose_fn); deterministic
     # fallback when the proposer is unconfigured/declines.
     research_wiki_queue = _collections.deque(maxlen=256)
+    # RFP_worker_telemetry §7.C/C4 — register a component-size provider so the
+    # memory sampler records {faiss shard rows, wiki-queue depth} alongside the
+    # RssAnon trend → the leak/size curve shows WHICH structure grows. Best-effort
+    # (the sampler swallows a provider fault); read-only, off the hot path.
+    try:
+        _c4_tel = _synth_tel()
+        if _c4_tel is not None:
+            def _synth_size_provider():
+                sizes = {"wiki_queue": len(research_wiki_queue)}
+                if synth_vector_store is not None:
+                    try:
+                        sizes["faiss"] = synth_vector_store.stats()
+                    except Exception:
+                        pass
+                return sizes
+            _c4_tel.set_size_provider(_synth_size_provider)
+    except Exception:  # noqa: BLE001
+        pass
     if engram_store is not None and cgn_bridge is not None:
         from titan_hcl.synthesis.research_wiki import (
             make_research_name_fn, make_contradiction_judge)
@@ -4084,6 +4147,13 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 continue
 
             if msg_type == KNOWLEDGE_MOMENT:
+                # RFP_worker_telemetry §7.C/C1 — this is the direct, in-turn
+                # agno→synthesis edge: agno_worker stamps the chat turn's
+                # trigger_id on the KNOWLEDGE_MOMENT payload; recording it on this
+                # handler's op_events lets `analyze --trace <id>` join one turn's
+                # agno prehook ops to the synthesis op it caused (cross-worker).
+                _km_trigger_id = payload.get("trigger_id")
+                _km_op_t0 = time.monotonic()
                 # P3 (RFP_synthesis_decision_authority) — the per-TURN post-LLM
                 # event (the RFP's CHAT_TURN_COMPLETE, realized on this existing
                 # non-blocking topic) now carries `s_reply` = the ONE sovereignty
@@ -4123,6 +4193,16 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             float(_km_ts))
                     except Exception:
                         pass
+                # §7.C/C1 — record the op stamped with the turn's trigger_id.
+                try:
+                    _t = _synth_tel()
+                    if _t is not None:
+                        _t.record_stage(
+                            "knowledge_moment",
+                            (time.monotonic() - _km_op_t0) * 1000.0,
+                            feature="recall", trigger_id=_km_trigger_id)
+                except Exception:  # noqa: BLE001
+                    pass
                 continue
 
             if msg_type == CGN_CONCEPT_GROUNDED:

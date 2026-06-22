@@ -1423,6 +1423,18 @@ def create_pre_hook(plugin):
         if plugin._limbo_mode:
             return
 
+        # RFP_worker_telemetry §7.C/C1 — mint a fresh per-chat-turn trigger_id.
+        # Stamped on THIS turn's agno op_events (via _ph_stage / research dispatch)
+        # AND propagated onto the bus events this turn spawns (KNOWLEDGE_MOMENT,
+        # RESEARCH_CONCEPT_SEED, …) so synthesis ops that process them carry the
+        # same id → `analyze --trace <id>` reconstructs one turn's cross-worker op
+        # chain. Best-effort: a uuid mint never fails, but guard the whole hook.
+        try:
+            import uuid as _uuid_tg
+            plugin._telemetry_trigger_id = _uuid_tg.uuid4().hex
+        except Exception:  # noqa: BLE001
+            plugin._telemetry_trigger_id = None
+
         # Per-section timing instrumentation (2026-05-12 latency diagnostic).
         # Each _ph_stage(name) emits "[PreHook:t] stage=name t+Xms" so we can
         # see exactly where the 7-28s on T3 goes. Strip after optimization.

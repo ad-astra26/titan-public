@@ -51,6 +51,8 @@ _DEFAULTS: Dict[str, Any] = {
     "flush_s": 5.0,             # flusher drain cadence
     "mem_sample_s": 30.0,       # RssAnon/VmRSS sample cadence
     "warn_ms": 5000.0,          # an op longer than this is flagged `stall=1`
+    "hb_gap_warn_ms": 20000.0,  # inter-heartbeat gap over this → HEARTBEAT_GAP row
+                                # (normal beat ≈10s; >20s = a missed beat / loop block)
     "ring_cap": 10000,          # bounded in-mem ring (drops oldest on overflow)
     "retention_days": 7.0,      # prune op_events/memory_samples older than this
     "prune_every_flushes": 720, # ~1h at flush_s=5 — prune is not free, do it rarely
@@ -112,6 +114,10 @@ _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS restart_events (
         ts REAL, reason TEXT, prev_uptime_s REAL
     )""",
+    """CREATE TABLE IF NOT EXISTS freeze_dumps (
+        ts REAL, stack_text TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_freeze_ts ON freeze_dumps(ts)",
 )
 
 
@@ -132,6 +138,15 @@ class Telemetry:
         self._stop = threading.Event()
         self._flusher: Optional[threading.Thread] = None
         self._started_monotonic = time.monotonic()
+        # C4 — component-size provider (best-effort callable → dict), sampled
+        # alongside RssAnon into memory_samples.sizes_json. Never on the hot path.
+        self._size_provider = None
+        # C5 — freeze-dump sink: the worker points its faulthandler all-thread
+        # dump at this file; the flusher ingests new dump text into freeze_dumps.
+        self._freeze_dump_fp = None
+        self._freeze_dump_path: Optional[str] = None
+        self._freeze_dump_pos = 0
+        self._boot_freeze_text: Optional[str] = None
         if not self._enabled:
             logger.info("[telemetry:%s] DISABLED (kill-switch)", worker_name)
             return
@@ -200,12 +215,110 @@ class Telemetry:
             logger.warning("[telemetry:%s] record_stage failed", self.worker,
                            exc_info=True)
 
-    def record_boot(self, reason: str = "", prev_uptime_s: float = 0.0) -> None:
-        """Record a worker (re)boot / disable reason → restart_events."""
+    def record_heartbeat_gap(self, gap_ms: float) -> None:
+        """C2 — record a HEARTBEAT_GAP op_event when the inter-heartbeat gap
+        exceeds `hb_gap_warn_ms` (a long gap = the worker loop was blocked → the
+        post-hoc stall signal the heartbeat itself can't emit during a freeze).
+        Normal ~10s beats are NOT recorded (only abnormal gaps). Best-effort."""
         if not self._enabled:
             return
-        self._ring.append(("restart", float(time.time()), str(reason),
-                           float(prev_uptime_s)))
+        try:
+            if gap_ms > float(self._cfg["hb_gap_warn_ms"]):
+                self._record("HEARTBEAT_GAP", "heartbeat", None,
+                             float(gap_ms), {})
+        except Exception:
+            logger.warning("[telemetry:%s] record_heartbeat_gap failed",
+                           self.worker, exc_info=True)
+
+    def record_boot(self, reason: str = "boot") -> None:
+        """C3 — record THIS worker (re)boot → restart_events, deriving the prior
+        run's uptime + the downtime from the DB itself (the prior boot's
+        restart_events.ts and the last memory_samples.ts = last-alive). Combined
+        with the op_events stall rows + memory_samples RssAnon trend already in
+        the DB, this lets `analyze` correlate a stall→DISABLE→restart across the
+        very reboot the stall caused. Called ONCE at worker boot. Never raises."""
+        if not self._enabled:
+            return
+        try:
+            prev_boot_ts, last_alive_ts = self._read_prev_run_marks()
+            prev_uptime_s = 0.0
+            detail = str(reason)
+            if last_alive_ts > 0.0:
+                if prev_boot_ts > 0.0:
+                    prev_uptime_s = max(0.0, last_alive_ts - prev_boot_ts)
+                downtime_s = max(0.0, time.time() - last_alive_ts)
+                detail = (f"{reason} (prev_uptime={prev_uptime_s:.0f}s "
+                          f"downtime={downtime_s:.0f}s)")
+            self._ring.append(("restart", float(time.time()), detail,
+                               float(prev_uptime_s)))
+        except Exception:
+            logger.warning("[telemetry:%s] record_boot failed", self.worker,
+                           exc_info=True)
+
+    def _read_prev_run_marks(self) -> tuple:
+        """(prev_boot_ts, last_alive_ts) from the persisted DB — best-effort,
+        (0.0, 0.0) on any failure / empty DB."""
+        prev_boot_ts = 0.0
+        last_alive_ts = 0.0
+        try:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT MAX(ts) FROM restart_events").fetchone()
+                if row and row[0] is not None:
+                    prev_boot_ts = float(row[0])
+                row = conn.execute(
+                    "SELECT MAX(ts) FROM memory_samples").fetchone()
+                if row and row[0] is not None:
+                    last_alive_ts = float(row[0])
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return prev_boot_ts, last_alive_ts
+
+    def uptime_s(self) -> float:
+        """Seconds since this Telemetry (≈ this worker process) started."""
+        return time.monotonic() - self._started_monotonic
+
+    # ── C4: component-size sampling ─────────────────────────────────────────
+    def set_size_provider(self, fn) -> None:
+        """Register a best-effort callable returning a dict of component sizes
+        (e.g. {"faiss_rows": N, "wiki_queue": M, "spine_nodes": K}). The flusher
+        calls it every mem_sample_s and stores the dict as memory_samples
+        .sizes_json. Called OFF the hot path; a faulty provider degrades to no
+        sizes, never a worker fault (INV-TEL-5)."""
+        self._size_provider = fn
+
+    # ── C5: freeze-dump capture ─────────────────────────────────────────────
+    def freeze_dump_file(self):
+        """Open (once) `data/freeze_<worker>.txt` and return the file object the
+        worker passes to `faulthandler.dump_traceback_later(file=…)`. The flusher
+        ingests new dump text from it into `freeze_dumps`. Returns None on failure
+        (caller then keeps the default stderr dump). Best-effort, never raises."""
+        if not self._enabled:
+            return None
+        try:
+            if self._freeze_dump_fp is None:
+                path = os.path.join(
+                    str(self._cfg["db_dir"]), f"freeze_{self.worker}.txt")
+                # Capture any dump left by the PRIOR run (incl. the freeze that
+                # killed it — the signal we most want) into a one-shot buffer,
+                # then truncate so subsequent boots never re-ingest it.
+                try:
+                    if os.path.exists(path) and os.path.getsize(path) > 0:
+                        with open(path, "r", errors="replace") as f:
+                            self._boot_freeze_text = f.read().strip() or None
+                except Exception:
+                    self._boot_freeze_text = None
+                self._freeze_dump_fp = open(path, "w", buffering=1)  # truncates
+                self._freeze_dump_path = path
+                self._freeze_dump_pos = 0
+            return self._freeze_dump_fp
+        except Exception:
+            logger.warning("[telemetry:%s] freeze_dump_file open failed",
+                           self.worker, exc_info=True)
+            return None
 
     def _record(self, op: str, feature: Optional[str], trigger_id: Optional[str],
                 dur_ms: float, ctx: dict, rss_mb: Optional[float] = None) -> None:
@@ -258,7 +371,14 @@ class Telemetry:
                             "INSERT INTO memory_samples(ts,rss_anon_mb,vmrss_mb,"
                             "sizes_json) VALUES(?,?,?,?)",
                             (time.time(), _read_rss_anon_mb(), _read_vmrss_mb(),
-                             None))
+                             self._sample_sizes_json()))
+                    # C5 — persist a prior-run freeze (once) + any new live dump.
+                    if self._boot_freeze_text:
+                        conn.execute(
+                            "INSERT INTO freeze_dumps(ts, stack_text) VALUES(?,?)",
+                            (time.time(), "[prior-run]\n" + self._boot_freeze_text))
+                        self._boot_freeze_text = None
+                    self._ingest_freeze_dumps(conn)
                     conn.commit()
                     flushes += 1
                     if prune_every and flushes % prune_every == 0:
@@ -270,11 +390,52 @@ class Telemetry:
                 logger.warning("[telemetry:%s] flush failed (continuing)",
                                self.worker, exc_info=True)
 
+    def _sample_sizes_json(self) -> Optional[str]:
+        """C4 — capture the registered component sizes as JSON (off the hot
+        path, in the flusher). None if no provider / empty / fault."""
+        fn = self._size_provider
+        if fn is None:
+            return None
+        try:
+            sizes = fn()
+            if sizes:
+                return json.dumps(sizes, default=str)
+        except Exception:
+            logger.warning("[telemetry:%s] size provider failed", self.worker,
+                           exc_info=True)
+        return None
+
+    def _ingest_freeze_dumps(self, conn: sqlite3.Connection) -> None:
+        """C5 — read any new faulthandler dump text appended since the last
+        flush and persist it as a freeze_dumps row. Best-effort."""
+        path = self._freeze_dump_path
+        if not path:
+            return
+        try:
+            size = os.path.getsize(path)
+            if size < self._freeze_dump_pos:   # truncated / rotated → restart
+                self._freeze_dump_pos = 0
+            if size <= self._freeze_dump_pos:
+                return
+            with open(path, "r", errors="replace") as f:
+                f.seek(self._freeze_dump_pos)
+                new_text = f.read()
+                self._freeze_dump_pos = f.tell()
+            new_text = new_text.strip()
+            if new_text:
+                conn.execute(
+                    "INSERT INTO freeze_dumps(ts, stack_text) VALUES(?,?)",
+                    (time.time(), new_text))
+        except Exception:
+            logger.warning("[telemetry:%s] freeze-dump ingest failed",
+                           self.worker, exc_info=True)
+
     def _prune(self, conn: sqlite3.Connection) -> None:
         cutoff = time.time() - float(self._cfg["retention_days"]) * 86400.0
         conn.execute("DELETE FROM op_events WHERE ts < ?", (cutoff,))
         conn.execute("DELETE FROM memory_samples WHERE ts < ?", (cutoff,))
         conn.execute("DELETE FROM restart_events WHERE ts < ?", (cutoff,))
+        conn.execute("DELETE FROM freeze_dumps WHERE ts < ?", (cutoff,))
 
     def flush_now(self) -> None:
         """Force a synchronous drain+write (for tests / shutdown). Best-effort."""
@@ -307,6 +468,12 @@ class Telemetry:
     def close(self) -> None:
         self._stop.set()
         self.flush_now()
+        try:
+            if self._freeze_dump_fp is not None:
+                self._freeze_dump_fp.close()
+                self._freeze_dump_fp = None
+        except Exception:
+            pass
 
 
 # ── per-process factory (one Telemetry per worker) ──────────────────────────
@@ -322,3 +489,18 @@ def get_telemetry(worker_name: str, config: Optional[dict] = None) -> Telemetry:
             tel = Telemetry(worker_name, config)
             _INSTANCES[worker_name] = tel
         return tel
+
+
+def get_active_telemetry() -> Optional[Telemetry]:
+    """Return THIS process's single Telemetry instance, or None.
+
+    Shared infra (e.g. `bus_socket._enrich_heartbeat`, the ONE heartbeat
+    chokepoint in every process) uses this to attribute a heartbeat-gap to the
+    heavy worker WITHOUT creating a writer: a worker process (synthesis/agno)
+    has created exactly one instance; every other process has zero → None →
+    no-op. NEVER creates an instance (that would open a spurious 2nd writer and
+    break INV-TEL-4); only returns an already-created one."""
+    with _INSTANCES_LOCK:
+        if len(_INSTANCES) == 1:
+            return next(iter(_INSTANCES.values()))
+        return None

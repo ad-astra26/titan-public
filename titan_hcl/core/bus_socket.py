@@ -887,6 +887,23 @@ class BusSocketClient:
                     payload["rss_mb"] = round(_kb / 1024.0, 1)
             except Exception:  # noqa: BLE001
                 pass
+        # RFP_worker_telemetry §7.C/C2 — heartbeat-gap. This is the ONE heartbeat
+        # chokepoint in EVERY process; for the heavy workers (synthesis/agno) an
+        # abnormal inter-heartbeat gap is the post-hoc stall signal the heartbeat
+        # itself can't emit during a freeze. get_active_telemetry() returns this
+        # process's worker Telemetry (or None in every other process) WITHOUT
+        # creating one — no spurious 2nd writer (INV-TEL-4). Never raises.
+        try:
+            from titan_hcl.logic.worker_telemetry import get_active_telemetry
+            _wtel = get_active_telemetry()
+            if _wtel is not None:
+                _hb_now = time.monotonic()
+                _hb_prev = getattr(self, "_hb_last_gap_mono", 0.0)
+                if _hb_prev > 0.0:
+                    _wtel.record_heartbeat_gap((_hb_now - _hb_prev) * 1000.0)
+                self._hb_last_gap_mono = _hb_now
+        except Exception:  # noqa: BLE001 — never break the heartbeat
+            pass
 
     def _raw_send(self, msg: dict) -> bool:
         """SPEC §8.0.ter publish path — non-blocking by construction.

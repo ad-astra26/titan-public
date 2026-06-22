@@ -758,6 +758,11 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                 "e_reply": _e_reply,
                 "v_reply": _v_reply,
                 "ts": _now,
+                # RFP_worker_telemetry §7.C/C1 — carry THIS turn's trigger_id (minted
+                # in agno's pre-hook on the shared plugin) onto the direct
+                # agno→synthesis edge so `analyze --trace <id>` joins the turn's
+                # agno ops to the synthesis op this event causes.
+                "trigger_id": getattr(worker_plugin, "_telemetry_trigger_id", None),
                 # §7.E.0 — per-Engram citation attribution: the surfaced + cited
                 # tx_hash sets (item_id = tx_hash, the tx-spine recall key) so
                 # synthesis_worker can resolve each → its Engram(s) and record
@@ -1324,6 +1329,31 @@ def agno_worker_main(recv_queue, send_queue, name: str,
 
     logger.info("[AgnoWorker] Boot")
     boot_start = time.time()
+
+    # RFP_worker_telemetry §7.C/C3+C4 — record this boot FIRST (before the
+    # flusher's first 30s memory-sample → prev-run uptime + downtime come from
+    # the PRIOR run) + register a size provider for the agno leak-watch (the
+    # bounded recent-turns store is the natural growth companion to RssAnon's
+    # +253MB/load observation). Best-effort; a fault never breaks the boot.
+    try:
+        from titan_hcl.logic.worker_telemetry import get_telemetry as _get_tel
+        _agno_boot_tel = _get_tel("agno")
+        if _agno_boot_tel is not None:
+            _agno_boot_tel.record_boot("agno_boot")
+
+            def _agno_size_provider():
+                try:
+                    from titan_hcl.modules import agno_hooks as _ah
+                    rt = getattr(_ah, "_recent_turns", None)
+                    if not rt:
+                        return {"recent_turns": 0, "recent_sessions": 0}
+                    return {"recent_turns": sum(len(v) for v in rt.values()),
+                            "recent_sessions": len(rt)}
+                except Exception:
+                    return {}
+            _agno_boot_tel.set_size_provider(_agno_size_provider)
+    except Exception:  # noqa: BLE001
+        pass
 
     # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
     # Constructed BEFORE the slow Agent + OVG init so:
