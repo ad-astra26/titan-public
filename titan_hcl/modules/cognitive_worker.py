@@ -110,6 +110,27 @@ from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
+# --- RFP_g18_high_rate_state_shm_migration §7.A — G-PARITY instrument -------
+# Env-gated, default OFF. When TITAN_G18_PARITY_PROBE=1, _dispatch_trinity_state
+# reads the matching SHM component slot at the instant each trinity bus event
+# arrives and logs the bus-carried tensor vs the SHM-slot tensor + slot
+# freshness. Proves INV-G18-3 (the slot carries the same tensor the bus event
+# did, AND is populated) BEFORE any consumer is cut over from bus → SHM reads.
+# No behavior change: the cached value is still the bus value; this only reads
+# SHM read-only and logs. Throttled per (type, src) to keep 70 Hz spirit sane.
+_G18_PARITY_PROBE = os.environ.get("TITAN_G18_PARITY_PROBE", "0") == "1"
+_G18_PARITY_INTERVAL_S = float(
+    os.environ.get("TITAN_G18_PARITY_INTERVAL_S", "2.0"))
+_G18_PARITY_READERS = {
+    ("BODY_STATE", "inner"): "read_inner_body_5d",
+    ("BODY_STATE", "outer"): "read_outer_body_5d",
+    ("MIND_STATE", "inner"): "read_inner_mind_15d",
+    ("MIND_STATE", "outer"): "read_outer_mind_15d",
+    ("SPIRIT_STATE", "inner"): "read_inner_spirit_45d",
+    ("SPIRIT_STATE", "outer"): "read_outer_spirit_45d",
+}
+_G18_PARITY_LAST_LOG: dict = {}
+
 # Heartbeat cadence per SPEC §9.C (10s — guardian_HCL liveness contract).
 _HEARTBEAT_INTERVAL_S = 10.0
 # Main loop poll cadence (kept tight so MODULE_SHUTDOWN is responsive).
@@ -2465,6 +2486,60 @@ def _decode_payload(payload):
     return {}
 
 
+def _g18_parity_probe(state_refs: dict, payload: dict, dim: int,
+                      src: str, type_label: str) -> None:
+    """RFP_g18 §7.A — log bus-carried tensor vs the matching SHM slot.
+
+    Read-only; throttled per (type, src). Surfaces three things the cutover
+    needs proven first: (1) the SHM slot is populated (not None/empty),
+    (2) its tensor matches the bus event's `values` (INV-G18-3 parity),
+    (3) its freshness (age_seconds/seq) vs the bus tick. Any non-zero
+    max_abs_diff or EMPTY slot = a blocker the migration must resolve
+    before BODY/MIND/SPIRIT_STATE leave the broadcast.
+    """
+    now = time.time()
+    key = (type_label, src)
+    if now - _G18_PARITY_LAST_LOG.get(key, 0.0) < _G18_PARITY_INTERVAL_S:
+        return
+    _G18_PARITY_LAST_LOG[key] = now
+    bank = state_refs.get("_shm_reader_bank")
+    method_name = _G18_PARITY_READERS.get(key)
+    if bank is None or method_name is None:
+        return
+    reader = getattr(bank, method_name, None)
+    if reader is None:
+        return
+    try:
+        snap = reader()
+    except Exception as err:  # instrument must never disturb the hot path
+        logger.warning("[G18-PARITY] %s src=%s reader %s raised: %s",
+                       type_label, src, method_name, err)
+        return
+    bus_vals = payload.get("values") or []
+    if snap is None:
+        logger.warning(
+            "[G18-PARITY] %s src=%s SHM slot EMPTY (reader=%s) bus[:3]=%s",
+            type_label, src, method_name,
+            [round(float(v), 4) for v in bus_vals[:3]])
+        return
+    shm_vals = snap.get("values") or []
+    n = min(len(bus_vals), len(shm_vals), dim)
+    if n == 0:
+        logger.warning(
+            "[G18-PARITY] %s src=%s no comparable values (bus=%d shm=%d)",
+            type_label, src, len(bus_vals), len(shm_vals))
+        return
+    max_abs_diff = max(
+        abs(float(bus_vals[i]) - float(shm_vals[i])) for i in range(n))
+    logger.info(
+        "[G18-PARITY] %s src=%s n=%d max_abs_diff=%.6f shm_age=%.3fs "
+        "shm_seq=%s bus[:3]=%s shm[:3]=%s",
+        type_label, src, n, max_abs_diff, snap.get("age_seconds", -1.0),
+        snap.get("seq"),
+        [round(float(v), 4) for v in bus_vals[:3]],
+        [round(float(v), 4) for v in shm_vals[:3]])
+
+
 def _dispatch_trinity_state(state_refs: dict, payload: dict, *, dim: int,
                             inner_key: str, outer_key: str, type_label: str) -> None:
     """Dispatch BODY_STATE / MIND_STATE / SPIRIT_STATE per SPEC §8.5.
@@ -2491,6 +2566,8 @@ def _dispatch_trinity_state(state_refs: dict, payload: dict, *, dim: int,
         logger.debug(
             "[CognitiveWorker] %s with unexpected src=%r — treated as inner",
             type_label, src)
+    if _G18_PARITY_PROBE:
+        _g18_parity_probe(state_refs, payload, dim, src, type_label)
 
 
 def _dispatch_dream_consolidate(state_refs: dict, payload: dict) -> None:
