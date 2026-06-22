@@ -3449,7 +3449,6 @@ def create_post_hook(plugin):
                 from titan_hcl.bus import make_msg as _mk2
                 from titan_hcl.synthesis.goal_class import goal_class as _gc_fn2
                 _feats_tr, _action_tr = _dec
-                _me_tr = getattr(plugin, "maker_engine", None)
                 _bus_tr.publish(_mk2(
                     _bus_mod2.TURN_REASONING_RECORD, "post_hook", "synthesis", {
                         "reasoning_id": _rid,
@@ -3459,9 +3458,13 @@ def create_post_hook(plugin):
                         "goal_class": _gc_fn2(user_prompt or ""),
                         "features": list(_feats_tr),
                         "user_id": user_id,
-                        # §7.1 — Maker attribution for the Maker-fact extractor (the app's
-                        # paired device is the Maker by default; non-Maker turns skip it).
-                        "is_maker": bool(_me_tr and _me_tr.is_maker(user_id)),
+                        # §7.1 — Maker attribution for the Maker-fact extractor. Read
+                        # the per-turn flag stashed by agno_worker from the inbound
+                        # payload (presence-based is_maker, computed at the api edge).
+                        # NOT `plugin.maker_engine.is_maker(...)` — maker_engine is
+                        # permanently None in the agno process, which made this gate
+                        # dead fleet-wide (BUG-MAKER-FACT-EXTRACTOR-GATE-DEAD).
+                        "is_maker": bool(getattr(plugin, "_current_is_maker", False)),
                     }))
         except Exception as _trr_err:
             logger.debug("[PostHook] §7.B turn record emit skipped: %s", _trr_err)
@@ -3473,10 +3476,16 @@ def create_post_hook(plugin):
         # MAKER_PRESENCE_VERIFIED path, so emitting here too would double-record
         # (with a weaker asserted_identity). Never raises.
         try:
-            _me_pr = getattr(plugin, "maker_engine", None)
+            # Maker detection via the per-turn presence flag (agno_worker stash),
+            # NOT `plugin.maker_engine` — that is permanently None in the agno
+            # process, so the old `_me_pr.is_maker(...)` never returned True and
+            # this guard NEVER skipped the Maker → his presence was double-recorded
+            # here (weak asserted_identity) alongside the MAKER_PRESENCE_VERIFIED
+            # path. Same root as BUG-MAKER-FACT-EXTRACTOR-GATE-DEAD.
+            _is_maker_pr = bool(getattr(plugin, "_current_is_maker", False))
             _bus_pr = getattr(plugin, "bus", None)
             if (_bus_pr is not None and user_id and user_id != "anonymous"
-                    and not (_me_pr and _me_pr.is_maker(user_id))):
+                    and not _is_maker_pr):
                 from titan_hcl import bus as _bus_pr_mod
                 from titan_hcl.bus import make_msg as _mk_pr
                 _evid_pr = "asserted_identity"

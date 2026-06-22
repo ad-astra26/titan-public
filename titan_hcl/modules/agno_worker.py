@@ -512,6 +512,14 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         # channel so the PostHook can label the PERSON_TURN_PRESENCE atom
         # (web/app/tcc). Mirrors the _current_user_id stash above.
         worker_plugin._current_channel = channel
+        # RFP_missions §7.1 — the turn's verified-Maker flag, computed at the api
+        # edge (presence-based is_maker, chat.py) and plumbed in the inbound
+        # payload. The PostHook's TURN_REASONING_RECORD gate for the Maker-fact
+        # extractor reads THIS — never `plugin.maker_engine`, which is permanently
+        # None in the agno process (no MakerEngine is instantiated here), so the
+        # old `_me_tr.is_maker(...)` path made is_maker always False → the gate
+        # never opened (BUG-MAKER-FACT-EXTRACTOR-GATE-DEAD, 2026-06-22).
+        worker_plugin._current_is_maker = is_maker
         # §7.F (F.2) — hashed identity helping-signals for cross-handle merge
         # (internal-only, NEVER rendered). did_hash from the already-plumbed Privy
         # DID (claims_sub); ip_hash hashed at the api edge (raw IP never plumbed).
