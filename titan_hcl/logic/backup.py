@@ -2684,12 +2684,16 @@ class RebirthBackup:
     async def _auto_fund_irys_before_upload(self) -> None:
         """Irys auto-fund via the ChainProvider (RFP_chain_provider Phase C tail) —
         `chain.balance()` + the BOUNDED `chain.fund()` replace the legacy
-        subprocess-`node` Irys path (INV-CP-3). Config moves to
-        `[chain.fund]` (Q-CP-3 clean cut). No-op when disabled / runway sufficient
-        / devnet. The runway→amount DECISION here is contained; it moves to the
+        subprocess-`node` Irys path (INV-CP-3). Config lives under `[backup.fund]`,
+        read via the per-section SHM slot (`get_params("backup")["fund"]`, the
+        config-as-SHM contract INV-CFG-7 — mirrors `[backup.mirror]`). Q-CP-3 chose
+        `[chain.fund]`, but config-as-SHM addresses config by worker-OWNED section
+        and `chain` is not one while `backup` owns funding, so the funding keys are
+        homed under the backup slot. No-op when disabled / runway sufficient /
+        devnet. The runway→amount DECISION here is contained; it moves to the
         BackupOrchestrator in the next redesign step (which will also enforce the
         wallet-reserve floor against the live wallet balance)."""
-        fcfg = ((self._full_config or {}).get("chain", {}) or {}).get("fund", {}) or {}
+        fcfg = (get_params("backup") or {}).get("fund", {}) or {}
         if not fcfg.get("enabled", False):
             return
         chain = self._ensure_chain()

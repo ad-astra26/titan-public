@@ -40,6 +40,12 @@
 "backup.dry_run_on_boot" = {type="bool", constraint="", reload="hot", owner=["backup"], sensitive=false}
 "backup.encryption_enabled" = {type="bool", constraint="", reload="hot", owner=["backup"], sensitive=false}
 "backup.encryption_tier" = {type="str", constraint="", reload="hot", owner=["backup"], sensitive=false}
+"backup.fund.avg_uploads_per_day" = {type="float", constraint=">0", reload="hot", owner=["backup"], sensitive=false}
+"backup.fund.daily_cap_sol" = {type="float", constraint="0..1", reload="hot", owner=["backup"], sensitive=false}
+"backup.fund.enabled" = {type="bool", constraint="", reload="hot", owner=["backup"], sensitive=false}
+"backup.fund.meditation_reserve_sol" = {type="float", constraint="0..1", reload="hot", owner=["backup"], sensitive=false}
+"backup.fund.min_runway_days" = {type="float", constraint=">0", reload="hot", owner=["backup"], sensitive=false}
+"backup.fund.target_runway_days" = {type="float", constraint=">0", reload="hot", owner=["backup"], sensitive=false}
 "backup.local_diff_enabled" = {type="bool", constraint="", reload="hot", owner=["backup"], sensitive=false}
 "backup.local_dir" = {type="str", constraint="", reload="restart_required", owner=["backup"], sensitive=false}
 "backup.local_rolling_days" = {type="int", constraint=">=0", reload="hot", owner=["backup"], sensitive=false}

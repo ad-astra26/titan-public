@@ -202,6 +202,27 @@ encryption_tier = "private"
 # supply it (alongside Shard-1) when running the resurrection protocol.
 backup_config_toml = false
 
+# Irys auto-funding (RFP_chain_provider Phase C) — keeps the Arweave/Irys deposit
+# topped up so on-chain backups never stall for lack of funds. Read via the backup
+# SHM slot (get_params("backup")["fund"]). Bounded + safe: a NO-OP on devnet (the
+# ChainProvider devnet guard), and on mainnet every top-up is trimmed to the daily
+# cap and recorded to an audit log. 🚨 On a MAINNET Titan this spends real SOL from
+# the operator wallet when the deposit runway drops below min_runway_days — leave
+# enabled=true to keep backups self-sustaining, or set false to fund manually.
+[backup.fund]
+enabled = true
+# Top up when the estimated Irys runway falls below this many days.
+min_runway_days = 3.0
+# When topping up, buy this many days of runway.
+target_runway_days = 14.0
+# Hard ceiling on auto-fund SOL spent per UTC day.
+daily_cap_sol = 0.05
+# Runway estimator denominator — assumed uploads per day.
+avg_uploads_per_day = 3.0
+# Wallet floor — never auto-fund below this balance (reserved for meditation/chain
+# fees). Enforced by the BackupOrchestrator wallet-reserve step.
+meditation_reserve_sol = 0.01
+
 # Phase 9 — T1-only off-host mirror from T2/T3. See rFP_backup_worker §5.2.
 [backup.mirror]
 # Off-Host Mirror — Copies other Titans' backups to this one for safety.

@@ -191,27 +191,41 @@ def test_manifest_truth_gate(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_auto_fund_via_chain_provider(tmp_path, monkeypatch):
-    """RFP_chain_provider Phase C tail: the unified_v2 auto-fund hook now uses the
-    ChainProvider (balance + bounded fund), gated by [chain.fund].enabled — the
-    BackupCascade subprocess path is gone. Enabled + low runway → chain.fund
-    fires; disabled → no-op."""
+    """RFP_chain_provider Phase C tail: the unified_v2 auto-fund hook uses the
+    ChainProvider (balance + bounded fund), gated by `[backup.fund].enabled` read
+    via the backup SHM slot (`get_params("backup")["fund"]`, config-as-SHM
+    INV-CFG-7 — mirrors `[backup.mirror]`). Enabled + low runway → chain.fund
+    fires; disabled → no-op.
+
+    REGRESSION (2026-06-22): the reader formerly read `_full_config["chain"]["fund"]`
+    — a `[chain.fund]` section that never exists in real config — so auto-fund was
+    silently OFF fleet-wide. This test must drive the REAL get_params mechanism (not
+    poke `_full_config`), or it re-encodes the bug it is meant to catch."""
     monkeypatch.chdir(tmp_path)
+    import titan_hcl.logic.backup as bmod
     from titan_hcl.logic.backup import RebirthBackup
     from titan_hcl.chain import FakeChainProvider
 
+    def _fund_params(section, fund):
+        return {"fund": fund} if section == "backup" else {}
+
     # enabled + low Irys deposit → low runway → chain.fund fires (bounded)
+    monkeypatch.setattr(bmod, "get_params",
+                        lambda section: _fund_params(section, {"enabled": True}))
     fake = FakeChainProvider()
     fake._balance_sol = 0.05            # ~1.2d runway at the default burn → < min 3d
     b_on = RebirthBackup(network_client=None, titan_id="T1", chain_provider=fake,
-                         full_config={"chain": {"fund": {"enabled": True}}})
+                         full_config={})
     await b_on._auto_fund_irys_before_upload()
     assert len(fake.fund_log) == 1 and fake.fund_log[0] > 0
 
     # disabled → no-op (no fund)
+    monkeypatch.setattr(bmod, "get_params",
+                        lambda section: _fund_params(section, {"enabled": False}))
     fake2 = FakeChainProvider()
     fake2._balance_sol = 0.05
     b_off = RebirthBackup(network_client=None, titan_id="T1", chain_provider=fake2,
-                          full_config={"chain": {"fund": {"enabled": False}}})
+                          full_config={})
     await b_off._auto_fund_irys_before_upload()
     assert fake2.fund_log == []
 
