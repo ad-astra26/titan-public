@@ -2395,6 +2395,61 @@ def emit_episode_record(
         return False
 
 
+# WORD_LEARNED — language_worker → cognitive_worker (RFP_phase_c_actr_memory_
+# rehoming §4.1/§4.2 Tier 2). Pre-Phase-C, spirit_worker recorded a `word_learned`
+# EPISODE *and* attended `active_word` to working memory on each word-grounding
+# (both in-proc). Post-Phase-C the word is known in language_worker but episodic_mem
+# + working_mem live in cognitive_worker, so this one targeted event carries the
+# grounded word; cognitive_worker does BOTH the record_episode + the working_mem
+# attend on receipt. Payload: {word:str, confidence:float, ts:float}.
+WORD_LEARNED = "WORD_LEARNED"
+WORD_LEARNED_MIN_INTERVAL_S = 2.0
+_word_learned_last_emit: dict = {}
+
+
+def emit_word_learned(
+    sender, src: str, word: str, confidence: float,
+    min_interval_s: Optional[float] = None,
+) -> bool:
+    """Emit a targeted WORD_LEARNED frame (RFP_phase_c_actr_memory_rehoming Tier 2).
+    Coalesced per-word (a re-grounding of the same word inside the interval is
+    dropped — bus hygiene), TARGETED dst="cognitive_worker", non-blocking, drop-safe.
+    Returns True if emitted, False if coalesced/dropped. cognitive_worker fills the
+    epoch from its own consciousness on receipt."""
+    now = time.time()
+    iv = (WORD_LEARNED_MIN_INTERVAL_S
+          if min_interval_s is None else min_interval_s)
+    if not str(word):
+        return False
+    if now - _word_learned_last_emit.get(str(word), 0.0) < iv:
+        return False
+    msg = {
+        "type": WORD_LEARNED,
+        "src": src,
+        "dst": "cognitive_worker",
+        "ts": now,
+        "rid": None,
+        "payload": {
+            "word": str(word)[:80],
+            "confidence": float(confidence),
+            "ts": now,
+        },
+    }
+    try:
+        if hasattr(sender, "put_nowait"):
+            sender.put_nowait(msg)
+        elif hasattr(sender, "publish"):
+            sender.publish(msg)
+        else:
+            return False
+        _word_learned_last_emit[str(word)] = now
+        return True
+    except Exception as e:
+        swallow_warn("[emit_word_learned] failed", e,
+                     key="bus.emit_word_learned")
+        return False
+
+
 # ----------------------------------------------------------------------
 # publish_module_error — Phase 11 / SPEC §11.I.4 typed-error envelope
 # ----------------------------------------------------------------------

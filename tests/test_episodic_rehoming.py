@@ -187,3 +187,29 @@ def test_emit_episode_record_is_targeted_and_coalesced():
     # immediate re-emit on the same key is coalesced (bus hygiene)
     assert bus.emit_episode_record(q, "synthesis", "x_engagement", metric=4.0) is False
     assert len(q.items) == 1
+
+
+# ── 5. Tier 2: WORD_LEARNED producer (language → cognitive) targeted + coalesced ──
+def test_emit_word_learned_is_targeted_and_coalesced():
+    import titan_hcl.bus as bus
+
+    class _Q:
+        def __init__(self):
+            self.items = []
+
+        def put_nowait(self, m):
+            self.items.append(m)
+
+    q = _Q()
+    bus._word_learned_last_emit.clear()
+    ok = bus.emit_word_learned(q, "language", "sovereignty", 0.62)
+    assert ok and len(q.items) == 1
+    msg = q.items[0]
+    assert msg["type"] == bus.WORD_LEARNED
+    assert msg["dst"] == "cognitive_worker"          # TARGETED, never dst="all"
+    assert msg["payload"]["word"] == "sovereignty"
+    assert msg["payload"]["confidence"] == 0.62
+    # same word re-grounded within the interval is coalesced; a different word emits
+    assert bus.emit_word_learned(q, "language", "sovereignty", 0.7) is False
+    assert bus.emit_word_learned(q, "language", "metabolic", 0.55) is True
+    assert len(q.items) == 2

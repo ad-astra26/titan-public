@@ -445,6 +445,10 @@ _COGNITIVE_WORKER_SUBSCRIBE_TOPICS = [
     # (G21 sole writer of episodic_memory.db). Phase-1 triggers are in-proc (direct
     # call); subscription is for Phase-2 cross-process (synthesis) episodes.
     bus.EPISODE_RECORD,            # → _dispatch_episode_record (episodic_mem.record_episode)
+    # WORD_LEARNED — language_worker word-grounding (RFP_phase_c_actr_memory_
+    # rehoming Tier 2). cognitive_worker owns episodic_mem + working_mem, so it
+    # does BOTH the word_learned episode + the active_word working-mem attend.
+    bus.WORD_LEARNED,              # → record_episode("word_learned") + working_mem.attend("active_word")
     # MEMORY_RECALL_PERTURBATION — Phase D (D-SPEC-116). i_depth + working_mem
     # legs of the recall bridge, re-homed from the retired spirit_worker. Emitted
     # by agno_hooks (interface) targeted dst="cognitive_worker"; the neuromod-nudge
@@ -1411,6 +1415,34 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 # (G21 sole writer of episodic_memory.db). Phase-2 cross-process
                 # episodes arrive here; Phase-1 native triggers call direct.
                 _dispatch_episode_record(state_refs, payload)
+
+            elif msg_type == bus.WORD_LEARNED:
+                # RFP_phase_c_actr_memory_rehoming Tier 2 — faithful port of the
+                # dropped spirit_worker word-learning pair (L9049 attend + L9056
+                # episode). language_worker grounded a word; cognitive_worker owns
+                # BOTH stores, so it does both here: (1) the word_learned episode
+                # (emergent significance = surprise of the grounding confidence),
+                # (2) the active_word working-mem attend. Epoch filled from the
+                # local consciousness snapshot (language_worker doesn't carry it).
+                _wl_word = str(payload.get("word", "")).strip()
+                if _wl_word:
+                    _wl_conf = float(payload.get("confidence", 0.0) or 0.0)
+                    _wl_ep = int((state_refs.get("consciousness", {}) or {}).get(
+                        "latest_epoch", {}).get("epoch_id", 0) or 0)
+                    _dispatch_episode_record(state_refs, {
+                        "event_type": "word_learned",
+                        "description": f"Learned '{_wl_word}' (conf {_wl_conf:.3f})",
+                        "metric": _wl_conf,
+                        "epoch_id": _wl_ep,
+                    })
+                    _wl_wm = state_refs.get("working_mem")
+                    if _wl_wm is not None:
+                        try:
+                            _wl_wm.attend("active_word", _wl_word,
+                                          {"confidence": _wl_conf}, _wl_ep)
+                        except Exception as _wl_err:
+                            logger.debug("[CognitiveWorker] active_word attend "
+                                         "raised: %s", _wl_err)
 
             elif msg_type == bus.MEMORY_RECALL_PERTURBATION:
                 # Phase D (D-SPEC-116) — i_depth + working_mem legs of the recall

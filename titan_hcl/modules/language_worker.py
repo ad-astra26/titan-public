@@ -1492,6 +1492,20 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                     domain=_p8_word,
                                     reason=f"word '{_p8_word}' crossed grounding threshold (conf={_p8_conf:.3f})",
                                 )
+                                # ── RFP_phase_c_actr_memory_rehoming §4.1/§4.2 Tier 2 ──
+                                # The dropped word_learned EPISODE + active_word
+                                # working-mem attend (spirit_worker L9049/9056). The
+                                # word is known here but episodic_mem + working_mem
+                                # live in cognitive_worker, so emit one targeted
+                                # WORD_LEARNED frame; cognitive_worker does BOTH on
+                                # receipt. Same EdgeDetector gate (one per first
+                                # grounding); coalesced per-word; never breaks the loop.
+                                try:
+                                    from titan_hcl.bus import emit_word_learned
+                                    emit_word_learned(send_queue, "language",
+                                                      _p8_word, float(_p8_conf))
+                                except Exception:
+                                    pass
                                 # ── Phase A (RFP_cgn_enhancements §9.1) ──────────
                                 # Same EdgeDetector gate (one per first-grounding):
                                 # ALSO fire a learning-event chain trigger so the
