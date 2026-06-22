@@ -74,3 +74,32 @@ def test_cold_read_returns_none(shm_root):
     'not yet initialized' message; never raises)."""
     assert _bank().read_self_reflection_state() is None
     assert _bank().read_coding_explorer_state() is None
+
+
+def test_counters_survive_restart(tmp_path):
+    """Cumulative counters must NOT reset to 0 on engine restart (2026-06-22):
+    total_introspections reloads from COUNT(self_insights); observed_chains /
+    observed_meta_chains reload from the self_reasoning_counters table."""
+    import sqlite3
+    from titan_hcl.logic.self_reasoning import SelfReasoningEngine
+
+    db = str(tmp_path / "inner_memory.db")
+    eng = SelfReasoningEngine(config={}, db_path=db)
+    eng._observed_chains = 5
+    eng._observed_meta_chains = 2
+    # two persisted insights → cumulative introspection truth
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO self_insights(sub_mode,epoch,timestamp,data) "
+                 "VALUES('audit',1,1.0,'{}')")
+    conn.execute("INSERT INTO self_insights(sub_mode,epoch,timestamp,data) "
+                 "VALUES('audit',2,2.0,'{}')")
+    conn.commit()
+    conn.close()
+    eng.persist_counters()
+
+    # simulate a Titan restart — fresh engine, same DB
+    eng2 = SelfReasoningEngine(config={}, db_path=db)
+    stats = eng2.get_stats()
+    assert stats["total_introspections"] == 2  # from COUNT(self_insights)
+    assert stats["observed_chains"] == 5       # from counters table
+    assert stats["observed_meta_chains"] == 2

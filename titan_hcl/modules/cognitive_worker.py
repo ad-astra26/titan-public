@@ -5587,6 +5587,22 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                         _ts_put("vocab.producible", _lg, "vocab_producible")
                     except Exception:
                         pass
+                    # Self-reflection cumulative counters (2026-06-22) — onto
+                    # the observatory timeline so introspections/predictions/
+                    # observed-chains accumulate historically and survive
+                    # restart. Source = self_reflection_state.bin (writer =
+                    # self_reflection_worker); the engine reloads the counters
+                    # from its DB on boot so the series is monotonic.
+                    try:
+                        _sr = _ts_bank.read_self_reflection_state()
+                        _sr_stats = _sr.get("stats") if isinstance(_sr, dict) else None
+                        if isinstance(_sr_stats, dict):
+                            _ts_put("selfref.introspections", _sr_stats, "total_introspections")
+                            _ts_put("selfref.predictions", _sr_stats, "total_predictions")
+                            _ts_put("selfref.observed_chains", _sr_stats, "observed_chains")
+                            _ts_put("selfref.prediction_accuracy", _sr_stats, "prediction_accuracy_ema")
+                    except Exception:
+                        pass
                 # `chi.total` alias — IDepthTab queries the dotted name; the
                 # base dict already records `chi_total` (underscore) consumed
                 # by other charts. Record both so each consumer resolves.

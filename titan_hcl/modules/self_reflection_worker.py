@@ -1890,6 +1890,12 @@ def _publish_self_reflection_stats(state_refs: dict, send_queue, name: str,
     from titan_hcl.core.state_registry import SELF_REFLECTION_STATE
     _write_diag_slot(state_refs, SELF_REFLECTION_STATE,
                      "_self_reflection_state_writer", payload)
+    # Persist cumulative observation counters (~every 30s @ 2.5s cadence) so
+    # observed_chains/meta survive restart (2026-06-22).
+    n = state_refs.get("_selfref_persist_tick", 0) + 1
+    state_refs["_selfref_persist_tick"] = n
+    if n % 12 == 1 and hasattr(sr, "persist_counters"):
+        sr.persist_counters()
 
 
 def _publish_coding_explorer_stats(state_refs: dict, send_queue, name: str,

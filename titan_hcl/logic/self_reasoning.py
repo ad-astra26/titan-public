@@ -303,6 +303,11 @@ class SelfReasoningEngine:
         self._cooldown = 0
         self._total_introspections = 0
         self._total_predictions = 0
+        # Bus-observation counters (cumulative across restarts via
+        # self_reasoning_counters table — 2026-06-22). Lazily bumped in
+        # observe_chain/observe_meta; reloaded from DB in _load_counters().
+        self._observed_chains = 0
+        self._observed_meta_chains = 0
         self._prediction_accuracy_ema = 0.5  # EMA of prediction accuracy
         self._prediction_accuracy_alpha = 0.1
 
@@ -327,11 +332,14 @@ class SelfReasoningEngine:
         # Initialize DB
         self._init_db()
         self._load_active_predictions()
+        self._load_counters()
 
         logger.info("[SelfReasoning] Initialized (cooldown=%d, max_pred=%d, "
-                    "active_pred=%d)",
+                    "active_pred=%d, cumulative: introspections=%d "
+                    "predictions=%d observed_chains=%d)",
                     self._cooldown_max, self._max_active_predictions,
-                    len(self._active_predictions))
+                    len(self._active_predictions), self._total_introspections,
+                    self._total_predictions, self._observed_chains)
 
     # ── DB Initialization ────────────────────────────────────────────
 
@@ -376,10 +384,62 @@ class SelfReasoningEngine:
                     ON self_predictions(verified);
                 CREATE INDEX IF NOT EXISTS idx_sp_check_epoch
                     ON self_predictions(check_epoch);
+
+                -- Cumulative bus-observation counters (2026-06-22) so
+                -- observed_chains/observed_meta_chains survive restart instead
+                -- of resetting to 0. introspections/predictions are derived
+                -- from COUNT(self_insights)/COUNT(self_predictions) and need no
+                -- row here.
+                CREATE TABLE IF NOT EXISTS self_reasoning_counters (
+                    name TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL DEFAULT 0
+                );
             """)
             conn.close()
         except Exception as e:
             logger.warning("[SelfReasoning] DB init failed: %s", e)
+
+    def _load_counters(self):
+        """Reload cumulative counters from the DB so they survive restart
+        (2026-06-22). total_introspections/total_predictions are the canonical
+        persisted truth (one row each per persisted insight/prediction);
+        observed_chains/meta come from self_reasoning_counters."""
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=5.0)
+            try:
+                self._total_introspections = int(
+                    conn.execute("SELECT COUNT(*) FROM self_insights")
+                    .fetchone()[0] or 0)
+                self._total_predictions = int(
+                    conn.execute("SELECT COUNT(*) FROM self_predictions")
+                    .fetchone()[0] or 0)
+                for name in ("observed_chains", "observed_meta_chains"):
+                    row = conn.execute(
+                        "SELECT value FROM self_reasoning_counters WHERE name=?",
+                        (name,)).fetchone()
+                    if row is not None:
+                        setattr(self, "_" + name, int(row[0] or 0))
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning("[SelfReasoning] counter reload failed: %s", e)
+
+    def persist_counters(self):
+        """Persist the bus-observation counters so they survive restart.
+        Cheap (2-row upsert); called on the worker's publish cadence."""
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=5.0)
+            try:
+                conn.executemany(
+                    "INSERT INTO self_reasoning_counters(name, value) "
+                    "VALUES(?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                    [("observed_chains", int(self._observed_chains)),
+                     ("observed_meta_chains", int(self._observed_meta_chains))])
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("[SelfReasoning] persist_counters failed: %s", e)
 
     def _load_active_predictions(self):
         """Load unverified predictions from DB."""
