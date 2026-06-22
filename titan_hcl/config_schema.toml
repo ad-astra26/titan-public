@@ -85,6 +85,7 @@
 "channels.whatsapp_token" = {type="str", constraint="", reload="hot", owner=["agency_worker"], sensitive=true}
 "channels.whatsapp_verify_token" = {type="str", constraint="", reload="hot", owner=["agency_worker"], sensitive=true}
 "chat.classifier_log_decisions" = {type="bool", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"chat.concurrent_chat_enabled" = {type="bool", constraint="", reload="restart_required", owner=["agno_worker"], sensitive=false}
 "chat.default_model_class" = {type="str", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
 "chat.default_tier" = {type="str", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
 "chat.features.known" = {type="list", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}

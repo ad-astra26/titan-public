@@ -208,6 +208,75 @@ async def _route_model_for_tier(agent, worker_plugin, prompt_text: str):
             except Exception:
                 pass
 
+
+# ── Concurrent multi-user chat (RFP_concurrent_multiuser_chat) ─────────────
+# Default ON: each chat mints its OWN agent over the shared chat context with
+# the tier baked in (no shared-agent mutation → no _chat_route_lock → concurrent
+# chats overlap). flag-OFF = the legacy shared-agent + _route_model_for_tier
+# lock path above (INV-CC-7 / kill-switch).
+def _concurrent_chat_enabled(worker_plugin) -> bool:
+    """`[chat] concurrent_chat_enabled` — default True (Maker flag rule)."""
+    try:
+        chat_cfg = (getattr(worker_plugin, "_full_config", {}) or {}).get("chat", {}) or {}
+        return bool(chat_cfg.get("concurrent_chat_enabled", True))
+    except Exception:
+        return True
+
+
+def _get_tier_classifier(worker_plugin):
+    """Cached ChatTierClassifier (lazy-init), or None if unavailable.
+
+    Shares `worker_plugin._tier_classifier_cache` with the legacy
+    `_route_model_for_tier` so both paths classify identically.
+    """
+    classifier = getattr(worker_plugin, "_tier_classifier_cache", None)
+    if classifier is None:
+        try:
+            from titan_hcl.modules.chat_tier_config import ChatTierClassifier
+            classifier = ChatTierClassifier.from_config(
+                getattr(worker_plugin, "_full_config", {}) or {})
+            worker_plugin._tier_classifier_cache = classifier
+        except Exception as _cls_err:
+            logger.debug("[AgnoWorker] tier classifier init failed: %s", _cls_err)
+            return None
+    return classifier
+
+
+def _classify_message_tier(worker_plugin, message_text):
+    """Classify `message_text` → TierConfig (or None if unavailable).
+
+    The concurrent path bakes this tier into a per-call agent instead of
+    mutating a shared one — same classification the legacy router does inline.
+    """
+    if getattr(worker_plugin, "_inference_provider", None) is None:
+        return None
+    classifier = _get_tier_classifier(worker_plugin)
+    if classifier is None:
+        return None
+    try:
+        return classifier.classify(message_text).tier
+    except Exception as _cls_err:
+        logger.debug("[AgnoWorker] classify failed: %s", _cls_err)
+        return None
+
+
+def _make_chat_agent(worker_plugin, message_text, shared_agent):
+    """Mint a fresh per-call agent for this chat (INV-CC-2: own instance per
+    concurrent call). Falls back to `shared_agent` if the chat context or
+    per-call build is unavailable (keeps chat working in degraded/test paths).
+    """
+    try:
+        from titan_hcl.modules.agno_agent_factory import make_agent
+        tier = _classify_message_tier(worker_plugin, message_text)
+        return make_agent(worker_plugin._chat_ctx, tier)
+    except Exception as _mk_err:  # noqa: BLE001
+        logger.warning(
+            "[AgnoWorker] per-call agent build failed (%s) — using shared agent",
+            _mk_err,
+        )
+        return shared_agent
+
+
 # D-SPEC-76 (SPEC v1.18.0) — default session LRU capacity. Canonical value
 # lives in `_phase_c_constants` (mirrored from SPEC constants TOML).
 from titan_hcl._phase_c_constants import (
@@ -565,17 +634,28 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                 "chat path normally): %s", _hook_err,
             )
 
-        # ── Run Agno agent (ζ.5 per-tier model routing) ──
-        # _route_model_for_tier classifies the prompt, swaps agent.model.id
-        # to the tier's concrete model (resolved via provider.resolve_model_class),
-        # serialises concurrent chats so requests don't trample each other's
-        # model id, and restores the original id on exit.
-        async with _route_model_for_tier(agent, worker_plugin, message_text):
-            run_output = await agent.arun(
+        # ── Run Agno agent ──
+        # Concurrent multi-user chat (RFP_concurrent_multiuser_chat): flag-ON
+        # (default) mints a per-call agent over the shared chat context with the
+        # tier baked in (model.id/max_tokens/guidance) and arun()s it with NO
+        # lock, so concurrent chats overlap. flag-OFF = legacy shared agent +
+        # _route_model_for_tier lock (which classifies + swaps model.id and
+        # serialises concurrent chats so they don't trample each other).
+        if _concurrent_chat_enabled(worker_plugin) and \
+                getattr(worker_plugin, "_chat_ctx", None) is not None:
+            run_agent = _make_chat_agent(worker_plugin, message_text, agent)
+            run_output = await run_agent.arun(
                 message_text,
                 session_id=session_id,
                 user_id=user_id,
             )
+        else:
+            async with _route_model_for_tier(agent, worker_plugin, message_text):
+                run_output = await agent.arun(
+                    message_text,
+                    session_id=session_id,
+                    user_id=user_id,
+                )
 
         if hasattr(run_output, "content"):
             response_text = str(run_output.content)
@@ -870,13 +950,24 @@ async def _handle_chat_stream_request(msg: dict, agent, worker_plugin,
         _emit_stream_progress(worker_plugin, "thinking")
 
         # ── 1. Run agent to completion (Pre+LLM+Post-with-OVG) ──
-        # ζ.5 per-tier model routing (D-SPEC-79) — see _route_model_for_tier
-        async with _route_model_for_tier(agent, worker_plugin, message_text):
-            run_output = await agent.arun(
+        # Concurrent multi-user chat (RFP_concurrent_multiuser_chat): flag-ON
+        # (default) = per-call agent over the shared context, NO lock; flag-OFF
+        # = legacy shared agent + _route_model_for_tier lock (ζ.5, D-SPEC-79).
+        if _concurrent_chat_enabled(worker_plugin) and \
+                getattr(worker_plugin, "_chat_ctx", None) is not None:
+            run_agent = _make_chat_agent(worker_plugin, message_text, agent)
+            run_output = await run_agent.arun(
                 message_text,
                 session_id=session_id,
                 user_id=user_id,
             )
+        else:
+            async with _route_model_for_tier(agent, worker_plugin, message_text):
+                run_output = await agent.arun(
+                    message_text,
+                    session_id=session_id,
+                    user_id=user_id,
+                )
         if hasattr(run_output, "content"):
             response_text = str(run_output.content)
         elif isinstance(run_output, str):
@@ -1075,7 +1166,9 @@ def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any], send_queue
     initialised before create_agent runs — including synthesis_tool_plugs,
     which agno_tools.create_tools reads off the plugin (Phase 6 amendment).
     """
-    from titan_hcl.modules.agno_agent_factory import create_agent
+    from titan_hcl.modules.agno_agent_factory import (
+        build_shared_chat_context, make_agent,
+    )
     from titan_hcl.modules.agno_worker_plugin import WorkerPlugin
 
     worker_plugin = WorkerPlugin(bus_client=bus_client, config=config)
@@ -1092,7 +1185,14 @@ def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any], send_queue
             "will report 'not wired': %s", _tp_err, exc_info=True,
         )
         worker_plugin.synthesis_tool_plugs = {}
-    agent = create_agent(worker_plugin, agent_config=config.get("agent"))
+    # Concurrent multi-user chat (RFP_concurrent_multiuser_chat): build the
+    # heavy shared chat context ONCE (one session db + one hook/tool set), stash
+    # it for the per-call chat path, and derive the shared legacy agent from the
+    # SAME context (used by the flag-off path, dream replay + agent_ready).
+    chat_ctx = build_shared_chat_context(
+        worker_plugin, agent_config=config.get("agent"))
+    worker_plugin._chat_ctx = chat_ctx
+    agent = make_agent(chat_ctx, None)
     return worker_plugin, agent
 
 

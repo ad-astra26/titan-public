@@ -235,7 +235,11 @@ class TestCreateAgentFactory:
             assert kwargs["post_hooks"] == ["post_hook"]
             assert kwargs["tools"] == ["tool1", "tool2"]
             assert kwargs["name"] == "TitanTest"
-            assert kwargs["add_history_to_context"] is True
+            # D-SPEC-159 — agno per-run history bypass defaults ON
+            # (agno_history_bypass=True) ⇒ add_history_to_context is False.
+            # (create_agent now flows through build_shared_chat_context +
+            # make_agent for concurrent chat — the wiring above is unchanged.)
+            assert kwargs["add_history_to_context"] is False
 
     def test_create_agent_falls_back_to_venice_on_provider_error(self):
         """Unknown provider should not crash — fall back to venice."""
