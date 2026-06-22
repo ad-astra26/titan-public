@@ -247,6 +247,69 @@ def _install_agno_to_dict_fastpath() -> None:
             "stock methods retained): %s", _patch_err)
 
 
+_AGNO_TABLE_CACHE_PATCHED = False
+
+
+def _install_agno_table_reflection_cache() -> None:
+    """Cache agno AsyncSqliteDb's reflected Table objects per (db, table_name).
+
+    LATENCY/IO tidy — NOT a memory fix. agno's ``_get_or_create_table`` runs
+    ``Table(name, self.metadata, autoload_with=conn)`` — a fresh schema
+    REFLECTION (sqlite PRAGMA introspection + Table/Column allocation) — on
+    EVERY ``upsert_session``/``get_session``, i.e. once per chat turn, even
+    though the session-table schema never changes after creation. Measured
+    cost: redundant introspection queries per turn + ~9 kB/turn of churn that
+    plateaus at ~0.7 MB (tracemalloc-confirmed bounded — there is NO per-chat
+    memory leak; this patch is purely to drop the repeated work). The session
+    DB FILE is still written exactly as before (the hearing sense reads the
+    file via sqlite3 — D-SPEC-159 — untouched).
+
+    Caches the reflected Table on the db instance the first time it's loaded
+    and returns it thereafter. Self-protecting: idempotent, version-pinned to
+    the agno range, never raises into chat (falls back to stock on any error).
+    """
+    global _AGNO_TABLE_CACHE_PATCHED
+    if _AGNO_TABLE_CACHE_PATCHED:
+        return
+    try:
+        import agno
+        from agno.db.sqlite.async_sqlite import AsyncSqliteDb
+
+        ver = getattr(agno, "__version__", "")
+        if not ver.startswith(("2.5.", "2.6.")):
+            logger.info(
+                "[AgnoFactory] table-reflection cache skipped — agno %s outside "
+                "the verified range", ver)
+            _AGNO_TABLE_CACHE_PATCHED = True
+            return
+
+        _orig_get_or_create = AsyncSqliteDb._get_or_create_table
+
+        async def _cached_get_or_create_table(
+            self, table_name, table_type, create_table_if_not_found=False,
+        ):
+            cache = self.__dict__.setdefault("_titan_reflected_table_cache", {})
+            cached = cache.get(table_name)
+            if cached is not None:
+                return cached
+            tbl = await _orig_get_or_create(
+                self, table_name, table_type, create_table_if_not_found,
+            )
+            if tbl is not None:
+                cache[table_name] = tbl
+            return tbl
+
+        AsyncSqliteDb._get_or_create_table = _cached_get_or_create_table
+        _AGNO_TABLE_CACHE_PATCHED = True
+        logger.info(
+            "[AgnoFactory] agno table-reflection cache installed (drops the "
+            "per-turn session-table re-reflection; file writes unchanged)")
+    except Exception as _patch_err:
+        logger.warning(
+            "[AgnoFactory] table-reflection cache install failed (non-fatal, "
+            "stock reflection retained): %s", _patch_err)
+
+
 @dataclass
 class SharedChatCtx:
     """Heavy, stateless-shareable chat state, built ONCE and shared by every
@@ -300,6 +363,9 @@ def build_shared_chat_context(
     # before any agent is built, so the per-turn session-save asdict waste is
     # eliminated for every chat. Self-guarded (see fn docstring).
     _install_agno_to_dict_fastpath()
+    # Drop the redundant per-turn session-table schema re-reflection (latency/IO
+    # tidy, not a memory fix — see fn docstring). Self-guarded + idempotent.
+    _install_agno_table_reflection_cache()
 
     from titan_hcl import inference
     from titan_hcl.modules.agno_guardrails import GuardianGuardrail

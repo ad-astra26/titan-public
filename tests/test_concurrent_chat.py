@@ -239,5 +239,38 @@ def test_make_chat_agent_falls_back_to_shared_on_error():
     assert got is shared
 
 
+# ── agno table-reflection cache (latency tidy, not a memory fix) ─────────────
+
+def test_agno_table_reflection_cache_reuses_table(tmp_path):
+    """The patch caches the reflected session Table so agno stops re-reflecting
+    it on every upsert_session — second turn must reuse the SAME Table object."""
+    from titan_hcl.modules.agno_agent_factory import (
+        _install_agno_table_reflection_cache,
+    )
+    _install_agno_table_reflection_cache()
+    from agno.db.sqlite.async_sqlite import AsyncSqliteDb
+    from agno.session import AgentSession
+
+    db = AsyncSqliteDb(db_file=str(tmp_path / "t.db"), session_table="titan_sessions")
+
+    def _sess():
+        return AgentSession(
+            session_id="s1", agent_id="t", user_id="u", session_data={},
+            metadata={}, agent_data={}, runs=[], summary=None,
+            created_at=1_700_000_000, updated_at=1_700_000_000,
+        )
+
+    async def run():
+        await db.upsert_session(_sess())          # creates + caches the table
+        cache = db.__dict__.get("_titan_reflected_table_cache", {})
+        assert "titan_sessions" in cache, "table not cached after first upsert"
+        first = cache["titan_sessions"]
+        await db.upsert_session(_sess())          # 2nd turn: must reuse cache
+        assert cache["titan_sessions"] is first, "table re-reflected, not cached"
+        await db.close()
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-p", "no:anchorpy"]))
