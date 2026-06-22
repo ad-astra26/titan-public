@@ -52,6 +52,27 @@ def test_judge_tolerates_string_bool():
     assert out["solved"] is True
 
 
+def test_judge_verifiable_defaults_true_when_missing():
+    # INV-MC-8 (2026-06-22): conservative — a verdict with no `verifiable` key keeps
+    # the old behavior (treated as verifiable), so real failures are never neutralized.
+    out = _judge(False, "wrong", 0.4).judge(problem="p", action="tool", evidence="e")
+    assert out["verifiable"] is True
+
+
+def test_judge_parses_explicit_verifiable_false():
+    def _p(prompt, t):
+        return ('{"solved": false, "correction": "", "confidence": 0.2, '
+                '"verifiable": false}')
+    out = TaskCompletionJudge(llm_provider=_p).judge(
+        problem="explore sociology", action="research", evidence="some notes")
+    assert out["solved"] is False and out["verifiable"] is False
+
+
+def test_judge_prompt_asks_for_verifiable():
+    from titan_hcl.synthesis import task_completion_judge as tcj
+    assert "verifiable" in tcj.JUDGE_PROMPT_TEMPLATE.lower()
+
+
 def test_judge_is_distinct_module_from_turnjudge():
     # INV-MC-8: the autonomous correctness judge is NOT the quality TurnJudge.
     from titan_hcl.synthesis import task_completion_judge as tcj
@@ -168,6 +189,49 @@ def test_exhaustion_emits_negative_reward():
     r = _rewards(sq)
     assert len(r) == 1 and r[0]["payload"]["reward"] == -0.5
     assert agency.rerun_calls == 2            # bounded at max_attempts=3 total
+
+
+def _by_type(sq, t):
+    return [m for m in sq.items if m["type"] == t]
+
+
+def test_nonverifiable_not_solved_is_NEUTRAL_not_negative():
+    """KEYSTONE FIX (INV-MC-8, 2026-06-22): an open-ended/exploratory self-intent has
+    no binary 'solved' — judging it solve/fail returns not-solved, and the old -0.5
+    POISONED the OML routing policy (research lane → action=0 collapse). A non-verifiable
+    outcome must be NEUTRAL (reward 0.0) AND must NOT feed a skill cell or a P9 revisit."""
+    sq = _FakeSendQ()
+    agency = _FakeAgency()
+    # not solved, NO correction (so no retry), verifiable=False
+    judge = _FakeJudge([{"solved": False, "correction": "", "confidence": 0.2,
+                         "verifiable": False}])
+    _emit(sq, judge, agency, helper="code_knowledge",
+          intent={"posture": "explore"},
+          ar={"helper": "code_knowledge", "action_type": "research",
+              "result": "some musings", "reasoning": "curious about sociology"})
+    r = _rewards(sq)
+    assert len(r) == 1, "still emits ONE experience (keeps φ)"
+    assert r[0]["payload"]["reward"] == 0.0, "NEUTRAL — never -0.5 for unverifiable"
+    # no skill-cell signal, no failed-attempt revisit for open-ended exploration
+    assert _by_type(sq, bus.AUTONOMOUS_SKILL_SCORE) == []
+    assert _by_type(sq, bus.FAILED_ATTEMPT_ENQUEUE) == []
+
+
+def test_verifiable_not_solved_still_negative_and_enqueues():
+    """A genuine VERIFIABLE failure keeps the real -0.5 signal + feeds the skill cell
+    (success=False) + enqueues a P9 revisit — the fix must NOT neutralize real failures."""
+    sq = _FakeSendQ()
+    agency = _FakeAgency([{"result": "x"}, {"result": "y"}])
+    judge = _FakeJudge([{"solved": False, "correction": "wrong value", "confidence": 0.2,
+                         "verifiable": True}])
+    _emit(sq, judge, agency, helper="coding_sandbox",
+          ar={"helper": "coding_sandbox", "action_type": "tool",
+              "result": "42", "reasoning": "compute the answer"})
+    r = _rewards(sq)
+    assert len(r) == 1 and r[0]["payload"]["reward"] == -0.5
+    ss = _by_type(sq, bus.AUTONOMOUS_SKILL_SCORE)
+    assert len(ss) == 1 and ss[0]["payload"]["success"] is False
+    assert len(_by_type(sq, bus.FAILED_ATTEMPT_ENQUEUE)) == 1
 
 
 def test_non_routing_helper_emits_nothing():

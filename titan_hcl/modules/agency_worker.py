@@ -431,6 +431,15 @@ def _maybe_emit_autonomous_experience(
                 action_name)
             return  # judge LLM miss → stays untrained (no false-positive reward)
         solved = bool(verdict.get("solved"))
+        # INV-MC-8 (2026-06-22, keystone fix): is the self-intent VERIFIABLE — does it
+        # have an objective, checkable success criterion? Open-ended/exploratory intents
+        # ("explore X", "reflect on Y") are NOT — they are structurally never "solved",
+        # so the old binary `not solved → -0.5` fed the OML routing policy a permanent
+        # FALSE failure signal for the research/autonomous lanes → action=0 collapse +
+        # P9 perpetual-abandon. A non-verifiable outcome is NEUTRAL: we keep the φ
+        # experience but never punish (or reward) the action for being unverifiable.
+        # See reference_oml_reward_must_be_correctness_aware_not_quality_aware + BUG entry.
+        verifiable = bool(verdict.get("verifiable", True))
         # Unified failure-replay (EEL-B2 / P9): a solved revisit is the highest-signal
         # experience → BOOSTED reward; a known_target verdict is a deterministic oracle
         # (rank-3 `autonomous_oracle`). `revisit`/`is_revisit` are read at the top.
@@ -439,7 +448,12 @@ def _maybe_emit_autonomous_experience(
         task_shape = action_name  # the means signature for the corrected skill cell
         # Source + magnitude. (The v1.1 direct path applies `*_reward_weight` HERE —
         # the join path does it instead; so weighting stays a live trust dial.)
-        if is_revisit and solved:
+        if not verifiable:
+            # Open-ended exploration → NEUTRAL (never poison the policy with a structural
+            # failure). No verifiable success criterion ⇒ neither +reward nor -penalty.
+            source = "task_completion"
+            reward = 0.0
+        elif is_revisit and solved:
             source = "autonomous_oracle" if known_target else "task_completion"
             wkey = ("autonomous_oracle_reward_weight" if known_target
                     else "task_completion_reward_weight")
@@ -460,10 +474,10 @@ def _maybe_emit_autonomous_experience(
             },
             "ts": time.time(),
         })
-        logger.info("[AgencyWorker][P8%s] autonomous %s → solved=%s reward=%+.2f "
-                    "attempts=%d (engagement-independent IQL experience)",
-                    "/revisit" if is_revisit else "", action_name, solved, reward,
-                    attempts)
+        logger.info("[AgencyWorker][P8%s] autonomous %s → solved=%s verifiable=%s "
+                    "reward=%+.2f attempts=%d (engagement-independent IQL experience)",
+                    "/revisit" if is_revisit else "", action_name, solved, verifiable,
+                    reward, attempts)
         # P1 (BUG-AUTONOMOUS-SUCCESS-NO-SKILL-CELL, 2026-06-20): a FRESH (non-revisit)
         # autonomous routing outcome must ALSO feed procedural skill formation, not only
         # the routing IQL above — else skill cells accrue ONLY from chat tool-use (audit
@@ -473,7 +487,10 @@ def _maybe_emit_autonomous_experience(
         # success=solved so the cell's time_cost = (succ/(succ+fail))^2 reflects real
         # autonomous competence (failures already also ride FAILED_ATTEMPT_ENQUEUE below
         # for an idle revisit — orthogonal: this records the competence signal).
-        if not is_revisit:
+        # Gate on `verifiable` (INV-MC-8, 2026-06-22): an open-ended exploration is not a
+        # skill success/failure — recording success=False would wrongly drag the cell's
+        # time_cost. Only VERIFIABLE outcomes feed procedural skill formation.
+        if not is_revisit and verifiable:
             send_queue.put({
                 "type": bus.AUTONOMOUS_SKILL_SCORE, "src": name, "dst": "synthesis",
                 "payload": {
@@ -492,10 +509,12 @@ def _maybe_emit_autonomous_experience(
                 solved=solved, oracle_id=source, goal_class=gc,
                 task_shape=task_shape, evidence=evidence,
                 correction=str(verdict.get("correction") or ""))
-        elif not solved:
-            # A NEW autonomous failure the corrector couldn't solve → queue it into
-            # the synthesis-owned failed_attempts store for an idle revisit (replaces
-            # the old "P9 enqueue pending" stub). The NEGATIVE reward already fired.
+        elif not solved and verifiable:
+            # A NEW *verifiable* autonomous failure the corrector couldn't solve → queue
+            # it into the synthesis-owned failed_attempts store for an idle revisit
+            # (replaces the old "P9 enqueue pending" stub). The NEGATIVE reward already
+            # fired. NON-verifiable (open-ended) failures are NOT enqueued — there is no
+            # "solve" to revisit, which is what caused P9's perpetual pending→abandon.
             intent_seed = {k: intent.get(k) for k in (
                 "posture", "source_layer", "source_dims", "deficit_values")
                 if isinstance(intent, dict) and intent.get(k) is not None}
