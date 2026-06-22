@@ -78,8 +78,11 @@ BOOT_DRIVER_PARITY: list[tuple[str, str]] = [
     ("meta_wisdom", "meta_wisdom"),
     ("meta_autoencoder", "meta_autoencoder"),
     # Memory engines used by Tier 1 SPEAK + ExperienceOrchestrator:
-    ("ex_mem", "ex_mem"),
-    ("e_mem", DRIVER_PASSIVE),  # Backing store consumed by exp_orchestrator
+    # NOTE: `ex_mem` was retired/superseded by ExperienceOrchestrator (RFP §2,
+    # Phase 15 chunk 15.1) and is no longer booted into state_refs — its stale
+    # parity entry (which had been failing since the retirement) is removed.
+    ("e_mem", "e_mem"),  # now actively read in _drive_one_epoch via the D6 waking-
+                         # dream recall (RFP_phase_c_actr_memory_rehoming §4.2)
     # ── Block F (2026-05-10): pre-D8 audit Track 1 migrations ──────
     # prediction_engine REMOVED from this list 2026-05-12 (Track 2
     # drift correction commit B8 per rFP_phase_c_self_improvement_subsystem_migration

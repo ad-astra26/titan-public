@@ -1443,6 +1443,35 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                         except Exception as _wl_err:
                             logger.debug("[CognitiveWorker] active_word attend "
                                          "raised: %s", _wl_err)
+                        # dream_context (RFP_phase_c §4.2, port of spirit_worker
+                        # L9076): on word-learning, recall the dream insight most
+                        # resonant with the current felt-state and, if strong
+                        # (sig>0.6), pin it as `dream_context` — the word's dream
+                        # resonance. e_mem in-proc; never breaks the handler.
+                        _wl_em = state_refs.get("e_mem")
+                        if _wl_em is not None:
+                            try:
+                                _wl_sv = list((state_refs.get(
+                                    "consciousness", {}) or {}).get(
+                                    "latest_epoch", {}).get(
+                                    "state_vector", []) or [])
+                                _wl_sl = 130 if len(_wl_sv) >= 130 else (
+                                    65 if len(_wl_sv) >= 65 else 0)
+                                if _wl_sl:
+                                    _wl_rec = _wl_em.recall_by_state(
+                                        _wl_sv[:_wl_sl], top_k=1)
+                                    if (_wl_rec and float(_wl_rec[0].get(
+                                            "significance", 0) or 0) > 0.6):
+                                        _wl_wm.attend(
+                                            "dream_context",
+                                            f"Dream resonance with '{_wl_word}'",
+                                            {"dream_id": _wl_rec[0].get("id"),
+                                             "significance":
+                                                 _wl_rec[0].get("significance")},
+                                            _wl_ep)
+                            except Exception as _wl_dc_err:
+                                logger.debug("[CognitiveWorker] dream_context "
+                                             "recall raised: %s", _wl_dc_err)
 
             elif msg_type == bus.MEMORY_RECALL_PERTURBATION:
                 # Phase D (D-SPEC-116) — i_depth + working_mem legs of the recall
@@ -5414,6 +5443,62 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                 "metric": _ep_drift,
                 "epoch_id": int(epoch_id or 0),
             })
+
+    # ── D6: Waking-Dream Recall ──────────────────────────────────────────
+    # RFP_phase_c_actr_memory_rehoming §4.2 — faithful port of the dropped
+    # spirit_worker D6 block (L5324-5375). During WAKING cognition, recall the
+    # experiential (dream-distilled) insights resonant with the current felt-state
+    # and pin the significant ones to working memory as `dream_recall`; if a
+    # REFLECTION program fired recently, bookmark the strongest recent insights
+    # (D6-D). e_mem is written LIVE via store_insight (experience_orchestrator
+    # confidence>0.5 + inner_coordinator on dream_end) — NOT frozen — so
+    # recall_by_state has data. In-proc (e_mem + working_mem + consciousness all in
+    # cognitive_worker); `_epoch_is_dreaming` already resolved (`:3172`). Never raises.
+    _d6_emem = state_refs.get("e_mem")
+    if (_d6_emem is not None and not _epoch_is_dreaming
+            and working_mem is not None and latest):
+        try:
+            _d6_sv = latest.get("state_vector", []) or []
+            if hasattr(_d6_sv, "to_list"):
+                _d6_sv = _d6_sv.to_list()
+            _d6_sv = list(_d6_sv) if _d6_sv else []
+            _d6_slice = 130 if len(_d6_sv) >= 130 else (
+                65 if len(_d6_sv) >= 65 else 0)
+            if _d6_slice:
+                _d6_recalled = _d6_emem.recall_by_state(
+                    _d6_sv[:_d6_slice], top_k=2)
+                for _d6_r in (_d6_recalled or []):
+                    if float(_d6_r.get("significance", 0) or 0) > 0.5:
+                        working_mem.attend(
+                            "dream_recall",
+                            f"Dream insight: {_d6_r.get('id', '?')}",
+                            {"significance": _d6_r.get("significance"),
+                             "dream_cycle": _d6_r.get("dream_cycle", 0)},
+                            epoch_id)
+                # D6-D: REFLECTION bookmarking (e_mem write). Current
+                # bookmark_insight signature is (insight_id, reason_tensor=...) —
+                # the old `reason=` kwarg was dropped, so it is NOT passed.
+                _d6_refl = False
+                _d6_nns = state_refs.get("neural_nervous_system")
+                if _d6_nns is not None:
+                    try:
+                        _d6_refl = any(
+                            s.get("program") == "REFLECTION"
+                            for s in (_d6_nns.get_recent_signals() or []))
+                    except Exception:
+                        _d6_refl = False
+                if _d6_refl:
+                    for _d6_d in (_d6_emem.recall_by_recency(limit=5) or []):
+                        if float(_d6_d.get("significance", 0) or 0) > 0.7:
+                            try:
+                                _d6_emem.bookmark_insight(
+                                    _d6_d["id"],
+                                    reason_tensor=_d6_sv[:_d6_slice])
+                            except Exception:
+                                pass
+        except Exception as _d6_err:
+            logger.debug(
+                "[CognitiveWorker] D6 waking-recall raised: %s", _d6_err)
 
     # prediction_engine driver REMOVED — Track 2 drift correction (rFP §2.C
     # + commit B8). PredictionEngine now lives in self_reflection_worker;
