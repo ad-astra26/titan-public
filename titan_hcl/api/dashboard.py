@@ -1405,6 +1405,117 @@ async def titan_vm_diagnostics(request: Request):
         return _error(str(e))
 
 
+# RFP_worker_telemetry §7.D / §1.2 step 10 — Observatory-facing JSON summary of a
+# heavy worker's bottleneck telemetry (the same data `analyze_worker_telemetry.py`
+# prints). Read-only over the per-worker SQLite-WAL DB; the worker is whitelisted
+# so the path param can never read an arbitrary file.
+_TELEMETRY_WORKERS = ("synthesis", "agno")
+
+
+@router.get("/v6/system/telemetry/{worker}")
+async def worker_telemetry_summary(worker: str, request: Request,
+                                   since: float | None = None):
+    """Bottleneck telemetry summary for a heavy worker (synthesis|agno):
+    top ops by total time, per-feature strain, the RssAnon trend + latest
+    component sizes, recent restarts, and freeze-dump count. `?since=<seconds>`
+    windows to the last N seconds. Read-only; never touches the worker."""
+    import os as _os
+    import sqlite3 as _sql
+    import time as _t
+    if worker not in _TELEMETRY_WORKERS:
+        return _error(f"unknown telemetry worker '{worker}' "
+                      f"(expected one of {_TELEMETRY_WORKERS})", code=404)
+    db = _os.path.join("data", f"telemetry_{worker}.db")
+    if not _os.path.exists(db):
+        return _error(f"telemetry DB not found: {db} "
+                      f"(worker may not have run yet)", code=404)
+    _w = (f"AND ts >= {_t.time() - float(since)}" if since else "")
+    try:
+        conn = _sql.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+        conn.row_factory = _sql.Row
+        try:
+            def _pct(vals, p):
+                if not vals:
+                    return 0.0
+                s = sorted(vals)
+                k = max(0, min(len(s) - 1,
+                               int(round((p / 100.0) * (len(s) - 1)))))
+                return s[k]
+            op_rows = conn.execute(
+                f"SELECT op, feature, duration_ms, stall FROM op_events "
+                f"WHERE 1=1 {_w}").fetchall()
+            by_op: dict = {}
+            for r in op_rows:
+                d = by_op.setdefault(r["op"], {"feature": r["feature"],
+                                               "durs": [], "stalls": 0})
+                d["durs"].append(r["duration_ms"] or 0.0)
+                d["stalls"] += int(r["stall"] or 0)
+            top_ops = sorted(
+                ({"op": op, "feature": d["feature"], "n": len(d["durs"]),
+                  "total_ms": round(sum(d["durs"]), 1),
+                  "p99_ms": round(_pct(d["durs"], 99), 1),
+                  "max_ms": round(max(d["durs"]), 1), "stalls": d["stalls"]}
+                 for op, d in by_op.items()),
+                key=lambda x: x["total_ms"], reverse=True)[:25]
+            feats: dict = {}
+            for r in op_rows:
+                f = r["feature"] or "(none)"
+                d = feats.setdefault(f, {"total_ms": 0.0, "stall_ms": 0.0,
+                                         "stalls": 0, "n": 0})
+                dur = r["duration_ms"] or 0.0
+                d["total_ms"] += dur
+                d["n"] += 1
+                if r["stall"]:
+                    d["stalls"] += 1
+                    d["stall_ms"] += dur
+            by_feature = sorted(
+                ({"feature": f, "n": d["n"],
+                  "total_ms": round(d["total_ms"], 1), "stalls": d["stalls"],
+                  "stall_ms": round(d["stall_ms"], 1)}
+                 for f, d in feats.items()),
+                key=lambda x: x["total_ms"], reverse=True)
+            mrows = conn.execute(
+                f"SELECT ts, rss_anon_mb, vmrss_mb, sizes_json FROM "
+                f"memory_samples WHERE 1=1 {_w} ORDER BY ts").fetchall()
+            memory = None
+            if mrows:
+                first, last = mrows[0], mrows[-1]
+                memory = {
+                    "samples": len(mrows),
+                    "rss_anon_first_mb": round(first["rss_anon_mb"], 1),
+                    "rss_anon_last_mb": round(last["rss_anon_mb"], 1),
+                    "rss_anon_delta_mb": round(
+                        last["rss_anon_mb"] - first["rss_anon_mb"], 1),
+                    "rss_anon_peak_mb": round(
+                        max(r["rss_anon_mb"] for r in mrows), 1),
+                    "vmrss_last_mb": round(last["vmrss_mb"], 1),
+                    "sizes_latest": last["sizes_json"],
+                }
+            restarts = [
+                {"ts": r["ts"], "reason": r["reason"],
+                 "prev_uptime_s": round(r["prev_uptime_s"], 1)}
+                for r in conn.execute(
+                    f"SELECT ts, reason, prev_uptime_s FROM restart_events "
+                    f"WHERE 1=1 {_w} ORDER BY ts DESC LIMIT 10").fetchall()]
+            freeze_row = conn.execute(
+                f"SELECT COUNT(*) c, MAX(ts) m FROM freeze_dumps "
+                f"WHERE 1=1 {_w}").fetchone()
+            return _ok({
+                "worker": worker, "db": db,
+                "op_event_count": len(op_rows),
+                "top_ops": top_ops,
+                "by_feature": by_feature,
+                "memory": memory,
+                "restarts": restarts,
+                "freeze_dumps": {"count": int(freeze_row["c"] or 0),
+                                 "latest_ts": freeze_row["m"]},
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        return _error(f"telemetry read failed: {e}")
+
+
 async def metabolism_evaluate_gate(
     request: Request,
     feature: str,
