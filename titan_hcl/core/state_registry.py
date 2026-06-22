@@ -818,6 +818,32 @@ INNER_SELF_INSIGHT = RegistrySpec(
     variable_size=True,
 )
 
+# Self-reflection diagnostics surface (2026-06-22) — completes the Track-2
+# read-side migration that left /v6/cognition/self-reflection reading an empty
+# coordinator under l0_rust_enabled=true (the SelfReasoningEngine itself was
+# always alive). G21 single-writer = self_reflection_worker (writes
+# SelfReasoningEngine.get_stats() each 2.5s publish cycle). Reader = api
+# StateAccessor.spirit._shm → dashboard get_v4_self_reflection. Variable
+# msgpack ≤4096B (typical ≈400-600B). Mirrors meta_teacher_state.bin precedent.
+SELF_REFLECTION_STATE = RegistrySpec(
+    name="self_reflection_state",
+    dtype=np.dtype("u1"),
+    shape=(4096,),
+    schema_version=1,
+    variable_size=True,
+)
+
+# CodingExplorer diagnostics surface (2026-06-22) — same Track-2 read-side
+# completion for /v6/cognition/coding-explorer. G21 single-writer =
+# self_reflection_worker (CodingExplorer.get_stats() each 5s publish cycle).
+CODING_EXPLORER_STATE = RegistrySpec(
+    name="coding_explorer_state",
+    dtype=np.dtype("u1"),
+    shape=(4096,),
+    schema_version=1,
+    variable_size=True,
+)
+
 # Identity — L0 owned.
 IDENTITY = RegistrySpec(
     name="identity",

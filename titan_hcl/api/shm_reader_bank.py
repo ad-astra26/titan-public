@@ -31,6 +31,7 @@ import numpy as np
 
 from titan_hcl.core.state_registry import (
     CHI_STATE,
+    CODING_EXPLORER_STATE,
     EPOCH_COUNTER,
     HORMONAL_STATE,
     IDENTITY,
@@ -38,6 +39,7 @@ from titan_hcl.core.state_registry import (
     INNER_MIND_15D,
     INNER_SELF_INSIGHT,
     INNER_SPIRIT_45D,
+    SELF_REFLECTION_STATE,
     NEUROMOD_STATE,
     OUTER_BODY_5D,
     OUTER_MIND_15D,
@@ -312,6 +314,9 @@ class ShmReaderBank:
         # Each slot has one canonical producer (G21).
         "_soul_state", "_cgn_engine_state",
         "_reasoning_state", "_meta_reasoning_state", "_meta_teacher_state",
+        # 2026-06-22 — diagnostics read-side for /v6/cognition/{self-reflection,
+        # coding-explorer}; writer = self_reflection_worker (G21).
+        "_self_reflection_state", "_coding_explorer_state",
         "_experience_stats",
         "_guardian_state", "_llm_state", "_media_state", "_msl_state",
         "_consciousness_age",
@@ -472,6 +477,12 @@ class ShmReaderBank:
             META_REASONING_STATE_SPEC, self.shm_root)
         self._meta_teacher_state = StateRegistryReader(
             META_TEACHER_STATE_SPEC, self.shm_root)
+        # 2026-06-22 — self_reflection_worker diagnostics slots (Track-2
+        # read-side completion). Writer = self_reflection_worker (G21).
+        self._self_reflection_state = StateRegistryReader(
+            SELF_REFLECTION_STATE, self.shm_root)
+        self._coding_explorer_state = StateRegistryReader(
+            CODING_EXPLORER_STATE, self.shm_root)
         # §3L Phase 15 chunk 15.1 (D-SPEC-PHASE15) — experience_stats.bin
         # reader. Writer is cognitive_worker (G21 single-writer;
         # ExperienceOrchestrator instance). Replaces the retired
@@ -1357,6 +1368,20 @@ class ShmReaderBank:
         output. Producer: cognitive_worker."""
         return self._read_msgpack_variable(
             self._meta_teacher_state, "meta_teacher_state")
+
+    def read_self_reflection_state(self) -> dict[str, Any] | None:
+        """SelfReasoningEngine.get_stats() snapshot — {titan_id, stats,
+        last_dream_state, ts}. Producer: self_reflection_worker (G21). Backs
+        /v6/cognition/self-reflection (2026-06-22 Track-2 read-side completion)."""
+        return self._read_msgpack_variable(
+            self._self_reflection_state, "self_reflection_state")
+
+    def read_coding_explorer_state(self) -> dict[str, Any] | None:
+        """CodingExplorer.get_stats() snapshot — {titan_id, stats,
+        sandbox_disabled, sandbox_last_status, ts}. Producer:
+        self_reflection_worker (G21). Backs /v6/cognition/coding-explorer."""
+        return self._read_msgpack_variable(
+            self._coding_explorer_state, "coding_explorer_state")
 
     def read_experience_stats(self) -> dict[str, Any] | None:
         """ExperienceStatsPublisher payload — total_records, undistilled,

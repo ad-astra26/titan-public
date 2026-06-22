@@ -1430,7 +1430,11 @@ async def worker_telemetry_summary(worker: str, request: Request,
         return _error(f"telemetry DB not found: {db} "
                       f"(worker may not have run yet)", code=404)
     _w = (f"AND ts >= {_t.time() - float(since)}" if since else "")
-    try:
+
+    def _read():
+        # Sync sqlite read body — run via asyncio.to_thread so it never blocks
+        # the FastAPI event loop (pre-commit async-block gate). Returns the
+        # payload dict; raises on read failure (handled by the caller).
         conn = _sql.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
         conn.row_factory = _sql.Row
         try:
@@ -1500,7 +1504,7 @@ async def worker_telemetry_summary(worker: str, request: Request,
             freeze_row = conn.execute(
                 f"SELECT COUNT(*) c, MAX(ts) m FROM freeze_dumps "
                 f"WHERE 1=1 {_w}").fetchone()
-            return _ok({
+            return {
                 "worker": worker, "db": db,
                 "op_event_count": len(op_rows),
                 "top_ops": top_ops,
@@ -1509,9 +1513,12 @@ async def worker_telemetry_summary(worker: str, request: Request,
                 "restarts": restarts,
                 "freeze_dumps": {"count": int(freeze_row["c"] or 0),
                                  "latest_ts": freeze_row["m"]},
-            })
+            }
         finally:
             conn.close()
+
+    try:
+        return _ok(await asyncio.to_thread(_read))
     except Exception as e:
         return _error(f"telemetry read failed: {e}")
 
@@ -1735,7 +1742,19 @@ async def get_v4_self_reflection(request: Request):
     titan_state = _get_plugin(request)
     plugin = titan_state  # backward-compat alias
     try:
+        # SHM-first (2026-06-22) — self_reflection_worker writes
+        # SelfReasoningEngine.get_stats() to self_reflection_state.bin each
+        # 2.5s publish cycle (G21). Completes the Track-2 read-side migration;
+        # previously `live` was hardcoded None → empty coordinator under
+        # l0_rust_enabled=true → perma "not yet initialized" despite the engine
+        # being fully alive.
         live = None
+        try:
+            spirit = titan_state.spirit
+            if spirit is not None and hasattr(spirit, "_shm"):
+                live = spirit._shm.read_self_reflection_state()
+        except Exception:  # noqa: BLE001 — SHM cold/miss falls through
+            live = None
         if live:
             payload = live.get("stats") if isinstance(live, dict) else None
             if payload:
@@ -1767,7 +1786,16 @@ async def get_v4_coding_explorer(request: Request):
     titan_state = _get_plugin(request)
     plugin = titan_state  # backward-compat alias
     try:
+        # SHM-first (2026-06-22) — self_reflection_worker writes
+        # CodingExplorer.get_stats() to coding_explorer_state.bin each 5s
+        # publish cycle (G21). Completes the Track-2 read-side migration.
         live = None
+        try:
+            spirit = titan_state.spirit
+            if spirit is not None and hasattr(spirit, "_shm"):
+                live = spirit._shm.read_coding_explorer_state()
+        except Exception:  # noqa: BLE001 — SHM cold/miss falls through
+            live = None
         if live:
             payload = live.get("stats") if isinstance(live, dict) else None
             if payload:

@@ -1048,6 +1048,53 @@ def _get_or_init_inner_self_insight_writer(state_refs: dict):
         return None
 
 
+def _get_or_init_diag_writer(state_refs: dict, spec, ref_key: str):
+    """Lazy-init a StateRegistryWriter for a diagnostics slot (2026-06-22 —
+    self_reflection_state.bin / coding_explorer_state.bin). Completes the
+    Track-2 read-side migration so /v6/cognition/{self-reflection,coding-explorer}
+    surface the live engine stats via SHM (canonical, G18/G21) instead of the
+    empty coordinator. Returns the writer or None on init failure (caller still
+    publishes the legacy bus event so no regression on init failure)."""
+    if ref_key in state_refs:
+        return state_refs[ref_key]
+    try:
+        from titan_hcl.core.state_registry import (
+            StateRegistryWriter, resolve_shm_root, resolve_titan_id,
+        )
+        writer = StateRegistryWriter(spec, resolve_shm_root(resolve_titan_id()))
+        state_refs[ref_key] = writer
+        state_refs[ref_key + "_errs"] = 0
+        logger.info(
+            "[SelfReflectionWorker] %s writer attached (diagnostics SHM slot, "
+            "2026-06-22 Track-2 read-side completion)", spec.name)
+        return writer
+    except Exception as e:
+        logger.warning(
+            "[SelfReflectionWorker] %s writer init failed: %s — SHM diag "
+            "write disabled this run", getattr(spec, "name", "?"), e,
+            exc_info=True)
+        state_refs[ref_key] = None
+        return None
+
+
+def _write_diag_slot(state_refs: dict, spec, ref_key: str, payload: dict) -> None:
+    """Write a diagnostics payload dict to its variable msgpack SHM slot.
+    Best-effort: SHM-write failure never breaks the legacy bus publish."""
+    writer = _get_or_init_diag_writer(state_refs, spec, ref_key)
+    if writer is None:
+        return
+    try:
+        import msgpack
+        writer.write_variable(msgpack.packb(payload, use_bin_type=True))
+    except Exception as e:  # noqa: BLE001
+        n = state_refs.get(ref_key + "_errs", 0) + 1
+        state_refs[ref_key + "_errs"] = n
+        if n % 100 == 1:
+            logger.warning(
+                "[SelfReflectionWorker] %s SHM write failed (#%d): %s",
+                getattr(spec, "name", "?"), n, e)
+
+
 def _handle_meta_introspect_request(payload: dict, state_refs: dict,
                                       name: str, send_queue=None) -> None:
     """rFP_meta_reasoning_self_reasoning_resolver_migration / SPEC §9.B
@@ -1831,12 +1878,18 @@ def _publish_self_reflection_stats(state_refs: dict, send_queue, name: str,
         logger.debug(
             "[SelfReflectionWorker] self_reasoning.get_stats failed: %s", e)
         return
-    _send_msg(send_queue, bus.SELF_REFLECTION_STATS_UPDATED, name, "all", {
+    payload = {
         "titan_id": titan_id,
         "stats": stats,
         "last_dream_state": state_refs.get("_last_dream_state"),
         "ts": time.time(),
-    })
+    }
+    _send_msg(send_queue, bus.SELF_REFLECTION_STATS_UPDATED, name, "all", payload)
+    # Canonical SHM read-side (2026-06-22) — completes the Track-2 migration so
+    # the api StateAccessor surfaces this via spirit._shm.read_self_reflection_state().
+    from titan_hcl.core.state_registry import SELF_REFLECTION_STATE
+    _write_diag_slot(state_refs, SELF_REFLECTION_STATE,
+                     "_self_reflection_state_writer", payload)
 
 
 def _publish_coding_explorer_stats(state_refs: dict, send_queue, name: str,
@@ -1851,13 +1904,17 @@ def _publish_coding_explorer_stats(state_refs: dict, send_queue, name: str,
         logger.debug(
             "[SelfReflectionWorker] coding_explorer.get_stats failed: %s", e)
         return
-    _send_msg(send_queue, bus.CODING_EXPLORER_STATS_UPDATED, name, "all", {
+    payload = {
         "titan_id": titan_id,
         "stats": stats,
         "sandbox_disabled": state_refs.get("_sandbox_disabled", False),
         "sandbox_last_status": state_refs.get("_sandbox_last_status"),
         "ts": time.time(),
-    })
+    }
+    _send_msg(send_queue, bus.CODING_EXPLORER_STATS_UPDATED, name, "all", payload)
+    from titan_hcl.core.state_registry import CODING_EXPLORER_STATE
+    _write_diag_slot(state_refs, CODING_EXPLORER_STATE,
+                     "_coding_explorer_state_writer", payload)
 
 
 def _publish_prediction_stats(state_refs: dict, send_queue, name: str,
