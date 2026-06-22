@@ -72,14 +72,9 @@ class KernelView(Protocol):
         """
         ...
 
-    @property
-    def state_register(self) -> object:
-        """StateRegister instance — legacy in-process state buffer.
-
-        Read path for subsystems that haven't yet migrated to the shm
-        RegistryBank. Will be deprecated once all readers use shm.
-        """
-        ...
+    # state_register property RETIRED — RFP_g18 §7.B (2026-06-22). The legacy
+    # in-process state buffer is no longer instantiated by the kernel; trinity
+    # STATE is read from SHM (the RegistryBank / ShmReaderBank component slots).
 
     @property
     def registry_bank(self) -> object:

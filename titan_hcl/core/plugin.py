@@ -199,9 +199,9 @@ class TitanHCL:
     def guardian(self):
         return self.kernel.guardian
 
-    @property
-    def state_register(self):
-        return self.kernel.state_register
+    # state_register property RETIRED — RFP_g18 §7.B (2026-06-22). Trinity STATE
+    # is read from SHM (ShmReaderBank); getattr(plugin, "state_register", None)
+    # now returns None for the few remaining getattr-safe legacy readers.
 
     @property
     def registry_bank(self):

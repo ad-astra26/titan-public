@@ -122,7 +122,8 @@ class WorkerPlugin:
         # SHM reads or bus.QUERY. For C2, leave None — hooks degrade
         # gracefully. Wiring these is a Chunk-K post-C2 optimization.
         self.reflex_collector: Any = None
-        self.state_register: Any = None
+        # state_register RETIRED (RFP_g18 §7.B) — getattr(self, "state_register",
+        # None) returns None; reflex/felt readers already degrade gracefully.
 
     # ────────────────────────────────────────────────────────────────
     # Bus-callable proxies (lazy property accessors)

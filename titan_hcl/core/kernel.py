@@ -493,22 +493,18 @@ class TitanKernel:
         # routing unchanged; worker registration in plugin.py provides the
         # subscriber name match.
 
-        # ── StateRegister (real-time state buffer) ──────────────────
-        from titan_hcl.logic.state_register import StateRegister
-        self.state_register = StateRegister()
-        # Phase D (D-SPEC-116): the STATE_SNAPSHOT snapshot-publish loop (and its
-        # spirit_enrichment.micro_tick_interval knob) was retired with
-        # spirit_worker; StateRegister now only maintains the real-time buffer
-        # the kernel reads for TITAN_SELF topology composition.
-        self.state_register.start(self.bus)
+        # ── StateRegister RETIRED — RFP_g18 §7.B / D-SPEC-162 (2026-06-22) ──
+        # The legacy v3/v4-era real-time state buffer (bus-subscribed BODY/MIND/
+        # SPIRIT_STATE → tensor cache) is retired: under rust-L0, trinity STATE is
+        # read from SHM (ShmReaderBank / the 6 component slots) — nothing read its
+        # data (the old "kernel reads for TITAN_SELF topology" comment was STALE;
+        # TITAN_SELF is composed from SHM), and its bus-subscribe was the last
+        # consumer keeping the BODY/MIND/SPIRIT_STATE broadcast alive (unblocks §7.D).
 
         # ── Microkernel v2 Phase A §A.2 — StateRegistry bank (shm) ──
-        # Owns writers/readers for /dev/shm/titan_{titan_id}/*.bin.
-        # Writers are populated by background threads reading from
-        # state_register (this process) and spirit_worker (subprocess).
-        # Feature-gated via [microkernel] flags in titan_params.toml;
-        # all default false so the shm path is byte-identical to the
-        # legacy path until Maker flips a flag.
+        # Owns writers/readers for /dev/shm/titan_{titan_id}/*.bin. Under rust-L0
+        # the Rust trinity daemons are the single-writers of the trinity slots
+        # (G21 / G-RPC-5b); this bank serves the Python-side READERS.
         #
         # titan_id resolution follows the canonical precedence chain
         # (data/titan_identity.json → TITAN_ID env → "T1") via

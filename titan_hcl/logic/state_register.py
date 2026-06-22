@@ -1,6 +1,15 @@
 """
 OuterState (formerly StateRegister) — Real-time state buffer for the Titan Trinity.
 
+⚠️ RETIRED AS A LIVE COMPONENT — RFP_g18 §7.B / D-SPEC-162 (2026-06-22).
+The kernel no longer instantiates StateRegister or calls .start() — its
+bus-subscribe to BODY/MIND/SPIRIT_STATE (the last consumer keeping that
+high-rate broadcast alive) is gone; under rust-L0 trinity STATE is read from
+SHM (ShmReaderBank / the 6 component slots). This class survives ONLY as the
+reflex-VM (titan_vm) data-interface + its test fixtures, where it is None in
+production. Its full deletion + repointing titan_vm's dotted-path data source
+to SHM is scoped to the v3/v4→v6 purge. Do NOT re-wire this to the bus.
+
 A thread-safe, always-current snapshot of Titan's entire cognitive state.
 Updated from DivineBus messages. Any component reads instantly — no bus
 round-trip, no queries, no waiting.

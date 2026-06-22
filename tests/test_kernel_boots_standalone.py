@@ -56,7 +56,8 @@ def test_kernel_constructs_with_wallet_path(kernel):
     # L0 infrastructure
     assert kernel.bus is not None
     assert kernel.guardian is not None
-    assert kernel.state_register is not None
+    # state_register RETIRED (RFP_g18 §7.B 2026-06-22) — kernel no longer
+    # instantiates it; trinity STATE is read from SHM (registry_bank).
     assert kernel.registry_bank is not None
     assert kernel.disk_health is not None
     assert kernel.bus_health is not None
@@ -95,7 +96,7 @@ def test_kernel_satisfies_kernelview_protocol(kernel):
 def test_kernel_exposes_all_kernelview_properties(kernel):
     """Every KernelView-declared field is reachable on the kernel instance."""
     for prop_name in [
-        "bus", "guardian", "state_register", "registry_bank",
+        "bus", "guardian", "registry_bank",  # state_register RETIRED (RFP_g18 §7.B)
         "soul", "network", "disk_health", "bus_health",
         "config", "titan_id", "limbo_mode",
     ]:
