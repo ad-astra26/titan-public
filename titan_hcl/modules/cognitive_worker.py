@@ -111,14 +111,38 @@ from titan_hcl.params import load_titan_params
 logger = logging.getLogger(__name__)
 
 # --- RFP_g18_high_rate_state_shm_migration §7.A — G-PARITY instrument -------
-# Env-gated, default OFF. When TITAN_G18_PARITY_PROBE=1, _dispatch_trinity_state
-# reads the matching SHM component slot at the instant each trinity bus event
-# arrives and logs the bus-carried tensor vs the SHM-slot tensor + slot
-# freshness. Proves INV-G18-3 (the slot carries the same tensor the bus event
-# did, AND is populated) BEFORE any consumer is cut over from bus → SHM reads.
-# No behavior change: the cached value is still the bus value; this only reads
-# SHM read-only and logs. Throttled per (type, src) to keep 70 Hz spirit sane.
-_G18_PARITY_PROBE = os.environ.get("TITAN_G18_PARITY_PROBE", "0") == "1"
+# Gated OFF by default. When enabled, _dispatch_trinity_state reads the matching
+# SHM component slot at the instant each trinity bus event arrives and logs the
+# bus-carried tensor vs the SHM-slot tensor + slot freshness. Proves INV-G18-3
+# (the slot carries the same tensor the bus event did, AND is populated) BEFORE
+# any consumer is cut over from bus → SHM reads. No behavior change: the cached
+# value is still the bus value; this only reads SHM read-only and logs.
+# Throttled per (type, src) to keep 70 Hz spirit sane.
+#
+# Gate = a marker FILE, NOT an env var: the kernel hands L2 workers a CURATED
+# env (titan-kernel-rs spawn.rs build_child_env() does env_clear() + a fixed
+# allowlist), so an arbitrary TITAN_G18_PARITY_PROBE never reaches a worker.
+# Workers DO get TITAN_DATA_DIR and run with cwd=repo-root, so the marker
+# <data_dir>/.g18_parity_probe is reliably findable. To enable on a box:
+#   touch <data_dir>/.g18_parity_probe  &&  full-restart the Titan
+# (cognitive_worker is not restart-allowlisted → full restart). The env var is
+# still honored for direct launches / offline tests.
+def _g18_parity_enabled() -> bool:
+    if os.environ.get("TITAN_G18_PARITY_PROBE", "0") == "1":
+        return True
+    for data_dir in (os.environ.get("TITAN_DATA_DIR"),
+                      os.environ.get("TITAN_KERNEL_DATA_DIR"), "data"):
+        if not data_dir:
+            continue
+        try:
+            if os.path.exists(os.path.join(data_dir, ".g18_parity_probe")):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+_G18_PARITY_PROBE = _g18_parity_enabled()
 _G18_PARITY_INTERVAL_S = float(
     os.environ.get("TITAN_G18_PARITY_INTERVAL_S", "2.0"))
 _G18_PARITY_READERS = {

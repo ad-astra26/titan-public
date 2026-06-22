@@ -107,6 +107,27 @@ def test_probe_off_is_inert(monkeypatch, caplog):
     assert refs["_inner_mind_state"] == [0.1] * 15  # cache still written
 
 
+def test_gate_env_var_enables(monkeypatch):
+    monkeypatch.setenv("TITAN_G18_PARITY_PROBE", "1")
+    assert cw._g18_parity_enabled() is True
+
+
+def test_gate_marker_file_enables(monkeypatch, tmp_path):
+    monkeypatch.delenv("TITAN_G18_PARITY_PROBE", raising=False)
+    monkeypatch.setenv("TITAN_DATA_DIR", str(tmp_path))
+    assert cw._g18_parity_enabled() is False  # no marker yet
+    (tmp_path / ".g18_parity_probe").touch()
+    assert cw._g18_parity_enabled() is True
+
+
+def test_gate_off_when_neither(monkeypatch, tmp_path):
+    monkeypatch.delenv("TITAN_G18_PARITY_PROBE", raising=False)
+    monkeypatch.setenv("TITAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("TITAN_KERNEL_DATA_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)  # cwd-relative "data" fallback also absent
+    assert cw._g18_parity_enabled() is False
+
+
 def test_missing_bank_is_safe(monkeypatch):
     monkeypatch.setattr(cw, "_G18_PARITY_PROBE", True)
     monkeypatch.setattr(cw, "_G18_PARITY_INTERVAL_S", 0.0)
