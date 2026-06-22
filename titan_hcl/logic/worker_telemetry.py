@@ -51,8 +51,13 @@ _DEFAULTS: Dict[str, Any] = {
     "flush_s": 5.0,             # flusher drain cadence
     "mem_sample_s": 30.0,       # RssAnon/VmRSS sample cadence
     "warn_ms": 5000.0,          # an op longer than this is flagged `stall=1`
-    "hb_gap_warn_ms": 20000.0,  # inter-heartbeat gap over this → HEARTBEAT_GAP row
-                                # (normal beat ≈10s; >20s = a missed beat / loop block)
+    "hb_gap_warn_ms": 50000.0,  # inter-heartbeat gap over this → HEARTBEAT_GAP row.
+                                # The heavy workers emit MODULE_HEARTBEAT every 30s
+                                # (synthesis/agno `_heartbeat_loop`), so a normal beat
+                                # is ~30s — the threshold must sit ABOVE it: >50s = a
+                                # whole beat was SKIPPED = the loop was genuinely
+                                # blocked (verified live on T1 2026-06-22: a 20s
+                                # threshold flagged every normal 30s beat as noise).
     "ring_cap": 10000,          # bounded in-mem ring (drops oldest on overflow)
     "retention_days": 7.0,      # prune op_events/memory_samples older than this
     "prune_every_flushes": 720, # ~1h at flush_s=5 — prune is not free, do it rarely
