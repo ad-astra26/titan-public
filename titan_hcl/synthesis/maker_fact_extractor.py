@@ -120,12 +120,25 @@ def maker_fact_loop(queue, maker_store, llm_fn, stop_event,
                 text = str((item or {}).get("prompt", "") or "").strip()
                 if not text or not looks_like_self_disclosure(text):
                     continue
-                for f in extract_maker_facts(text, llm_fn):
+                facts = extract_maker_facts(text, llm_fn)
+                # Observability (PII-safe — count + category only, NEVER the fact
+                # value, which is Maker PII and this runs on mainnet T1). Lets us
+                # watch the gate→extract→record pipeline fire live (BUG-MAKER-FACT-
+                # EXTRACTOR-GATE-DEAD verify, 2026-06-22).
+                logger.info(
+                    "[MakerFactExtractor] maker self-disclosure turn drained → "
+                    "%d candidate fact(s) extracted", len(facts))
+                for f in facts:
                     try:
                         maker_store.record_fact(
                             category=f["category"], value=f["value"],
                             provenance="maker-told", confidence=f["confidence"],
                             source_turn=text[:280])
+                        logger.info(
+                            "[MakerFactExtractor] recorded MakerFact "
+                            "category=%s provenance=maker-told confidence=%.2f",
+                            str(f.get("category", "")),
+                            float(f.get("confidence", 0.0) or 0.0))
                     except Exception as e:  # noqa: BLE001
                         logger.debug("[MakerFactExtractor] record_fact soft-fail: %s", e)
         except Exception as e:  # noqa: BLE001

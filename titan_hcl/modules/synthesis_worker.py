@@ -4358,6 +4358,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             and maker_fact_queue is not None):
                         maker_fact_queue.append(
                             {"prompt": str(payload.get("prompt", "") or "")})
+                        # Observability — the gate now OPENS for Maker turns (was
+                        # dead fleet-wide; BUG-MAKER-FACT-EXTRACTOR-GATE-DEAD). No
+                        # PII: logs only that a Maker turn was enqueued, not content.
+                        logger.info(
+                            "[MakerFact gate] Maker turn enqueued for fact "
+                            "extraction (is_maker=True, rid=%s)", _rid)
                 except Exception as _tr_err:
                     logger.debug("[synthesis_worker] turn record/judge-enqueue "
                                  "failed: %s", _tr_err)
