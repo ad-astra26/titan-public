@@ -1392,8 +1392,10 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                                     "consciousness", {}) or {}).get(
                                     "latest_epoch", {}).get(
                                     "state_vector", []) or [])
-                                _wl_sl = 130 if len(_wl_sv) >= 130 else (
-                                    65 if len(_wl_sv) >= 65 else 0)
+                                # 65D inner felt-tensor — matches the stored insight
+                                # dim (see D6 note); 130D would match only low-sig
+                                # rows and leave dream_context inert.
+                                _wl_sl = 65 if len(_wl_sv) >= 65 else 0
                                 if _wl_sl:
                                     _wl_rec = _wl_em.recall_by_state(
                                         _wl_sv[:_wl_sl], top_k=1)
@@ -5313,8 +5315,13 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
             if hasattr(_d6_sv, "to_list"):
                 _d6_sv = _d6_sv.to_list()
             _d6_sv = list(_d6_sv) if _d6_sv else []
-            _d6_slice = 130 if len(_d6_sv) >= 130 else (
-                65 if len(_d6_sv) >= 65 else 0)
+            # Probe the 65D INNER felt-tensor — store_insight writes felt_tensor =
+            # inner_tensor = optimal[:65] (experience_orchestrator.py:421), so the
+            # high-significance insights are 65D. The original's 130D-preference is
+            # stale against the current store (live T3 probe 2026-06-22: 130D→sig
+            # 0.11 / 65D→sig 1.0), which would leave dream_recall inert. _cosine_sim
+            # returns 0 on dim mismatch, so 65D matches the 65D rows cleanly.
+            _d6_slice = 65 if len(_d6_sv) >= 65 else 0
             if _d6_slice:
                 _d6_recalled = _d6_emem.recall_by_state(
                     _d6_sv[:_d6_slice], top_k=2)
