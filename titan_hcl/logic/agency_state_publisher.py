@@ -23,6 +23,15 @@ from titan_hcl.logic.session3_state_specs import (
     AGENCY_STATE_SPEC,
 )
 
+# The action `_history` deque holds up to 500 entries (module.py), but the
+# agency_state slot is capped at AGENCY_STATE_MAX_BYTES=8192 — sized for a
+# DIGEST of the last ~50 actions (see docstring/SPEC §7.1). Serializing all
+# 500 entries (~58B each ≈ 29KB) overflows the slot → every publish is
+# rejected oversize → the slot freezes + CRITICAL spam (BUG-AGENCY-STATE-
+# PAYLOAD-OVER-8192B, 2026-06-22). The aggregate counters below still span
+# the full deque; only this trailing window is serialized into the payload.
+_POSTURE_DIGEST_MAX = 50
+
 
 class AgencyStatePublisher(BaseStatePublisher):
     slot_name = AGENCY_STATE_SLOT
@@ -52,7 +61,9 @@ class AgencyStatePublisher(BaseStatePublisher):
         budget_per_hour = int(getattr(agency, "_budget_per_hour", 0) or 0)
         budget_remaining = max(0, budget_per_hour - llm_calls_this_hour)
 
-        # History deque — last action timestamp + posture digest of last 50
+        # History deque — aggregate counters span the FULL deque (≤500); the
+        # serialized digest is bounded to the last _POSTURE_DIGEST_MAX entries
+        # so the payload stays under AGENCY_STATE_MAX_BYTES.
         history = list(getattr(agency, "_history", []) or [])
         last_action_ts = 0.0
         posture_digest: list[dict[str, Any]] = []
@@ -62,7 +73,8 @@ class AgencyStatePublisher(BaseStatePublisher):
         now = time.time()
         cutoff_hour = now - 3600
         cutoff_day = now - 86400
-        for entry in history:
+        digest_start = max(0, len(history) - _POSTURE_DIGEST_MAX)
+        for idx, entry in enumerate(history):
             if not isinstance(entry, dict):
                 continue
             ts = float(entry.get("ts", 0) or 0)
@@ -74,12 +86,13 @@ class AgencyStatePublisher(BaseStatePublisher):
                 actions_in_day += 1
             if entry.get("success"):
                 success_count += 1
-            posture_digest.append({
-                "posture": str(entry.get("posture", "")),
-                "helper": str(entry.get("helper", "")),
-                "success": bool(entry.get("success", False)),
-                "ts": ts,
-            })
+            if idx >= digest_start:
+                posture_digest.append({
+                    "posture": str(entry.get("posture", "")),
+                    "helper": str(entry.get("helper", "")),
+                    "success": bool(entry.get("success", False)),
+                    "ts": ts,
+                })
         success_rate = (
             success_count / len(history) if history else 0.0)
 

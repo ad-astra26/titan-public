@@ -30,13 +30,11 @@ from titan_hcl.logic.base_state_publisher import (
 from titan_hcl.logic.output_verifier_state_publisher import (
     OutputVerifierStatePublisher)
 from titan_hcl.logic.reflex_state_publisher import ReflexStatePublisher
-from titan_hcl.logic.rl_state_publisher import RLStatePublisher
 from titan_hcl.logic.session3_state_specs import (
     AGENCY_STATE_SPEC,
     ASSESSMENT_STATE_SPEC,
     OUTPUT_VERIFIER_STATE_SPEC,
     REFLEX_STATE_SPEC,
-    RL_STATE_SPEC,
     SOCIAL_PERCEPTION_STATE_SPEC,
     TIMECHAIN_STATE_SPEC,
 )
@@ -230,36 +228,58 @@ def test_agency_state_cold_boot(shm_root):
     assert decoded["registered_helpers"] == []
 
 
-def test_rl_state_round_trip(shm_root):
-    pub = RLStatePublisher(titan_id="T_TEST")
+def test_agency_state_full_history_stays_under_cap(shm_root):
+    """Regression for BUG-AGENCY-STATE-PAYLOAD-OVER-8192B (2026-06-22): a full
+    500-entry `_history` deque must NOT overflow AGENCY_STATE_MAX_BYTES — the
+    serialized posture digest is bounded while the aggregate counters span the
+    full deque. Before the fix, all 500 entries were serialized (~29KB) and
+    every publish was rejected oversize, freezing the slot."""
+    from titan_hcl._phase_c_constants import AGENCY_STATE_MAX_BYTES
+    from titan_hcl.logic.agency_state_publisher import _POSTURE_DIGEST_MAX
 
-    class _Recorder:
-        buffer = list(range(100))
-        storage = list(range(50))
-        buffer_size = 50000
-        last_train_ts = 1234.5
-        training_loss_ema = 0.014
-        total_transitions = 100
+    now = time.time()
 
-    class _Gatekeeper:
-        sovereignty_score = 0.78
-        _decision_history = [{"d": i} for i in range(7)]
+    class _Reg:
+        _names = ["infra_inspect", "web_search", "art_generate",
+                  "audio_generate", "coding_sandbox", "code_knowledge",
+                  "memo_inscribe", "kin_sense"]
 
-    pub.publish(_Recorder(), _Gatekeeper())
-    decoded = _read_slot(RL_STATE_SPEC, shm_root)
-    assert decoded["buffer_len"] == 100
-    assert decoded["storage_len"] == 50
-    assert decoded["sovereignty_score"] == pytest.approx(0.78)
-    assert decoded["decision_history_len"] == 7
-    assert decoded["training_loss_ema"] == pytest.approx(0.014)
+        def list_all_names(self):
+            return list(self._names)
 
+        def get_all_statuses(self):
+            return {n: "ready" for n in self._names}
 
-def test_rl_state_cold_boot(shm_root):
-    pub = RLStatePublisher(titan_id="T_TEST")
-    pub.publish(None, None)
-    decoded = _read_slot(RL_STATE_SPEC, shm_root)
-    assert decoded["buffer_len"] == 0
-    assert decoded["sovereignty_score"] == 0.0
+    class _Agency:
+        _action_counter = 12345
+        _llm_calls_this_hour = 7
+        _budget_per_hour = 20
+        _registry = _Reg()
+        # Full deque of realistic entries — pre-fix this serialized to ~29KB.
+        _history = [
+            {"posture": "curious_exploration", "helper": "web_search",
+             "success": bool(i % 2), "ts": now - i * 7.0}
+            for i in range(500)
+        ]
+
+    pub = AgencyStatePublisher(titan_id="T_TEST")
+    payload = pub._compute_payload(_Agency())
+    encoded = msgpack.packb(payload, use_bin_type=True)
+
+    # The slot fits — no oversize rejection.
+    assert len(encoded) <= AGENCY_STATE_MAX_BYTES
+    # Digest is windowed to the trailing _POSTURE_DIGEST_MAX entries.
+    assert len(payload["posture_history_digest"]) == _POSTURE_DIGEST_MAX
+    # But aggregate counters still span the FULL 500-entry deque.
+    assert payload["total_actions"] == 12345
+    assert payload["actions_this_day"] == 500
+    assert payload["success_rate"] == pytest.approx(250 / 500)
+
+    # Round-trips through SHM cleanly (the publish actually succeeds now).
+    pub.publish(_Agency())
+    decoded = _read_slot(AGENCY_STATE_SPEC, shm_root)
+    assert decoded["total_actions"] == 12345
+    assert len(decoded["posture_history_digest"]) == _POSTURE_DIGEST_MAX
 
 
 def test_timechain_state_round_trip(shm_root):
@@ -319,21 +339,44 @@ def test_reflex_state_cold_boot(shm_root):
     assert decoded["reflex_count"] == 0
 
 
-def test_social_perception_state_round_trip(shm_root):
+def test_social_perception_state_round_trip(shm_root, tmp_path, monkeypatch):
+    """D-SPEC-89 (2026-05-18): sentiment fields come from the
+    `events_teacher.db.felt_experiences` table, NOT `inner_state.observables`
+    (the old observables path was a dead end → sentiment_ema=0 fleet-wide).
+    Seed a temp DB and assert the [-1,1]→[0,1] sentiment mapping + derived
+    rates."""
+    import sqlite3
+    import titan_hcl.logic.social_perception_state_publisher as sp_mod
+
+    # The publisher resolves the DB relative to its own module file:
+    #   dirname(__file__)/../../data/events_teacher.db
+    # Redirect that module dir to a tmp tree so we never touch a live DB.
+    fake_logic_dir = tmp_path / "titan_hcl" / "logic"
+    fake_logic_dir.mkdir(parents=True)
+    monkeypatch.setattr(sp_mod, "__file__",
+                        str(fake_logic_dir / "social_perception_state_publisher.py"))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "events_teacher.db"
+
+    now = time.time()
+    con = sqlite3.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE felt_experiences (sentiment REAL, arousal REAL, "
+        "relevance REAL, created_at REAL, contagion_type TEXT)")
+    # avg(sentiment)=0.3 → (0.3+1)/2 = 0.65; two rows inside the 24h window.
+    con.executemany(
+        "INSERT INTO felt_experiences (sentiment, created_at) VALUES (?, ?)",
+        [(0.2, now - 100), (0.4, now - 200)])
+    con.commit()
+    con.close()
+
     pub = SocialPerceptionStatePublisher(titan_id="T_TEST")
-
-    class _Inner:
-        observables = {
-            "sentiment_ema": 0.65, "interaction_rate": 0.42,
-            "social_activity": 0.58, "last_interaction_ts": 1234.0,
-        }
-
-    state_refs = {"inner_state": _Inner()}
-    pub.publish(state_refs)
+    pub.publish({})
     decoded = _read_slot(SOCIAL_PERCEPTION_STATE_SPEC, shm_root)
     assert decoded["sentiment_ema"] == pytest.approx(0.65)
-    assert decoded["interaction_rate"] == pytest.approx(0.42)
-    assert decoded["social_activity"] == pytest.approx(0.58)
+    assert decoded["interaction_rate"] == pytest.approx(2 / 24.0)
+    assert decoded["social_activity"] == pytest.approx(2 / 50.0)
 
 
 def test_social_perception_state_cold_boot(shm_root):
