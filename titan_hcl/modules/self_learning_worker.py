@@ -2135,18 +2135,47 @@ class _IntrospectionRoutine:
             pass
         # Local refractory (INV-IT-9) — no body write in v1 (Q6)
         self.drive.record_outcome(win=(r > 0.0), reward=r)
-        # Phase C SELF anchor hook (set by the worker when Phase C is wired)
-        if self._anchor is not None:
-            try:
-                self._anchor(pending, rk, readout)
-            except Exception:  # noqa: BLE001
-                pass
+        # Phase C — SELF anchor (one-way MEMORY_MEMPOOL_ADD; memory_worker
+        # promotes domain="self" at the dream boundary).
+        try:
+            self._emit_self_anchor(pending, stance, rk, readout)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[inner_turn] self-anchor soft-fail: %s", e)
         logger.info("[inner_turn] verify gp=%d stance=%d r=%.3f (e_d=%.3f e_Δ=%.3f) "
                     "level=%.3f grade=%d theta=%.3f", pending["gp_count"], stance, r,
                     rk["e_descr"], rk["e_delta"], readout["level"], readout["grade"],
                     self.drive.theta)
 
-    _anchor = None    # Phase C sets a callable(pending, rk, readout)
+    def _emit_self_anchor(self, pending, stance, rk, readout) -> None:
+        """Phase C / INV-IT-5 — persist the introspective episode to the SELF node
+        via the G19-safe one-way MEMORY_MEMPOOL_ADD event (NOT a direct
+        add_to_mempool call). memory_worker promotes it to domain="self" at the
+        dream boundary (the soul_diary path; consolidation_defaults self rule)."""
+        from titan_hcl.synthesis.inner_introspection import INNER_STANCES
+        stance_name = INNER_STANCES[int(stance) % len(INNER_STANCES)]
+        accurate = rk["reward"] > 0.0
+        narration = (pending.get("narration") or "").strip()
+        felt = "a coherent" if accurate else "a dissonant"
+        body = (narration + ("\n\n" if narration else "")
+                + f"I turned inward through my {stance_name}, and found {felt} "
+                  f"reading of myself — my self-prediction scored {rk['reward']:.2f} "
+                  f"(now-error {rk['e_descr']:.2f}, change-error {rk['e_delta']:.2f}). "
+                  f"My self-knowledge sits at level {readout['level']:.2f}.")
+        try:
+            self.send_queue.put({
+                "type": bus.MEMORY_MEMPOOL_ADD, "src": self.name, "dst": "memory",
+                "ts": time.time(),
+                "payload": {
+                    "user_prompt": f"An inner turn — introspection on my {stance_name}",
+                    "agent_response": body,
+                    "user_identifier": "Titan",
+                    "source": "inner_turn",
+                    "tags": ["inner_turn", "introspection", f"stance:{stance_name}",
+                             "domain:self"],
+                },
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[inner_turn] MEMORY_MEMPOOL_ADD put soft-fail: %s", e)
 
     def _maybe_persist(self) -> None:
         self._since_persist += 1

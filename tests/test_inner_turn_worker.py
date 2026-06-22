@@ -153,6 +153,45 @@ def test_no_fire_when_dreaming(monkeypatch):
         assert pend == 0
 
 
+def test_self_anchor_emitted_and_classified(monkeypatch):
+    """Phase C / INV-IT-5 — VERIFY emits a one-way MEMORY_MEMPOOL_ADD tagged for
+    the SELF node, and the consolidation classifier routes it to domain='self'."""
+    monkeypatch.setattr(_srb, "ShmReaderBank", _FakeBank)
+    cfg = dict(slw._DEFAULTS)
+    cfg["inner_turn_enabled"] = True
+    q = _Q()
+    with tempfile.TemporaryDirectory() as td:
+        store = slw._SelfLearningStore(path=os.path.join(td, "sl.duckdb"))
+        routine = slw._IntrospectionRoutine(
+            cfg, store, "self_learning", q, "test",
+            ensure_shm_root=lambda _t: td, StateRegistryWriter=_FakeWriter)
+        fb = _FakeBank()
+        routine.bank = fb
+        life = _FakeLife()
+        routine.tick(life, chat_active=False)            # baseline gp=0
+        fb.state = np.concatenate([np.full(5, 0.2), np.full(15, 0.3),
+                                   np.linspace(-1, 1, 45),
+                                   _seeking_neuromod()]).astype(np.float32)
+        fb.gp = 1
+        routine.tick(life, chat_active=False)            # seed
+        fb.state = np.concatenate([np.full(5, 0.25), np.full(15, 0.35),
+                                   np.linspace(-0.9, 0.9, 45),
+                                   _seeking_neuromod()]).astype(np.float32)
+        fb.gp = 2
+        routine.tick(life, chat_active=False)            # verify → anchor
+
+    anchors = [m for m in q.items if m.get("type") == "MEMORY_MEMPOOL_ADD"]
+    assert anchors, "a SELF-anchor event should be emitted on verify"
+    payload = anchors[-1]["payload"]
+    assert payload["source"] == "inner_turn"
+    assert "domain:self" in payload["tags"] and "inner_turn" in payload["tags"]
+    assert anchors[-1]["dst"] == "memory"
+
+    # the consolidation classifier routes the episode to the SELF partition.
+    from titan_hcl.synthesis.consolidation_defaults import derive_domain_hint
+    assert derive_domain_hint(payload["user_prompt"]) == "self"
+
+
 def test_disabled_flag_is_inert(monkeypatch):
     monkeypatch.setattr(_srb, "ShmReaderBank", _FakeBank)
     cfg = dict(slw._DEFAULTS)

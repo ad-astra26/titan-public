@@ -91,6 +91,7 @@ _DOMAIN_BACKFILL_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     # (Split 2026-06-10, RFP_titan_authored_soul_diary §7.P2 — `self` was lumped
     # with the interpersonal/social bucket; that conflation is now separated.)
     (("self", "soul_diary", "soul-diary", "diary", "introspect",
+      "inner_turn", "inner turn",
       "sovereignty", "self-refactor", "self-inspection"), "self"),
     # Interpersonal / social — dialogue, bonds, the people he speaks with. This
     # is where the formerly-"self"-labeled interpersonal content now routes

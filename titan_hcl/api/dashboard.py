@@ -6321,15 +6321,31 @@ async def get_v6_mastery(request: Request):
             MASTERY_LEVEL_STATE_SPEC, mastery_flat_to_readout,
         )
 
+        # The Inner Turn (RFP_introspective_inner_turn Phase D) — a SEPARATE
+        # inner-domain MasteryLevel slot. `?domain=inner` reads it; default /
+        # `outer` is byte-identical to before (G5).
+        domain = (request.query_params.get("domain") or "outer").lower()
+        if domain == "inner":
+            from titan_hcl.synthesis.inner_introspection import (
+                MASTERY_LEVEL_INNER_STATE_SPEC,
+            )
+            spec = MASTERY_LEVEL_INNER_STATE_SPEC
+            empty = "not yet published (no introspective great-pulse yet)"
+        else:
+            spec = MASTERY_LEVEL_STATE_SPEC
+            empty = "not yet published (no idle IQL pass yet)"
+
         def _read_shm():
             reader = StateRegistryReader(
-                MASTERY_LEVEL_STATE_SPEC, ensure_shm_root(resolve_titan_id()))
+                spec, ensure_shm_root(resolve_titan_id()))
             return reader.read()
 
         flat = await asyncio.to_thread(_read_shm)
         if flat is None:
-            return _ok({"status": "not yet published (no idle IQL pass yet)"})
-        return _ok(mastery_flat_to_readout(flat))
+            return _ok({"domain": domain, "status": empty})
+        out = mastery_flat_to_readout(flat)
+        out["domain"] = domain
+        return _ok(out)
     except Exception as e:
         logger.error("[Dashboard] /v6/mastery error: %s", e)
         return _error(str(e))
