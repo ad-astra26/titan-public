@@ -55,6 +55,11 @@ class WorkingMemory:
     - active_dream: Recently recalled dream insight
     """
 
+    # Process-wide set of item_types already logged once — drives the zero-spam
+    # "first attend of each leg" observability below (RFP_phase_c_actr_memory_
+    # rehoming). Useful diagnostic that each restored working-memory leg fires.
+    _seen_item_types: set = set()
+
     def __init__(self, capacity: int = DEFAULT_CAPACITY,
                  decay_epochs: int = DEFAULT_DECAY_EPOCHS):
         self.capacity = capacity
@@ -67,6 +72,12 @@ class WorkingMemory:
         If item already exists (same type+key), refresh its epoch.
         If at capacity, evict lowest-strength item.
         """
+        # Zero-spam observability: log the FIRST attend of each item_type at INFO
+        # (once per process) so the journal shows each working-memory leg activate.
+        if item_type not in WorkingMemory._seen_item_types:
+            WorkingMemory._seen_item_types.add(item_type)
+            logger.info("[WorkingMem] first attend of item_type=%s (key=%s)",
+                        item_type, str(key)[:40])
         # Check if already attending to this
         for item in self._items:
             if item.item_type == item_type and item.key == key:
