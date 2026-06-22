@@ -101,8 +101,19 @@ def create_tools(plugin):
                     parent_goal = (_goal_row.get("content") or "").strip() or None
         except Exception:
             parent_goal = None
+        # §9.3 / INV-Syn-20 — if the agent just delegated to a matched procedural
+        # skill (match_procedural_skill stashed its skill_id), attribute THIS tool
+        # call to it so ToolPlug.invoke fires the skill-outcome sink →
+        # SkillFailureTracker.record_outcome (repair-fork-on-failure). Consume-once:
+        # one delegation = one primary execution; clear after so later tool calls in
+        # the turn aren't mis-attributed. Without this, parent_skill_id was never set
+        # → record_outcome never fired → 0 repair forks fleet-wide
+        # (BUG-SKILLFAILURETRACKER-PARENT-SKILL-ID-UNSET, 2026-06-22).
+        parent_skill_id = getattr(plugin, "_last_matched_skill_id", None) or None
+        if parent_skill_id is not None:
+            plugin._last_matched_skill_id = None
         call = ToolCall(tool_id=tool_id, args=args, parent_chat_tx=parent_chat_tx,
-                        parent_goal=parent_goal)
+                        parent_goal=parent_goal, parent_skill_id=parent_skill_id)
         return plug.invoke(call)
 
     # ------------------------------------------------------------------
@@ -626,6 +637,13 @@ def create_tools(plugin):
                     skill_meta["failure_count"] = int(full.get("failure_count") or 0)
             except Exception as e:
                 logger.debug("match_procedural_skill store lookup failed: %s", e)
+        # §9.3 / INV-Syn-20 — stash the delegated skill_id so the NEXT tool call
+        # this turn (the skill's execution) is attributed to it via parent_skill_id
+        # → SkillFailureTracker.record_outcome. Reset per-turn in the agno PreHook.
+        try:
+            plugin._last_matched_skill_id = skill_meta["skill_id"] or None
+        except Exception:
+            pass
         try:
             return _json.dumps(skill_meta, ensure_ascii=False)
         except Exception:

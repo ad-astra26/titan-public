@@ -2035,6 +2035,7 @@ def create_pre_hook(plugin):
         plugin._last_outer_decision = None
         plugin._last_reasoning_id = None  # RFP §7.B (B.1) — set for non-verifiable turns
         plugin._last_composite_match = None  # §7.E — the matched composite (E.1 replay / E.3 source)
+        plugin._last_matched_skill_id = None  # §9.3 — delegated-skill attribution (consume-once per tool call)
         if _router_active and _self_learning_enabled(plugin):
             try:
                 _readout_for_policy = locals().get("_readout")

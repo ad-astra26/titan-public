@@ -1023,7 +1023,8 @@ def _build_local_tool_plugs(send_queue) -> dict:
                                 evidence_ref="", latency_ms=0,
                                 parent_goal="", tool_id="",
                                 decision_features=None, decision_action=None,
-                                recipe_json="", result_summary=""):
+                                recipe_json="", result_summary="",
+                                parent_skill_id=None):
         try:
             _payload = {
                 "parent_tool_call_tx": parent_tool_call_tx,
@@ -1033,6 +1034,11 @@ def _build_local_tool_plugs(send_queue) -> dict:
                 # task-shape) skill-score event (INV-Syn-29).
                 "parent_goal": parent_goal, "tool_id": tool_id,
             }
+            # §9.3 — the delegated-skill id (if this tool call executed a matched
+            # skill) so synthesis fires SkillFailureTracker.record_outcome →
+            # repair-fork-on-failure → bump_version. Only present on delegated runs.
+            if parent_skill_id:
+                _payload["parent_skill_id"] = str(parent_skill_id)
             # v1.1 — the OuterMetaPolicy decision (only set on the policy-driven
             # ToolBackstop path) → synthesis's verdict-time C1 capture writes the
             # Reasoning record + trains the policy (INV-OML-11/12).

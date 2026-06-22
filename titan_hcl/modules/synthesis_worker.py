@@ -4169,6 +4169,18 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     logger.debug(
                         "[synthesis_worker] tool-call verdict record failed: %s",
                         _tcv_err)
+                # ── §9.3 — if this tool call executed a DELEGATED skill (agno
+                # stashed its skill_id → parent_skill_id rode the verdict here),
+                # feed the SkillFailureTracker so 3 consecutive failures spawn a
+                # repair fork → bump_version. The synthesis-side plug fires its own
+                # in-process sink (tools/base.py:232); the agno plug has none, so we
+                # close the loop here, on the verdict the agno self-oracle already
+                # ships (BUG-SKILLFAILURETRACKER-PARENT-SKILL-ID-UNSET, 2026-06-22).
+                _tcv_skill_id = str(payload.get("parent_skill_id", "") or "")
+                if _tcv_skill_id:
+                    _skill_outcome_sink(
+                        _tcv_skill_id,
+                        str(payload.get("verdict", "")) == "true")
                 # ── §7.E (E.2) — cache the verified (prompt → answer) as a
                 # PromptSignature so an identical DURABLE re-ask is served literally
                 # (zero LLM/oracle) by the agno reader. Fires on ANY true tool

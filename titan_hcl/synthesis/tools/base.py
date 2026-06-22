@@ -204,6 +204,13 @@ class ToolPlugBase:
                         verdict=_verdict_str, evidence_ref=_ev_ref,
                         latency_ms=latency_ms,
                         parent_goal=call.parent_goal, tool_id=self.tool_id,
+                        # §9.3 — carry the delegated-skill id so synthesis fires
+                        # SkillFailureTracker.record_outcome at the verdict handler
+                        # (the agno plug has no in-process skill_outcome_sink; the
+                        # synthesis-side plug fires :232 directly). Closes the
+                        # repair-fork-on-failure loop cross-process via the EXISTING
+                        # verdict delivery — no new bus topic.
+                        parent_skill_id=call.parent_skill_id,
                         # v1.1 — carry the OuterMetaPolicy decision so synthesis's
                         # verdict-time C1 capture writes the Reasoning record + trains.
                         decision_features=call.decision_features,
