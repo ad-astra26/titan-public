@@ -280,6 +280,15 @@ _EXTERNAL_POST_CHANNELS = frozenset({"x_post", "x_reply"})
 # Titan's diary; the OVG post-hook must catch it."
 _STRICT_CONSISTENCY_CHANNELS = _EXTERNAL_POST_CHANNELS | frozenset({"soul_diary"})
 
+# Narrative-SELF voice channels — Titan's introspective inner voice (the Inner
+# Turn, RFP_introspective_inner_turn Phase B). The standard hard violations
+# (directives/injection/identity/qualia) still block, but this is deliberately
+# NOT a strict-consistency channel: the inner voice is grounded FELT narration
+# (neuromod/body levels), not factual numeric claims, so the soul_diary-style
+# numeric-divergence hard-block would false-positive on felt language. The voice
+# is narrative SELF memory only and NEVER enters any reward (INV-IT-2).
+_NARRATIVE_SELF_CHANNELS = frozenset({"inner_voice"})
+
 
 def _compile_qualia_patterns() -> dict[str, list[re.Pattern]]:
     """Patterns for Proof of Qualia — authenticity sub-checks."""

@@ -73,6 +73,7 @@ from titan_hcl.synthesis.inner_introspection import (
     InnerSelfPredictor,
     assemble_inner_state,
     build_inner_phi,
+    build_inner_voice_prompts,
     curiosity_from_neuromod,
     inner_reward_kernel,
     znorm_channels,
@@ -228,6 +229,10 @@ _DEFAULTS = {
     "inner_iql_steps": 10,             # inner IQL SGD steps per great-pulse verify
     "inner_persist_every": 1,          # great-pulses between inner-state persists
     "inner_dialogue_turns": 2,         # Phase B narrative dialogue rounds (never a reward)
+    "inner_voice_enabled": True,       # Phase B LLM narrator (narrative-only; INV-IT-2)
+    "inner_voice_temperature": 0.8,    # voice sampling temperature
+    "inner_voice_max_tokens": 200,     # voice length cap
+    "inner_voice_timeout_s": 20.0,     # voice LLM call timeout
     "inner_drive_theta0": 0.35,        # initial introspective-drive threshold (adaptive)
     "inner_drive_alpha": 0.01,         # WIN → θ−α (refractory discharge, INV-IT-9)
     "inner_drive_beta": 0.02,          # LOSE → θ+β (dissonance persists)
@@ -2012,16 +2017,67 @@ class _IntrospectionRoutine:
         except Exception as e:  # noqa: BLE001
             logger.warning("[inner_turn] init failed (disabled): %s", e)
             self.enabled = False
+            return
+        # ── Phase B — the inner VOICE (narrative SELF memory, INV-IT-2). Own
+        # LLM provider + OVG, mirroring soul_diary (asyncio.run a sync call). A
+        # missing provider/verifier → voice stays None → the loop runs headless
+        # (Phase A behavior); the voice is NEVER a reward input.
+        self._provider = None
+        self._verifier = None
+        if bool(self.cfg.get("inner_voice_enabled", True)):
+            try:
+                from titan_hcl.params import get_params as _gp
+                from titan_hcl.inference import get_provider
+                inf_cfg = _gp("inference") or {}
+                from titan_hcl.modules.soul_diary_worker import _resolve_provider_name
+                self._provider = get_provider(_resolve_provider_name(inf_cfg), inf_cfg)
+                from titan_hcl.logic.output_verifier import OutputVerifier
+                self._verifier = OutputVerifier(titan_id=titan_id)
+                self._compose_voice = self._compose_inner_voice
+                logger.info("[inner_turn] inner voice enabled (provider ready)")
+            except Exception as e:  # noqa: BLE001
+                logger.info("[inner_turn] inner voice unavailable (headless "
+                            "loop; voice is not load-bearing): %s", e)
+
+    def _compose_inner_voice(self, s_raw, neuro, stance) -> str:
+        """Phase B — narrate the inner body in first person (grounded prompts +
+        provider.complete + OVG on channel='inner_voice'). Returns the narration
+        on an OVG PASS, else "" (soft-fail; the loop never depends on it)."""
+        if self._provider is None:
+            return ""
+        prompts = build_inner_voice_prompts(
+            s_raw, neuro, int(stance),
+            dialogue_turns=int(self.cfg.get("inner_dialogue_turns", 2)))
+        import asyncio as _asyncio
+        try:
+            text = _asyncio.run(self._provider.complete(
+                prompt=prompts["user_prompt"], system=prompts["system_prompt"],
+                temperature=float(self.cfg.get("inner_voice_temperature", 0.8)),
+                max_tokens=int(self.cfg.get("inner_voice_max_tokens", 200)),
+                timeout=float(self.cfg.get("inner_voice_timeout_s", 20.0))))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[inner_turn] voice compose failed: %s", e)
+            return ""
+        text = (text or "").strip()
+        if not text or self._verifier is None:
+            return text if self._verifier is None else ""
+        try:
+            result = self._verifier.verify_safety(
+                text, channel="inner_voice", injected_context=prompts["user_prompt"])
+            return text if bool(getattr(result, "passed", False)) else ""
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[inner_turn] voice OVG failed: %s", e)
+            return ""
 
     def _sense(self):
-        """SENSE → (s_raw, s_norm, phi, neuro_dict). None on a torn read."""
+        """SENSE → (s_raw, s_norm, phi, neuro_dict)."""
         body = self.bank.read_inner_body_5d()
         mind = self.bank.read_inner_mind_15d()
         spirit = self.bank.read_inner_spirit_45d()
         neuro = self.bank.read_neuromod()
         s_raw = assemble_inner_state(body, mind, spirit, neuro)
         s_norm = znorm_channels(s_raw)
-        return s_norm, build_inner_phi(s_norm), neuro
+        return s_raw, s_norm, build_inner_phi(s_norm), neuro
 
     def _metabolic_ok(self, life, chat_active) -> bool:
         """At rest = not dreaming, no live chat turn, metabolic headroom (§5.2
@@ -2058,7 +2114,7 @@ class _IntrospectionRoutine:
         if not self._metabolic_ok(life, chat_active):
             return                          # the luxury of rest only (INV-IT-3)
 
-        s_norm, phi, neuro = self._sense()
+        s_raw, s_norm, phi, neuro = self._sense()
         volatility = (0.0 if self._prev_norm is None
                       else float(np.linalg.norm(s_norm - self._prev_norm)
                                  / np.sqrt(len(s_norm))))
@@ -2078,20 +2134,21 @@ class _IntrospectionRoutine:
             d = self.drive.compute_drive(curiosity, volatility)
             if self.drive.should_fire(drive=d, great_pulse_fired=True,
                                       metabolic_ok=True):
-                self._seed(gp, s_norm, phi)
+                self._seed(gp, s_raw, s_norm, phi, neuro)
         except Exception as e:  # noqa: BLE001
             logger.debug("[inner_turn] seed soft-fail: %s", e)
 
         self._maybe_persist()
 
-    def _seed(self, gp, s_norm, phi) -> None:
+    def _seed(self, gp, s_raw, s_norm, phi, neuro) -> None:
         stance = self.iql.select_stance(phi)
         descr, delta = self.predictor.predict(phi, stance)
         narration = ""
-        if self._compose_voice is not None:     # Phase B
+        if self._compose_voice is not None:     # Phase B — the inner voice
             try:
-                narration = self._compose_voice(s_norm, stance) or ""
-            except Exception:  # noqa: BLE001
+                narration = self._compose_voice(s_raw, neuro, stance) or ""
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[inner_turn] voice soft-fail: %s", e)
                 narration = ""
         self.store.stash_inner_prediction(
             gp_count=gp, stance=stance, phi=phi.tolist(),

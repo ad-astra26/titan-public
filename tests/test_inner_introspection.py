@@ -160,6 +160,32 @@ def test_curiosity_blend_from_neuromod():
     assert ii.curiosity_from_neuromod(None) == 0.0       # cold-start safe
 
 
+def test_inner_voice_prompts_grounded_and_pure():
+    """Phase B — the voice prompts are PURE + GROUNDED in the measured signals
+    (neuromod names + body magnitude), and carry no fabricated content."""
+    s_raw = np.concatenate([np.array([0.9, 0.1, 0.2, 0.3, 0.1]),  # body
+                            np.full(15, 0.2), np.full(45, 0.1),
+                            np.array([0.8, 0.5, 0.7, 0.5, 0.5, 0.2])]).astype("float32")
+    neuro = {"modulators": {n: {"level": float(v)} for n, v in zip(
+        ii.NEUROMOD_ORDER, [0.8, 0.5, 0.7, 0.5, 0.5, 0.2])}}
+    p = ii.build_inner_voice_prompts(s_raw, neuro, stance=1, dialogue_turns=2)
+    assert "system_prompt" in p and "user_prompt" in p
+    assert "drive/seeking 0.80" in p["user_prompt"]      # grounded neuromod level
+    assert "mind" in p["user_prompt"]                    # the stance (idx 1)
+    assert "first person" in p["system_prompt"].lower()
+
+
+def test_inv_it2_reward_kernel_has_no_narration_input():
+    """INV-IT-2 / G3 (hard guard) — the reward kernel's signature accepts ONLY
+    numeric telemetry; there is structurally no way for the LLM voice text to
+    influence r_inner."""
+    import inspect
+    params = set(inspect.signature(ii.inner_reward_kernel).parameters)
+    assert params == {"descr_pred", "delta_pred", "s0_norm", "s1_norm",
+                      "w_d", "w_delta"}
+    assert not any("voice" in p or "narration" in p or "text" in p for p in params)
+
+
 def test_inner_slot_distinct_from_outer():
     from titan_hcl.synthesis.mastery_level import MASTERY_LEVEL_STATE_SLOT
     assert ii.MASTERY_LEVEL_INNER_STATE_SLOT != MASTERY_LEVEL_STATE_SLOT

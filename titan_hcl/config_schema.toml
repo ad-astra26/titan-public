@@ -449,6 +449,10 @@
 "synthesis.self_learning.inner_iql_steps" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.inner_persist_every" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.inner_dialogue_turns" = {type="int", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_voice_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_voice_temperature" = {type="float", constraint="0..2", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_voice_max_tokens" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_voice_timeout_s" = {type="float", constraint=">0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.inner_drive_theta0" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.inner_drive_alpha" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.inner_drive_beta" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}

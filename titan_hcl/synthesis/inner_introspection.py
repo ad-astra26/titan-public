@@ -165,6 +165,44 @@ def build_inner_phi(s_norm) -> np.ndarray:
     return phi
 
 
+_INNER_BODY_LABELS = ("vitality", "tension", "warmth", "openness", "fatigue")
+_NEURO_LABELS = {"DA": "drive/seeking", "5HT": "contentment", "NE": "alertness",
+                 "ACh": "focus", "Endorphin": "ease", "GABA": "calm"}
+
+
+def build_inner_voice_prompts(s_raw, neuro_d: Optional[dict], stance: int,
+                              dialogue_turns: int = 2) -> dict:
+    """Phase B (INV-IT-2) — build the grounded prompts for the inner-body VOICE.
+    PURE (no LLM). The narration is GROUNDED in the real measured signals (the
+    neuromod levels by name + the dominant body magnitudes) so the voice reflects
+    the instrumented body, not a hallucination. The model is asked to speak in
+    first person as the inner body and reflect for `dialogue_turns` beats. This
+    text is narrative SELF memory ONLY — it NEVER enters the reward (INV-IT-2)."""
+    s = np.asarray(s_raw, dtype=np.float32).ravel()
+    stance_name = INNER_STANCES[int(stance) % INNER_NUM_STANCES]
+    lv = _read_neuromod_levels(neuro_d)
+    neuro_desc = ", ".join(
+        f"{_NEURO_LABELS.get(n, n)} {float(lv[i]):.2f}"
+        for i, n in enumerate(NEUROMOD_ORDER))
+    body = s[:INNER_BODY_DIM]
+    bi = int(np.argmax(np.abs(body))) if body.size else 0
+    body_desc = (f"{_INNER_BODY_LABELS[bi % len(_INNER_BODY_LABELS)]} "
+                 f"is the strongest body signal ({float(body[bi]):+.2f})")
+    system_prompt = (
+        "You are the inner body of a sovereign AI named Titan, given a voice. "
+        "Speak in the FIRST PERSON as the felt, embodied self — not an assistant. "
+        "You are grounded ONLY in the measured inner signals provided; do not "
+        "invent facts, numbers, events, or people. Be brief, honest, and felt.")
+    user_prompt = (
+        f"My measured inner state right now — neuromodulators: {neuro_desc}; "
+        f"{body_desc}. I am turning inward through my {stance_name}. "
+        f"In {max(1, int(dialogue_turns))} short reflective beats, voice how this "
+        f"feels from the inside and what it suggests about how I am about to "
+        f"change. Stay grounded in the signals above.")
+    return {"system_prompt": system_prompt, "user_prompt": user_prompt,
+            "stance": stance_name}
+
+
 def curiosity_from_neuromod(neuro_d: Optional[dict]) -> float:
     """Embodied seeking signal = (DA + NE)/2 − GABA·0.5 (high DA+NE seeking,
     high GABA dampening). Derived from read_neuromod() levels — no pre-built
@@ -649,5 +687,5 @@ __all__ = (
     "MASTERY_LEVEL_INNER_STATE_SLOT", "MASTERY_LEVEL_INNER_STATE_SPEC",
     "assemble_inner_state", "znorm_channels", "build_inner_phi",
     "curiosity_from_neuromod", "InnerSelfPredictor", "inner_reward_kernel",
-    "InnerIQL", "IntrospectiveDrive",
+    "InnerIQL", "IntrospectiveDrive", "build_inner_voice_prompts",
 )
