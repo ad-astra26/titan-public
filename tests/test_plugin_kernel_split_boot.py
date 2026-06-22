@@ -5,29 +5,28 @@ Covers:
   - TitanHCL constructs with a TitanKernel reference
   - Compat @property facade (bus, guardian, soul, _full_config, etc.)
     delegates to kernel identically
-  - All 13 plugin proxy @properties exist and return None pre-boot
-  - _register_modules populates guardian with all 16 supervised modules
-    tagged with correct layers (L0/L1/L2/L3)
-  - Module layers match LAYER_CANON table (Microkernel v2 §A.5)
+  - The live plugin proxy @properties exist and return None pre-boot
   - get_v3_status() returns the expected shape (compatible with legacy
     TitanCore.get_v3_status)
-  - microkernel config passthrough preserved in spirit ModuleSpec
-    (regression guard for S2 fix #2)
+  - boot is a coroutine + the dashboard-critical methods are exposed
 
-Does NOT run `await plugin.boot()` — that would spawn 16 subprocesses.
-The boot orchestration semantics are tested via contract (method order
-+ presence), not execution, to keep the test fast and isolated.
+NOTE: the module-registration tests (_register_modules + layer-canon
+assertions) were removed 2026-06-22 — _register_modules was deleted in the
+Phase-6 plugin cutover (registration moved to the ModuleSpec registry), so
+they tested a method that no longer exists.
+
+Does NOT run `await plugin.boot()` — that would spawn subprocesses.
+The boot orchestration semantics are tested via contract (method
+presence), not execution, to keep the test fast and isolated.
 
 Reference: titan-docs/PLAN_microkernel_phase_a_s3.md §6.2
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 
 import pytest
 
-from titan_hcl._layer_canon import LAYER_CANON
 from titan_hcl.core.kernel import TitanKernel
 from titan_hcl.core.plugin import TitanHCL
 
@@ -86,68 +85,15 @@ def test_plugin_proxy_properties_exist_return_none_pre_boot(plugin):
 
     `sovereignty` is no longer a parent @property proxy — sovereignty is
     wired without a parent proxy facade (see plugin.py proxy block); the
-    remaining accessors are the live set."""
+    remaining accessors are the live set. recorder/gatekeeper (offline-RL
+    retired, P1) + scholar are no longer proxies — dropped from the roster."""
     for name in [
-        "memory", "metabolism", "mood_engine", "recorder",
-        "gatekeeper", "scholar", "consciousness", "social_graph", "social",
+        "memory", "metabolism", "mood_engine",
+        "consciousness", "social_graph", "social",
         "studio", "maker_engine", "sage_researcher",
     ]:
         assert hasattr(plugin, name), f"proxy {name} not defined"
         assert getattr(plugin, name) is None, f"{name} should be None pre-boot"
-
-
-def test_plugin_register_modules_supervises_all_canonical_modules(plugin):
-    """Every module in LAYER_CANON must be registered with guardian.
-
-    The exact roster grew well past the Phase-A 16-module baseline and is
-    now flag-gated (cognitive_worker / expression_worker / ns_module / …
-    register only under microkernel.l0_rust_enabled=true), so an exact-set
-    assertion is brittle. The durable invariant is: the canonical
-    supervised modules (LAYER_CANON) are ALL present. Flag-gated extras
-    are allowed on top."""
-    plugin._register_modules()
-    registered = set(plugin.guardian._modules.keys())
-    canon = set(LAYER_CANON.keys())
-    # outer_body/outer_mind/outer_spirit are Rust-daemon-owned under
-    # l0_rust_enabled=true (the fixture's production mode) — the Python A.S8
-    # ModuleSpecs register ONLY when l0_rust_enabled=false (plugin.py:393).
-    # LAYER_CANON lists them because it spans both modes; exclude them here.
-    rust_owned_under_l0 = {"outer_body", "outer_mind", "outer_spirit"}
-    expected_present = canon - rust_owned_under_l0
-    missing = expected_present - registered
-    assert not missing, f"canonical modules not registered: {sorted(missing)}"
-
-
-def test_plugin_module_layers_match_canon(plugin):
-    """Every registered module THAT LAYER_CANON covers must carry its
-    canonical layer. (Newer flag-gated modules absent from LAYER_CANON are
-    not policed here — LAYER_CANON is the Phase-A supervised-module table.)"""
-    plugin._register_modules()
-    modules = plugin.guardian._modules
-    for name, expected_layer in LAYER_CANON.items():
-        if name not in modules:
-            continue
-        assert modules[name].spec.layer == expected_layer, (
-            f"module {name}: spec.layer={modules[name].spec.layer} "
-            f"but canon={expected_layer}"
-        )
-
-
-def test_plugin_cognitive_gets_microkernel_config_passthrough(plugin):
-    """Regression guard for S2 bug fix #2: the cognitive engine host needs the
-    microkernel section in its config to resolve shm_*_enabled flags.
-    (D-SPEC-116: was spirit_worker; spirit retired, cognitive_worker is the host.
-    Only registered under l0_rust_enabled=true — skip otherwise.)"""
-    plugin._register_modules()
-    modules = plugin.guardian._modules
-    if "cognitive_worker" not in modules:
-        import pytest as _pytest
-        _pytest.skip("cognitive_worker not registered (l0_rust_enabled=false)")
-    cw_info = modules["cognitive_worker"]
-    assert "microkernel" in cw_info.spec.config, (
-        "cognitive_worker config missing microkernel passthrough — "
-        "RegistryBank.is_enabled() would silently return False"
-    )
 
 
 def test_plugin_get_v3_status_shape(plugin):
@@ -174,7 +120,9 @@ def test_plugin_exposes_dashboard_critical_methods():
     (D-SPEC-106) — TitanHCL is no longer mirroring any legacy surface."""
     expected_methods = [
         "boot", "create_agent", "get_v3_status", "reload_api",
-        "_register_modules", "_create_proxies",
+        # _register_modules retired in the Phase-6 plugin cutover (module
+        # registration moved to the ModuleSpec registry); _create_proxies stays.
+        "_create_proxies",
         # _wire_sovereignty → _wire_life_force (v1.8.5 / D-SPEC-59).
         "_wire_metabolism", "_wire_life_force", "_wire_studio", "_wire_social",
         "_boot_agency", "_boot_reflex_collector",
@@ -192,19 +140,3 @@ def test_plugin_exposes_dashboard_critical_methods():
         assert hasattr(TitanHCL, method), f"missing {method}"
 
 
-def test_plugin_registers_imw_at_correct_layer(plugin):
-    """IMW is L1 per §A.5 + PLAN §1.2 (writes inner_memory.db, L1's DB)."""
-    plugin._register_modules()
-    assert plugin.guardian._modules["imw"].spec.layer == "L1"
-
-
-def test_plugin_registers_observatory_writer_at_correct_layer(plugin):
-    """observatory_writer is L3 per §A.5 (writes observatory.db, L3's DB)."""
-    plugin._register_modules()
-    assert plugin.guardian._modules["observatory_writer"].spec.layer == "L3"
-
-
-def test_plugin_cgn_layer_honored(plugin):
-    """CGN stays L2 per project_cgn_as_higher_state_registry.md invariant."""
-    plugin._register_modules()
-    assert plugin.guardian._modules["cgn"].spec.layer == "L2"
