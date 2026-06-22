@@ -55,10 +55,6 @@ class WorkingMemory:
     - active_dream: Recently recalled dream insight
     """
 
-    # [ACTR-REHOMING TEMP 2026-06-22 — REMOVE] process-wide set of item_types
-    # already logged once (first-attend observability).
-    _seen_item_types: set = set()
-
     def __init__(self, capacity: int = DEFAULT_CAPACITY,
                  decay_epochs: int = DEFAULT_DECAY_EPOCHS):
         self.capacity = capacity
@@ -71,13 +67,6 @@ class WorkingMemory:
         If item already exists (same type+key), refresh its epoch.
         If at capacity, evict lowest-strength item.
         """
-        # [ACTR-REHOMING TEMP OBSERVABILITY 2026-06-22 — REMOVE after T3 gate
-        # verification] Log the FIRST attend of each item_type at INFO so the live
-        # journal shows each restored working-memory leg fire exactly once (no spam).
-        if item_type not in WorkingMemory._seen_item_types:
-            WorkingMemory._seen_item_types.add(item_type)
-            logger.info("[WorkingMem] FIRST attend of item_type=%s (key=%s)",
-                        item_type, str(key)[:40])
         # Check if already attending to this
         for item in self._items:
             if item.item_type == item_type and item.key == key:

@@ -12082,47 +12082,6 @@ async def post_v4_timechain_test_commit(request: Request):
         return _error(str(e))
 
 
-# [ACTR-REHOMING TEMP 2026-06-22 — REMOVE after T3 gate verification]
-async def post_v6_admin_actr_inject(request: Request):
-    """TEMP: inject the hard-to-trigger ACT-R rehoming gates to verify the restored
-    Episodic + Working faculty live on T3 (RFP_phase_c_actr_memory_rehoming). Body:
-    {event: "kin"|"word"|"recall", n?: int}. Significance-gated episodes (kin/word)
-    need a warm baseline + a surprising metric, so the route VARIES the metric across
-    n injections (pass n>=5). Attends (active_word/dream_context/memory_recall_echo)
-    are not gated -> fire on the first inject."""
-    try:
-        body = await request.json()
-        event = str(body.get("event", "")).lower()
-        n = max(1, int(body.get("n", 1) or 1))
-        titan_state = _get_plugin(request)
-        from titan_hcl.bus import make_msg
-        sent = 0
-        for i in range(n):
-            if event == "kin":
-                _res = [0.30, 0.92, 0.55, 0.97, 0.41, 0.88][i % 6]
-                titan_state.bus.publish(make_msg(
-                    bus.KIN_SIGNAL, "dashboard", "cognitive_worker",
-                    {"resonance": _res, "kin_emotion": "joy",
-                     "kin_pubkey": "TESTKIN_ACTR"}))
-            elif event == "word":
-                _conf = [0.52, 0.88, 0.61, 0.95, 0.55, 0.79][i % 6]
-                titan_state.bus.publish(make_msg(
-                    bus.WORD_LEARNED, "dashboard", "cognitive_worker",
-                    {"word": f"TESTWORD_ACTR_{i}", "confidence": _conf}))
-            elif event == "recall":
-                titan_state.bus.publish(make_msg(
-                    bus.MEMORY_RECALL_PERTURBATION, "dashboard",
-                    "cognitive_worker",
-                    {"nudge_map": {"DA": 0.02}, "memory_count": 3}))
-            else:
-                return _error(f"unknown event '{event}'")
-            sent += 1
-        return _ok({"injected": event, "count": sent})
-    except Exception as e:
-        logger.error("[Dashboard] actr-inject error: %s", e)
-        return _error(str(e))
-
-
 # =====================================================================
 # GET /v4/timechain/backup-status — Backup system status
 async def get_v4_timechain_backup_status(request: Request):
