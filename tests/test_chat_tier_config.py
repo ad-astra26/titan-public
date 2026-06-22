@@ -168,7 +168,13 @@ class TestEmptyConfig:
         assert "directives" in result.active_features
         assert "reasoning_chain" in result.active_features
 
-    def test_missing_chat_section_passthrough(self):
+    def test_missing_chat_section_passthrough(self, monkeypatch):
+        # No `chat` key in the passed config → from_config falls back to the
+        # live SHM read; with no chat config anywhere → passthrough safety net.
+        monkeypatch.setattr(
+            "titan_hcl.modules.chat_tier_config.get_params",
+            lambda section=None: {},
+        )
         cls = ChatTierClassifier.from_config({})
         result = cls.classify("Hi")
         assert result.tier.name == "passthrough"

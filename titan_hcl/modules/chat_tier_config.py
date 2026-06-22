@@ -145,8 +145,20 @@ class ChatTierClassifier:
 
     @classmethod
     def from_config(cls, full_config: dict[str, Any]) -> "ChatTierClassifier":
-        """Construct from the full TOML config dict (expects [chat] section)."""
-        chat_cfg = get_params("chat") or {}
+        """Construct from a config's [chat] section.
+
+        Prefers an explicit `chat` section in `full_config` (callers that
+        already hold the merged config, and tests that inject one); falls back
+        to the live SHM-backed `get_params("chat")` when the passed config has
+        no `chat` key (the config-as-SHM canonical read — the agno_worker is
+        spawned with only the merged [agent]+[inference] block, so its
+        `_full_config` typically lacks [chat]). Restores the `full_config`
+        parameter that the Phase B SHM sweep (2c43f78db) had left unused.
+        """
+        if isinstance(full_config, dict) and "chat" in full_config:
+            chat_cfg = full_config.get("chat") or {}
+        else:
+            chat_cfg = get_params("chat") or {}
         default_model_class = chat_cfg.get("default_model_class", "heavy")
         default_name = chat_cfg.get("default_tier", "casual")
         log_decisions = bool(chat_cfg.get("classifier_log_decisions", False))

@@ -407,6 +407,8 @@
 "synthesis.spine_export.throttle_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.spine_export.min_interval_s" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.recall.augment_chat" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.spine_export.min_interval_s" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.spine_export.throttle_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 # secrets-only key (lives in ~/.titan/secrets.toml, no config/params placeholder) — declared manually; the generator only sees params+config.
 "synthesis.user_id_hash_salt" = {type="str", constraint="", reload="restart_required", owner=["synthesis"], sensitive=true}
 "synthesis.decision_authority.gibberish_probe_every" = {type="int", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}

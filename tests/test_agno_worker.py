@@ -127,9 +127,16 @@ class TestWorkerPluginProxies:
         p = self._make_plugin()
         assert p.consciousness is None
 
-    def test_sage_researcher_returns_none(self):
+    def test_sage_researcher_constructed_in_process(self):
+        """2026-06-15 — sage_researcher is wired in-process for the chat
+        research lane (was hardcoded None, which silently degraded every
+        STATE_NEED_RESEARCH to empty). Real StealthSageResearcher; falls back
+        to None only on init failure."""
         p = self._make_plugin()
-        assert p.sage_researcher is None
+        sr = p.sage_researcher
+        assert sr is not None
+        from titan_hcl.logic.sage.researcher import StealthSageResearcher
+        assert isinstance(sr, StealthSageResearcher)
 
     def test_output_verifier_is_constructed(self):
         p = self._make_plugin()
@@ -549,6 +556,7 @@ class TestChatStreamRequestHandler:
         send_q = Queue()
         stats = {"in_flight": 0, "total_chats_24h": 0, "last_chat_ts": 0.0}
         worker_plugin = MagicMock()
+        worker_plugin._chat_ctx = None  # legacy path → uses the passed agent mock
         # OVG result with ovg_data dict (D-SPEC-74 VerifiedResult shape)
         worker_plugin._last_ovg_result.ovg_data = {
             "verified": True, "signature": "sig123",
@@ -573,14 +581,18 @@ class TestChatStreamRequestHandler:
         chunks: list = []
         while not send_q.empty():
             chunks.append(send_q.get_nowait())
+        # §7.B (B.4) live-progress frames (carry a `phase`: thinking/
+        # writing-reply) precede the SSE delivery — filter to the real
+        # content/done frames (phase is None).
+        sse = [c for c in chunks if not c["payload"].get("phase")]
         # Short response: 1 content segment + 1 done marker
-        assert len(chunks) == 2
-        assert chunks[0]["payload"]["chunk"] == "hello world"
-        assert chunks[0]["payload"]["done"] is False
-        assert chunks[1]["payload"]["done"] is True
+        assert len(sse) == 2
+        assert sse[0]["payload"]["chunk"] == "hello world"
+        assert sse[0]["payload"]["done"] is False
+        assert sse[1]["payload"]["done"] is True
         # Done frame carries ovg_headers
-        assert chunks[1]["payload"]["ovg_headers"]["verified"] is True
-        assert chunks[1]["payload"]["ovg_headers"]["signature"] == "sig123"
+        assert sse[1]["payload"]["ovg_headers"]["verified"] is True
+        assert sse[1]["payload"]["ovg_headers"]["signature"] == "sig123"
 
     def test_stream_handler_segments_long_response(self):
         """Long responses (>200 chars) are split at sentence/word boundaries."""
@@ -603,6 +615,7 @@ class TestChatStreamRequestHandler:
         send_q = Queue()
         stats = {"in_flight": 0, "total_chats_24h": 0, "last_chat_ts": 0.0}
         worker_plugin = MagicMock()
+        worker_plugin._chat_ctx = None  # legacy path → uses the passed agent mock
 
         agent = MagicMock()
         agent.arun = AsyncMock(side_effect=RuntimeError("stream upstream fail"))
@@ -615,9 +628,14 @@ class TestChatStreamRequestHandler:
         asyncio.run(_handle_chat_stream_request(
             msg, agent, worker_plugin, send_q, "agno_worker", stats,
         ))
-        out = send_q.get(timeout=1.0)
-        assert out["payload"]["done"] is True
-        assert out["payload"]["error"] == "stream upstream fail"
+        # Drain the queue (live-progress frames may precede the error/done
+        # frame) and assert on the terminal done frame.
+        frames = []
+        while not send_q.empty():
+            frames.append(send_q.get_nowait())
+        done_frames = [f for f in frames if f["payload"].get("done") is True]
+        assert len(done_frames) == 1
+        assert done_frames[0]["payload"]["error"] == "stream upstream fail"
 
 
 # ────────────────────────────────────────────────────────────────────
