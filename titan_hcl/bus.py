@@ -1192,31 +1192,36 @@ class DivineBus:
         OUTER_TRINITY_STATE, SPHERE_PULSE, FILTER_DOWN_V4,
     }
 
-    # 2026-05-09 — High-rate broadcast types that flood unmigrated subscribers
-    # (legacy wildcard mode = no broadcast_filter registered). Mirrors the
-    # bus_socket.py:_HIGH_RATE_BROADCAST_TYPES stopgap to also cover the
-    # Phase C path: Rust kernel-rs broker → Python `_client` (attach_client) →
-    # DivineBus.publish() → in-process subscribers. Without this stopgap,
-    # Phase C T3 (l0_rust_enabled=true) bypasses the bus_socket filter entirely
-    # because messages enter via _client.publish callback, not via the socket
-    # broker that owns _HIGH_RATE_BROADCAST_TYPES. Result on T3 2026-05-09:
-    # 125k SPIRIT_STATE drops/10min, /v4/chi + /v4/nervous-system + /v4/neuromodulators
-    # stuck on bootstrap defaults. Phase A+B Python publishers (T1+T2) are below
-    # Schumann rate so this stopgap is a no-op for them. Phase D D-SPEC-82
-    # retired the STATE_SNAPSHOT_RESPONSE pipeline that originally amplified
-    # the impact on api subscribers — endpoints now read SHM-direct.
-    #
+    # RFP_g18 §7.D / D-SPEC-162 (2026-06-22) — migrated trinity STATE types that
+    # NO LONGER broadcast. Their consumers (cognitive_worker §7.C, state_register
+    # §7.B) now read SHM (G18 state=SHM), so these skip the dst="all" fan-out
+    # ENTIRELY (no subscriber). G-PARITY-verified the SHM slot carries the same
+    # tensor the bus event did (T3 2026-06-22). The blackboard latest-value write
+    # is KEPT (in-kernel compat, RFP §6 Q3). Was partial-suppressed via
+    # _HIGH_RATE_BROADCAST_TYPES; now fully dropped, so REMOVED from that stopgap.
+    _STATE_NO_BROADCAST_TYPES = frozenset({
+        BODY_STATE,    # Schumann body 7.83 Hz  — consumers read inner/outer_body_5d
+        MIND_STATE,    # Schumann mind 23.49 Hz — read inner/outer_mind_15d
+        SPIRIT_STATE,  # Schumann spirit 70.47 Hz — read inner/outer_spirit_45d
+    })
+
+    # 2026-05-09 stopgap — high-rate EVENT types that flood unmigrated wildcard
+    # subscribers (no broadcast_filter). SHRUNK 2026-06-22 (RFP_g18 §7.D) to the
+    # EVENT set ONLY: the migrated trinity STATE types are gone (they fully skip
+    # the broadcast via _STATE_NO_BROADCAST_TYPES). What remains are genuine
+    # UI-stream / Rust-only EVENTS that stay bus-legal under G18 but still need
+    # flood-capping. Covers the Phase C path: Rust kernel-rs broker → Python
+    # `_client` → DivineBus.publish_in_process() → in-process subscribers.
+    # 🔒 INV-G18-4: this set is SHRUNK, NEVER deleted — deleting it re-opens the
+    # T3 2026-05-09 wildcard queue-overflow (125k drops/10min) for the EVENT types.
     # Stopgap until rFP_bus_broadcast_filter_migration ships per-worker
-    # ModuleSpec.broadcast_topics for every spawn_graduated worker. See BUGS.md
+    # ModuleSpec.broadcast_topics. See BUGS.md
     # BUG-BUS-PER-WORKER-BROADCAST-FILTER-MIGRATION-INCOMPLETE-20260430.
     _HIGH_RATE_BROADCAST_TYPES = frozenset({
-        SPHERE_PULSE,                           # 6 clocks × ~12 Hz Schumann pulses
-        "PI_HEARTBEAT_UPDATED",                 # ~10 Hz π-heartbeat
-        "BIG_PULSE",                            # frequent state aggregation
-        BODY_STATE,                             # Schumann body 7.83 Hz
-        MIND_STATE,                             # Schumann mind 23.49 Hz
-        SPIRIT_STATE,                           # Schumann spirit × 9 = 70.47 Hz
-        "TOPOLOGY_STATE_UPDATED",               # frequent topology snapshots
+        SPHERE_PULSE,                           # EVENT (RFP_g18 R1): observatory SSE / UI animation, ~12 Hz
+        "PI_HEARTBEAT_UPDATED",                 # ~10 Hz π-heartbeat (SSE stream)
+        "BIG_PULSE",                            # frequent state aggregation (SSE stream)
+        "TOPOLOGY_STATE_UPDATED",               # frequent topology snapshots (SSE stream)
         # Phase C Rust types (no Python module constants — Rust-only publishers)
         "INNER_SPIRIT_FILTER_DOWN",             # 70.47 Hz from inner-spirit-rs
         "UNIFIED_SPIRIT_FILTER_DOWN",           # GLOBAL filter at Schumann
@@ -1440,6 +1445,12 @@ class DivineBus:
             bb_key = f"{msg.get('src', 'unknown')}_{msg_type}"
             self._blackboard.write(bb_key, msg)
 
+        # RFP_g18 §7.D — migrated trinity STATE types no longer broadcast: their
+        # consumers read SHM (G18 state=SHM). Blackboard latest-value kept above;
+        # skip the dst="all" fan-out + broker re-forward entirely (zero subscriber).
+        if msg_type in self._STATE_NO_BROADCAST_TYPES:
+            return delivered
+
         if dst == "all":
             # Broadcast to every registered module (except sender and reply-only).
             # Hold _lock during iteration to prevent "dictionary changed size
@@ -1540,6 +1551,13 @@ class DivineBus:
 
         with self._lock:
             self._stats["published"] += 1
+
+        # RFP_g18 §7.D — migrated trinity STATE types do not broadcast (SHM
+        # consumers, G18). Incoming Rust STATE messages enter via THIS path
+        # (broker → _client → publish_in_process); skip the in-process fan-out
+        # entirely (zero subscriber). This is the live cutover point.
+        if msg_type in self._STATE_NO_BROADCAST_TYPES:
+            return 0
 
         delivered = 0
         if dst == "all":

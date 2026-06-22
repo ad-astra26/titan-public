@@ -171,9 +171,12 @@ def test_guardian_filters_out_unwanted_broadcasts():
         f"Guardian received {len(drained)} unwanted broadcasts despite "
         f"filter. Filter check broken? First 3: {drained[:3]}")
 
-    # Filter stats reflect the dropped broadcasts (1200 broadcasts × 1
-    # subscriber = 1200 filtered)
-    assert bus._stats["filtered_broadcasts"] >= 1200
+    # Filter stats reflect the dropped broadcasts. Post-RFP_g18 §7.D the 100
+    # SPIRIT_STATE publishes are FULLY DROPPED (in _STATE_NO_BROADCAST_TYPES —
+    # they never reach the filter-count path) rather than filtered, which is
+    # even stronger for this test's intent (Guardian still receives none). So
+    # the 11 remaining high-rate EVENT types × 100 = 1100 are filtered.
+    assert bus._stats["filtered_broadcasts"] >= 1100
 
 
 # ── agency ───────────────────────────────────────────────────────────
