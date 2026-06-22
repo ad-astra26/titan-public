@@ -438,6 +438,23 @@
 "synthesis.self_learning.failure_replay_max_revisits" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_solved_reward" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_chat_quiet_s" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+# The Inner Turn (RFP_introspective_inner_turn) — great-pulse-triggered introspective mastery (SEPARATE inner domain, INV-IT-4)
+"synthesis.self_learning.inner_turn_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_metabolic_drain_floor" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_policy_lr" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_predictor_lr" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_w_d" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_w_delta" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_iql_window" = {type="int", constraint=">=2", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_iql_steps" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_persist_every" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_dialogue_turns" = {type="int", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_drive_theta0" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_drive_alpha" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_drive_beta" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_drive_floor" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_drive_ceil" = {type="float", constraint="0..1", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.inner_drive_dna_bias" = {type="float", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 "twitter_social.auth_session" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=true}
 "twitter_social.email" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
 "twitter_social.password" = {type="str", constraint="", reload="hot", owner=["social_worker"], sensitive=true}

@@ -64,6 +64,19 @@ from titan_hcl.synthesis.mastery_level import (
     MasteryLevel,
     mastery_readout_to_flat,
 )
+from titan_hcl.synthesis.inner_introspection import (
+    INNER_GOAL_CLASS,
+    INNER_PHI_DIM,
+    MASTERY_LEVEL_INNER_STATE_SPEC,
+    IntrospectiveDrive,
+    InnerIQL,
+    InnerSelfPredictor,
+    assemble_inner_state,
+    build_inner_phi,
+    curiosity_from_neuromod,
+    inner_reward_kernel,
+    znorm_channels,
+)
 from titan_hcl.synthesis.outer_meta_reasoning import OuterMetaReasoningEngine
 from titan_hcl.synthesis.outer_reasoning import OuterReasoningEngine
 from titan_hcl.params import get_params
@@ -202,6 +215,25 @@ _DEFAULTS = {
     "competence_w_adv": 0.4,          # weight: advantage-positive-rate
     "competence_window": 200,         # recent decisions for success_rate
     "competence_ema_alpha": 0.05,     # competence_rate smoothing
+    # ── The Inner Turn (RFP_introspective_inner_turn) — great-pulse-triggered
+    # introspective mastery. SEPARATE inner domain (INV-IT-4). Flag default ON
+    # (kill-switch only). Thresholds are adaptive/DNA-seeded, not hardcoded.
+    "inner_turn_enabled": True,        # the kill-switch (default ON)
+    "inner_metabolic_drain_floor": 0.6,   # max metabolic drain to permit introspection (§5.2)
+    "inner_policy_lr": 0.01,           # inner IQL π learning rate
+    "inner_predictor_lr": 0.3,         # inner self-model (NLMS) learning rate
+    "inner_w_d": 0.5,                  # interoceptive (describe-now) reward weight (Q5)
+    "inner_w_delta": 0.5,              # predictive-delta (anticipate-change) weight (Q5)
+    "inner_iql_window": 256,           # recent inner reward_tuples per IQL consolidation
+    "inner_iql_steps": 10,             # inner IQL SGD steps per great-pulse verify
+    "inner_persist_every": 1,          # great-pulses between inner-state persists
+    "inner_dialogue_turns": 2,         # Phase B narrative dialogue rounds (never a reward)
+    "inner_drive_theta0": 0.35,        # initial introspective-drive threshold (adaptive)
+    "inner_drive_alpha": 0.01,         # WIN → θ−α (refractory discharge, INV-IT-9)
+    "inner_drive_beta": 0.02,          # LOSE → θ+β (dissonance persists)
+    "inner_drive_floor": 0.10,         # θ lower bound
+    "inner_drive_ceil": 0.80,          # θ upper bound
+    "inner_drive_dna_bias": 0.0,       # per-Titan temperament seed (curious → lower θ)
     # ── P4 — level-driven reward shaping (ARCHITECTURE_mastery_leveling.md §4) ──
     # As the level rises, the easy `direct` path's POSITIVE reward decays (coasting
     # pays less → the policy explores harder paths). Applied to the IQL TRAINING
@@ -390,6 +422,36 @@ class _SelfLearningStore:
             except Exception as _e:  # noqa: BLE001
                 logger.debug("[self_learning] macro_emitted ALTER %s soft-fail: %s",
                              _col, _e)
+        # ── The Inner Turn (RFP_introspective_inner_turn, Q1=A) — a FULLY
+        # SEPARATE inner-domain namespace in the same db (worker = G21 sole
+        # writer). ZERO mixing with the outer reward_tuples/success_rate/policy
+        # so the outer routing level is provably untouched (INV-IT-4 / G5).
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS seq_inner_reward_tuples START 1")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS inner_reward_tuples ("
+            " id INTEGER PRIMARY KEY DEFAULT nextval('seq_inner_reward_tuples'),"
+            " features_json VARCHAR, action INTEGER, reward DOUBLE,"
+            " goal_class VARCHAR, e_descr DOUBLE, e_delta DOUBLE, ts DOUBLE)")
+        # The pending self-prediction (t0), keyed by the great-pulse count at
+        # which it was made; verified at the NEXT great pulse (INV-IT-8).
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS inner_pending_prediction ("
+            " id INTEGER PRIMARY KEY, gp_count BIGINT, stance INTEGER,"
+            " phi_json VARCHAR, s0_norm_json VARCHAR, descr_json VARCHAR,"
+            " delta_json VARCHAR, narration VARCHAR, ts DOUBLE)")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS inner_mastery_level_state ("
+            " id INTEGER PRIMARY KEY, state_json VARCHAR, ts DOUBLE)")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS inner_policy_iql_state ("
+            " id INTEGER PRIMARY KEY, iql_json VARCHAR, ts DOUBLE)")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS inner_predictor_state ("
+            " id INTEGER PRIMARY KEY, pred_json VARCHAR, ts DOUBLE)")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS inner_drive_state ("
+            " id INTEGER PRIMARY KEY, drive_json VARCHAR, ts DOUBLE)")
 
     # -- policy weights -------------------------------------------------
     def load_policy_flat(self):
@@ -470,6 +532,121 @@ class _SelfLearningStore:
         except Exception as e:  # noqa: BLE001
             logger.debug("[self_learning] success_rate soft-fail: %s", e)
             return 0.0
+
+    # -- The Inner Turn — SEPARATE inner-domain store (INV-IT-4 / Q1=A) -------
+    def record_inner_reward_tuple(self, *, features, action, reward, goal_class,
+                                  e_descr=0.0, e_delta=0.0) -> None:
+        try:
+            self._conn.execute(
+                "INSERT INTO inner_reward_tuples (features_json, action, reward, "
+                "goal_class, e_descr, e_delta, ts) VALUES (?,?,?,?,?,?,?)",
+                [json.dumps(list(features)), int(action), float(reward),
+                 str(goal_class or ""), float(e_descr), float(e_delta), time.time()])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] record_inner_reward_tuple soft-fail: %s", e)
+
+    def inner_iql_transitions(self, n: int):
+        """Most-recent INNER reward tuples (oldest→newest) for the inner IQL
+        trajectory linking. Reads ONLY inner_reward_tuples — never the outer
+        table (INV-IT-4)."""
+        try:
+            rows = self._conn.execute(
+                "SELECT features_json, action, reward, goal_class, ts FROM ("
+                "  SELECT features_json, action, reward, goal_class, ts, id"
+                "  FROM inner_reward_tuples ORDER BY id DESC LIMIT ?"
+                ") ORDER BY ts ASC, id ASC", [int(n)]).fetchall()
+            return [(json.loads(r[0]), int(r[1]), float(r[2]),
+                     str(r[3] or ""), float(r[4] or 0.0)) for r in rows]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] inner_iql_transitions soft-fail: %s", e)
+            return []
+
+    def inner_success_rate(self, window: int) -> float:
+        """Inner-domain scale-free success rate — goal_class-scoped to the inner
+        rows ONLY (the goal_class-aware success_rate the outer one is not). This
+        is what keeps the outer ratchet untouched (G5)."""
+        try:
+            row = self._conn.execute(
+                "SELECT AVG(CASE WHEN reward > 0 THEN 1.0 ELSE 0.0 END) FROM ("
+                "  SELECT reward FROM inner_reward_tuples ORDER BY id DESC LIMIT ?)",
+                [int(window)]).fetchone()
+            return float(row[0]) if row and row[0] is not None else 0.0
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] inner_success_rate soft-fail: %s", e)
+            return 0.0
+
+    def inner_reward_count(self) -> int:
+        try:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM inner_reward_tuples").fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] inner_reward_count soft-fail: %s", e)
+            return 0
+
+    def stash_inner_prediction(self, *, gp_count, stance, phi, s0_norm,
+                               descr, delta, narration="") -> None:
+        """Persist the pending self-prediction (single row, id=0) so it survives
+        ticks until the next great pulse verifies it (INV-IT-8)."""
+        try:
+            self._conn.execute(
+                "INSERT INTO inner_pending_prediction (id, gp_count, stance, "
+                "phi_json, s0_norm_json, descr_json, delta_json, narration, ts) "
+                "VALUES (0,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO UPDATE SET "
+                "gp_count=excluded.gp_count, stance=excluded.stance, "
+                "phi_json=excluded.phi_json, s0_norm_json=excluded.s0_norm_json, "
+                "descr_json=excluded.descr_json, delta_json=excluded.delta_json, "
+                "narration=excluded.narration, ts=excluded.ts",
+                [int(gp_count), int(stance), json.dumps(list(phi)),
+                 json.dumps(list(s0_norm)), json.dumps(list(descr)),
+                 json.dumps(list(delta)), str(narration or ""), time.time()])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] stash_inner_prediction soft-fail: %s", e)
+
+    def pop_inner_prediction(self):
+        """Return + clear the pending prediction, or None if none stands."""
+        try:
+            row = self._conn.execute(
+                "SELECT gp_count, stance, phi_json, s0_norm_json, descr_json, "
+                "delta_json, narration FROM inner_pending_prediction WHERE id=0"
+            ).fetchone()
+            if not row:
+                return None
+            self._conn.execute("DELETE FROM inner_pending_prediction WHERE id=0")
+            return {"gp_count": int(row[0]), "stance": int(row[1]),
+                    "phi": json.loads(row[2]), "s0_norm": json.loads(row[3]),
+                    "descr": json.loads(row[4]), "delta": json.loads(row[5]),
+                    "narration": str(row[6] or "")}
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] pop_inner_prediction soft-fail: %s", e)
+            return None
+
+    def _save_inner_blob(self, table: str, col: str, obj: dict) -> None:
+        try:
+            self._conn.execute(
+                f"INSERT INTO {table} (id, {col}, ts) VALUES (0,?,?) "
+                f"ON CONFLICT (id) DO UPDATE SET {col}=excluded.{col}, ts=excluded.ts",
+                [json.dumps(obj), time.time()])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] save %s soft-fail: %s", table, e)
+
+    def _load_inner_blob(self, table: str, col: str):
+        try:
+            row = self._conn.execute(
+                f"SELECT {col} FROM {table} WHERE id=0").fetchone()
+            return json.loads(row[0]) if row and row[0] else None
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[self_learning] load %s soft-fail: %s", table, e)
+            return None
+
+    def save_inner_iql(self, d): self._save_inner_blob("inner_policy_iql_state", "iql_json", d)
+    def load_inner_iql(self): return self._load_inner_blob("inner_policy_iql_state", "iql_json")
+    def save_inner_mastery(self, d): self._save_inner_blob("inner_mastery_level_state", "state_json", d)
+    def load_inner_mastery(self): return self._load_inner_blob("inner_mastery_level_state", "state_json")
+    def save_inner_predictor(self, d): self._save_inner_blob("inner_predictor_state", "pred_json", d)
+    def load_inner_predictor(self): return self._load_inner_blob("inner_predictor_state", "pred_json")
+    def save_inner_drive(self, d): self._save_inner_blob("inner_drive_state", "drive_json", d)
+    def load_inner_drive(self): return self._load_inner_blob("inner_drive_state", "drive_json")
 
     def chunk_count(self) -> int:
         """Number of distilled macros = chunked (mastered) routines (SOAR ②).
@@ -1082,6 +1259,13 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
     except Exception:  # noqa: BLE001
         _life = None
 
+    # ── The Inner Turn (RFP_introspective_inner_turn) — great-pulse-triggered
+    # introspective mastery. Fully separate inner domain (INV-IT-4); flag-on by
+    # default (kill-switch only). A failed init self-disables (never blocks boot).
+    _introspection = _IntrospectionRoutine(
+        cfg, store, name, send_queue, titan_id, ensure_shm_root,
+        StateRegistryWriter)
+
     # ── Phase C piece 6 — the OUTER two-level reasoner (numpy-only; INV-OML-8) ──
     # OuterMetaReasoningEngine (reuses the meta handlers via PrimitiveHandlersMixin)
     # over OuterReasoningEngine (reuses reasoning.py's primitive funcs). The
@@ -1165,6 +1349,13 @@ def self_learning_worker_main(recv_queue, send_queue, name: str,
                               chat_active=_chat_active)
             except Exception as e:  # noqa: BLE001
                 logger.debug("[self_learning] explore tick soft-fail: %s", e)
+            # The Inner Turn polls the great pulse on the same idle cadence (the
+            # poll is event-driven: it no-ops unless a NEW great pulse fired —
+            # INV-IT-7). Separate try so it never affects the outer explore tick.
+            try:
+                _introspection.tick(_life, _chat_active)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[self_learning] introspection tick soft-fail: %s", e)
             last_explore = now
 
         try:
@@ -1728,6 +1919,270 @@ def _update_mastery_level(cfg, store, policy, transitions, mastery, level_writer
                 f"milestones={','.join(readout['milestones'])}")
     except Exception as e:  # noqa: BLE001
         logger.debug("[self_learning] mastery level update soft-fail: %s", e)
+
+
+class _IntrospectionRoutine:
+    """The Inner Turn (RFP_introspective_inner_turn) — the pre-BRAIN seed of
+    ARCHITECTURE_brain.md §5.2's `Introspection` DeepThinking routine.
+
+    Polls the emergent GREAT PULSE (SHM, G18 — `resonance_metadata.great_pulse_
+    count` delta; the worker has NO great-pulse bus subscription) and on each
+    pulse, while at rest, runs the event-to-event loop (INV-IT-7/8):
+      • VERIFY the prediction made at the PREVIOUS great pulse against the now-
+        measured inner state → r_inner (pure telemetry, INV-IT-1) → inner store
+        → inner IQL train → InnerMasteryLevel update + SHM publish → drive WIN/
+        LOSE refractory (INV-IT-9) → (Phase C) SELF anchor.
+      • SEED a fresh prediction (this pulse = t0) iff the embodied drive clears
+        its adaptive threshold.
+
+    FULLY SEPARATE from the outer routing learner (Q1=A / INV-IT-4): its own
+    bank/predictor/IQL/level/SHM-slot/store-tables. Touches nothing outer."""
+
+    def __init__(self, cfg, store, name, send_queue, titan_id, ensure_shm_root,
+                 StateRegistryWriter):
+        self.cfg = cfg
+        self.store = store
+        self.name = name
+        self.send_queue = send_queue
+        self.enabled = bool(cfg.get("inner_turn_enabled", True))
+        self.bank = None
+        self.iql = None
+        self.predictor = None
+        self.mastery = None
+        self.drive = None
+        self.level_writer = None
+        self._last_gp = None            # last seen great_pulse_count (None=unseen)
+        self._prev_norm = None          # for inner-state volatility
+        self._since_persist = 0
+        self._compose_voice = None      # Phase B injects the LLM narrator
+        if not self.enabled:
+            return
+        try:
+            from titan_hcl.api.shm_reader_bank import ShmReaderBank
+            self.bank = ShmReaderBank(titan_id=titan_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[inner_turn] ShmReaderBank init failed (disabled): %s", e)
+            self.enabled = False
+            return
+        try:
+            self.iql = InnerIQL(lr=float(cfg.get("inner_policy_lr", 0.01)))
+            self.iql.init_iql()
+            _iq = store.load_inner_iql()
+            if _iq is not None and self.iql.load_dict(_iq):
+                logger.info("[inner_turn] InnerIQL restored (iql_updates=%d)",
+                            self.iql.total_iql_updates)
+            self.predictor = InnerSelfPredictor(
+                lr=float(cfg.get("inner_predictor_lr", 0.3)))
+            _pp = store.load_inner_predictor()
+            if _pp is not None:
+                self.predictor.load_dict(_pp)
+            self.mastery = MasteryLevel(
+                n_grades=int(cfg["level_n_grades"]),
+                grade_lo=float(cfg["level_grade_lo"]),
+                grade_hi=float(cfg["level_grade_hi"]),
+                ema_alpha=float(cfg["level_ema_alpha"]),
+                competence_floor_base=float(cfg["level_competence_floor_base"]),
+                competence_floor_slope=float(cfg["level_competence_floor_slope"]),
+                competence_ema_alpha=float(cfg["competence_ema_alpha"]))
+            _ms = store.load_inner_mastery()
+            if _ms is not None:
+                self.mastery.load_dict(_ms)
+            self.drive = IntrospectiveDrive(
+                theta0=float(cfg.get("inner_drive_theta0", 0.35)),
+                alpha=float(cfg.get("inner_drive_alpha", 0.01)),
+                beta=float(cfg.get("inner_drive_beta", 0.02)),
+                floor=float(cfg.get("inner_drive_floor", 0.10)),
+                ceil=float(cfg.get("inner_drive_ceil", 0.80)),
+                dna_bias=float(cfg.get("inner_drive_dna_bias", 0.0)))
+            _dr = store.load_inner_drive()
+            if _dr is not None:
+                self.drive.load_dict(_dr)
+            self.level_writer = StateRegistryWriter(
+                MASTERY_LEVEL_INNER_STATE_SPEC, ensure_shm_root(titan_id))
+            # Boot-publish the inner level so /v6/mastery?domain=inner is correct
+            # the instant the worker is up (mirrors the outer boot-publish).
+            try:
+                self.level_writer.write(mastery_readout_to_flat(self.mastery.readout()))
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info("[inner_turn] Introspection routine ready (grade=%d, "
+                        "theta=%.3f, inner_rewards=%d)",
+                        self.mastery.readout()["grade"], self.drive.theta,
+                        store.inner_reward_count())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[inner_turn] init failed (disabled): %s", e)
+            self.enabled = False
+
+    def _sense(self):
+        """SENSE → (s_raw, s_norm, phi, neuro_dict). None on a torn read."""
+        body = self.bank.read_inner_body_5d()
+        mind = self.bank.read_inner_mind_15d()
+        spirit = self.bank.read_inner_spirit_45d()
+        neuro = self.bank.read_neuromod()
+        s_raw = assemble_inner_state(body, mind, spirit, neuro)
+        s_norm = znorm_channels(s_raw)
+        return s_norm, build_inner_phi(s_norm), neuro
+
+    def _metabolic_ok(self, life, chat_active) -> bool:
+        """At rest = not dreaming, no live chat turn, metabolic headroom (§5.2
+        survival > DeepThinking; INV-IT-3). Soft — a torn life read permits."""
+        if chat_active:
+            return False
+        if life is None:
+            return True
+        try:
+            if life.is_dreaming():
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            drain = float(life.get_metabolic_drain())
+            return drain <= float(self.cfg.get("inner_metabolic_drain_floor", 0.6))
+        except Exception:  # noqa: BLE001
+            return True
+
+    def tick(self, life, chat_active) -> None:
+        """One poll. Event-driven: does nothing unless a NEW great pulse fired."""
+        if not self.enabled or self.bank is None:
+            return
+        meta = self.bank.read_resonance_metadata()
+        if not isinstance(meta, dict):
+            return
+        gp = int(meta.get("great_pulse_count", 0))
+        if self._last_gp is None:          # first poll — establish the baseline
+            self._last_gp = gp
+            return
+        if gp <= self._last_gp:             # no new great pulse → nothing to do
+            return
+        self._last_gp = gp
+        if not self._metabolic_ok(life, chat_active):
+            return                          # the luxury of rest only (INV-IT-3)
+
+        s_norm, phi, neuro = self._sense()
+        volatility = (0.0 if self._prev_norm is None
+                      else float(np.linalg.norm(s_norm - self._prev_norm)
+                                 / np.sqrt(len(s_norm))))
+        self._prev_norm = s_norm
+
+        # ── VERIFY the prediction stashed at the previous great pulse ──────
+        pending = self.store.pop_inner_prediction()
+        if pending is not None:
+            try:
+                self._verify(pending, s_norm, phi)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[inner_turn] verify soft-fail: %s", e)
+
+        # ── SEED a fresh prediction iff the embodied drive fires ───────────
+        try:
+            curiosity = curiosity_from_neuromod(neuro)
+            d = self.drive.compute_drive(curiosity, volatility)
+            if self.drive.should_fire(drive=d, great_pulse_fired=True,
+                                      metabolic_ok=True):
+                self._seed(gp, s_norm, phi)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[inner_turn] seed soft-fail: %s", e)
+
+        self._maybe_persist()
+
+    def _seed(self, gp, s_norm, phi) -> None:
+        stance = self.iql.select_stance(phi)
+        descr, delta = self.predictor.predict(phi, stance)
+        narration = ""
+        if self._compose_voice is not None:     # Phase B
+            try:
+                narration = self._compose_voice(s_norm, stance) or ""
+            except Exception:  # noqa: BLE001
+                narration = ""
+        self.store.stash_inner_prediction(
+            gp_count=gp, stance=stance, phi=phi.tolist(),
+            s0_norm=s_norm.tolist(), descr=descr.tolist(), delta=delta.tolist(),
+            narration=narration)
+
+    def _verify(self, pending, s1_norm, _phi_now) -> None:
+        import numpy as _np
+        phi0 = _np.asarray(pending["phi"], dtype=_np.float32)
+        s0 = _np.asarray(pending["s0_norm"], dtype=_np.float32)
+        descr = _np.asarray(pending["descr"], dtype=_np.float32)
+        delta = _np.asarray(pending["delta"], dtype=_np.float32)
+        stance = int(pending["stance"])
+        rk = inner_reward_kernel(
+            descr, delta, s0, s1_norm,
+            w_d=float(self.cfg.get("inner_w_d", 0.5)),
+            w_delta=float(self.cfg.get("inner_w_delta", 0.5)))
+        r = float(rk["reward"])
+        # RECORD (inner store only — INV-IT-4)
+        self.store.record_inner_reward_tuple(
+            features=phi0.tolist(), action=stance, reward=r,
+            goal_class=INNER_GOAL_CLASS,
+            e_descr=rk["e_descr"], e_delta=rk["e_delta"])
+        # The self-model learns toward the MEASURED outcome (its accuracy climbs)
+        self.predictor.learn(phi0, stance, s0, s1_norm - s0)
+        # Inner IQL consolidation pass over recent inner transitions
+        rows = self.store.inner_iql_transitions(
+            int(self.cfg.get("inner_iql_window", 256)))
+        trans = _build_inner_transitions(rows)
+        if len(trans) >= 2:
+            self.iql.train_iql(trans, steps=int(self.cfg.get("inner_iql_steps", 10)))
+        # InnerMasteryLevel update from V̄ + the inner-scoped competence (G5: the
+        # inner success rate reads ONLY inner_reward_tuples).
+        vbar = self.iql.value_symlog(phi0)
+        comp = self.iql.advantage_positive_rate()
+        sr = self.store.inner_success_rate(int(self.cfg.get("competence_window", 50)))
+        readout = self.mastery.update(vbar, max(comp, sr))
+        try:
+            self.level_writer.write(mastery_readout_to_flat(readout))
+        except Exception:  # noqa: BLE001
+            pass
+        # Local refractory (INV-IT-9) — no body write in v1 (Q6)
+        self.drive.record_outcome(win=(r > 0.0), reward=r)
+        # Phase C SELF anchor hook (set by the worker when Phase C is wired)
+        if self._anchor is not None:
+            try:
+                self._anchor(pending, rk, readout)
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info("[inner_turn] verify gp=%d stance=%d r=%.3f (e_d=%.3f e_Δ=%.3f) "
+                    "level=%.3f grade=%d theta=%.3f", pending["gp_count"], stance, r,
+                    rk["e_descr"], rk["e_delta"], readout["level"], readout["grade"],
+                    self.drive.theta)
+
+    _anchor = None    # Phase C sets a callable(pending, rk, readout)
+
+    def _maybe_persist(self) -> None:
+        self._since_persist += 1
+        if self._since_persist < int(self.cfg.get("inner_persist_every", 1)):
+            return
+        self._since_persist = 0
+        try:
+            self.store.save_inner_iql(self.iql.to_dict())
+            self.store.save_inner_predictor(self.predictor.to_dict())
+            self.store.save_inner_mastery(self.mastery.to_dict())
+            self.store.save_inner_drive(self.drive.to_dict())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[inner_turn] persist soft-fail: %s", e)
+
+
+def _build_inner_transitions(rows):
+    """Per-stance trajectory linking for the inner IQL (mirrors _build_routing_
+    transitions but over the INNER feature dim). rows = [(features, action,
+    reward, goal_class, ts), …] sorted ts ASC."""
+    from collections import defaultdict
+    valid = []
+    groups = defaultdict(list)
+    for feats, action, reward, gc, _ts in rows:
+        if len(feats) != INNER_PHI_DIM:
+            continue
+        valid.append((feats, int(action), float(reward), str(gc or "")))
+        groups[gc].append(len(valid) - 1)
+    out = []
+    for _gc, idxs in groups.items():
+        for j, ix in enumerate(idxs):
+            feats, action, reward, gcl = valid[ix]
+            nxt = valid[idxs[j + 1]][0] if j + 1 < len(idxs) else None
+            out.append({"state": feats, "action": action, "reward": reward,
+                        "next_state": nxt, "terminal": nxt is None,
+                        "goal_class": gcl})
+    return out
 
 
 def _explore_tick(cfg, store, policy, shm_writer, life, send_queue, name,
