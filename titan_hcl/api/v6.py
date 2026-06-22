@@ -338,6 +338,9 @@ _T = (
      None, None, (), ("timechain_worker",), True, "/v4/timechain/verify/{height}"),
     ("/v6/timechain/test-commit", "POST", "post_v4_timechain_test_commit", "timechain", "mutation",
      None, "commands.timechain_test_commit", (), ("timechain_worker",), False, "/v4/timechain/test-commit"),
+    # [ACTR-REHOMING TEMP 2026-06-22 — REMOVE after T3 gate verification]
+    ("/v6/admin/actr-inject", "POST", "post_v6_admin_actr_inject", "cognitive", "mutation",
+     None, None, (), ("cognitive_worker",), False, None),
     ("/v6/timechain/backup-status", "GET", "get_v4_timechain_backup_status", "timechain", "readout",
      None, None, (), ("timechain_worker",), True, "/v4/timechain/backup-status"),
     ("/v6/timechain/verify-memories", "GET", "get_v4_timechain_verify_memories", "timechain", "readout",
