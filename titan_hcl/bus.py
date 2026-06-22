@@ -935,6 +935,25 @@ NS_REWARD = "NS_REWARD"                                # expression_worker → c
 #   }
 EXPERIENCE_RECORD = "EXPERIENCE_RECORD"                # producers → cognitive_worker (Record stage of distillation loop)
 
+# EPISODE_RECORD — the durable twin of EXPERIENCE_RECORD (RFP_phase_c_actr_memory_
+# rehoming §4.1). Restores the dead ACT-R Episodic faculty: cognitive_worker-native
+# autobiographical events (great_pulse / dreaming_start|end / kin_exchange) are
+# recorded into episodic_memory.db. Like EXPERIENCE_RECORD, producers emit the
+# semantic content they own; cognitive_worker — G21 sole writer of episodic_memory.db
+# — enriches on receipt with the consciousness felt-state (full state_vector) +
+# hormonal snapshot, computes EMERGENT significance = the affective-loop surprise of
+# `metric` folded into its OWN per-event EMA (episodic_significance_state.json,
+# single-writer; surprise-only, no net — Phase 1), then calls record_episode(). All
+# Phase-1 triggers are in-proc so they call _dispatch_episode_record directly (no bus
+# hop); the event + emit helper exist so Phase 2's cross-process (synthesis) episodes
+# share one targeted, coalesced, drop-safe path.
+#   - P2, TARGETED dst="cognitive_worker" (NEVER dst="all" — mirrors EXPERIENCE_RECORD).
+#   - Non-blocking, per-event-type min-interval coalescing, drop-safe.
+# Payload (producer-owned): {event_type:str, description:str, metric:float,
+#   epoch_id:int, ts:float} — `metric` = the event's natural-scale scalar folded into
+#   the per-event surprise baseline; `description` = short autobiographical text.
+EPISODE_RECORD = "EPISODE_RECORD"                      # producers → cognitive_worker (Record stage of the Episodic faculty)
+
 # Track 2 outer_interface_worker periodic stats publishers (NEW v1.2.1 per
 # SPEC §9.B outer_interface_worker Bus publications row). Coalesced at the
 # broker by ("titan_id",) so under backpressure the freshest snapshot wins.
@@ -2311,6 +2330,68 @@ def emit_experience_record(
     except Exception as e:
         swallow_warn("[emit_experience_record] failed", e,
                      key="bus.emit_experience_record")
+        return False
+
+
+# EPISODE_RECORD producer (RFP_phase_c_actr_memory_rehoming §4.1) — the durable-twin
+# clone of emit_experience_record. Targeted dst="cognitive_worker", non-blocking,
+# per-event-type min-interval coalescing, drop-safe.
+EPISODE_RECORD_MIN_INTERVAL_S = 2.0
+_episode_record_last_emit: dict = {}
+
+
+def emit_episode_record(
+    sender, src: str, event_type: str, description: str = "",
+    metric: float = 0.0, epoch_id: int = 0,
+    min_interval_s: Optional[float] = None, coalesce_key: Optional[str] = None,
+) -> bool:
+    """Emit a targeted EPISODE_RECORD frame — Record stage of the ACT-R Episodic
+    faculty (RFP_phase_c_actr_memory_rehoming §4.1). Producers pass the SEMANTIC
+    content they own (event_type / description / metric); cognitive_worker enriches
+    (felt-state + hormones), scores emergent significance from `metric`, and records.
+
+    Bus-hygiene invariants (mirrors emit_experience_record): TARGETED
+    dst="cognitive_worker" (never dst="all"), non-blocking put_nowait/publish,
+    per-event-type min-interval coalescing, drop-safe (full queue → False, no stall).
+
+    NOTE: Phase-1 triggers are all in cognitive_worker's own process and call
+    _dispatch_episode_record directly (no bus hop); this producer exists for Phase 2's
+    cross-process (synthesis-resident) episodes. Returns True if emitted, False if
+    coalesced or dropped."""
+    now = time.time()
+    iv = (EPISODE_RECORD_MIN_INTERVAL_S
+          if min_interval_s is None else min_interval_s)
+    if not str(event_type):
+        return False
+    key = str(coalesce_key) if coalesce_key else str(event_type)
+    if now - _episode_record_last_emit.get(key, 0.0) < iv:
+        return False  # coalesced — bus hygiene
+    msg = {
+        "type": EPISODE_RECORD,
+        "src": src,
+        "dst": "cognitive_worker",
+        "ts": now,
+        "rid": None,
+        "payload": {
+            "event_type": str(event_type),
+            "description": str(description)[:500],
+            "metric": float(metric),
+            "epoch_id": int(epoch_id or 0),
+            "ts": now,
+        },
+    }
+    try:
+        if hasattr(sender, "put_nowait"):
+            sender.put_nowait(msg)
+        elif hasattr(sender, "publish"):
+            sender.publish(msg)
+        else:
+            return False
+        _episode_record_last_emit[key] = now
+        return True
+    except Exception as e:
+        swallow_warn("[emit_episode_record] failed", e,
+                     key="bus.emit_episode_record")
         return False
 
 

@@ -39,6 +39,36 @@ EVENT_TYPES = (
 )
 
 
+def compute_significance(event_type: str, metric: float, state_path: str,
+                         cfg=None) -> Optional[float]:
+    """Emergent episodic significance = the affective-loop SURPRISE of `metric`
+    folded into a per-event EMA baseline (RFP_phase_c_actr_memory_rehoming §4.1).
+
+    Reuses `affective_nudge.compute_event_nudge` (the affective loop's event-signal
+    scorer) against a cognitive_worker-OWNED `state_path` (single-writer; NOT the
+    synthesis-pinned affective_nudge_state.json) and returns only the `surprise`
+    scalar — NO net, NO valence (an episode is significant whether the surprise is
+    pleasant or not; `intrinsic_positive=True` just keeps the scorer from dropping
+    below-baseline events). The baseline is keyed by `event_type`, so great_pulse /
+    dreaming_start / dreaming_end / kin_exchange each habituate independently.
+
+    Returns None on the honest "nothing earned" cases (zero metric, first-ever
+    observation / still warming up, or surprise→0 on-baseline) → the caller does NOT
+    record. Surprise is unbounded above; `record_episode`'s SIGNIFICANCE_THRESHOLD
+    then gates which surprises are large enough to remember. Never raises."""
+    try:
+        from titan_hcl.logic.affective_nudge import (
+            compute_event_nudge, AffectiveConfig)
+        nudge = compute_event_nudge(
+            float(metric), state_path, signal_type=str(event_type),
+            cfg=cfg or AffectiveConfig(), intrinsic_positive=True)
+        return float(nudge.surprise) if nudge is not None else None
+    except Exception as e:
+        logger.debug("[episodic] compute_significance(%s) failed: %s",
+                     event_type, e)
+        return None
+
+
 def _cosine_sim(a: list, b: list) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0

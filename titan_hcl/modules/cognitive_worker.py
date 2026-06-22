@@ -415,6 +415,12 @@ _COGNITIVE_WORKER_SUBSCRIBE_TOPICS = [
     # worker enriches + records via _dispatch_experience_record. Targeted
     # dst="cognitive_worker" (P2, never dst=all) — bus-hygiene §3.1.
     bus.EXPERIENCE_RECORD,         # → _dispatch_experience_record (exp_orchestrator.record_outcome)
+    # EPISODE_RECORD — the durable twin (RFP_phase_c_actr_memory_rehoming §4.1).
+    # Restores the dead ACT-R Episodic faculty: enrich felt-state + hormones,
+    # score emergent surprise-significance, persist via EpisodicMemory.record_episode
+    # (G21 sole writer of episodic_memory.db). Phase-1 triggers are in-proc (direct
+    # call); subscription is for Phase-2 cross-process (synthesis) episodes.
+    bus.EPISODE_RECORD,            # → _dispatch_episode_record (episodic_mem.record_episode)
     # MEMORY_RECALL_PERTURBATION — Phase D (D-SPEC-116). i_depth + working_mem
     # legs of the recall bridge, re-homed from the retired spirit_worker. Emitted
     # by agno_hooks (interface) targeted dst="cognitive_worker"; the neuromod-nudge
@@ -1183,6 +1189,21 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                             "kin_emotion": _kin_emotion,
                         },
                     })
+                    # Episodic record (RFP_phase_c_actr_memory_rehoming §4.1): a kin
+                    # exchange is an autobiographical event. In-proc → direct call;
+                    # significance = surprise of the resonance vs the kin_exchange
+                    # baseline (an unusually-strong exchange is the memorable one).
+                    _kin_ep = int((state_refs.get("consciousness", {}) or {}).get(
+                        "latest_epoch", {}).get("epoch_id", 0) or 0)
+                    _dispatch_episode_record(state_refs, {
+                        "event_type": "kin_exchange",
+                        "description": (
+                            f"Exchanged consciousness with my twin "
+                            f"{_kin_pubkey[:8]} — resonance {_kin_resonance:.3f}, "
+                            f"they felt {_kin_emotion}"),
+                        "metric": _kin_resonance,
+                        "epoch_id": _kin_ep,
+                    })
                     if _kin_resonance > 0.5:
                         _kin_nr = state_refs.get("_neuromod_reader")
                         _kin_neuromods = _kin_nr() if _kin_nr else {}
@@ -1358,6 +1379,14 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 # semantic content with in-proc inner-state + hormones + perception
                 # key, then persist via ExperienceOrchestrator (G21 sole writer).
                 _dispatch_experience_record(state_refs, payload)
+
+            elif msg_type == bus.EPISODE_RECORD:
+                # Record stage of the ACT-R Episodic faculty (RFP_phase_c_actr_
+                # memory_rehoming §4.1) — enrich felt-state + hormones, score
+                # emergent surprise-significance, persist via record_episode
+                # (G21 sole writer of episodic_memory.db). Phase-2 cross-process
+                # episodes arrive here; Phase-1 native triggers call direct.
+                _dispatch_episode_record(state_refs, payload)
 
             elif msg_type == bus.MEMORY_RECALL_PERTURBATION:
                 # Phase D (D-SPEC-116) — i_depth + working_mem legs of the recall
@@ -2829,6 +2858,85 @@ def _dispatch_experience_record(state_refs: dict, payload: dict) -> None:
             "[CognitiveWorker] EXPERIENCE_RECORD record raised: %s", _exp_err)
 
 
+def _dispatch_episode_record(state_refs: dict, payload: dict) -> None:
+    """EPISODE_RECORD consumer — Record stage of the ACT-R Episodic faculty
+    (RFP_phase_c_actr_memory_rehoming §4.1). The durable twin of
+    _dispatch_experience_record: producers (the 3 cognitive_worker-native Phase-1
+    triggers — great_pulse / dreaming_start|end / kin_exchange) supply
+    {event_type, description, metric, epoch_id}; this owner — G21 sole writer of
+    episodic_memory.db — enriches with the in-proc consciousness felt-state (full
+    state_vector, 65D inner-trinity fallback) + the hormonal snapshot (verbatim from
+    _dispatch_experience_record), computes EMERGENT significance = the affective-loop
+    SURPRISE of `metric` folded into its OWN per-event EMA (episodic_significance_
+    state.json, beside the DB — single-writer; surprise-only, NO net), then persists
+    via record_episode (which gates at SIGNIFICANCE_THRESHOLD).
+
+    Sub-ms; no downstream bus emit; graceful degradation — a missing engine / no
+    earned surprise never raises (an episode is recoverable, not critical state)."""
+    episodic_mem = state_refs.get("episodic_mem")
+    if episodic_mem is None:
+        return
+    try:
+        event_type = str(payload.get("event_type", "")).strip()
+        if not event_type:
+            return
+        description = str(payload.get("description", ""))[:500]
+        metric = payload.get("metric", None)
+        epoch_id = int(payload.get("epoch_id", 0) or 0)
+
+        # Emergent significance = surprise of `metric` vs this event's running
+        # baseline (cognitive_worker-owned EMA file, co-located with the DB).
+        if metric is None:
+            return
+        _sig_dir = os.path.dirname(
+            getattr(episodic_mem, "_db_path", "./data/episodic_memory.db")) or "."
+        _sig_path = os.path.join(_sig_dir, "episodic_significance_state.json")
+        from titan_hcl.logic.episodic_memory import (
+            compute_significance as _episodic_significance)
+        significance = _episodic_significance(
+            event_type, float(metric), _sig_path)
+        if significance is None:
+            return  # no earned surprise (first-ever / warming up / on-baseline)
+
+        # Felt-state enrichment — verbatim from _dispatch_experience_record: prefer
+        # the full consciousness state_vector, fall back to the cached 65D inner
+        # trinity kept fresh by the BODY/MIND/SPIRIT_STATE handlers.
+        consciousness = state_refs.get("consciousness")
+        _sv = []
+        if consciousness:
+            _sv = (consciousness.get("latest_epoch", {}) or {}).get(
+                "state_vector", []) or []
+            if hasattr(_sv, "to_list"):
+                _sv = _sv.to_list()
+        _sv = list(_sv) if _sv else []
+        if not _sv:
+            _ib = list(state_refs.get("_inner_body_state") or [])[:5]
+            _im = list(state_refs.get("_inner_mind_state") or [])[:15]
+            _isp = list(state_refs.get("_inner_spirit_state") or [])[:45]
+            _sv = _ib + _im + _isp  # 65D felt-tensor fallback
+
+        nns = state_refs.get("neural_nervous_system")
+        hormonal_snapshot = {}
+        if nns is not None and getattr(nns, "_hormonal_enabled", False):
+            try:
+                hormonal_snapshot = {h: round(v.level, 3)
+                                     for h, v in nns._hormonal._hormones.items()}
+            except Exception:
+                hormonal_snapshot = {}
+
+        episodic_mem.record_episode(
+            event_type=event_type,
+            description=description,
+            felt_state=_sv,
+            hormonal_snapshot=hormonal_snapshot,
+            epoch_id=epoch_id,
+            significance=float(significance),
+        )
+    except Exception as _ep_err:
+        logger.debug(
+            "[CognitiveWorker] EPISODE_RECORD record raised: %s", _ep_err)
+
+
 def _dispatch_stimulus(state_refs: dict, msg_type: str, payload: dict) -> None:
     """Feed CONVERSATION_STIMULUS / EXPERIENCE_STIMULUS to ReasoningEngine.
 
@@ -3330,6 +3438,41 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
             logger.warning("[DreamBridge] dream-end harvest/inject failed: %s",
                            _db_err, exc_info=True)
     state_refs["_dream_bridge_was_dreaming"] = _epoch_is_dreaming
+
+    # ── Episodic record: dream start / end (RFP_phase_c_actr_memory_rehoming §4.1) ──
+    # cognitive_worker-native autobiographical episode on each dream-cycle edge,
+    # using a self-contained edge detector (own state key, independent of the bridge
+    # gates above). Metric is a real cycle scalar — wake-duration before sleep
+    # (start) / dream-duration in epochs (end) — folded into a per-event surprise
+    # baseline, so only unusually-timed cycles are remembered (habituation automatic).
+    # start/end key separate baselines (their metrics are not comparable). In-proc →
+    # direct call; never raises into the driver.
+    _ep_dream_prev = bool(state_refs.get("_episodic_dream_was_dreaming", False))
+    # epoch_id is not yet bound this early in the driver (assigned ~L3710); read the
+    # fresh epoch from the consciousness state snapshot in state_refs instead.
+    _ep_eid = int((state_refs.get("consciousness", {}) or {}).get(
+        "latest_epoch", {}).get("epoch_id", 0) or 0)
+    if _epoch_is_dreaming and not _ep_dream_prev:
+        _ep_last_end = int(state_refs.get("_episodic_dream_last_end_epoch", 0) or 0)
+        _ep_wake_dur = float(_ep_eid - _ep_last_end) if _ep_last_end > 0 else 0.0
+        state_refs["_episodic_dream_start_epoch"] = _ep_eid
+        _dispatch_episode_record(state_refs, {
+            "event_type": "dreaming_start",
+            "description": f"Entered dreaming after {int(_ep_wake_dur)} epochs awake",
+            "metric": _ep_wake_dur,
+            "epoch_id": _ep_eid,
+        })
+    elif _ep_dream_prev and not _epoch_is_dreaming:
+        _ep_start = int(state_refs.get("_episodic_dream_start_epoch", 0) or 0)
+        _ep_dream_dur = float(_ep_eid - _ep_start) if _ep_start > 0 else 0.0
+        state_refs["_episodic_dream_last_end_epoch"] = _ep_eid
+        _dispatch_episode_record(state_refs, {
+            "event_type": "dreaming_end",
+            "description": f"Woke from a {int(_ep_dream_dur)}-epoch dream",
+            "metric": _ep_dream_dur,
+            "epoch_id": _ep_eid,
+        })
+    state_refs["_episodic_dream_was_dreaming"] = _epoch_is_dreaming
 
     # 3. Read NEUROMOD_STATE shm slot + drive coordinator.update_neuromodulators.
     if neuromod_reader is not None and coordinator is not None:
@@ -4162,6 +4305,22 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                         _sov_fired = (_sov_cur_gp - _sov_prev_gp) > 0
                         state_refs["_sov_prev_great_pulses"] = _sov_cur_gp
                         state_refs["_sov_last_sent_epoch"] = _sov_eid
+                        # Episodic record (RFP_phase_c_actr_memory_rehoming §4.1):
+                        # a GREAT PULSE integration is an autobiographical milestone.
+                        # In-proc → direct call; significance = surprise of the
+                        # integration delta vs the great_pulse baseline (an
+                        # unusually-large integration is the memorable one).
+                        if _sov_fired:
+                            _gp_delta = float(_sov_cur_gp - _sov_prev_gp)
+                            _dispatch_episode_record(state_refs, {
+                                "event_type": "great_pulse",
+                                "description": (
+                                    f"Great Pulse integration "
+                                    f"(+{int(_gp_delta)} pulse(s), "
+                                    f"total {_sov_cur_gp})"),
+                                "metric": _gp_delta,
+                                "epoch_id": _sov_eid,
+                            })
                         _sov_dev_age = float(getattr(
                             pi_monitor, "developmental_age", 0.0) or 0.0) \
                             if pi_monitor else 0.0
@@ -5466,13 +5625,13 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
         except Exception as _err:
             _log_driver_err("med_watchdog.check", _err)
 
-    # episodic_mem — passive backing store; consumer migration follows
-    # in next session as part of dream-cycle path migration. Bare
-    # reference satisfies the parity invariant for now.
-    episodic_mem = state_refs.get("episodic_mem")
-    _ = episodic_mem  # parity-anchor; concrete record_episode callsites
-                      # remain in spirit_worker_main legacy path until
-                      # dream-cycle migration ships.
+    # episodic_mem — the ACT-R Episodic faculty now has LIVE writers
+    # (RFP_phase_c_actr_memory_rehoming §4.1): the 3 cognitive_worker-native
+    # triggers (great_pulse @ SOVEREIGNTY_EPOCH, dreaming_start/end @ the dream
+    # edges, kin_exchange @ KIN_SIGNAL) call _dispatch_episode_record →
+    # record_episode. The pre-Phase-C `_ = episodic_mem` parity-anchor (which gamed
+    # the boot-driver-parity test while the faculty was dead) is DELETED; write-
+    # liveness is now asserted by tests/test_episodic_rehoming.py.
 
     # 9. Drive NeuromodRewardObserver — emits per-program reward from
     #    neuromod EMAs every tick_interval ticks.

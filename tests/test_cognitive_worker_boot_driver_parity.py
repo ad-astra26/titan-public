@@ -87,7 +87,13 @@ BOOT_DRIVER_PARITY: list[tuple[str, str]] = [
     # cognitive_worker consumes PREDICTION_GENERATED bus events via the
     # dispatcher → state_refs["_latest_prediction"] cache slot.
     ("working_mem", "working_mem"),
-    ("episodic_mem", "episodic_mem"),
+    # episodic_mem: marker is the REAL driver call, not the engine name. The faculty
+    # is driven via _dispatch_episode_record(...) from _drive_one_epoch (great_pulse @
+    # SOVEREIGNTY_EPOCH + dreaming_start/end @ the dream edges) per
+    # RFP_phase_c_actr_memory_rehoming §4.1. This CLOSES the gaming the old
+    # `_ = episodic_mem` parity-anchor enabled (a bare reference with no live call
+    # while the faculty was dead) — the marker now demands an actual writer call.
+    ("episodic_mem", "_dispatch_episode_record"),
     ("intuition_convergence", "intuition_convergence"),
     ("wallet_observer", "wallet_observer"),
     ("meta_recruitment", "meta_recruitment"),
