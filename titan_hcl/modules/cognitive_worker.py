@@ -110,51 +110,6 @@ from titan_hcl.params import load_titan_params
 
 logger = logging.getLogger(__name__)
 
-# --- RFP_g18_high_rate_state_shm_migration §7.A — G-PARITY instrument -------
-# Gated OFF by default. When enabled, _dispatch_trinity_state reads the matching
-# SHM component slot at the instant each trinity bus event arrives and logs the
-# bus-carried tensor vs the SHM-slot tensor + slot freshness. Proves INV-G18-3
-# (the slot carries the same tensor the bus event did, AND is populated) BEFORE
-# any consumer is cut over from bus → SHM reads. No behavior change: the cached
-# value is still the bus value; this only reads SHM read-only and logs.
-# Throttled per (type, src) to keep 70 Hz spirit sane.
-#
-# Gate = a marker FILE, NOT an env var: the kernel hands L2 workers a CURATED
-# env (titan-kernel-rs spawn.rs build_child_env() does env_clear() + a fixed
-# allowlist), so an arbitrary TITAN_G18_PARITY_PROBE never reaches a worker.
-# Workers DO get TITAN_DATA_DIR and run with cwd=repo-root, so the marker
-# <data_dir>/.g18_parity_probe is reliably findable. To enable on a box:
-#   touch <data_dir>/.g18_parity_probe  &&  full-restart the Titan
-# (cognitive_worker is not restart-allowlisted → full restart). The env var is
-# still honored for direct launches / offline tests.
-def _g18_parity_enabled() -> bool:
-    if os.environ.get("TITAN_G18_PARITY_PROBE", "0") == "1":
-        return True
-    for data_dir in (os.environ.get("TITAN_DATA_DIR"),
-                      os.environ.get("TITAN_KERNEL_DATA_DIR"), "data"):
-        if not data_dir:
-            continue
-        try:
-            if os.path.exists(os.path.join(data_dir, ".g18_parity_probe")):
-                return True
-        except Exception:
-            continue
-    return False
-
-
-_G18_PARITY_PROBE = _g18_parity_enabled()
-_G18_PARITY_INTERVAL_S = float(
-    os.environ.get("TITAN_G18_PARITY_INTERVAL_S", "2.0"))
-_G18_PARITY_READERS = {
-    ("BODY_STATE", "inner"): "read_inner_body_5d",
-    ("BODY_STATE", "outer"): "read_outer_body_5d",
-    ("MIND_STATE", "inner"): "read_inner_mind_15d",
-    ("MIND_STATE", "outer"): "read_outer_mind_15d",
-    ("SPIRIT_STATE", "inner"): "read_inner_spirit_45d",
-    ("SPIRIT_STATE", "outer"): "read_outer_spirit_45d",
-}
-_G18_PARITY_LAST_LOG: dict = {}
-
 # Heartbeat cadence per SPEC §9.C (10s — guardian_HCL liveness contract).
 _HEARTBEAT_INTERVAL_S = 10.0
 # Main loop poll cadence (kept tight so MODULE_SHUTDOWN is responsive).
@@ -392,9 +347,10 @@ def _build_chain_archive_response(chain_archive, name: str,
 # EXPRESSION events are produced internally by the epoch driver
 # (expression_manager.evaluate_all() in chunk 8G), not bus-subscribed.
 _COGNITIVE_WORKER_SUBSCRIBE_TOPICS = [
-    bus.BODY_STATE,                # 5D, src=inner|outer per SPEC §8.5
-    bus.MIND_STATE,                # 15D, src=inner|outer
-    bus.SPIRIT_STATE,              # 45D, src=inner|outer
+    # RFP_g18 §7.C (2026-06-22): BODY/MIND/SPIRIT_STATE removed — trinity STATE
+    # is now read from SHM (the 6 component slots via ShmReaderBank) in the
+    # epoch driver, per G18 (state=SHM). Was a bus-subscribe per SPEC §8.5;
+    # G-PARITY-verified the SHM slot carries the same tensor (T3 2026-06-22).
     bus.KERNEL_EPOCH_TICK,         # circadian phase update (1Hz)
     bus.CGN_DREAM_CONSOLIDATE,     # → coordinator.dreaming.consolidate_pending
     # v1.8.2 (D-SPEC-56): dream_state_worker forwards DREAM_WAKE_REQUEST here
@@ -1081,28 +1037,9 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         try:
             payload = _decode_payload(msg.get("payload"))
 
-            if msg_type == bus.BODY_STATE:
-                _dispatch_trinity_state(
-                    state_refs, payload, dim=5,
-                    inner_key="_inner_body_state",
-                    outer_key="_outer_body_state",
-                    type_label="BODY_STATE")
-
-            elif msg_type == bus.MIND_STATE:
-                _dispatch_trinity_state(
-                    state_refs, payload, dim=15,
-                    inner_key="_inner_mind_state",
-                    outer_key="_outer_mind_state",
-                    type_label="MIND_STATE")
-
-            elif msg_type == bus.SPIRIT_STATE:
-                _dispatch_trinity_state(
-                    state_refs, payload, dim=45,
-                    inner_key="_inner_spirit_state",
-                    outer_key="_outer_spirit_state",
-                    type_label="SPIRIT_STATE")
-
-            elif msg_type == bus.KERNEL_EPOCH_TICK:
+            # RFP_g18 §7.C: BODY/MIND/SPIRIT_STATE no longer bus-dispatched —
+            # the epoch driver reads the 6 trinity tensors from SHM (G18).
+            if msg_type == bus.KERNEL_EPOCH_TICK:
                 # Circadian phase (1Hz tick from Rust kernel-rs).
                 # Used by epoch driver (chunk 8G) for arming logic.
                 phase = payload.get("phase")
@@ -2600,90 +2537,6 @@ def _decode_payload(payload):
     return {}
 
 
-def _g18_parity_probe(state_refs: dict, payload: dict, dim: int,
-                      src: str, type_label: str) -> None:
-    """RFP_g18 §7.A — log bus-carried tensor vs the matching SHM slot.
-
-    Read-only; throttled per (type, src). Surfaces three things the cutover
-    needs proven first: (1) the SHM slot is populated (not None/empty),
-    (2) its tensor matches the bus event's `values` (INV-G18-3 parity),
-    (3) its freshness (age_seconds/seq) vs the bus tick. Any non-zero
-    max_abs_diff or EMPTY slot = a blocker the migration must resolve
-    before BODY/MIND/SPIRIT_STATE leave the broadcast.
-    """
-    now = time.time()
-    key = (type_label, src)
-    if now - _G18_PARITY_LAST_LOG.get(key, 0.0) < _G18_PARITY_INTERVAL_S:
-        return
-    _G18_PARITY_LAST_LOG[key] = now
-    bank = state_refs.get("_shm_reader_bank")
-    method_name = _G18_PARITY_READERS.get(key)
-    if bank is None or method_name is None:
-        return
-    reader = getattr(bank, method_name, None)
-    if reader is None:
-        return
-    try:
-        snap = reader()
-    except Exception as err:  # instrument must never disturb the hot path
-        logger.warning("[G18-PARITY] %s src=%s reader %s raised: %s",
-                       type_label, src, method_name, err)
-        return
-    bus_vals = payload.get("values") or []
-    if snap is None:
-        logger.warning(
-            "[G18-PARITY] %s src=%s SHM slot EMPTY (reader=%s) bus[:3]=%s",
-            type_label, src, method_name,
-            [round(float(v), 4) for v in bus_vals[:3]])
-        return
-    shm_vals = snap.get("values") or []
-    n = min(len(bus_vals), len(shm_vals), dim)
-    if n == 0:
-        logger.warning(
-            "[G18-PARITY] %s src=%s no comparable values (bus=%d shm=%d)",
-            type_label, src, len(bus_vals), len(shm_vals))
-        return
-    max_abs_diff = max(
-        abs(float(bus_vals[i]) - float(shm_vals[i])) for i in range(n))
-    logger.info(
-        "[G18-PARITY] %s src=%s n=%d max_abs_diff=%.6f shm_age=%.3fs "
-        "shm_seq=%s bus[:3]=%s shm[:3]=%s",
-        type_label, src, n, max_abs_diff, snap.get("age_seconds", -1.0),
-        snap.get("seq"),
-        [round(float(v), 4) for v in bus_vals[:3]],
-        [round(float(v), 4) for v in shm_vals[:3]])
-
-
-def _dispatch_trinity_state(state_refs: dict, payload: dict, *, dim: int,
-                            inner_key: str, outer_key: str, type_label: str) -> None:
-    """Dispatch BODY_STATE / MIND_STATE / SPIRIT_STATE per SPEC §8.5.
-
-    Reads payload.src ∈ {"inner", "outer"} and writes payload.values to
-    one of the 6 internal cache slots indexed by (type, src). Preserves
-    G1 doctrinal symmetry — inner and outer are equally first-class.
-
-    Rust producers (titan-{inner,outer}-{body,mind,spirit}-rs) publish
-    `{src: "inner"|"outer", type: <NAME>, values: [N floats], ts: float}`
-    per SPEC §8.5 row in §8.5 Trinity tensor messages table. If src is
-    missing (legacy publisher), default to "inner" with a debug log so
-    we don't lose the tensor; this matches legacy 67D-only consciousness
-    epoch behavior.
-    """
-    src = payload.get("src", "inner")
-    values = payload.get("values")
-    if not isinstance(values, list) or len(values) < dim:
-        # Bad payload — keep prior cache value, don't blank.
-        return
-    target_key = inner_key if src == "inner" else outer_key
-    state_refs[target_key] = list(values[:dim])
-    if src not in ("inner", "outer"):
-        logger.debug(
-            "[CognitiveWorker] %s with unexpected src=%r — treated as inner",
-            type_label, src)
-    if _G18_PARITY_PROBE:
-        _g18_parity_probe(state_refs, payload, dim, src, type_label)
-
-
 def _dispatch_dream_consolidate(state_refs: dict, payload: dict) -> None:
     """Trigger DreamingEngine consolidation per CGN signal."""
     coordinator = state_refs.get("coordinator")
@@ -3323,52 +3176,50 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
     epoch_counter_snap = None
 
     if shm_bank is not None:
-        # Bus-cache fallback for the 6 trinity tensor slots — only override
-        # when the bus cache is at default (never updated). _populated_from_shm
-        # flag avoids logging on every tick.
-        def _is_default_5(v):
-            return all(abs(float(x) - 0.5) < 1e-6 for x in v)
-
-        def _is_default_15(v):
-            return all(abs(float(x) - 0.5) < 1e-6 for x in v)
-
-        def _is_default_45(v):
-            return all(abs(float(x) - 0.5) < 1e-6 for x in v)
-
+        # RFP_g18 §7.C (2026-06-22): SHM is the PRIMARY source for the 6 trinity
+        # tensors (G18 state=SHM) — read UNCONDITIONALLY each epoch. Previously a
+        # bus-cache fallback ("only override when the bus cache is at default");
+        # the BODY/MIND/SPIRIT_STATE bus-subscribe is now retired, so SHM is the
+        # source. G-PARITY-verified live (T3 2026-06-22) that the slot carries
+        # the same tensor the bus event did. Each read keeps the prior value if
+        # the slot is momentarily unpopulated (snap None / no values), then the
+        # 6 values are written back to the cache slots so the event-driven
+        # felt-tensor readers (_dispatch_experience_record / _dispatch_episode_
+        # record) stay SHM-sourced rather than regressing to the 0.5 default.
         try:
-            if _is_default_5(inner_body):
-                snap = shm_bank.read_inner_body_5d()
-                if snap and snap.get("values"):
-                    inner_body = snap["values"]
-            if _is_default_15(inner_mind_15):
-                snap = shm_bank.read_inner_mind_15d()
-                if snap and snap.get("values"):
-                    inner_mind_15 = snap["values"]
-            if _is_default_45(inner_spirit_45):
-                snap = shm_bank.read_inner_spirit_45d()
-                if snap:
-                    # SAT/CHIT/ANANDA → flat 45D
-                    sat = snap.get("SAT") or [0.5] * 15
-                    chit = snap.get("CHIT") or [0.5] * 15
-                    ananda = snap.get("ANANDA") or [0.5] * 15
-                    inner_spirit_45 = list(sat) + list(chit) + list(ananda)
-                    inner_spirit_45d_snap = snap
-            if _is_default_5(outer_body):
-                snap = shm_bank.read_outer_body_5d()
-                if snap and snap.get("values"):
-                    outer_body = snap["values"]
-            if _is_default_15(outer_mind_15):
-                snap = shm_bank.read_outer_mind_15d()
-                if snap and snap.get("values"):
-                    outer_mind_15 = snap["values"]
-            if _is_default_45(outer_spirit_45):
-                snap = shm_bank.read_outer_spirit_45d()
-                if snap and snap.get("values"):
-                    outer_spirit_45 = snap["values"]
+            snap = shm_bank.read_inner_body_5d()
+            if snap and snap.get("values"):
+                inner_body = snap["values"]
+            snap = shm_bank.read_inner_mind_15d()
+            if snap and snap.get("values"):
+                inner_mind_15 = snap["values"]
+            snap = shm_bank.read_inner_spirit_45d()
+            if snap:
+                # SAT/CHIT/ANANDA → flat 45D
+                sat = snap.get("SAT") or [0.5] * 15
+                chit = snap.get("CHIT") or [0.5] * 15
+                ananda = snap.get("ANANDA") or [0.5] * 15
+                inner_spirit_45 = list(sat) + list(chit) + list(ananda)
+                inner_spirit_45d_snap = snap
+            snap = shm_bank.read_outer_body_5d()
+            if snap and snap.get("values"):
+                outer_body = snap["values"]
+            snap = shm_bank.read_outer_mind_15d()
+            if snap and snap.get("values"):
+                outer_mind_15 = snap["values"]
+            snap = shm_bank.read_outer_spirit_45d()
+            if snap and snap.get("values"):
+                outer_spirit_45 = snap["values"]
+            # Write back so event-driven felt-tensor readers are SHM-sourced.
+            state_refs["_inner_body_state"] = inner_body
+            state_refs["_inner_mind_state"] = inner_mind_15
+            state_refs["_inner_spirit_state"] = inner_spirit_45
+            state_refs["_outer_body_state"] = outer_body
+            state_refs["_outer_mind_state"] = outer_mind_15
+            state_refs["_outer_spirit_state"] = outer_spirit_45
         except Exception as _err:
             logger.debug(
-                "[CognitiveWorker] shm trinity-tensor fallback read failed: %s",
-                _err)
+                "[CognitiveWorker] shm trinity-tensor read failed: %s", _err)
 
         # Read remaining SPEC §1096 slots — these are pure shm-owned
         # (no bus equivalent), so always read regardless of cache state.
