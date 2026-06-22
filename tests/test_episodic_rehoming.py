@@ -25,15 +25,15 @@ def test_significance_is_emergent_surprise_and_habituates():
 
         # Warm the per-event baseline with a steady value (first fold seeds → None;
         # warming-up folds → None; on-baseline → None). No surprise is fabricated.
-        warm = [compute_significance("great_pulse", 1.0, sp) for _ in range(4)]
+        warm = [compute_significance("pi_cluster", 1.0, sp) for _ in range(4)]
         assert all(s is None for s in warm), (
             "a steady, on-baseline signal must earn NO significance (got %r)" % warm)
 
         # Now a genuinely novel magnitude → real surprise. Repeat it: as the baseline
         # μ moves toward the new value, the SAME event becomes less surprising.
-        s1 = compute_significance("great_pulse", 12.0, sp)
-        s2 = compute_significance("great_pulse", 12.0, sp)
-        s3 = compute_significance("great_pulse", 12.0, sp)
+        s1 = compute_significance("pi_cluster", 12.0, sp)
+        s2 = compute_significance("pi_cluster", 12.0, sp)
+        s3 = compute_significance("pi_cluster", 12.0, sp)
         assert s1 is not None and s2 is not None and s3 is not None
         assert s1 > s2 > s3, (
             "repeated identical events must HABITUATE (decreasing significance), "
@@ -43,20 +43,20 @@ def test_significance_is_emergent_surprise_and_habituates():
 
 
 def test_significance_baselines_are_per_event_type():
-    """Each event_type keys its OWN baseline — great_pulse's history does not bleed
+    """Each event_type keys its OWN baseline — pi_cluster's history does not bleed
     into kin_exchange's surprise (RFP §4.1: separate _SignalBaseline per trigger)."""
     with tempfile.TemporaryDirectory() as d:
         sp = os.path.join(d, "sig.json")
-        # Saturate great_pulse at a high value.
+        # Saturate pi_cluster at a high value.
         for _ in range(5):
-            compute_significance("great_pulse", 50.0, sp)
+            compute_significance("pi_cluster", 50.0, sp)
         # A brand-new event_type seeds independently (first observation → None,
-        # NOT contaminated by great_pulse's μ) and warms up on its OWN scale
+        # NOT contaminated by pi_cluster's μ) and warms up on its OWN scale
         # (min_samples=2 → seed + one warm-up fold emit nothing).
         assert compute_significance("kin_exchange", 0.4, sp) is None   # seed
         assert compute_significance("kin_exchange", 0.4, sp) is None   # warming up
         # Now its own baseline is live; a deviation earns its own surprise — and the
-        # value is on kin's 0..1 scale, proving it never inherited great_pulse's μ=50.
+        # value is on kin's 0..1 scale, proving it never inherited pi_cluster's μ=50.
         s = compute_significance("kin_exchange", 0.9, sp)
         assert s is not None and s > 0.0
 
@@ -67,7 +67,7 @@ def test_record_episode_appends_and_recalls():
         mem = EpisodicMemory(db_path=os.path.join(d, "episodic_memory.db"))
         assert mem.count() == 0
         rid = mem.record_episode(
-            event_type="great_pulse", description="test pulse",
+            event_type="pi_cluster", description="test pulse",
             felt_state=[0.1] * 130, hormonal_snapshot={"DA": 0.6},
             epoch_id=7, significance=0.8)
         assert rid is not None and mem.count() == 1
@@ -76,7 +76,7 @@ def test_record_episode_appends_and_recalls():
         assert mem.count() == 1
         # recall_by_feeling cosines over the SAME felt space we recorded
         hits = mem.recall_by_feeling([0.1] * 130, top_k=5)
-        assert hits and hits[0]["event_type"] == "great_pulse"
+        assert hits and hits[0]["event_type"] == "pi_cluster"
 
 
 # ── 3. The owner dispatch is a LIVE caller (write-liveness, end-to-end) ────────
@@ -96,7 +96,7 @@ def test_dispatch_episode_record_is_a_live_writer():
 
         def emit(metric):
             _dispatch_episode_record(state_refs, {
-                "event_type": "great_pulse",
+                "event_type": "pi_cluster",
                 "description": "integration",
                 "metric": metric,
                 "epoch_id": 11,
@@ -112,9 +112,55 @@ def test_dispatch_episode_record_is_a_live_writer():
         emit(15.0)
         assert mem.count() == 1, "a surprising event must be recorded (live writer)"
         row = mem.get_autobiography(limit=1)[0]
-        assert row["event_type"] == "great_pulse"
+        assert row["event_type"] == "pi_cluster"
         assert row["significance"] >= SIGNIFICANCE_THRESHOLD
         assert row["felt_state"] and len(row["felt_state"]) == 130
+
+
+# ── 3b. action_completed gate inside _dispatch_experience_record ──────────────
+def test_action_completed_episodic_gate():
+    """A high-scoring autonomous ACTION (context.helper present + outcome_score>0.7)
+    records an `action_completed` episode via _dispatch_experience_record; a
+    non-action experience (no helper) or a low score does NOT. Faithful port of
+    spirit_worker L7406 (RFP §4.1)."""
+    from titan_hcl.modules.cognitive_worker import _dispatch_experience_record
+
+    class _StubOrch:
+        _plugins = {}
+
+        def record_outcome(self, **kw):
+            return None
+
+    with tempfile.TemporaryDirectory() as d:
+        mem = EpisodicMemory(db_path=os.path.join(d, "episodic_memory.db"))
+        state_refs = {
+            "exp_orchestrator": _StubOrch(),
+            "episodic_mem": mem,
+            "consciousness": {"latest_epoch": {
+                "state_vector": [0.3] * 130, "epoch_id": 4}},
+            "neural_nervous_system": None,
+        }
+
+        def exp(score, helper=True):
+            ctx = {"helper": "research_helper"} if helper else {}
+            _dispatch_experience_record(state_refs, {
+                "domain": "research", "action_taken": "x",
+                "outcome_score": score, "context": ctx, "epoch_id": 4})
+
+        # A non-action experience (no helper) never records an episode.
+        for _ in range(4):
+            exp(0.95, helper=False)
+        assert mem.count() == 0, "non-action experiences must not episode"
+        # A low-scoring action does not clear the action gate.
+        for _ in range(4):
+            exp(0.3, helper=True)
+        assert mem.count() == 0, "score<=0.7 actions must not episode"
+        # High-scoring actions: warm the baseline, then a surprising score records.
+        for _ in range(3):
+            exp(0.75, helper=True)
+        exp(0.99, helper=True)
+        assert mem.count() >= 1, "a surprising high-score action must episode"
+        assert mem.get_autobiography(limit=1)[0]["event_type"] == "action_completed"
 
 
 # ── 4. The bus producer is targeted + coalesced (Phase-2 cross-process path) ──

@@ -2877,6 +2877,24 @@ def _dispatch_experience_record(state_refs: dict, payload: dict) -> None:
         _exp_stats_pub = state_refs.get("_experience_stats_publisher")
         if _exp_stats_pub is not None:
             _exp_stats_pub.publish(exp_orchestrator)
+
+        # ── Episodic record: action_completed ───────────────────────────
+        # RFP_phase_c_actr_memory_rehoming §4.1 — faithful port of the dropped
+        # spirit_worker block (L7406): a high-scoring autonomous ACTION is an
+        # autobiographical event. Pre-Phase-C this rode the ACTION_RESULT handler;
+        # post-Phase-C agency action outcomes flow here via EXPERIENCE_RECORD
+        # (agency_worker.py:913 emit, context carries `helper`/`success`). Gate is
+        # faithful (an action with score>0.7); only EXPERIENCE_RECORDs that ARE
+        # actions (context.helper present) qualify — language/kin domains do not.
+        # Significance is EMERGENT surprise of the score (was the raw `score`).
+        if (state_refs.get("episodic_mem") is not None
+                and context.get("helper") and outcome_score > 0.7):
+            _dispatch_episode_record(state_refs, {
+                "event_type": "action_completed",
+                "description": f"{context.get('helper')} scored {outcome_score:.3f}",
+                "metric": float(outcome_score),
+                "epoch_id": epoch_id,
+            })
     except Exception as _exp_err:
         logger.debug(
             "[CognitiveWorker] EXPERIENCE_RECORD record raised: %s", _exp_err)
@@ -2885,9 +2903,9 @@ def _dispatch_experience_record(state_refs: dict, payload: dict) -> None:
 def _dispatch_episode_record(state_refs: dict, payload: dict) -> None:
     """EPISODE_RECORD consumer — Record stage of the ACT-R Episodic faculty
     (RFP_phase_c_actr_memory_rehoming §4.1). The durable twin of
-    _dispatch_experience_record: producers (the 3 cognitive_worker-native Phase-1
-    triggers — great_pulse / dreaming_start|end / kin_exchange) supply
-    {event_type, description, metric, epoch_id}; this owner — G21 sole writer of
+    _dispatch_experience_record: producers (the real recovered-source triggers —
+    pi_cluster / hormonal_spike / action_completed / kin_exchange / word_learned)
+    supply {event_type, description, metric, epoch_id}; this owner — G21 sole writer of
     episodic_memory.db — enriches with the in-proc consciousness felt-state (full
     state_vector, 65D inner-trinity fallback) + the hormonal snapshot (verbatim from
     _dispatch_experience_record), computes EMERGENT significance = the affective-loop
@@ -3462,41 +3480,6 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
             logger.warning("[DreamBridge] dream-end harvest/inject failed: %s",
                            _db_err, exc_info=True)
     state_refs["_dream_bridge_was_dreaming"] = _epoch_is_dreaming
-
-    # ── Episodic record: dream start / end (RFP_phase_c_actr_memory_rehoming §4.1) ──
-    # cognitive_worker-native autobiographical episode on each dream-cycle edge,
-    # using a self-contained edge detector (own state key, independent of the bridge
-    # gates above). Metric is a real cycle scalar — wake-duration before sleep
-    # (start) / dream-duration in epochs (end) — folded into a per-event surprise
-    # baseline, so only unusually-timed cycles are remembered (habituation automatic).
-    # start/end key separate baselines (their metrics are not comparable). In-proc →
-    # direct call; never raises into the driver.
-    _ep_dream_prev = bool(state_refs.get("_episodic_dream_was_dreaming", False))
-    # epoch_id is not yet bound this early in the driver (assigned ~L3710); read the
-    # fresh epoch from the consciousness state snapshot in state_refs instead.
-    _ep_eid = int((state_refs.get("consciousness", {}) or {}).get(
-        "latest_epoch", {}).get("epoch_id", 0) or 0)
-    if _epoch_is_dreaming and not _ep_dream_prev:
-        _ep_last_end = int(state_refs.get("_episodic_dream_last_end_epoch", 0) or 0)
-        _ep_wake_dur = float(_ep_eid - _ep_last_end) if _ep_last_end > 0 else 0.0
-        state_refs["_episodic_dream_start_epoch"] = _ep_eid
-        _dispatch_episode_record(state_refs, {
-            "event_type": "dreaming_start",
-            "description": f"Entered dreaming after {int(_ep_wake_dur)} epochs awake",
-            "metric": _ep_wake_dur,
-            "epoch_id": _ep_eid,
-        })
-    elif _ep_dream_prev and not _epoch_is_dreaming:
-        _ep_start = int(state_refs.get("_episodic_dream_start_epoch", 0) or 0)
-        _ep_dream_dur = float(_ep_eid - _ep_start) if _ep_start > 0 else 0.0
-        state_refs["_episodic_dream_last_end_epoch"] = _ep_eid
-        _dispatch_episode_record(state_refs, {
-            "event_type": "dreaming_end",
-            "description": f"Woke from a {int(_ep_dream_dur)}-epoch dream",
-            "metric": _ep_dream_dur,
-            "epoch_id": _ep_eid,
-        })
-    state_refs["_episodic_dream_was_dreaming"] = _epoch_is_dreaming
 
     # 3. Read NEUROMOD_STATE shm slot + drive coordinator.update_neuromodulators.
     if neuromod_reader is not None and coordinator is not None:
@@ -4329,22 +4312,6 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                         _sov_fired = (_sov_cur_gp - _sov_prev_gp) > 0
                         state_refs["_sov_prev_great_pulses"] = _sov_cur_gp
                         state_refs["_sov_last_sent_epoch"] = _sov_eid
-                        # Episodic record (RFP_phase_c_actr_memory_rehoming §4.1):
-                        # a GREAT PULSE integration is an autobiographical milestone.
-                        # In-proc → direct call; significance = surprise of the
-                        # integration delta vs the great_pulse baseline (an
-                        # unusually-large integration is the memorable one).
-                        if _sov_fired:
-                            _gp_delta = float(_sov_cur_gp - _sov_prev_gp)
-                            _dispatch_episode_record(state_refs, {
-                                "event_type": "great_pulse",
-                                "description": (
-                                    f"Great Pulse integration "
-                                    f"(+{int(_gp_delta)} pulse(s), "
-                                    f"total {_sov_cur_gp})"),
-                                "metric": _gp_delta,
-                                "epoch_id": _sov_eid,
-                            })
                         _sov_dev_age = float(getattr(
                             pi_monitor, "developmental_age", 0.0) or 0.0) \
                             if pi_monitor else 0.0
@@ -4584,6 +4551,34 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                                     max_delta=0.02,
                                     developmental_age=_r_dev_age,
                                     source="filter_down_abandon")
+
+                        # ── Working-memory attend: reasoning_conclusion ──────
+                        # RFP_phase_c_actr_memory_rehoming §4.2 — faithful port of
+                        # the dropped spirit_worker attend (L4338): on a reasoning
+                        # COMMIT, hold the committed plan in working memory so
+                        # downstream cognition (reasoning.get_context) sees the
+                        # current conclusion. ONE canonical working_mem (state_refs).
+                        if _r_result.get("action") == "COMMIT":
+                            _rc_wm = state_refs.get("working_mem")
+                            if _rc_wm is not None:
+                                try:
+                                    _rc_plan = _r_result.get(
+                                        "reasoning_plan", {}) or {}
+                                    _rc_ep = int(
+                                        (state_refs.get("consciousness", {}) or {}).get(
+                                            "latest_epoch", {}).get(
+                                                "epoch_id", 0) or 0)
+                                    _rc_wm.attend(
+                                        "reasoning_conclusion",
+                                        str(_rc_plan.get("intent", "reflect")),
+                                        {"plan": _rc_plan,
+                                         "confidence": float(
+                                             _r_result.get("confidence", 0.0))},
+                                        _rc_ep)
+                                except Exception as _rc_err:
+                                    logger.debug(
+                                        "[CognitiveWorker] reasoning_conclusion "
+                                        "attend raised: %s", _rc_err)
 
                         # ── rFP α §2b — CGN reasoning_strategy emission (RESTORED).
                         #
@@ -5362,6 +5357,32 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
         except Exception as _err:
             _log_driver_err("working_mem.decay", _err)
 
+    # ── Episodic record: consciousness-epoch milestones ──────────────────
+    # RFP_phase_c_actr_memory_rehoming §4.1 — faithful port of the dropped
+    # spirit_worker P2a block (L5305-5318): a π-curvature cluster or a large
+    # state-drift IS an autobiographical event. Same event DEFINITIONS as the
+    # original (curv>2.9 / drift>3.0, elif — mutually exclusive, π takes priority);
+    # significance is now EMERGENT surprise of the metric (via _dispatch_episode_
+    # record's per-event baseline) instead of the old 0.6 / drift÷5 constants. The
+    # dispatch enriches felt_state (full state_vector) + hormones. In-proc direct.
+    if state_refs.get("episodic_mem") is not None and latest:
+        _ep_curv = float(latest.get("curvature", 0.0) or 0.0)
+        _ep_drift = float(latest.get("drift_magnitude", 0.0) or 0.0)
+        if _ep_curv > 2.9:
+            _dispatch_episode_record(state_refs, {
+                "event_type": "pi_cluster",
+                "description": f"π-curvature {_ep_curv:.3f} at epoch {epoch_id}",
+                "metric": _ep_curv,
+                "epoch_id": int(epoch_id or 0),
+            })
+        elif _ep_drift > 3.0:
+            _dispatch_episode_record(state_refs, {
+                "event_type": "hormonal_spike",
+                "description": f"Large drift {_ep_drift:.2f} at epoch {epoch_id}",
+                "metric": _ep_drift,
+                "epoch_id": int(epoch_id or 0),
+            })
+
     # prediction_engine driver REMOVED — Track 2 drift correction (rFP §2.C
     # + commit B8). PredictionEngine now lives in self_reflection_worker;
     # cognitive_worker reads novelty signal from state_refs["_latest_prediction"]
@@ -5650,10 +5671,12 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
             _log_driver_err("med_watchdog.check", _err)
 
     # episodic_mem — the ACT-R Episodic faculty now has LIVE writers
-    # (RFP_phase_c_actr_memory_rehoming §4.1): the 3 cognitive_worker-native
-    # triggers (great_pulse @ SOVEREIGNTY_EPOCH, dreaming_start/end @ the dream
-    # edges, kin_exchange @ KIN_SIGNAL) call _dispatch_episode_record →
-    # record_episode. The pre-Phase-C `_ = episodic_mem` parity-anchor (which gamed
+    # (RFP_phase_c_actr_memory_rehoming §4.1, faithful port of the recovered
+    # spirit_worker triggers): pi_cluster + hormonal_spike @ the consciousness-epoch
+    # block (after working_mem.decay), action_completed @ _dispatch_experience_record
+    # (agency score>0.7), kin_exchange @ KIN_SIGNAL — all call _dispatch_episode_
+    # record → record_episode. (word_learned arrives cross-process from language_
+    # worker = Tier 2.) The pre-Phase-C `_ = episodic_mem` parity-anchor (which gamed
     # the boot-driver-parity test while the faculty was dead) is DELETED; write-
     # liveness is now asserted by tests/test_episodic_rehoming.py.
 
