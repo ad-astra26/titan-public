@@ -663,6 +663,13 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
             response_text = run_output
         else:
             response_text = str(run_output)
+        # Concurrent multi-user chat: run_agent (per-call Agent) + run_output
+        # (RunResponse holding the enriched-prompt messages) are DEAD after the
+        # content is extracted — release them now so under N concurrent chats
+        # they don't linger through the ~200 lines of post-processing below
+        # (shrinks the simultaneous-in-flight peak). Chat continues on
+        # response_text. (No-op on the legacy branch where run_agent is unset.)
+        run_agent = run_output = None
 
     except Exception as e:
         logger.exception("[AgnoWorker] agent.arun failed: %s", e)
@@ -979,6 +986,9 @@ async def _handle_chat_stream_request(msg: dict, agent, worker_plugin,
             response_text = run_output
         else:
             response_text = str(run_output)
+        # Release the dead per-call agent + RunResponse before the post-LLM
+        # processing below (see _handle_chat_request for rationale).
+        run_agent = run_output = None
 
         # ── 2. Pull OVG verdict from PostHook side-channel ──
         # agno_hooks PostHook writes worker_plugin._last_ovg_result =
@@ -1201,6 +1211,46 @@ def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any], send_queue
     return worker_plugin, agent
 
 
+def _install_malloc_trim_daemon(interval_s: float = 30.0) -> None:
+    """Periodically return glibc-retained freed memory to the OS (RssAnon hygiene).
+
+    agno_worker's RssAnon plateaus far above its live Python heap (tracemalloc
+    flat ~145MB while RssAnon reaches ~1GB over a 21.9h soak — measured
+    2026-06-23), the classic glibc pattern of holding freed allocations in
+    per-thread arenas instead of returning them. Chat transients (enrichment /
+    recall / LLM buffers, amplified by concurrent /chat) inflate this high-water
+    until it crosses the guardian rss_limit → THROTTLE. A periodic
+    malloc_trim(0) hands the freed pages back to the OS, lowering the RSS
+    high-water with NO effect on the live working set or behaviour. Daemon
+    thread (never blocks chat); idempotent; interval<=0 disables (kill-switch).
+    """
+    if not interval_s or interval_s <= 0:
+        return
+    if getattr(_install_malloc_trim_daemon, "_running", False):
+        return
+    import ctypes
+    import threading
+    try:
+        _trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except Exception as _e:  # non-glibc / unavailable → skip silently
+        logger.debug("[AgnoWorker] malloc_trim unavailable, skipping: %s", _e)
+        return
+    _install_malloc_trim_daemon._running = True  # type: ignore[attr-defined]
+
+    def _loop() -> None:
+        while True:
+            try:
+                time.sleep(interval_s)
+                _trim(0)
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, name="agno_malloc_trim", daemon=True).start()
+    logger.info(
+        "[AgnoWorker] malloc_trim daemon started (interval=%.0fs) — returns "
+        "glibc-retained freed memory to the OS", interval_s)
+
+
 def _install_phase9_baseline_hook() -> None:
     """Install file-flag → JSON-dump daemon thread for Phase 9 Chunk 9A.
 
@@ -1394,6 +1444,16 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     # behavior change to chat handling. To be removed when Phase 9 closes
     # (gated by RFP §3F.5 LOCK; see §3F.2 chunk 9A).
     _install_phase9_baseline_hook()
+    # RssAnon hygiene (2026-06-23): return glibc-retained freed memory to the OS
+    # periodically (tracemalloc-flat-but-RSS-high = arena retention, amplified by
+    # concurrent /chat transients). Configurable via [chat] malloc_trim_interval_s
+    # (default 30s; 0 disables). Soft-fail → default interval.
+    try:
+        _trim_interval = float((get_params("chat") or {}).get(
+            "malloc_trim_interval_s", 30.0))
+    except Exception:
+        _trim_interval = 30.0
+    _install_malloc_trim_daemon(_trim_interval)
 
     # ── asyncio loop owned by this worker (Agno is async-first) ──
     import asyncio

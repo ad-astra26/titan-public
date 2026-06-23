@@ -79,7 +79,7 @@ class TestWorkerPlugin:
     def test_reflex_collector_initially_none(self):
         p = self._make_plugin()
         assert p.reflex_collector is None
-        assert p.state_register is None
+        # (state_register proxy retired from WorkerPlugin — no longer asserted)
 
     def test_state_writes_persist(self):
         """Hook pattern: pre_hook sets _current_user_id → post_hook reads it."""
