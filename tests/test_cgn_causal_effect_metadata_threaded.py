@@ -66,3 +66,25 @@ def test_no_metadata_defaults_empty_no_crash(tmp_path):
     cgn.record_experience(consumer="reasoning_strategy", concept_id="c1", reward=0.5)
     txs = [t for t in cgn._buffer._buffer if t.concept_id == "c1"]
     assert txs and isinstance(txs[-1].metadata, dict)
+
+
+def test_meta_chain_success_yields_real_effect_not_reward_bucket():
+    """Fix 2 (meta): once chain_success is in the metadata (now emitted by
+    meta_reasoning), the meta extractor forms a real chain-outcome effect
+    instead of the degenerate reward-bucket — combined with Fix 1 this makes
+    meta a fully-working causal consumer."""
+    import numpy as np
+    from titan_hcl.logic.haov_causal_generator import extract_effect
+    from titan_hcl.logic.cgn_types import CGNTransition
+
+    def _t(md, reward):
+        return CGNTransition(
+            consumer="meta", concept_id="p",
+            state=np.zeros(30, dtype=np.float32), action=0,
+            action_params=np.zeros(4, dtype=np.float32),
+            reward=reward, metadata=md)
+
+    assert extract_effect("meta", _t({"chain_success": True}, 0.5), 0.5) == "chain_success"
+    assert extract_effect("meta", _t({"chain_success": False}, 0.1), 0.1) == "chain_failure"
+    # pre-Fix-2 (no key) degenerates to reward-bucket — the bug we fixed:
+    assert extract_effect("meta", _t({"chain_id": 1}, 0.5), 0.5) == "strong_positive"

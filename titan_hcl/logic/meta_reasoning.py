@@ -4293,6 +4293,13 @@ class MetaReasoningEngine(PrimitiveHandlersMixin):
                             "domain": final_domain_mcgn,
                             "epoch": self.state.start_epoch,
                             "chain_length": len(prims_in_chain),
+                            # Fix 2 (BUG-CGN-CAUSAL-EFFECT-METADATA-DROPPED): the
+                            # real domain-effect the meta extractor reads
+                            # (_extract_meta → chain_success/chain_failure), so the
+                            # causal generator forms on chain-outcome rather than
+                            # the degenerate reward-bucket. Criterion mirrors the
+                            # established terminal-success gate (:4536, reward>0.3).
+                            "chain_success": bool(task_success_mcgn > 0.3),
                         },
                     )
                     # Upgrade III peer publishing (audit 2026-04-23 Q2) —
