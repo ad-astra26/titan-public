@@ -88,3 +88,17 @@ def test_meta_chain_success_yields_real_effect_not_reward_bucket():
     assert extract_effect("meta", _t({"chain_success": False}, 0.1), 0.1) == "chain_failure"
     # pre-Fix-2 (no key) degenerates to reward-bucket — the bug we fixed:
     assert extract_effect("meta", _t({"chain_id": 1}, 0.5), 0.5) == "strong_positive"
+
+
+def test_reasoning_strategy_depth_delta_via_outcome_context(tmp_path):
+    """Fix 2 (reasoning_strategy): the real chain-to-chain depth_delta (reasoning.py)
+    flows via the outcome_context channel (record_outcome:597 merges it onto
+    t.metadata) → real chain_deeper/shallower effect, not the reward-bucket."""
+    from titan_hcl.logic.haov_causal_generator import extract_effect
+    cgn = _mk_cgn(tmp_path)
+    cgn.register_consumer(CGNConsumerConfig(name="reasoning_strategy"))
+    cgn.record_experience(consumer="reasoning_strategy", concept_id="c",
+                          reward=0.5, outcome_context={"depth_delta": 2})
+    txs = [t for t in cgn._buffer._buffer if t.concept_id == "c"]
+    assert txs and txs[-1].metadata.get("depth_delta") == 2
+    assert extract_effect("reasoning_strategy", txs[-1], 0.5) == "chain_deeper"

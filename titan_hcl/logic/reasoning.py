@@ -1356,6 +1356,12 @@ class ReasoningEngine:
         self._rr_cum_bonus: float = 0.0   # Σ intermediate reward this chain (cap = _rr_cap)
         self._rr_threshold_crossed: bool = False  # one-shot per chain
         self._rr_prev_confidence: float = 0.5
+        # Chain-to-chain reasoning DEPTH tracker (Fix 2, BUG-CGN-CAUSAL-EFFECT-
+        # METADATA-DROPPED reasoning_strategy): the cgn causal extractor reads
+        # depth_delta to form chain_deeper/shallower hypotheses instead of the
+        # degenerate reward-bucket. Persists ACROSS chains (NOT per-chain reset)
+        # so the delta is a real this-chain-vs-last comparison.
+        self._rr_prev_chain_length: int = 0
         # Per-chain step snapshots for Mechanism B online training at conclusion
         # and for action_chains_step SQLite persistence (Phase 0.5).
         self._rr_step_snapshots: list[dict] = []
@@ -1845,12 +1851,19 @@ class ReasoningEngine:
                         "confidence_final": round(float(self.confidence), 4),
                         "gut_agreement_final": round(float(self.gut_agreement), 4),
                         "chain_length": len(self.chain),
+                        # Fix 2 reasoning_strategy effect-delta — REAL chain-to-chain
+                        # depth change. The cgn causal extractor reads depth_delta
+                        # (abs>=1 → chain_deeper/shallower) so reasoning_strategy forms
+                        # on reasoning-depth shifts, not the degenerate reward-bucket.
+                        # Flows via outcome_context → record_outcome:597 → t.metadata.
+                        "depth_delta": len(self.chain) - self._rr_prev_chain_length,
                         "state_embedding_tier1": _tier1,
                         "neuromod_state": _nm_state,
                         "source": "reasoning.chain_commit",
                         "mech_a_size": len(self.seq_quality_store._table),
                         "mech_b_updates": int(self.step_value_net.total_updates),
                     }
+                    self._rr_prev_chain_length = len(self.chain)
             except Exception as e:
                 logger.warning("[Reasoning/CGN] emission prep failed: %s", e)
 
