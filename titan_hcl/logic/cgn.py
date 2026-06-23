@@ -711,7 +711,8 @@ class ConceptGroundingNetwork:
 
     def record_experience(self, consumer: str, concept_id: str, reward: float,
                           action: int = 0, state=None, action_params=None,
-                          outcome_context: dict = None) -> None:
+                          outcome_context: dict = None,
+                          metadata: dict = None) -> None:
         """Record a single-shot COMPLETE transition (action + reward together).
 
         For simultaneous-outcome consumers whose encounter and outcome coincide
@@ -741,6 +742,12 @@ class ConceptGroundingNetwork:
                 dtype=np.float32),
             reward=0.0,  # pending — record_outcome sets the real reward on match
             timestamp=time.time(),
+            # BUG-CGN-CAUSAL-EFFECT-METADATA-DROPPED fix: carry the emit's effect
+            # metadata onto the pending transition so the causal generator's
+            # per-consumer effect extractor (haov_causal_generator.py:48-107) sees
+            # the real domain-effect delta instead of falling back to reward-bucket.
+            # record_outcome (:597) further merges outcome_context onto this same dict.
+            metadata=dict(metadata) if metadata else {},
         )
         self._buffer.add(pending)
         # Self-match: record_outcome finds this most-recent reward==0.0 pending

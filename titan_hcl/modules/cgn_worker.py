@@ -921,7 +921,8 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             action=payload.get("action", 0),
                             state=payload.get("state"),
                             action_params=payload.get("action_params"),
-                            outcome_context=payload.get("outcome_context"))
+                            outcome_context=payload.get("outcome_context"),
+                            metadata=payload.get("metadata", {}))
                     else:
                         # Delayed reward for an existing pending transition
                         cgn.record_outcome(
