@@ -331,7 +331,14 @@ _DEFAULTS = {
 # deterministic oracle dominates). Unregistered sources default to rank 0 → would be
 # silently dropped on a contended join, so both are registered explicitly.
 _REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3,
-                       "idk_oracle": 3, "autonomous_oracle": 3, "task_completion": 0}
+                       "idk_oracle": 3, "autonomous_oracle": 3, "task_completion": 0,
+                       # Research-curiosity (§7.P3): the agency emit uses source=
+                       # "curiosity" (substantive-evidence grounding of a graph gap =
+                       # a correctness-grounded oracle reward). MUST be registered or
+                       # it defaults to rank-0 and loses to llm_judge on a contended
+                       # tx (INV-MC-8) — defeating the whole point of out-competing
+                       # the quality judge. Ranks peer to the other oracles.
+                       "curiosity": 3}
 # (_SURVIVAL_STATES removed 2026-06-20 — survival/starvation no longer gates the
 #  mastery explore tick; metabolism is not design-complete. See _explore_tick.)
 
