@@ -7,6 +7,7 @@ sends responses via send_queue. This isolates Cognee's ~500MB footprint.
 Entry point: memory_worker_main(recv_queue, send_queue, name, config)
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -769,6 +770,66 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 logger.warning(
                     "[MemoryWorker] RESEARCH_CONFIRMED handler failed: %s",
                     _rc_err)
+            continue
+
+        # RFP_titan_research_agent §1.4 / §7.P3 (step 3b) — the AUTONOMOUS analog of
+        # RESEARCH_CONFIRMED (the no-chat curiosity path). agency_worker grounded a
+        # knowledge-graph gap Z (step 3a, dst="memory" targeted — memory is
+        # reply_only). Anchor the finding (durable → tx_hash + sidecar) FROM THE DICT
+        # ALONE (build_promotion_tx hashes the dict; set_timechain_tx_hash is a benign
+        # no-op for the synthetic id — no node store needed), then re-emit
+        # RESEARCH_CONCEPT_SEED CARRYING `_research_target` so synthesis (sole spine
+        # writer) seeds/refines Z itself (not a sibling) + credits the skill (3c).
+        # Volatile findings get no concept (FC-3/INV-OML-6). Soft — never break the loop.
+        if msg_type == bus.RESEARCH_CURIOSITY_GROUNDED:
+            _rp = msg.get("payload", {}) or {}
+            try:
+                _content = (str(_rp.get("query", "")) + "\n"
+                            + str(_rp.get("content", ""))).strip()
+                if not _content:
+                    continue
+                from titan_hcl.synthesis.research_volatility import is_volatile
+                if is_volatile(_content):
+                    logger.debug("[MemoryWorker] curiosity-grounded: volatile "
+                                 "content → no concept (FC-3)")
+                    continue
+                _rt = _rp.get("_research_target") or {}
+                # Synthetic negative id (NOT a stored node): build_promotion_tx hashes
+                # the dict; set_timechain_tx_hash(_nid) → node_store miss skip +
+                # update_node 0-row no-op. The durable artifact is the seeded Engram.
+                _nid = -(int(hashlib.sha256(_content.encode()).hexdigest()[:12], 16))
+                _node = {
+                    "id": _nid,
+                    "user_prompt": str(_rp.get("query", "")),
+                    "agent_response": str(_rp.get("content", "")),
+                    "tags": ["acquired:research"],
+                    "source_id": "research",
+                    "neuromod_context": {},
+                }
+                _sidecar = _get_thought_sidecar(
+                    os.environ.get("TITAN_DATA_DIR", "data"))
+                with ctx.write_lock:
+                    _tx = _anchor_promoted_node(
+                        _node, now=time.time(), sidecar=_sidecar, ctx=ctx) or ""
+                if _tx:
+                    _synth_bus_emit(bus.RESEARCH_CONCEPT_SEED, {
+                        "tx_hash": _tx,
+                        "content": _content,
+                        "domain_hint": _rt.get("domain_hint", ""),
+                        "source": "autonomous_curiosity",
+                        "_research_target": _rt,
+                        "volatile": False,
+                        "felt_coverage": 0.0,
+                        "ts": time.time(),
+                    })
+                    logger.info(
+                        "[MemoryWorker] curiosity-grounded: anchored Z=%s → "
+                        "RESEARCH_CONCEPT_SEED (autonomous)",
+                        _rt.get("concept_id", "?"))
+            except Exception as _cg_err:  # noqa: BLE001
+                logger.warning(
+                    "[MemoryWorker] RESEARCH_CURIOSITY_GROUNDED handler failed: %s",
+                    _cg_err)
             continue
 
         # ── §7.F (F.1) — social-graph Person presence enrichment ──────

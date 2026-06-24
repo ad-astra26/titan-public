@@ -434,6 +434,10 @@
 "synthesis.self_learning.p8_max_attempts" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.autonomous_oracle_reward_weight" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.task_completion_reward_weight" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+# RFP_titan_research_agent §1.4 / §7.P3 — verifiable autonomous curiosity (graph-gap research → skill).
+"synthesis.self_learning.research_curiosity_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.curiosity_research_reward_weight" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.curiosity_min_evidence_chars" = {type="int", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_interval_s" = {type="float", constraint=">0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_max_revisits" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}

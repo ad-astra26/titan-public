@@ -439,6 +439,51 @@ def _maybe_emit_autonomous_experience(
         gc = f"autonomous:{action_name}"
         evidence = str(action_result.get("result") or "")
 
+        # RFP_titan_research_agent §1.4 / §7.P3 (step 3a) — VERIFIABLE autonomous
+        # curiosity. When this research action TARGETED a knowledge-graph gap Z (2b
+        # stashed `_research_target` on helper_params, gated by the kill-switch), the
+        # success oracle is the measurable groundedness of Z — NOT the LLM judge's
+        # unachievable "is this open-ended research solved?" (which returns the
+        # structural −0.5, BUG-P8-OPENENDED). So: emit a small Tier-1 routing reward
+        # (learning-to-research) + hand the evidence to memory_worker to anchor →
+        # RESEARCH_CONCEPT_SEED → synthesis seeds/refines Z + credits the skill (3c).
+        # Then RETURN — bypass the judge entirely (no −0.5; the skill credit is 3c).
+        _rt = (action_result.get("helper_params") or {}).get("_research_target")
+        if _rt and not is_revisit and feats is not None:
+            _min_chars = int(sl.get("curiosity_min_evidence_chars", 80))
+            _substantive = len(evidence.strip()) >= _min_chars
+            _gc = f"ground-concept:{_rt.get('domain_hint', 'general') or 'general'}"
+            _rew = (float(sl.get("curiosity_research_reward_weight", 0.5))
+                    if _substantive else 0.0)
+            send_queue.put({
+                "type": bus.SELF_LEARN_REWARD, "src": name, "dst": "self_learning",
+                "payload": {
+                    "features": list(feats.to_vector().tolist()),
+                    "action": int(action_idx),
+                    "reward": _rew,
+                    "goal_class": _gc,
+                    "source": "curiosity",
+                },
+                "ts": time.time(),
+            })
+            if _substantive:
+                send_queue.put({
+                    "type": bus.RESEARCH_CURIOSITY_GROUNDED, "src": name, "dst": "memory",
+                    "payload": {
+                        "query": str((action_result.get("helper_params") or {}).get(
+                            "query", "")),
+                        "content": evidence,
+                        "_research_target": _rt,
+                    },
+                    "ts": time.time(),
+                })
+            logger.info(
+                "[AgencyWorker][P3/curiosity] ground-concept '%s' substantive=%s "
+                "reward=%+.2f → memory anchor%s (judge bypassed)",
+                _rt.get("concept_id", "?"), _substantive, _rew,
+                "" if _substantive else " SKIPPED (thin evidence)")
+            return
+
         verdict = judge.judge(problem=problem, action=action_name, evidence=evidence)
         attempts = 1
         # solve-until-correct: retry (regen code / refine query) while unsolved.

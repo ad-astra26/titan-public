@@ -1199,7 +1199,8 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                         lifetime_epochs: float = 417.0, recall_floor: float = 0.65,
                         mature_at: int = 2, macro_compose_min: int = 2,
                         lint_caps: dict | None = None,
-                        dk2_every: int = 20, lint_every: int = 30) -> None:
+                        dk2_every: int = 20, lint_every: int = 30,
+                        procedural_skill_store=None) -> None:
     """DK.1/DK.3/DK.5 (§7.D-knowledge) — the sovereign LLM-Wiki + research-skill +
     librarian-lint daemon. Drains the bounded queue of confirmed research findings
     (held by the RESEARCH_CONCEPT_SEED handler) and per item:
@@ -1278,15 +1279,52 @@ def _research_wiki_loop(wiki_queue, engram_store, cgn_bridge, name_fn,
                 # seed_research_concept refuses; explicit guard for clarity).
                 try:
                     if str(item.get("tx_hash", "") or "") and not item.get("volatile"):
+                        # RFP_titan_research_agent §7.P3 (3c) — for an autonomous-
+                        # curiosity item, OVERRIDE name_fn to force the seed onto the
+                        # target concept Z, so DK.1 BUMPS Z (refinement) instead of the
+                        # LLM librarian minting a SIBLING (which would leave Δ(Z)=0).
+                        # research_wiki dedups by the name_fn concept_id
+                        # (research_wiki.py:152,163). None on the chat path → normal.
+                        _rt = item.get("_research_target") or None
+                        _nf = ((lambda c, _t=_rt: (
+                                    _t["concept_id"],
+                                    _t.get("name") or _t["concept_id"],
+                                    _t.get("domain_hint", "") or ""))
+                               if _rt else name_fn)
                         cv = seed_research_concept(
                             engram_store=engram_store, cgn_bridge=cgn_bridge,
                             tx_hash=str(item.get("tx_hash", "") or ""),
-                            content=_content, name_fn=name_fn,
+                            content=_content, name_fn=_nf,
                             domain_hint=str(item.get("domain_hint", "") or ""),
                             felt_coverage=float(item.get("felt_coverage", 0.0) or 0.0),
                             created_epoch=float(_now_epoch()))  # M0 emergent stamp
                         if cv is not None:
                             seeded += 1
+                        # Tier-1 skill credit (§1.4 step 6): a durable anchored
+                        # refinement of Z (cv not None) IS the success oracle — the
+                        # groundedness scalar is dream-lagged, so we credit on the
+                        # deterministic seed, not a Δ on the stale scalar. The
+                        # ground-concept cell becomes delegatable (closes the dead
+                        # autonomous-skill loop). enqueue_score_event is @on_writer →
+                        # auto-routes to the writer thread (safe from this daemon).
+                        if (cv is not None and _rt is not None
+                                and procedural_skill_store is not None
+                                and _rt.get("concept_id")):
+                            try:
+                                _dom = _rt.get("domain_hint", "") or "general"
+                                procedural_skill_store.enqueue_score_event(
+                                    oracle_id="web_api_oracle",
+                                    goal_class=f"ground-concept:{_dom}",
+                                    task_shape=str(_rt["concept_id"]),
+                                    success=True)
+                                logger.info(
+                                    "[synthesis_worker] DK.1 curiosity: refined Z=%s "
+                                    "→ ground-concept:%s skill credited",
+                                    _rt["concept_id"], _dom)
+                            except Exception:  # noqa: BLE001
+                                logger.warning(
+                                    "[synthesis_worker] DK.1 curiosity skill-credit "
+                                    "failed (continuing)", exc_info=True)
                 except Exception:  # noqa: BLE001
                     # never stall the queue, but DO surface the error (no silent
                     # except — Maker directive 2026-06-15).
@@ -3351,6 +3389,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 "lint_caps": _lint_caps,
                 "dk2_every": int(_rcfg.get("dk2_every", 20)),
                 "lint_every": int(_rcfg.get("lint_every", 30)),
+                # RFP_titan_research_agent §7.P3 (3c) — the DK.1 loop credits a
+                # ground-concept ProceduralSkill when it refines an autonomous-
+                # curiosity target Z (sole-writer enqueue, @on_writer).
+                "procedural_skill_store": procedural_skill_store,
             },
             daemon=True, name=f"synthesis-research-wiki-{name}").start()
         logger.info("[synthesis_worker] DK.1/DK.3/DK.5 research-wiki+lint+skill "
@@ -4914,6 +4956,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         "source": str(payload.get("source", "") or ""),       # DK.5
                         "volatile": bool(payload.get("volatile", False)),     # DK.5/Axis-1
                         "felt_coverage": float(payload.get("felt_coverage", 0.0) or 0.0),
+                        # RFP_titan_research_agent §7.P3 (3c) — the autonomous-curiosity
+                        # target (present only on the autonomous path) forces DK.1 to
+                        # refine Z + credit a ground-concept skill (None on the chat path).
+                        "_research_target": payload.get("_research_target"),
                     })
                 except Exception as _seed_err:  # noqa: BLE001
                     logger.debug("[synthesis_worker] research concept seed "

@@ -359,6 +359,16 @@ RESEARCH_CONFIRMED = "RESEARCH_CONFIRMED"
 #   {tx_hash (the finding's anchor — deref target, INV-OML-10), content, domain_hint,
 #   felt_coverage, ts}.
 RESEARCH_CONCEPT_SEED = "RESEARCH_CONCEPT_SEED"
+# RESEARCH_CURIOSITY_GROUNDED (RFP_titan_research_agent §1.4 / §7.P3 step 3a→3b):
+#   agency_worker → memory_worker. The autonomous (no-chat) analog of RESEARCH_CONFIRMED:
+#   a `research` posture that TARGETED a knowledge-graph gap Z produced substantive
+#   evidence → tell memory_worker to anchor it (durable → tx_hash + sidecar, from the
+#   dict alone — no node store) and re-emit RESEARCH_CONCEPT_SEED carrying the
+#   `_research_target` so synthesis seeds/refines Z (not a sibling) + credits the skill.
+#   TARGETED dst="memory" (memory is reply_only=True — broadcast would be skipped).
+#   Payload: {query, content, _research_target:{concept_id,version,baseline_groundedness,
+#   domain_hint,name}, ts}.
+RESEARCH_CURIOSITY_GROUNDED = "RESEARCH_CURIOSITY_GROUNDED"
 # ── Phase B (§7.B, C1′) — the NON-verifiable lane. agno PostHook → synthesis_worker
 # AFTER the response is generated (a direct/research/IDK turn has no oracle). The
 # synthesis single-writer graphs a `Reasoning(kind='turn')` record under SELF →
