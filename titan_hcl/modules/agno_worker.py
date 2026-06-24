@@ -151,6 +151,15 @@ async def _route_model_for_tier(agent, worker_plugin, prompt_text: str):
 
     model_class = result.tier.model_class
     target_id = provider.resolve_model_class(model_class)
+    # Phase B (§7.B) — let the bandit router override the model for the chat heavy
+    # class (passthrough unless enabled). Soft — falls back to the plain resolution.
+    try:
+        _ar = _get_adaptive_router()
+        if _ar is not None:
+            target_id = _ar.choose(provider, model_class,
+                                   in_flight=int(_AGNO_IN_FLIGHT["n"]), is_chat=True)
+    except Exception:
+        pass
     original_id = getattr(agent.model, "id", None)
     # ζ.6 — also swap max_tokens when the tier caps it. None = leave default.
     target_max_tokens = result.tier.max_tokens
@@ -260,6 +269,61 @@ def _classify_message_tier(worker_plugin, message_text):
         return None
 
 
+# ── Load-adaptive inference routing (RFP_load_adaptive_inference_routing Phase B) ──
+# Process-global contextual-bandit router. PASSTHROUGH-by-default (router_enabled=false)
+# → changes NOTHING until enabled. Config-hot-reloadable (re-read live). All soft.
+_AGNO_IN_FLIGHT = {"n": 0}   # mirror of stats_ref["in_flight"] for the router context
+_adaptive_router = None
+
+
+def _get_adaptive_router():
+    global _adaptive_router
+    try:
+        cfg = (get_params("inference").get("autoscale", {}) or {})
+    except Exception:
+        cfg = {}
+    if _adaptive_router is None:
+        try:
+            from titan_hcl.inference.adaptive_router import AdaptiveRouter
+            _adaptive_router = AdaptiveRouter(cfg)
+        except Exception as _ar_err:  # noqa: BLE001
+            logger.debug("[AgnoWorker] adaptive router init failed: %s", _ar_err)
+            return None
+    else:
+        _adaptive_router.update_cfg(cfg)   # live config hot-reload
+    return _adaptive_router
+
+
+def _adaptive_model_override(worker_plugin, tier):
+    """The router's chosen model id for this chat turn, or None (→ factory resolves
+    normally via resolve_model_class). Soft — never breaks the chat build."""
+    if tier is None:
+        return None
+    try:
+        router = _get_adaptive_router()
+        provider = getattr(worker_plugin, "_inference_provider", None)
+        if router is None or provider is None:
+            return None
+        return router.choose(provider, getattr(tier, "model_class", None),
+                             in_flight=int(_AGNO_IN_FLIGHT["n"]), is_chat=True)
+    except Exception as _ov_err:  # noqa: BLE001
+        logger.debug("[AgnoWorker] adaptive override soft-fail: %s", _ov_err)
+        return None
+
+
+def _router_feedback(model_id, latency_s, in_flight):
+    """Fold an observed completion (model + latency) into the router's learning. Soft."""
+    if not model_id:
+        return
+    try:
+        router = _get_adaptive_router()
+        if router is not None:
+            router.feedback(model_id, float(latency_s),
+                            in_flight=int(in_flight or 0), is_chat=True)
+    except Exception:
+        pass
+
+
 def _make_chat_agent(worker_plugin, message_text, shared_agent):
     """Mint a fresh per-call agent for this chat (INV-CC-2: own instance per
     concurrent call). Falls back to `shared_agent` if the chat context or
@@ -268,7 +332,10 @@ def _make_chat_agent(worker_plugin, message_text, shared_agent):
     try:
         from titan_hcl.modules.agno_agent_factory import make_agent
         tier = _classify_message_tier(worker_plugin, message_text)
-        return make_agent(worker_plugin._chat_ctx, tier)
+        # Phase B — let the bandit router pick the model for the chat heavy class
+        # (passthrough/None unless enabled). make_agent uses the override or resolves.
+        override = _adaptive_model_override(worker_plugin, tier)
+        return make_agent(worker_plugin._chat_ctx, tier, model_override=override)
     except Exception as _mk_err:  # noqa: BLE001
         logger.warning(
             "[AgnoWorker] per-call agent build failed (%s) — using shared agent",
@@ -466,6 +533,7 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
     is_maker = bool(payload.get("is_maker", False))
 
     stats_ref["in_flight"] = stats_ref.get("in_flight", 0) + 1
+    _AGNO_IN_FLIGHT["n"] = stats_ref["in_flight"]   # mirror for the §7.B router context
 
     # D-SPEC-76 (SPEC v1.18.0) — session pre-warm LRU.
     # Track (user_id, session_id) recency to surface hit/miss observability
@@ -641,9 +709,12 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         # lock, so concurrent chats overlap. flag-OFF = legacy shared agent +
         # _route_model_for_tier lock (which classifies + swaps model.id and
         # serialises concurrent chats so they don't trample each other).
+        _rt0 = time.time()        # §7.B — time the completion for the router's reward
+        _route_model = None
         if _concurrent_chat_enabled(worker_plugin) and \
                 getattr(worker_plugin, "_chat_ctx", None) is not None:
             run_agent = _make_chat_agent(worker_plugin, message_text, agent)
+            _route_model = getattr(getattr(run_agent, "model", None), "id", None)
             run_output = await run_agent.arun(
                 message_text,
                 session_id=session_id,
@@ -651,11 +722,16 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
             )
         else:
             async with _route_model_for_tier(agent, worker_plugin, message_text):
+                _route_model = getattr(getattr(agent, "model", None), "id", None)
                 run_output = await agent.arun(
                     message_text,
                     session_id=session_id,
                     user_id=user_id,
                 )
+        # §7.B — fold this turn's (model, latency) into the bandit (soft, no-op unless
+        # router_enabled). in_flight read live (this turn is still counted).
+        _router_feedback(_route_model, time.time() - _rt0,
+                         stats_ref.get("in_flight", 0))
 
         if hasattr(run_output, "content"):
             response_text = str(run_output.content)
@@ -677,6 +753,7 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
 
     finally:
         stats_ref["in_flight"] = max(0, stats_ref.get("in_flight", 0) - 1)
+        _AGNO_IN_FLIGHT["n"] = stats_ref["in_flight"]   # mirror for the §7.B router
 
     # ── Phase 9 strict cited gate (INV-Syn-23) ──
     # Post-LLM, decide which surfaced retrieval items the response actually
@@ -947,6 +1024,7 @@ async def _handle_chat_stream_request(msg: dict, agent, worker_plugin,
     message_text = payload.get("message", "")
 
     stats_ref["in_flight"] = stats_ref.get("in_flight", 0) + 1
+    _AGNO_IN_FLIGHT["n"] = stats_ref["in_flight"]   # mirror for the §7.B router context
     try:
         worker_plugin._current_user_id = user_id
         worker_plugin._pre_chat_user_id = user_id
@@ -1051,6 +1129,7 @@ async def _handle_chat_stream_request(msg: dict, agent, worker_plugin,
         }, rid=rid)
     finally:
         stats_ref["in_flight"] = max(0, stats_ref.get("in_flight", 0) - 1)
+        _AGNO_IN_FLIGHT["n"] = stats_ref["in_flight"]   # mirror for the §7.B router
         worker_plugin._stream_progress_ctx = None  # §7.B (B.4) — never leak forward
 
 
@@ -1351,10 +1430,21 @@ def _keepalive_loop(worker_plugin, stats_ref: dict,
     asyncio.set_event_loop(loop)
     recent_peak = 1.0
     _fired = 0
+    _ticks = 0
     interval = float(ka_cfg.get("keepalive_interval_s", 25.0) or 25.0)
     try:
         while not stop_event.is_set():
             try:
+                # §7.B — periodically persist the bandit router's learned policy
+                # (save/resume). Soft + cheap; ~every 10 ticks (= ~4 min at 25s).
+                _ticks += 1
+                if _ticks % 10 == 0:
+                    try:
+                        _r = _get_adaptive_router()
+                        if _r is not None:
+                            _r.save()
+                    except Exception:
+                        pass
                 # re-read config live → tuning is a config hot-reload, not a restart
                 try:
                     ka = (_gp("inference").get("autoscale", {}) or {})

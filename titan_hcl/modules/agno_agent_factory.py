@@ -554,8 +554,13 @@ def build_shared_chat_context(
     )
 
 
-def make_agent(ctx: "SharedChatCtx", tier: Any = None) -> Any:
+def make_agent(ctx: "SharedChatCtx", tier: Any = None,
+               model_override: Any = None) -> Any:
     """Mint a cheap, per-call Agno Agent over the shared `ctx`.
+
+    `model_override` (RFP_load_adaptive_inference_routing §7.B) — when the bandit
+    router picked a concrete model id for this turn, use it INSTEAD of resolving
+    `tier.model_class`; None falls back to the normal `resolve_model_class` path.
 
     Concurrent multi-user chat (RFP_concurrent_multiuser_chat §1.2): each
     in-flight chat gets its OWN Agent instance (INV-CC-2 — resolves agno #3120
@@ -577,14 +582,18 @@ def make_agent(ctx: "SharedChatCtx", tier: Any = None) -> Any:
     instructions = ctx.base_instructions
 
     if tier is not None:
-        # ζ.5 — concrete model id for the tier's abstract model_class.
-        try:
-            target_id = ctx.provider.resolve_model_class(
-                getattr(tier, "model_class", None)
-            )
-        except Exception as _rmc_err:  # noqa: BLE001
-            logger.debug("[AgnoFactory] resolve_model_class failed: %s", _rmc_err)
-            target_id = None
+        # ζ.5 — concrete model id for the tier's abstract model_class. §7.B: the
+        # bandit router's `model_override` (when present) wins over the plain resolve.
+        if model_override:
+            target_id = model_override
+        else:
+            try:
+                target_id = ctx.provider.resolve_model_class(
+                    getattr(tier, "model_class", None)
+                )
+            except Exception as _rmc_err:  # noqa: BLE001
+                logger.debug("[AgnoFactory] resolve_model_class failed: %s", _rmc_err)
+                target_id = None
         if target_id:
             model.id = target_id
         # ζ.6 — per-tier response cap (None = leave the model default).
