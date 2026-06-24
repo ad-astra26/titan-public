@@ -40,7 +40,9 @@ from titan_hcl.modules._heartbeat_grace import (
 
 logger = logging.getLogger(__name__)
 
-_HEARTBEAT_INTERVAL_S = 30.0
+# §10.B — Python L2/L3 modules MUST publish MODULE_HEARTBEAT every 10s
+# (MODULE_HEARTBEAT_INTERVAL_S=10, MODULE_HEARTBEAT_TIMEOUT_S=90).
+_HEARTBEAT_INTERVAL_S = 10.0
 _POLL_INTERVAL_S = 0.2
 # Phase 11 §11.I.5 boot-grace heartbeat state (set per-boot in the entry fn).
 _WORKER_READY: bool = False
@@ -417,23 +419,15 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
         except Exception:  # noqa: BLE001
             pass
 
-    # ── parent_watcher: enter relaxed-mode (RFP_pattern_logic live-fix 2026-06-24).
-    # A spawn-respawned worker (restart-module) is reparented to init (ppid==1)
-    # WITHOUT a re-adoption BUS_HANDOFF → the parent_watcher self-SIGTERMs it at the
-    # 30s poll (worker_lifecycle.py:339) → shm_pid_dead loop. Relaxed-mode is what
-    # adoption sets (worker_swap_handler.py:283): ppid==1 alone no longer kills us —
-    # the BUS (the real supervision channel) does, after supervision_timeout. Safe: a
-    # dead kernel also makes the bus unreachable → still caught, with the grace window.
+    # §7.D — register a bus-INDEPENDENT shutdown save (the load-bearing graceful-exit
+    # save path; the floor SIGTERM handler runs it on EVERY exit). All transitions /
+    # particles already write-through to duckdb (autocommit-durable), so this only
+    # closes the connection cleanly — but registering it is the contract.
     try:
-        from titan_hcl.core.worker_swap_handler import get_active_swap_state
-        from titan_hcl.core.worker_lifecycle import resume_parent_watcher
-        _sw_state = get_active_swap_state()
-        if _sw_state is not None and getattr(_sw_state, "watcher_state", None) is not None:
-            resume_parent_watcher(_sw_state.watcher_state, relaxed=True)
-            logger.info("[pattern_logic] parent_watcher relaxed-mode engaged "
-                        "(survives restart-module reparenting)")
-    except Exception as _rx:  # noqa: BLE001
-        logger.debug("[pattern_logic] relaxed-mode setup skipped: %s", _rx)
+        from titan_hcl.core.worker_shutdown import register_shutdown_save
+        register_shutdown_save(name, lambda: store.close())
+    except Exception as _rs:  # noqa: BLE001
+        logger.debug("[pattern_logic] register_shutdown_save skipped: %s", _rs)
 
     logger.info("[pattern_logic] booted — db=%s embedder=%s cadence=%.0fs",
                 db_path, embedder is not None, float(cfg["min_interval_s"]))
@@ -475,6 +469,27 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
         # in-process watcher SIGTERM'd it ~28s after boot → shm_pid_dead restart loop.
         from titan_hcl.core import worker_swap_handler as _swap
         if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        # ── SAVE_NOW → SAVE_DONE (§11.H.9 / D-SPEC-146) — REQUIRED. The guardian's
+        # stop() publishes SAVE_NOW and waits the full save_timeout=30s for a matching
+        # SAVE_DONE (core.py:897-982). A worker that never replies stalls EVERY stop
+        # for 30s — and under restart-module that window perpetuates a shm_pid_dead
+        # restart loop (the bug this worker hit live, 2026-06-24). State is already
+        # duckdb-durable (write-through autocommit), so there's nothing to flush — ack
+        # immediately, echoing the request_id so the orchestrator proceeds at once.
+        if msg_type == bus.SAVE_NOW:
+            _save_rid = (msg.get("payload") or {}).get("request_id")
+            _t0 = time.time()
+            try:
+                send_queue.put_nowait({
+                    "type": bus.SAVE_DONE, "src": name, "dst": "guardian",
+                    "ts": time.time(),
+                    "payload": {"module": name, "request_id": _save_rid,
+                                "saved": True, "errors": 0,
+                                "duration_ms": int((time.time() - _t0) * 1000)}})
+            except Exception:  # noqa: BLE001
+                pass
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
