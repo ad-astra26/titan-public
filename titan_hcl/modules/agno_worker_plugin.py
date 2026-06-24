@@ -10,8 +10,14 @@ expect on the `plugin` parameter, backed by:
                             sage_researcher / output_verifier — via bus QUERY)
   - worker-local caches    (replaces parent's plugin._last_X / _pre_chat_X /
                             _current_X / _pending_X / _limbo_mode attrs;
-                            shared across pre_hook / post_hook within a
-                            single chat — Agno serializes chat dispatch)
+                            flow pre_hook → post_hook within a single chat.
+                            ⚠ Chat dispatch is NO LONGER serial: RFP §7.B0
+                            (B0-dispatch) runs the chats concurrently on one
+                            asyncio loop, so the PER-TURN subset of these
+                            fields is request-scoped via a ContextVar bag —
+                            see `_REQUEST_SCOPED_FIELDS` / `enter_request_scope`
+                            at the top of this module. Singletons + cross-turn
+                            accumulators + chat_id-keyed dicts stay plain attrs.)
   - inline stateless tools (maker_engine + _skill_registry — Q4 LOCKED;
                             constructed once at worker boot)
 
@@ -26,6 +32,7 @@ bus-callable proxies behind the same attribute surface.
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 from typing import Any, Optional
@@ -34,6 +41,154 @@ from titan_hcl.bus import DivineBus
 from titan_hcl.params import get_params
 
 logger = logging.getLogger(__name__)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Request-scoped per-turn state (RFP_load_adaptive_inference_routing §7.B0)
+# ════════════════════════════════════════════════════════════════════════
+#
+# B0-dispatch (agno_worker) runs ONE asyncio event loop in ONE daemon thread
+# and schedules each chat via `run_coroutine_threadsafe`, so multiple chats
+# now overlap. asyncio is single-threaded cooperative concurrency — the hazard
+# is NOT a data race but INTERLEAVING across `await agent.arun()`: chat A sets
+# `plugin._current_user_id = alice`, yields at the await, chat B sets it to
+# `bob`, then A's PostHook reads `bob` → every synthesis record (presence /
+# conversation episode / maker-fact / reasoning) tagged with the wrong user.
+#
+# Fix: the ~38 fields that live for exactly ONE turn (set on entry / in the
+# PreHook or a tool, read later the same turn in the PostHook or
+# `_handle_chat_request` tail) are backed by a per-task ContextVar bag instead
+# of plain plugin attributes. Each chat coroutine installs its OWN bag via
+# `enter_request_scope()` before its first await; asyncio.Task copies the
+# context at creation so the `.set()` only affects that task. Outside any chat
+# task (boot, keepalive thread, tests, non-chat handlers) `_request_bag()`
+# returns the process-global fallback bag → byte-identical to the
+# pre-concurrency single-flight behavior.
+#
+# Per-field classification (VERIFIED in code 2026-06-24 — traced, not inferred;
+# supersedes the RFP §7.B0 list where they differ, per the trace-over-RFP rule):
+#   • MIGRATE (scalar per-turn, read across the await → contaminates): the 11
+#     `_current_*`, the 16 scalar `_last_*`, and the per-turn `_pre_chat_*` /
+#     telemetry / research / stream fields enumerated below.
+#   • LEAVE (already safe-by-key): `_last_surfaced_items` / `_last_cited_use`
+#     are dicts keyed by f"{user_id}:{session_id}"; once `_current_user_id` is
+#     task-local their keys are correct-per-task and never collide across users.
+#     (Migrating them would break the worker's cross-call `.pop(chat_id)`.)
+#   • LEAVE (cross-turn accumulators, shared BY DESIGN): `_p2_gibberish_baseline`
+#     / `_p2_gibberish_turn_count` (every-N-turns calibration probe) — scoping
+#     would reset them each turn and break the probe.
+#   • LEAVE (singletons/caches set once at boot): proxies, `engine_recall`,
+#     `_tier_classifier_cache`, `_verified_context_builder`, `_chat_ctx`,
+#     `_cited_use_detector`, resolvers, `_limbo_mode`, etc.
+
+# name → default value (matches the pre-B0 WorkerPlugin.__init__ literals; any
+# field absent from __init__ defaulted None — its readers all use getattr/None).
+_REQUEST_SCOPED_FIELDS: dict[str, Any] = {
+    # ── the 11 `_current_*` (set in agno_worker._handle_chat_request:642-674
+    #    + PreHook) ──
+    "_current_user_id": None,
+    "_current_session_id": None,
+    "_current_channel": None,
+    "_current_is_maker": False,
+    "_current_did_hash": None,
+    "_current_ip_hash": None,
+    "_current_engagement_level": 0.0,
+    "_current_tool_intent": None,
+    "_current_chat_tier": None,
+    "_current_chat_model_class": None,
+    "_current_chat_features": None,
+    # ── the 16 scalar `_last_*` (reset/set each turn, read in PostHook /
+    #    handler tail) ──
+    "_last_perceptual_field": None,
+    "_last_research_sources": [],   # always wholesale-assigned; fresh copy on get
+    "_last_prompt_vec": None,
+    "_last_prompt_text": None,
+    "_last_router_decision": None,
+    "_last_recall_score": 0.0,
+    "_last_outer_decision": None,
+    "_last_reasoning_id": None,
+    "_last_composite_match": None,
+    "_last_matched_skill_id": None,
+    "_last_execution_mode": "",
+    "_last_retrieval_sample": None,
+    "_last_tool_activity": None,
+    "_last_sovereignty_s": 0.0,
+    "_last_ovg_result": None,
+    "_last_interface_input": None,
+    # ── per-turn `_pre_chat_*` / telemetry / research / stream fields the RFP
+    #    list missed but which trace as per-turn-set-then-read-across-await ──
+    "_pre_chat_user_id": "",
+    "_pre_chat_ku": None,
+    "_pre_chat_neuromods": {},       # fresh copy on get
+    "_pre_chat_recent_presence": None,
+    "_pre_chat_presence_record": None,
+    "_telemetry_trigger_id": None,
+    "_acquired_research_source": None,
+    "_stream_progress_ctx": None,
+    "_research_call_count": 0,
+    "_force_research_topic": None,
+    "_dk4_concept_name": None,       # write-only today; scoped for uniformity
+}
+
+# The per-task state bag. None → not inside a chat request scope → fall back to
+# the process-global bag (single-flight behavior, unchanged).
+_REQUEST_STATE: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "agno_request_state", default=None)
+_GLOBAL_FALLBACK_BAG: dict[str, Any] = {}
+
+
+def _request_bag() -> dict:
+    bag = _REQUEST_STATE.get()
+    return bag if bag is not None else _GLOBAL_FALLBACK_BAG
+
+
+def enter_request_scope() -> None:
+    """Install a FRESH per-task state bag for the current chat coroutine.
+
+    MUST be called at the top of each chat coroutine (`_handle_chat_request`,
+    `_handle_chat_stream_request`, `_handle_dream_inbox_replay`) BEFORE its
+    first `await`, so concurrent chats never share the per-turn fields. Because
+    asyncio.Task copies the context at creation, this `.set()` is visible only
+    to the calling task and its descendants. Idempotent per task.
+    """
+    _REQUEST_STATE.set({})
+
+
+class _RequestScopedAttr:
+    """Data descriptor backing a per-turn WorkerPlugin field with the
+    `_REQUEST_STATE` ContextVar bag (RFP §7.B0 B0-state).
+
+    Reads/writes hit the calling task's bag under a chat request scope, else
+    the process-global fallback bag. There is exactly one WorkerPlugin per
+    worker process, so keying the bag by attribute name alone is sufficient.
+    """
+
+    __slots__ = ("name", "default")
+
+    def __init__(self, name: str, default: Any = None):
+        self.name = name
+        self.default = default
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        bag = _request_bag()
+        if self.name in bag:
+            return bag[self.name]
+        # Return a FRESH copy of mutable defaults so a wholesale-reassign or an
+        # in-place mutation can never leak through the shared default object.
+        d = self.default
+        if isinstance(d, list):
+            return list(d)
+        if isinstance(d, dict):
+            return dict(d)
+        return d
+
+    def __set__(self, obj, value):
+        _request_bag()[self.name] = value
+
+    def __delete__(self, obj):
+        _request_bag().pop(self.name, None)
 
 
 def extract_sources_from_findings(findings: str) -> list[str]:
@@ -348,6 +503,18 @@ class WorkerPlugin:
         call surface used by `agno_hooks.py:1471` + `agno_tools.py:56`.
         """
         return extract_sources_from_findings(findings)
+
+
+# ── RFP §7.B0 B0-state — install the per-turn request-scoped descriptors ──
+# Routes the ~38 per-turn fields through the `_REQUEST_STATE` ContextVar bag so
+# concurrent chats (B0-dispatch) never cross-contaminate. Done after the class
+# body so every existing `plugin._current_user_id = …` / read site (136 across
+# the codebase) is unchanged — the descriptor intercepts get/set transparently.
+# `__init__`'s own assignments of these names run OUTSIDE a request scope, so
+# they seed the process-global fallback bag with the same defaults.
+for _rsf_name, _rsf_default in _REQUEST_SCOPED_FIELDS.items():
+    setattr(WorkerPlugin, _rsf_name, _RequestScopedAttr(_rsf_name, _rsf_default))
+del _rsf_name, _rsf_default
 
 
 # ────────────────────────────────────────────────────────────────────

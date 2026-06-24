@@ -43,6 +43,7 @@ See:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures as concurrent_futures
 import logging
 import os
 import threading
@@ -77,6 +78,69 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S = 30.0
 SHM_REPUBLISH_INTERVAL_S = 1.0  # dual-trigger: on tick + on completion
+# RFP §7.B0 (B0-dispatch) — recv thread waits this long for a dream-inbox
+# replay scheduled on the chat loop before logging + continuing (the replay
+# keeps running in the background; the bound just keeps the recv loop alive).
+DREAM_REPLAY_TIMEOUT_S = 120.0
+
+
+class _ChatLoopDispatcher:
+    """RFP §7.B0 (B0-dispatch) — owns the agno chat asyncio loop.
+
+    Pre-B0 the recv loop ran each chat with `loop.run_until_complete(...)`
+    (serial → `in_flight` stuck at 1 → the Phase B router could not
+    load-balance). This dispatcher runs the loop FOREVER in a daemon thread and
+    `schedule()`s chat coroutines onto it via `run_coroutine_threadsafe`
+    (non-blocking), so multiple `arun()`s overlap. Every scheduled Future is
+    held until done; its done-callback drops it and LOGS any exception
+    (INV-CC-ERRORS-SURFACE — a silently-dying chat task is the exact failure
+    `directive_error_visibility` forbids). Extracted to module level so the
+    dispatch mechanics are unit-testable (tests/test_b0_concurrent_dispatch.py).
+    """
+
+    def __init__(self, loop, *, log: Optional[logging.Logger] = None):
+        self._loop = loop
+        self._log = log if log is not None else logger
+        self._futures: set = set()
+        self._thread = threading.Thread(
+            target=loop.run_forever, name="agno-chat-loop", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def schedule(self, coro):
+        """Schedule `coro` on the loop (non-blocking). Returns the
+        concurrent.futures.Future, tracked for exception surfacing."""
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        self._futures.add(fut)
+        fut.add_done_callback(self._on_done)
+        return fut
+
+    def _on_done(self, fut) -> None:
+        # Surface the error BEFORE dropping tracking — a caller waiting on the
+        # in-flight count must never observe count==0 before the crash is logged.
+        try:
+            exc = fut.exception()
+        except concurrent_futures.CancelledError:
+            exc = None
+        except Exception:  # noqa: BLE001 — never let the callback itself raise
+            exc = None
+        if exc is not None:
+            self._log.error(
+                "[AgnoWorker] chat task crashed (B0-dispatch): %s",
+                exc, exc_info=exc)
+        self._futures.discard(fut)
+
+    @property
+    def in_flight_count(self) -> int:
+        return len(self._futures)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=timeout)
+        except Exception:
+            pass
 
 
 # Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
@@ -522,6 +586,14 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
     dream_state_worker to buffer the message + (maker only) emit
     DREAM_WAKE_REQUEST, then reply with a dream-mode CHAT_RESPONSE.
     """
+    # RFP §7.B0 (B0-state) — install THIS chat task's own per-turn state bag
+    # BEFORE any plugin per-turn field is written, so concurrent chats
+    # (B0-dispatch) never cross-contaminate user_id / reasoning_id / presence /
+    # maker-fact records. No-op-safe: under the legacy serial dispatch each task
+    # ran to completion before the next, so this changes nothing there.
+    from titan_hcl.modules.agno_worker_plugin import enter_request_scope
+    enter_request_scope()
+
     payload = msg.get("payload", {}) or {}
     src = msg.get("src", "")
     rid = msg.get("rid")
@@ -711,23 +783,35 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         # serialises concurrent chats so they don't trample each other).
         _rt0 = time.time()        # §7.B — time the completion for the router's reward
         _route_model = None
-        if _concurrent_chat_enabled(worker_plugin) and \
-                getattr(worker_plugin, "_chat_ctx", None) is not None:
-            run_agent = _make_chat_agent(worker_plugin, message_text, agent)
-            _route_model = getattr(getattr(run_agent, "model", None), "id", None)
-            run_output = await run_agent.arun(
-                message_text,
-                session_id=session_id,
-                user_id=user_id,
-            )
-        else:
-            async with _route_model_for_tier(agent, worker_plugin, message_text):
-                _route_model = getattr(getattr(agent, "model", None), "id", None)
-                run_output = await agent.arun(
+        # RFP §7.B0 (B0-dispatch) — backpressure. Under concurrent dispatch a
+        # burst could otherwise spawn an unbounded number of simultaneous LLM
+        # calls; the semaphore (set at boot, max_concurrent_chats) caps the
+        # in-flight `arun`s. None when _handle_chat_request is driven outside
+        # agno_worker_main (direct unit calls) → degrades to no cap.
+        _sem = getattr(worker_plugin, "_chat_semaphore", None)
+        if isinstance(_sem, asyncio.Semaphore):
+            await _sem.acquire()
+        try:
+            if _concurrent_chat_enabled(worker_plugin) and \
+                    getattr(worker_plugin, "_chat_ctx", None) is not None:
+                run_agent = _make_chat_agent(worker_plugin, message_text, agent)
+                _route_model = getattr(getattr(run_agent, "model", None), "id", None)
+                run_output = await run_agent.arun(
                     message_text,
                     session_id=session_id,
                     user_id=user_id,
                 )
+            else:
+                async with _route_model_for_tier(agent, worker_plugin, message_text):
+                    _route_model = getattr(getattr(agent, "model", None), "id", None)
+                    run_output = await agent.arun(
+                        message_text,
+                        session_id=session_id,
+                        user_id=user_id,
+                    )
+        finally:
+            if isinstance(_sem, asyncio.Semaphore):
+                _sem.release()
         # §7.B — fold this turn's (model, latency) into the bandit (soft, no-op unless
         # router_enabled). in_flight read live (this turn is still counted).
         _router_feedback(_route_model, time.time() - _rt0,
@@ -946,6 +1030,12 @@ async def _handle_dream_inbox_replay(msg: dict, agent, worker_plugin,
         return
     processed = 0
     for rmsg in replay_msgs:
+        # RFP §7.B0 (B0-state) — fresh per-turn bag for EACH replayed message so
+        # a multi-message replay does not leak one buffered user's state into
+        # the next (these run sequentially in this one task, but per-message
+        # isolation keeps the per-turn fields clean turn-to-turn).
+        from titan_hcl.modules.agno_worker_plugin import enter_request_scope
+        enter_request_scope()
         if not isinstance(rmsg, dict):
             continue
         synthetic = {
@@ -1015,6 +1105,12 @@ async def _handle_chat_stream_request(msg: dict, agent, worker_plugin,
     Future (deferred): incremental sentence-boundary verify_safety would
     let us stream during LLM generation. Real R&D — not this chunk.
     """
+    # RFP §7.B0 (B0-state) — this chat task's own per-turn state bag (see
+    # _handle_chat_request for the rationale). The stream path also writes the
+    # per-turn `_stream_progress_ctx`, which is request-scoped too.
+    from titan_hcl.modules.agno_worker_plugin import enter_request_scope
+    enter_request_scope()
+
     payload = msg.get("payload", {}) or {}
     src = msg.get("src", "")
     rid = msg.get("rid")
@@ -1043,21 +1139,31 @@ async def _handle_chat_stream_request(msg: dict, agent, worker_plugin,
         # Concurrent multi-user chat (RFP_concurrent_multiuser_chat): flag-ON
         # (default) = per-call agent over the shared context, NO lock; flag-OFF
         # = legacy shared agent + _route_model_for_tier lock (ζ.5, D-SPEC-79).
-        if _concurrent_chat_enabled(worker_plugin) and \
-                getattr(worker_plugin, "_chat_ctx", None) is not None:
-            run_agent = _make_chat_agent(worker_plugin, message_text, agent)
-            run_output = await run_agent.arun(
-                message_text,
-                session_id=session_id,
-                user_id=user_id,
-            )
-        else:
-            async with _route_model_for_tier(agent, worker_plugin, message_text):
-                run_output = await agent.arun(
+        # RFP §7.B0 (B0-dispatch) — share the chat backpressure semaphore with
+        # _handle_chat_request so streamed + non-streamed chats are capped
+        # together (one max_concurrent_chats budget over ALL in-flight arun's).
+        _sem = getattr(worker_plugin, "_chat_semaphore", None)
+        if isinstance(_sem, asyncio.Semaphore):
+            await _sem.acquire()
+        try:
+            if _concurrent_chat_enabled(worker_plugin) and \
+                    getattr(worker_plugin, "_chat_ctx", None) is not None:
+                run_agent = _make_chat_agent(worker_plugin, message_text, agent)
+                run_output = await run_agent.arun(
                     message_text,
                     session_id=session_id,
                     user_id=user_id,
                 )
+            else:
+                async with _route_model_for_tier(agent, worker_plugin, message_text):
+                    run_output = await agent.arun(
+                        message_text,
+                        session_id=session_id,
+                        user_id=user_id,
+                    )
+        finally:
+            if isinstance(_sem, asyncio.Semaphore):
+                _sem.release()
         if hasattr(run_output, "content"):
             response_text = str(run_output.content)
         elif isinstance(run_output, str):
@@ -2054,6 +2160,36 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     except Exception as _wte:
         logger.debug("[AgnoWorker] warm-infra thread spawn failed: %s", _wte)
 
+    # ── RFP §7.B0 (B0-dispatch) — run the asyncio loop in a daemon thread ──
+    # Pre-B0 the recv loop dispatched each chat with `loop.run_until_complete(
+    # _handle_chat_request(...))` — serial: chat A's `arun()` finished before B
+    # was dequeued, so `in_flight` never exceeded 1 and the Phase B router could
+    # not load-balance. Now the loop runs forever in its own thread and the recv
+    # loop SCHEDULES chats onto it via `run_coroutine_threadsafe` (non-blocking)
+    # → multiple `arun()`s overlap. B0-state (the ContextVar request scope, see
+    # agno_worker_plugin) keeps each overlapping chat's per-turn state isolated.
+    #
+    # Backpressure: `_chat_semaphore` (max_concurrent_chats) is acquired around
+    # the `arun` inside `_handle_chat_request` so a burst can never spawn an
+    # unbounded number of concurrent LLM calls. Task hygiene: every scheduled
+    # Future is held in `_chat_futures` with a done-callback that drops it +
+    # logs any exception (INV-CC-ERRORS-SURFACE — a chat task dying silently is
+    # the exact failure directive_error_visibility forbids).
+    _agno_cfg2 = (config or {}).get("agno_worker", {}) or {}
+    _max_concurrent_chats = int(_agno_cfg2.get("max_concurrent_chats", 16))
+    if worker_plugin is not None:
+        worker_plugin._chat_semaphore = asyncio.Semaphore(_max_concurrent_chats)
+    _dispatcher = _ChatLoopDispatcher(loop)
+    _dispatcher.start()
+    logger.info(
+        "[AgnoWorker] B0-dispatch: chat event loop running in daemon thread "
+        "(max_concurrent_chats=%d)", _max_concurrent_chats)
+
+    def _schedule_on_loop(coro):
+        """Schedule a coroutine on the chat loop (non-blocking). Returns the
+        concurrent.futures.Future, tracked for exception surfacing."""
+        return _dispatcher.schedule(coro)
+
     # ── Main dispatch loop ──
     # D-SPEC-128 (BUG-AGNO-SILENT-HANG fix): read from the bus client's
     # `consumer_queue`, NOT the raw `recv_queue`. The bus_client's
@@ -2180,7 +2316,12 @@ def agno_worker_main(recv_queue, send_queue, name: str,
                               "ts": time.time(),
                           }, rid=msg.get("rid"))
                 else:
-                    loop.run_until_complete(
+                    # B0-dispatch: schedule (non-blocking) so the recv loop keeps
+                    # dequeuing → concurrent chats overlap. in_flight is bumped
+                    # inside the coroutine (loop thread); publishing stats here
+                    # reflects it within one scheduling cycle (eventually
+                    # consistent, single-writer = SHM-safe).
+                    _schedule_on_loop(
                         _handle_chat_request(
                             msg, agent, worker_plugin, send_queue, name, stats,
                         )
@@ -2202,7 +2343,8 @@ def agno_worker_main(recv_queue, send_queue, name: str,
                               "ts": time.time(),
                           }, rid=msg.get("rid"))
                 else:
-                    loop.run_until_complete(
+                    # B0-dispatch: schedule (non-blocking) — same as CHAT_REQUEST.
+                    _schedule_on_loop(
                         _handle_chat_stream_request(
                             msg, agent, worker_plugin, send_queue, name, stats,
                         )
@@ -2215,11 +2357,27 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             # ── Dream-inbox replay (RFP Phase A — moved from parent bridge) ──
             if msg_type == DREAM_INBOX_REPLAY:
                 if agent is not None and worker_plugin is not None:
-                    loop.run_until_complete(
-                        _handle_dream_inbox_replay(
-                            msg, agent, worker_plugin, send_queue, name, stats,
-                        )
-                    )
+                    # B0-dispatch: the loop now runs forever in its own thread,
+                    # so the recv thread can no longer `run_until_complete` on
+                    # it. This is a maintenance op the recv thread genuinely
+                    # WAITS for (INV-CC-ORDERING — replay is not interleaved with
+                    # live chats); schedule + block on the result with a bound.
+                    try:
+                        _schedule_on_loop(
+                            _handle_dream_inbox_replay(
+                                msg, agent, worker_plugin, send_queue, name,
+                                stats,
+                            )
+                        ).result(timeout=DREAM_REPLAY_TIMEOUT_S)
+                    except concurrent_futures.TimeoutError:
+                        logger.warning(
+                            "[AgnoWorker] dream-inbox replay exceeded %.0fs "
+                            "(continuing; runs on in background)",
+                            DREAM_REPLAY_TIMEOUT_S)
+                    except Exception as _dr_err:
+                        logger.error(
+                            "[AgnoWorker] dream-inbox replay failed: %s",
+                            _dr_err, exc_info=True)
                     if publisher:
                         publisher.publish(stats)
                         last_shm_publish = time.time()
@@ -2237,6 +2395,14 @@ def agno_worker_main(recv_queue, send_queue, name: str,
         # spurious "raw_recv.get raised" warnings during teardown.
         try:
             bus_client.stop()
+        except Exception:
+            pass
+        # B0-dispatch: the loop runs forever in the dispatcher's daemon thread;
+        # stop it on its own thread before closing (a running loop cannot be
+        # closed). Daemon thread → the process exits regardless, but a clean
+        # stop avoids "Event loop is closed" noise from in-flight callbacks.
+        try:
+            _dispatcher.stop(timeout=5.0)
         except Exception:
             pass
         try:

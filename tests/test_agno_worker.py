@@ -308,7 +308,15 @@ class TestChatRequestHandler:
         assert call_args.kwargs["user_id"] == "alice"
 
     def test_chat_request_updates_worker_plugin_state(self):
-        """Pre-call: set _current_user_id + _pre_chat_user_id on plugin."""
+        """The handler sets _current_user_id + _pre_chat_user_id so the hooks +
+        arun see this turn's identity.
+
+        RFP §7.B0 (B0-state): the per-turn fields are now REQUEST-SCOPED via a
+        ContextVar bag, so they are visible DURING the chat task (where arun +
+        the hooks run) but do NOT leak out of it afterward (that leakage is the
+        exact cross-contamination B0 fixes). So we capture the values at
+        arun-time (inside the task) and assert isolation after the task returns.
+        """
         from titan_hcl.modules.agno_worker import _handle_chat_request
 
         send_q = Queue()
@@ -316,11 +324,20 @@ class TestChatRequestHandler:
         agent = MagicMock()
         run_output = MagicMock()
         run_output.content = "hi"
-        agent.arun = AsyncMock(return_value=run_output)
 
         # Use real WorkerPlugin so state writes actually land
         from titan_hcl.modules.agno_worker_plugin import WorkerPlugin
         worker_plugin = WorkerPlugin(bus_client=MagicMock())
+
+        seen = {}
+
+        async def _capturing_arun(message, session_id=None, user_id=None):
+            # Runs INSIDE the chat task → must observe this turn's state.
+            seen["current_user_id"] = worker_plugin._current_user_id
+            seen["pre_chat_user_id"] = worker_plugin._pre_chat_user_id
+            return run_output
+
+        agent.arun = _capturing_arun
 
         msg = {
             "type": bus.CHAT_REQUEST,
@@ -330,8 +347,12 @@ class TestChatRequestHandler:
         asyncio.run(_handle_chat_request(
             msg, agent, worker_plugin, send_q, "agno_worker", stats,
         ))
-        assert worker_plugin._current_user_id == "bob"
-        assert worker_plugin._pre_chat_user_id == "bob"
+        # set correctly DURING the turn (what the hooks/arun actually see)
+        assert seen["current_user_id"] == "bob"
+        assert seen["pre_chat_user_id"] == "bob"
+        # B0-state isolation: NOT leaked to the process-global scope after the task
+        assert worker_plugin._current_user_id is None
+        assert worker_plugin._pre_chat_user_id == ""
 
     def test_chat_request_emits_chat_response(self):
         from titan_hcl.modules.agno_worker import _handle_chat_request
