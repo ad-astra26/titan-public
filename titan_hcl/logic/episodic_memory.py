@@ -23,10 +23,10 @@ logger = logging.getLogger(__name__)
 # Significance threshold — only record events above this
 SIGNIFICANCE_THRESHOLD = 0.3
 
-# Event types
+# Event types (documentation; `event_type` is free-form — the per-event EMA key).
 EVENT_TYPES = (
     "word_learned",      # Learned a new word
-    "conversation",      # Had a conversation
+    "conversation",      # Had a conversation (§7.2 — turn-judge reward, person-linked)
     "hormonal_spike",    # Extreme hormonal event
     "great_pulse",       # GREAT PULSE integration
     "dreaming_start",    # Entered dreaming
@@ -36,6 +36,10 @@ EVENT_TYPES = (
     "first_time",        # Any first-time event
     "pi_cluster",        # π-cluster detected
     "bookmark",          # Dream bookmarked
+    "kin_exchange",      # Kin encounter (Phase 1)
+    # §7.2 Phase 2 — synthesis-resident affective-signal episodes (felt_impact set):
+    "skill_score", "sol_receipt", "maker_bond", "x_engagement", "chain_reuse",
+    "experience_feel",   # §7.2 — reasoning-COMMIT felt outcome (native, surprise-only)
 )
 
 
@@ -115,6 +119,19 @@ class EpisodicMemory:
                 created_at REAL NOT NULL
             )
         """)
+        # RFP_phase_c_actr_memory_rehoming §7.2 (Phase 2) — additive, backward-
+        # compatible columns. `felt_impact` = the affective net's learned magnitude
+        # (how much the event moved Titan; NULL for surprise-only events that have
+        # no net, e.g. the cognitive_worker-native triggers). `person_id` = the
+        # recognized interlocutor (links a `conversation` episode to the
+        # PresenceCapture identity). Existing rows survive (ADD COLUMN IF NOT EXISTS
+        # leaves them NULL). SQLite ignores a duplicate add via the IF NOT EXISTS.
+        for _col, _decl in (("felt_impact", "REAL"), ("person_id", "TEXT")):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE episodic_memory ADD COLUMN {_col} {_decl}")
+            except sqlite3.OperationalError:
+                pass  # column already present (older SQLite has no IF NOT EXISTS)
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_ep_event_type
             ON episodic_memory(event_type)
@@ -122,6 +139,10 @@ class EpisodicMemory:
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_ep_epoch
             ON episodic_memory(epoch_id)
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ep_person
+            ON episodic_memory(person_id)
         """)
         self._conn.commit()
 
@@ -133,8 +154,14 @@ class EpisodicMemory:
         hormonal_snapshot: dict = None,
         epoch_id: int = 0,
         significance: float = 0.5,
+        felt_impact: Optional[float] = None,
+        person_id: str = "",
     ) -> Optional[int]:
         """Record a significant life event.
+
+        `felt_impact` (§7.2) = the affective net's learned magnitude (None for
+        surprise-only events with no net). `person_id` = the recognized interlocutor
+        (links a `conversation` episode to the PresenceCapture identity; "" if N/A).
 
         Returns row ID if recorded, None if below significance threshold.
         """
@@ -144,8 +171,8 @@ class EpisodicMemory:
         cur = self._conn.execute("""
             INSERT INTO episodic_memory
             (event_type, description, felt_state, hormonal_snapshot,
-             epoch_id, significance, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+             epoch_id, significance, created_at, felt_impact, person_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             event_type,
             description,
@@ -154,12 +181,17 @@ class EpisodicMemory:
             epoch_id,
             significance,
             time.time(),
+            float(felt_impact) if felt_impact is not None else None,
+            str(person_id) if person_id else None,
         ))
         self._conn.commit()
         row_id = cur.lastrowid
 
-        logger.info("[episodic] Recorded '%s': %s (sig=%.2f, epoch=%d)",
-                    event_type, description[:50] if description else "", significance, epoch_id)
+        logger.info("[episodic] Recorded '%s': %s (sig=%.2f, epoch=%d%s%s)",
+                    event_type, description[:50] if description else "",
+                    significance, epoch_id,
+                    f", impact={felt_impact:.3f}" if felt_impact is not None else "",
+                    f", person={person_id}" if person_id else "")
         return row_id
 
     def recall_by_time(self, epoch_start: int, epoch_end: int) -> list:

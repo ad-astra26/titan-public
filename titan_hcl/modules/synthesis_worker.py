@@ -898,6 +898,53 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
         _publish_affective_nudge(send_queue, name, shm_bank, affective_runtime,
                                  signal_type, nudge, modulator)
 
+    # §7.2 (Phase 2) — the DURABLE twin of the affective nudge. One event, two
+    # products: the transient nudge (above) AND, when the signal's already-computed
+    # surprise clears the episodic gate, a durable life-episode. Significance = the
+    # Nudge.surprise (same currency as Phase 1, the 0.3 gate); felt_impact = the
+    # affective net's learned magnitude (how much it moved Titan). Reuses the BUILT
+    # recorder via bus.emit_episode_record (TARGETED cognitive_worker, 2s coalesced,
+    # drop-safe). Off-hot-path, soft — a failure NEVER affects skill formation/nudge.
+    from titan_hcl.logic.episodic_memory import (
+        SIGNIFICANCE_THRESHOLD as _EP_SIG_MIN)
+    _ep_age_box: dict = {}
+
+    def _episode_epoch() -> int:
+        r = _ep_age_box.get("r")
+        if r is None and "tried" not in _ep_age_box:
+            _ep_age_box["tried"] = True
+            try:
+                from titan_hcl.logic.consciousness_age_reader import (
+                    ConsciousnessAgeReader)
+                r = ConsciousnessAgeReader()
+                _ep_age_box["r"] = r
+            except Exception:
+                r = None
+        try:
+            return int(r.get_age_epochs()) if r is not None else 0
+        except Exception:
+            return 0
+
+    def _emit_affective_episode(signal_type: str, nudge: Any) -> None:
+        """Record the affective signal as an episode when its surprise clears the
+        episodic gate. significance = Nudge.surprise; felt_impact = Nudge.magnitude.
+        Soft — never raises into the drain (an episode is recoverable, not critical)."""
+        if nudge is None or send_queue is None:
+            return
+        try:
+            _surprise = float(getattr(nudge, "surprise", 0.0) or 0.0)
+            if _surprise < _EP_SIG_MIN:
+                return  # not memorable enough — habituation + the 0.3 gate
+            from titan_hcl import bus as _bus_ep
+            _bus_ep.emit_episode_record(
+                send_queue, "synthesis", signal_type,
+                significance=_surprise,
+                felt_impact=float(getattr(nudge, "magnitude", 0.0) or 0.0),
+                epoch_id=_episode_epoch())
+        except Exception as _ep_err:
+            logger.debug("[synthesis_worker] affective episode emit failed: %s",
+                         _ep_err)
+
     _last_balance: Optional[float] = None       # §7.C sol_receipt: last balance_sol
     _SOL_DELTA_EPS = 1e-7                        # skip sub-100-lamport float noise
     _last_engagement_ts: Optional[float] = None  # §7.C x_engagement: snapshot cursor
@@ -923,13 +970,13 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                     try:
                         from titan_hcl.logic.affective_nudge import (
                             SKILL_SCORE_MODULATOR)
+                        _n_skill = affective_runtime.observe_drain(
+                            int(summary.get("successes", 0)),
+                            int(summary.get("failures", 0)),
+                            time.time())
                         _emit_affective_nudge(
-                            "skill_score",
-                            affective_runtime.observe_drain(
-                                int(summary.get("successes", 0)),
-                                int(summary.get("failures", 0)),
-                                time.time()),
-                            SKILL_SCORE_MODULATOR)
+                            "skill_score", _n_skill, SKILL_SCORE_MODULATOR)
+                        _emit_affective_episode("skill_score", _n_skill)
                     except Exception as e:
                         logger.debug(
                             "[synthesis_worker] affective nudge tick failed: %s", e)
@@ -956,11 +1003,12 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                             if abs(_delta) > _SOL_DELTA_EPS:
                                 _now = time.time()
                                 # sol_receipt — symmetric (receipt + / spend −).
+                                _n_sol = affective_runtime.observe_signal(
+                                    "sol_receipt", _delta, _now)
                                 _emit_affective_nudge(
-                                    "sol_receipt",
-                                    affective_runtime.observe_signal(
-                                        "sol_receipt", _delta, _now),
+                                    "sol_receipt", _n_sol,
                                     SIGNAL_MODULATOR["sol_receipt"])
+                                _emit_affective_episode("sol_receipt", _n_sol)
                                 # maker_bond — a +receipt whose funding feePayer is
                                 # the Maker (ONE metered RPC pair, only on +delta).
                                 # §7.D (D.2/D.3): the on-chain receipt is now ONE of
@@ -976,11 +1024,13 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                                     _fp = (solana_oracle.latest_funding_feepayer(
                                         _wallet) if _wallet else None)
                                     if _fp and _fp == maker_pubkey:
+                                        _n_bond = (affective_runtime
+                                                   .observe_maker_bond(_now))
                                         _emit_affective_nudge(
-                                            "maker_bond",
-                                            affective_runtime.observe_maker_bond(
-                                                _now),
+                                            "maker_bond", _n_bond,
                                             SIGNAL_MODULATOR["maker_bond"])
+                                        _emit_affective_episode(
+                                            "maker_bond", _n_bond)
                         _last_balance = _bal
 
                     # x_engagement — aggregate engagement delta since last tick
@@ -991,12 +1041,13 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                             os.path.join(data_dir, "events_teacher.db"),
                             _last_engagement_ts)
                         if _eng_delta > 0:
+                            _n_eng = affective_runtime.observe_signal(
+                                "x_engagement", _eng_delta, time.time(),
+                                intrinsic_positive=True)
                             _emit_affective_nudge(
-                                "x_engagement",
-                                affective_runtime.observe_signal(
-                                    "x_engagement", _eng_delta, time.time(),
-                                    intrinsic_positive=True),
+                                "x_engagement", _n_eng,
                                 SIGNAL_MODULATOR["x_engagement"])
+                            _emit_affective_episode("x_engagement", _n_eng)
 
                     # chain_reuse — OUTER competence-reuse: each agno `skill_delegate`
                     # decision (a learned skill matched → reuse, no re-run) is noted
@@ -1008,12 +1059,13 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                     # signal. Intrinsically-positive competence-confirmation event.
                     _reuse_n = affective_runtime.drain_chat_reuse()
                     if _reuse_n > 0:
+                        _n_reuse = affective_runtime.observe_signal(
+                            "chain_reuse", _reuse_n, time.time(),
+                            intrinsic_positive=True)
                         _emit_affective_nudge(
-                            "chain_reuse",
-                            affective_runtime.observe_signal(
-                                "chain_reuse", _reuse_n, time.time(),
-                                intrinsic_positive=True),
+                            "chain_reuse", _n_reuse,
                             SIGNAL_MODULATOR["chain_reuse"])
+                        _emit_affective_episode("chain_reuse", _n_reuse)
                 except Exception as e:
                     logger.debug(
                         "[synthesis_worker] affective event-tap tick failed: %s", e)
@@ -1054,7 +1106,27 @@ def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
     stashed decision + trains. OFF the recv loop (LLM is network I/O on its own
     thread → no GIL/heartbeat starvation; INV-OML-12 continuous, NOT dream-gated).
     Late user/Maker feedback supersedes via the self_learning corrective-delta. Soft."""
-    from titan_hcl.bus import SELF_LEARN_REWARD
+    from titan_hcl.bus import SELF_LEARN_REWARD, emit_episode_record
+    # §7.2 (Phase 2) — the `conversation` episode rides the judge: a turn's
+    # memorability = its judged reward (NULL at turn-completion → scored here). Lazy
+    # epoch reader (cheap SHM), soft.
+    _cv_age_box: dict = {}
+
+    def _conv_epoch() -> int:
+        r = _cv_age_box.get("r")
+        if r is None and "tried" not in _cv_age_box:
+            _cv_age_box["tried"] = True
+            try:
+                from titan_hcl.logic.consciousness_age_reader import (
+                    ConsciousnessAgeReader)
+                r = ConsciousnessAgeReader()
+                _cv_age_box["r"] = r
+            except Exception:
+                r = None
+        try:
+            return int(r.get_age_epochs()) if r is not None else 0
+        except Exception:
+            return 0
     stop_event.wait(min(interval_s, 25.0))   # settle; offset from the recompute pass
     while not stop_event.is_set():
         scored = 0
@@ -1091,6 +1163,26 @@ def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
                     "goal_class": item.get("goal_class", ""),
                     "source": "llm_judge",
                 })
+                # §7.2 — the `conversation` episode. metric = the judged reward →
+                # surprise on cognitive_worker's _SignalBaseline("conversation") (no
+                # net — not an affective signal). person_id links it to the
+                # PresenceCapture identity; coalesced per-interlocutor. The MAKER is
+                # SKIPPED (his felt-recognition = maker_bond + MAKER_PRESENCE_VERIFIED,
+                # mirroring PresenceCapture's own Maker-skip). Soft — never stalls the
+                # judge; the episode is recoverable, not critical state.
+                _cv_uid = str(item.get("user_id", "") or "").strip()
+                if _cv_uid and _cv_uid != "anonymous" and not item.get("is_maker"):
+                    try:
+                        emit_episode_record(
+                            send_queue, "synthesis", "conversation",
+                            description=f"Conversation with {_cv_uid}",
+                            metric=float(out["reward"]),
+                            epoch_id=_conv_epoch(),
+                            person_id=_cv_uid,
+                            coalesce_key=f"conversation:{_cv_uid}")
+                    except Exception as _cv_err:  # noqa: BLE001
+                        logger.debug("[synthesis_worker] conversation episode "
+                                     "emit failed: %s", _cv_err)
                 scored += 1
             if scored:
                 logger.info("[synthesis_worker] §7.B turn-judge scored %d "
@@ -4448,7 +4540,25 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             "response": str(payload.get("response", "") or ""),
                             "action": _act or "direct",
                             "goal_class": str(payload.get("goal_class", "") or ""),
+                            # §7.2 — carried so the judge-deferred `conversation`
+                            # episode can link to the interlocutor + skip the Maker.
+                            "user_id": str(payload.get("user_id", "") or ""),
+                            "is_maker": bool(payload.get("is_maker", False)),
                         })
+                    # §7.2 — conversation_context working-memory leg (the 2nd deferred
+                    # WM item-type). UNGATED + per-turn (unlike the judge-deferred,
+                    # gated `conversation` episode): cognitive_worker must always know
+                    # the CURRENT interlocutor for reasoning.get_context(). Targeted,
+                    # coalesced per-interlocutor, soft. Mirrors WORD_LEARNED→active_word.
+                    try:
+                        from titan_hcl.bus import emit_turn_context as _emit_tc
+                        _emit_tc(send_queue, name,
+                                 str(payload.get("user_id", "") or ""),
+                                 goal_class=str(payload.get("goal_class", "") or ""),
+                                 is_maker=bool(payload.get("is_maker", False)))
+                    except Exception as _tc_emit_err:  # noqa: BLE001
+                        logger.debug("[synthesis_worker] TURN_CONTEXT emit "
+                                     "failed: %s", _tc_emit_err)
                     # §7.1 — if the MAKER is speaking, also queue the turn for the
                     # Maker-fact extractor (gated + LLM off the recv loop).
                     if (_rid and bool(payload.get("is_maker"))

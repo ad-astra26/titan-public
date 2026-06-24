@@ -405,6 +405,10 @@ _COGNITIVE_WORKER_SUBSCRIBE_TOPICS = [
     # rehoming Tier 2). cognitive_worker owns episodic_mem + working_mem, so it
     # does BOTH the word_learned episode + the active_word working-mem attend.
     bus.WORD_LEARNED,              # → record_episode("word_learned") + working_mem.attend("active_word")
+    # TURN_CONTEXT — the 2nd deferred WM leg (RFP_phase_c_actr_memory_rehoming §7.2).
+    # synthesis re-emits per chat turn; cognitive_worker attends conversation_context
+    # (the current interlocutor) into the canonical working_mem. UNGATED, per-turn.
+    bus.TURN_CONTEXT,              # → working_mem.attend("conversation_context")
     # MEMORY_RECALL_PERTURBATION — Phase D (D-SPEC-116). i_depth + working_mem
     # legs of the recall bridge, re-homed from the retired spirit_worker. Emitted
     # by agno_hooks (interface) targeted dst="cognitive_worker"; the neuromod-nudge
@@ -1411,6 +1415,30 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                             except Exception as _wl_dc_err:
                                 logger.debug("[CognitiveWorker] dream_context "
                                              "recall raised: %s", _wl_dc_err)
+
+            elif msg_type == bus.TURN_CONTEXT:
+                # RFP_phase_c_actr_memory_rehoming §7.2 — the 2nd deferred working-
+                # memory leg (`conversation_context`). synthesis re-emits per chat
+                # turn; cognitive_worker (the canonical working_mem owner) attends the
+                # CURRENT interlocutor so reasoning.get_context() sees who Titan is
+                # talking to. UNGATED + per-turn (distinct from the gated, judge-
+                # deferred `conversation` EPISODE_RECORD). Mirrors active_word.
+                _tc_uid = str(payload.get("user_id", "")).strip()
+                if _tc_uid and _tc_uid != "anonymous":
+                    _tc_wm = state_refs.get("working_mem")
+                    if _tc_wm is not None:
+                        try:
+                            _tc_ep = int(
+                                (state_refs.get("consciousness", {}) or {}).get(
+                                    "latest_epoch", {}).get("epoch_id", 0) or 0)
+                            _tc_wm.attend(
+                                "conversation_context", _tc_uid,
+                                {"goal_class": str(payload.get("goal_class", "")),
+                                 "is_maker": bool(payload.get("is_maker", False))},
+                                _tc_ep)
+                        except Exception as _tc_err:
+                            logger.debug("[CognitiveWorker] conversation_context "
+                                         "attend raised: %s", _tc_err)
 
             elif msg_type == bus.MEMORY_RECALL_PERTURBATION:
                 # Phase D (D-SPEC-116) — i_depth + working_mem legs of the recall
@@ -2841,20 +2869,31 @@ def _dispatch_episode_record(state_refs: dict, payload: dict) -> None:
         description = str(payload.get("description", ""))[:500]
         metric = payload.get("metric", None)
         epoch_id = int(payload.get("epoch_id", 0) or 0)
+        # §7.2 — Phase-2 additive passthrough fields (None/"" for Phase-1 callers).
+        _passthrough_sig = payload.get("significance", None)
+        _felt_impact = payload.get("felt_impact", None)
+        _person_id = str(payload.get("person_id", "") or "")
 
-        # Emergent significance = surprise of `metric` vs this event's running
-        # baseline (cognitive_worker-owned EMA file, co-located with the DB).
-        if metric is None:
-            return
-        _sig_dir = os.path.dirname(
-            getattr(episodic_mem, "_db_path", "./data/episodic_memory.db")) or "."
-        _sig_path = os.path.join(_sig_dir, "episodic_significance_state.json")
-        from titan_hcl.logic.episodic_memory import (
-            compute_significance as _episodic_significance)
-        significance = _episodic_significance(
-            event_type, float(metric), _sig_path)
-        if significance is None:
-            return  # no earned surprise (first-ever / warming up / on-baseline)
+        # Significance source (§7.2):
+        #   • passthrough — the synthesis-resident affective signals ALREADY folded
+        #     the surprise (Nudge.surprise); use it verbatim, no recompute. This keeps
+        #     ONE currency with the metric path (same 0.3 gate, comparable column).
+        #   • else — the Phase-1 metric→EMA path: surprise of `metric` vs this event's
+        #     running baseline (cognitive_worker-owned EMA file, co-located with the DB).
+        if _passthrough_sig is not None:
+            significance = float(_passthrough_sig)
+        else:
+            if metric is None:
+                return
+            _sig_dir = os.path.dirname(
+                getattr(episodic_mem, "_db_path", "./data/episodic_memory.db")) or "."
+            _sig_path = os.path.join(_sig_dir, "episodic_significance_state.json")
+            from titan_hcl.logic.episodic_memory import (
+                compute_significance as _episodic_significance)
+            significance = _episodic_significance(
+                event_type, float(metric), _sig_path)
+            if significance is None:
+                return  # no earned surprise (first-ever / warming up / on-baseline)
 
         # Felt-state enrichment — verbatim from _dispatch_experience_record: prefer
         # the full consciousness state_vector, fall back to the cached 65D inner
@@ -2889,6 +2928,9 @@ def _dispatch_episode_record(state_refs: dict, payload: dict) -> None:
             hormonal_snapshot=hormonal_snapshot,
             epoch_id=epoch_id,
             significance=float(significance),
+            felt_impact=(float(_felt_impact)
+                         if _felt_impact is not None else None),
+            person_id=_person_id,
         )
     except Exception as _ep_err:
         logger.debug(
@@ -4493,6 +4535,39 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                                     logger.debug(
                                         "[CognitiveWorker] reasoning_conclusion "
                                         "attend raised: %s", _rc_err)
+
+                            # ── experience_feel episode (RFP §7.2, Phase 2) ──────
+                            # A reasoning COMMIT is a felt outcome. cognitive_worker-
+                            # NATIVE (in-proc) so it calls the recorder DIRECTLY (like
+                            # the KIN handler), surprise-only via the metric→EMA path
+                            # (no affective net — this isn't a synthesis signal). The
+                            # felt scalar is the recovered pre-C FOCUS-hook score
+                            # (spirit_worker ~L4289): confidence*0.6 + gut_agreement
+                            # *0.4 — both keys are on the reasoning conclusion dict
+                            # (reasoning.py:1749-1750). Kept DISTINCT from skill_score
+                            # (different site/granularity → no double-log). Never raises.
+                            try:
+                                _ef_conf = float(
+                                    _r_result.get("confidence", 0.0) or 0.0)
+                                _ef_gut = float(
+                                    _r_result.get("gut_agreement", 0.0) or 0.0)
+                                _ef_metric = _ef_conf * 0.6 + _ef_gut * 0.4
+                                _ef_ep = int(
+                                    (state_refs.get("consciousness", {}) or {}).get(
+                                        "latest_epoch", {}).get(
+                                            "epoch_id", 0) or 0)
+                                _dispatch_episode_record(state_refs, {
+                                    "event_type": "experience_feel",
+                                    "description": (
+                                        "Reasoning committed "
+                                        f"(conf {_ef_conf:.2f}, gut {_ef_gut:.2f})"),
+                                    "metric": _ef_metric,
+                                    "epoch_id": _ef_ep,
+                                })
+                            except Exception as _ef_err:
+                                logger.debug(
+                                    "[CognitiveWorker] experience_feel episode "
+                                    "raised: %s", _ef_err)
 
                         # ── rFP α §2b — CGN reasoning_strategy emission (RESTORED).
                         #

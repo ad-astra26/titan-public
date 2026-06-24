@@ -213,3 +213,178 @@ def test_emit_word_learned_is_targeted_and_coalesced():
     assert bus.emit_word_learned(q, "language", "sovereignty", 0.7) is False
     assert bus.emit_word_learned(q, "language", "metabolic", 0.55) is True
     assert len(q.items) == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2 (§7.2) — affective-signal + conversation episodes via the synthesis hook
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── P2.1 — schema migration: felt_impact + person_id persist + deserialize ─────
+def test_record_episode_persists_felt_impact_and_person_id():
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        mem = EpisodicMemory(db_path=os.path.join(d, "episodic_memory.db"))
+        rid = mem.record_episode(
+            event_type="conversation", description="with alice",
+            felt_state=[0.4] * 65, hormonal_snapshot={"DA": 0.7},
+            epoch_id=3, significance=1.2, felt_impact=0.08, person_id="alice")
+        assert rid is not None
+        row = mem.get_autobiography(limit=1)[0]
+        assert abs(row["felt_impact"] - 0.08) < 1e-9
+        assert row["person_id"] == "alice"
+        # Phase-1-style call (no new fields) leaves them NULL — backward compatible.
+        mem.record_episode(event_type="pi_cluster", significance=0.9,
+                           felt_state=[0.1] * 130)
+        pi = [r for r in mem.get_autobiography(limit=5)
+              if r["event_type"] == "pi_cluster"][0]
+        assert pi["felt_impact"] is None and pi["person_id"] is None
+        _ = json  # silence lint; felt_state round-trips via _deserialize already
+
+
+# ── P2.2 — backward-compat: a PRE-Phase-2 DB is migrated in place, rows survive ─
+def test_old_schema_db_is_migrated_and_rows_survive():
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        dbp = os.path.join(d, "episodic_memory.db")
+        # Build the OLD 8-column schema (no felt_impact/person_id) + one row.
+        c = sqlite3.connect(dbp)
+        c.execute(
+            "CREATE TABLE episodic_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "event_type TEXT NOT NULL, description TEXT, felt_state TEXT, "
+            "hormonal_snapshot TEXT, epoch_id INTEGER NOT NULL DEFAULT 0, "
+            "significance REAL NOT NULL DEFAULT 0.0, created_at REAL NOT NULL)")
+        c.execute("INSERT INTO episodic_memory "
+                  "(event_type, significance, created_at) VALUES (?,?,?)",
+                  ("great_pulse", 0.9, 1.0))
+        c.commit()
+        c.close()
+        # Opening via EpisodicMemory must ALTER-add the new cols without data loss.
+        mem = EpisodicMemory(db_path=dbp)
+        assert mem.count() == 1, "the pre-existing row must survive migration"
+        old = mem.get_autobiography(limit=1)[0]
+        assert old["event_type"] == "great_pulse"
+        assert old["felt_impact"] is None and old["person_id"] is None
+        # And the migrated DB accepts the new fields.
+        assert mem.record_episode(
+            event_type="sol_receipt", significance=0.8,
+            felt_impact=0.05, person_id="") is not None
+
+
+# ── P2.3 — recorder PASSTHROUGH: synthesis-computed surprise is used verbatim ───
+def test_dispatch_passthrough_significance_skips_recompute():
+    """When the producer passes a pre-computed `significance` (the affective signals
+    already folded Nudge.surprise), the recorder uses it DIRECTLY — it does NOT
+    re-fold `metric` into the episodic EMA. Proven by recording on the FIRST-EVER
+    event (the metric path would return None → no record), and by storing felt_impact
+    + person_id (§7.2)."""
+    from titan_hcl.modules.cognitive_worker import _dispatch_episode_record
+    with tempfile.TemporaryDirectory() as d:
+        mem = EpisodicMemory(db_path=os.path.join(d, "episodic_memory.db"))
+        state_refs = {
+            "episodic_mem": mem,
+            "consciousness": {"latest_epoch": {
+                "state_vector": [0.2] * 130, "epoch_id": 5}},
+            "neural_nervous_system": None,
+        }
+        # First-ever sol_receipt: the metric→EMA path would seed→None→no record.
+        # The passthrough significance forces it through (proving no recompute).
+        _dispatch_episode_record(state_refs, {
+            "event_type": "sol_receipt",
+            "description": "receipt",
+            "metric": 0.05,
+            "epoch_id": 5,
+            "significance": 1.7,          # already-computed surprise
+            "felt_impact": 0.09,          # the net's magnitude
+            "person_id": "",
+        })
+        assert mem.count() == 1, "passthrough significance must record on first event"
+        row = mem.get_autobiography(limit=1)[0]
+        assert abs(row["significance"] - 1.7) < 1e-9, "exact passthrough value stored"
+        assert abs(row["felt_impact"] - 0.09) < 1e-9
+        # A passthrough below the 0.3 gate is still dropped (one currency, one gate).
+        _dispatch_episode_record(state_refs, {
+            "event_type": "x_engagement", "metric": 0.0,
+            "epoch_id": 5, "significance": 0.1})
+        assert mem.count() == 1, "below-threshold passthrough is gated like Phase 1"
+
+
+# ── P2.4 — recorder still honours the Phase-1 metric path when no passthrough ───
+def test_dispatch_metric_path_unchanged_without_passthrough():
+    """A Phase-1-style payload (no significance/felt_impact/person_id) records
+    exactly as before — the metric→EMA surprise path, byte-identical behaviour."""
+    from titan_hcl.modules.cognitive_worker import _dispatch_episode_record
+    with tempfile.TemporaryDirectory() as d:
+        mem = EpisodicMemory(db_path=os.path.join(d, "episodic_memory.db"))
+        state_refs = {
+            "episodic_mem": mem,
+            "consciousness": {"latest_epoch": {
+                "state_vector": [0.2] * 130, "epoch_id": 1}},
+            "neural_nervous_system": None,
+        }
+
+        def emit(metric):
+            _dispatch_episode_record(state_refs, {
+                "event_type": "great_pulse", "metric": metric, "epoch_id": 1})
+
+        for _ in range(4):
+            emit(1.0)
+        assert mem.count() == 0, "on-baseline metric path records nothing"
+        emit(20.0)
+        assert mem.count() == 1, "a surprising metric still records (Phase-1 path)"
+        assert mem.get_autobiography(limit=1)[0]["felt_impact"] is None
+
+
+# ── P2.5 — emit_episode_record carries the §7.2 passthrough fields ─────────────
+def test_emit_episode_record_carries_passthrough_fields():
+    import titan_hcl.bus as bus
+
+    class _Q:
+        def __init__(self):
+            self.items = []
+
+        def put_nowait(self, m):
+            self.items.append(m)
+
+    q = _Q()
+    bus._episode_record_last_emit.clear()
+    ok = bus.emit_episode_record(
+        q, "synthesis", "maker_bond", metric=1.0, epoch_id=2,
+        significance=2.4, felt_impact=0.11, person_id="maker")
+    assert ok
+    p = q.items[0]["payload"]
+    assert p["significance"] == 2.4 and p["felt_impact"] == 0.11
+    assert p["person_id"] == "maker"
+    # A bare Phase-1 emit leaves the passthrough fields null/empty (backward compat).
+    bus._episode_record_last_emit.clear()
+    bus.emit_episode_record(q, "cognitive_worker", "kin_exchange", metric=0.5)
+    p2 = q.items[1]["payload"]
+    assert p2["significance"] is None and p2["felt_impact"] is None
+    assert p2["person_id"] == ""
+
+
+# ── P2.6 — emit_turn_context: targeted, per-interlocutor coalesced, skips anon ──
+def test_emit_turn_context_targeted_coalesced_anon_skip():
+    import titan_hcl.bus as bus
+
+    class _Q:
+        def __init__(self):
+            self.items = []
+
+        def put_nowait(self, m):
+            self.items.append(m)
+
+    q = _Q()
+    bus._turn_context_last_emit.clear()
+    # Anonymous / empty interlocutor → no-op (no WM attend for a faceless turn).
+    assert bus.emit_turn_context(q, "synthesis", "") is False
+    assert bus.emit_turn_context(q, "synthesis", "anonymous") is False
+    assert len(q.items) == 0
+    # A real interlocutor emits a TARGETED frame to cognitive_worker.
+    assert bus.emit_turn_context(q, "synthesis", "alice", goal_class="chitchat") is True
+    msg = q.items[0]
+    assert msg["type"] == bus.TURN_CONTEXT and msg["dst"] == "cognitive_worker"
+    assert msg["payload"]["user_id"] == "alice"
+    # Same interlocutor within the interval coalesces; a different one emits.
+    assert bus.emit_turn_context(q, "synthesis", "alice") is False
+    assert bus.emit_turn_context(q, "synthesis", "bob") is True
+    assert len(q.items) == 2

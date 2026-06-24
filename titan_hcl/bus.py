@@ -2362,11 +2362,23 @@ def emit_episode_record(
     sender, src: str, event_type: str, description: str = "",
     metric: float = 0.0, epoch_id: int = 0,
     min_interval_s: Optional[float] = None, coalesce_key: Optional[str] = None,
+    significance: Optional[float] = None, felt_impact: Optional[float] = None,
+    person_id: str = "",
 ) -> bool:
     """Emit a targeted EPISODE_RECORD frame — Record stage of the ACT-R Episodic
     faculty (RFP_phase_c_actr_memory_rehoming §4.1). Producers pass the SEMANTIC
     content they own (event_type / description / metric); cognitive_worker enriches
     (felt-state + hormones), scores emergent significance from `metric`, and records.
+
+    §7.2 (Phase 2) additive passthrough — when the producer ALREADY computed the
+    surprise + the affective net's magnitude (the synthesis-resident affective
+    signals), it passes them directly so the recorder does NOT recompute:
+      - `significance` (not None) ⇒ authoritative; the recorder skips compute_significance.
+      - `felt_impact` ⇒ the net's learned magnitude, stored alongside (None = no net).
+      - `person_id` ⇒ the recognized interlocutor (links a `conversation` episode to
+        the PresenceCapture identity).
+    All three default to the Phase-1 behaviour (None/"") → the metric→EMA path,
+    byte-identical to before.
 
     Bus-hygiene invariants (mirrors emit_experience_record): TARGETED
     dst="cognitive_worker" (never dst="all"), non-blocking put_nowait/publish,
@@ -2396,6 +2408,11 @@ def emit_episode_record(
             "metric": float(metric),
             "epoch_id": int(epoch_id or 0),
             "ts": now,
+            "significance": (float(significance)
+                             if significance is not None else None),
+            "felt_impact": (float(felt_impact)
+                            if felt_impact is not None else None),
+            "person_id": str(person_id) if person_id else "",
         },
     }
     try:
@@ -2423,6 +2440,61 @@ def emit_episode_record(
 WORD_LEARNED = "WORD_LEARNED"
 WORD_LEARNED_MIN_INTERVAL_S = 2.0
 _word_learned_last_emit: dict = {}
+
+# TURN_CONTEXT — synthesis → cognitive_worker (RFP_phase_c_actr_memory_rehoming
+# §7.2). The 2nd deferred working-memory leg (`conversation_context`). A chat turn
+# completes on the agno path → synthesis's TURN_REASONING_RECORD handler re-emits
+# this lightweight per-turn frame so cognitive_worker (the canonical working_mem
+# owner) attends the CURRENT interlocutor. UNGATED + per-turn (unlike the gated,
+# judge-deferred `conversation` EPISODE_RECORD) so reasoning.get_context() always
+# sees who Titan is talking to right now. Mirrors the WORD_LEARNED→active_word
+# pattern. Payload: {user_id:str, goal_class:str, is_maker:bool, ts:float}.
+TURN_CONTEXT = "TURN_CONTEXT"
+TURN_CONTEXT_MIN_INTERVAL_S = 1.0
+_turn_context_last_emit: dict = {}
+
+
+def emit_turn_context(
+    sender, src: str, user_id: str, goal_class: str = "",
+    is_maker: bool = False, min_interval_s: Optional[float] = None,
+) -> bool:
+    """Emit a targeted TURN_CONTEXT frame (§7.2 — conversation_context WM leg).
+    TARGETED dst="cognitive_worker", non-blocking, per-interlocutor min-interval
+    coalescing (keyed by user_id), drop-safe. Returns True if emitted, False if
+    coalesced/dropped. Empty user_id ⇒ no-op (anonymous turns carry no interlocutor)."""
+    uid = str(user_id or "").strip()
+    if not uid or uid == "anonymous":
+        return False
+    now = time.time()
+    iv = (TURN_CONTEXT_MIN_INTERVAL_S
+          if min_interval_s is None else min_interval_s)
+    if now - _turn_context_last_emit.get(uid, 0.0) < iv:
+        return False  # coalesced — bus hygiene
+    msg = {
+        "type": TURN_CONTEXT,
+        "src": src,
+        "dst": "cognitive_worker",
+        "ts": now,
+        "rid": None,
+        "payload": {
+            "user_id": uid,
+            "goal_class": str(goal_class or ""),
+            "is_maker": bool(is_maker),
+            "ts": now,
+        },
+    }
+    try:
+        if hasattr(sender, "put_nowait"):
+            sender.put_nowait(msg)
+        elif hasattr(sender, "publish"):
+            sender.publish(msg)
+        else:
+            return False
+        _turn_context_last_emit[uid] = now
+        return True
+    except Exception as e:
+        swallow_warn("[emit_turn_context] failed", e, key="bus.emit_turn_context")
+        return False
 
 
 def emit_word_learned(
