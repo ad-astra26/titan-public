@@ -248,8 +248,17 @@ class TestCreateAgentFactory:
             # make_agent for concurrent chat — the wiring above is unchanged.)
             assert kwargs["add_history_to_context"] is False
 
-    def test_create_agent_falls_back_to_venice_on_provider_error(self):
-        """Unknown provider should not crash — fall back to venice."""
+    def test_create_agent_raises_on_unknown_provider_no_venice_fallback(self):
+        """An unknown/failing inference provider must surface LOUDLY — it must
+        NOT silently fall back to a hardcoded 'venice'.
+
+        The venice fallback was REMOVED 2026-06-24 (Maker rule: no hardcoded
+        inference provider) because it masked the real provider failure AND hit
+        depleted Venice credits. `agno_agent_factory.build_shared_chat_context`
+        now re-raises the provider-construction error. (This test previously
+        asserted the old fall-back-to-venice behavior — updated to the new
+        contract.)
+        """
         from titan_hcl.modules.agno_worker_plugin import WorkerPlugin
         plugin = WorkerPlugin(
             bus_client=MagicMock(),
@@ -261,7 +270,8 @@ class TestCreateAgentFactory:
         plugin.guardian = MagicMock()
         with patch("agno.agent.Agent"), patch("agno.db.sqlite.async_sqlite.AsyncSqliteDb"):
             from titan_hcl.modules.agno_agent_factory import create_agent
-            agent = create_agent(plugin)  # should not raise
+            with pytest.raises(ValueError, match="[Uu]nknown inference provider"):
+                create_agent(plugin)
 
 
 # ────────────────────────────────────────────────────────────────────
