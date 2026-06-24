@@ -5286,13 +5286,17 @@ async def get_v4_community_engagement_stats(request: Request,
 # of events_teacher.db (same invariant as community-engagement-stats above);
 # T2/T3 proxy their per-titan slice to T1 over HTTP.
 _T1_INTERNAL_URL = "http://203.0.113.10:7777"  # genesis T1 api ([kin.peers.T1] / [meta_teacher.peers].t1)
+# Absolute path to the T1-canonical DB (repo_root/data/events_teacher.db). Decide
+# local-read vs T1-proxy by FILE PRESENCE, not titan_id: titan_id is free-form
+# (not a T1/T2/T3 enum) and the api-process plugin proxy doesn't reliably expose
+# it, so an id compare mis-routed T1→its own proxy (self-proxy → 502).
+_ET_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "data", "events_teacher.db")
 
 
-def _events_teacher_local_id(request: Request) -> str:
-    """The titan_id of the box this api process runs on."""
-    from titan_hcl.core.state_registry import resolve_titan_id
-    plugin = getattr(request.app.state, "titan_hcl", None)
-    return resolve_titan_id(getattr(plugin, "titan_id", None) if plugin else None)
+def _events_teacher_has_local_db() -> bool:
+    return os.path.exists(_ET_DB_PATH)
 
 
 def _events_teacher_proxy(path_qs: str) -> JSONResponse:
@@ -5317,16 +5321,15 @@ async def get_v6_events_teacher_feed(request: Request, titan_id: str | None = No
     """
     try:
         import sqlite3
-        local = _events_teacher_local_id(request)
-        tid = (titan_id or local or "T1").upper()
-        if local != "T1":
+        tid = (titan_id or "T1").upper()
+        if not _events_teacher_has_local_db():
             qs = f"/v6/events-teacher/feed?titan_id={tid}&limit={int(limit)}"
             if since is not None:
                 qs += f"&since={float(since)}"
             return _events_teacher_proxy(qs)
         from titan_hcl.logic.events_teacher import EventsTeacherReader
         try:
-            rows = EventsTeacherReader().feed(tid, n=limit, since=since)
+            rows = EventsTeacherReader(_ET_DB_PATH).feed(tid, n=limit, since=since)
         except sqlite3.OperationalError:
             rows = []  # DB absent (cold start) → empty-state, not a 500
         return _ok({"titan_id": tid, "count": len(rows), "events": rows})
@@ -5345,14 +5348,13 @@ async def get_v6_events_teacher_followers(request: Request, titan_id: str | None
     """
     try:
         import sqlite3
-        local = _events_teacher_local_id(request)
-        tid = (titan_id or local or "T1").upper()
-        if local != "T1":
+        tid = (titan_id or "T1").upper()
+        if not _events_teacher_has_local_db():
             return _events_teacher_proxy(
                 f"/v6/events-teacher/followers?titan_id={tid}&limit={int(limit)}")
         from titan_hcl.logic.events_teacher import EventsTeacherReader
         try:
-            rows = EventsTeacherReader().followers(tid, n=limit)
+            rows = EventsTeacherReader(_ET_DB_PATH).followers(tid, n=limit)
         except sqlite3.OperationalError:
             rows = []
         return _ok({"titan_id": tid, "count": len(rows), "followers": rows})
@@ -5372,14 +5374,13 @@ async def get_v6_events_teacher_impact(request: Request, titan_id: str | None = 
     """
     try:
         import sqlite3
-        local = _events_teacher_local_id(request)
-        tid = (titan_id or local or "T1").upper()
-        if local != "T1":
+        tid = (titan_id or "T1").upper()
+        if not _events_teacher_has_local_db():
             return _events_teacher_proxy(
                 f"/v6/events-teacher/impact?titan_id={tid}&window_hours={int(window_hours)}")
         from titan_hcl.logic.events_teacher import EventsTeacherReader
         try:
-            data = EventsTeacherReader().impact(tid, window_hours=window_hours)
+            data = EventsTeacherReader(_ET_DB_PATH).impact(tid, window_hours=window_hours)
         except sqlite3.OperationalError:
             data = {"window_hours": int(window_hours), "totals": {}, "affect": {},
                     "pipeline": {}, "sources": []}
