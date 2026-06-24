@@ -5279,6 +5279,117 @@ async def get_v4_community_engagement_stats(request: Request,
         return _error(str(e))
 
 
+# ── /v6/events-teacher/* — social-perception readouts (rFP Observatory §5.2) ─
+# Read-only windows onto events_teacher.db: what Titan FELT about the X/Twitter
+# channel (felt_experiences), which kin it tracks (follower_interactions +
+# user_valence), and the windowed affect/pipeline impact. T1 is the SOLE holder
+# of events_teacher.db (same invariant as community-engagement-stats above);
+# T2/T3 proxy their per-titan slice to T1 over HTTP.
+_T1_INTERNAL_URL = "http://203.0.113.10:7777"  # genesis T1 api ([kin.peers.T1] / [meta_teacher.peers].t1)
+
+
+def _events_teacher_local_id(request: Request) -> str:
+    """The titan_id of the box this api process runs on."""
+    from titan_hcl.core.state_registry import resolve_titan_id
+    plugin = getattr(request.app.state, "titan_hcl", None)
+    return resolve_titan_id(getattr(plugin, "titan_id", None) if plugin else None)
+
+
+def _events_teacher_proxy(path_qs: str) -> JSONResponse:
+    """T2/T3 → fetch the T1-canonical events_teacher.db slice over HTTP."""
+    import urllib.request
+    import json as _json
+    try:
+        with urllib.request.urlopen(_T1_INTERNAL_URL + path_qs, timeout=8.0) as resp:
+            return JSONResponse(_json.loads(resp.read()))
+    except Exception as e:
+        logger.error("[Dashboard] events-teacher T1 proxy %s error: %s", path_qs, e)
+        return _error(f"events_teacher T1 proxy failed: {e}", code=502)
+
+
+async def get_v6_events_teacher_feed(request: Request, titan_id: str | None = None,
+                                     limit: int = 30, since: float | None = None):
+    """Recent felt experiences — what Titan felt about incoming X/Twitter events.
+
+    Query params: ?titan_id=T1|T2|T3 (default = local box) &limit=30 &since=<unix>
+    Returns: {titan_id, count, events:[{author, topic, sentiment, arousal,
+    relevance, concept_signals, semantic_concepts, felt_summary, ...}]}.
+    """
+    try:
+        import sqlite3
+        local = _events_teacher_local_id(request)
+        tid = (titan_id or local or "T1").upper()
+        if local != "T1":
+            qs = f"/v6/events-teacher/feed?titan_id={tid}&limit={int(limit)}"
+            if since is not None:
+                qs += f"&since={float(since)}"
+            return _events_teacher_proxy(qs)
+        from titan_hcl.logic.events_teacher import EventsTeacherReader
+        try:
+            rows = EventsTeacherReader().feed(tid, n=limit, since=since)
+        except sqlite3.OperationalError:
+            rows = []  # DB absent (cold start) → empty-state, not a 500
+        return _ok({"titan_id": tid, "count": len(rows), "events": rows})
+    except Exception as e:
+        logger.error("[Dashboard] /v6/events-teacher/feed error: %s", e)
+        return _error(str(e))
+
+
+async def get_v6_events_teacher_followers(request: Request, titan_id: str | None = None,
+                                          limit: int = 25):
+    """Kin registry + affinity — followers Titan tracks, with valence/relevance.
+
+    Query params: ?titan_id=T1|T2|T3 (default = local box) &limit=25
+    Returns: {titan_id, count, followers:[{handle, accumulated_relevance,
+    valence, interaction_count, last_sentiment, topics_seen, ...}]}.
+    """
+    try:
+        import sqlite3
+        local = _events_teacher_local_id(request)
+        tid = (titan_id or local or "T1").upper()
+        if local != "T1":
+            return _events_teacher_proxy(
+                f"/v6/events-teacher/followers?titan_id={tid}&limit={int(limit)}")
+        from titan_hcl.logic.events_teacher import EventsTeacherReader
+        try:
+            rows = EventsTeacherReader().followers(tid, n=limit)
+        except sqlite3.OperationalError:
+            rows = []
+        return _ok({"titan_id": tid, "count": len(rows), "followers": rows})
+    except Exception as e:
+        logger.error("[Dashboard] /v6/events-teacher/followers error: %s", e)
+        return _error(str(e))
+
+
+async def get_v6_events_teacher_impact(request: Request, titan_id: str | None = None,
+                                       window_hours: int = 24):
+    """Windowed social-perception impact — the affect signal the incoming stream
+    produced (sentiment/arousal/relevance), plus distillation throughput and
+    per-source effectiveness.
+
+    Query params: ?titan_id=T1|T2|T3 (default = local box) &window_hours=24
+    Returns: {titan_id, window_hours, totals, affect, pipeline, sources}.
+    """
+    try:
+        import sqlite3
+        local = _events_teacher_local_id(request)
+        tid = (titan_id or local or "T1").upper()
+        if local != "T1":
+            return _events_teacher_proxy(
+                f"/v6/events-teacher/impact?titan_id={tid}&window_hours={int(window_hours)}")
+        from titan_hcl.logic.events_teacher import EventsTeacherReader
+        try:
+            data = EventsTeacherReader().impact(tid, window_hours=window_hours)
+        except sqlite3.OperationalError:
+            data = {"window_hours": int(window_hours), "totals": {}, "affect": {},
+                    "pipeline": {}, "sources": []}
+        data["titan_id"] = tid
+        return _ok(data)
+    except Exception as e:
+        logger.error("[Dashboard] /v6/events-teacher/impact error: %s", e)
+        return _error(str(e))
+
+
 # ---------------------------------------------------------------------------
 # GET /v4/debug/dim-sources — Phase 2.5.A producer-firing diagnostic
 # rFP_trinity_130d_phase2_5_closure §2.3

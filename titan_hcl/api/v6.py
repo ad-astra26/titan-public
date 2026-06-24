@@ -278,6 +278,14 @@ _T = (
      None, "commands.compose_reply", (), ("social_worker",), False, "/v4/compose-reply"),
     ("/v6/social/community-engagement-stats", "GET", "get_v4_community_engagement_stats", "social", "readout",
      None, None, (), ("social_worker",), True, "/v4/community-engagement-stats"),
+    # ── events-teacher (social-perception readouts; rFP Observatory §5.2) ──
+    # T1-canonical events_teacher.db; rpc=True because T2/T3 proxy to T1.
+    ("/v6/events-teacher/feed", "GET", "get_v6_events_teacher_feed", "events-teacher", "readout",
+     None, None, (), ("language_worker",), True, None),
+    ("/v6/events-teacher/followers", "GET", "get_v6_events_teacher_followers", "events-teacher", "readout",
+     None, None, (), ("language_worker",), True, None),
+    ("/v6/events-teacher/impact", "GET", "get_v6_events_teacher_impact", "events-teacher", "readout",
+     None, None, (), ("language_worker",), True, None),
     ("/v6/social/kin-signature", "GET", "get_kin_signature", "social", "readout",
      None, None, (), ("social_worker",), True, "/v4/kin-signature"),
     ("/v6/social/kin-exchange", "POST", "kin_exchange", "social", "mutation",

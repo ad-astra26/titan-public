@@ -865,6 +865,187 @@ class EventsTeacherDB:
             conn.close()
 
 
+class EventsTeacherReader:
+    """Read-only reader over events_teacher.db for the Observatory API.
+
+    Deliberately NOT EventsTeacherDB: that class auto-constructs a writer
+    client in __init__ (the events_teacher_writer daemon) and runs CREATE
+    TABLE DDL — neither is wanted in the api process, and per-route
+    EventsTeacherDB() construction has historically leaked writer threads
+    (see EventsTeacherDB.__init__ note). This reader opens the file in
+    SQLite read-only (`mode=ro`) mode, runs only SELECTs, never spins a
+    writer, and never mutates the schema. Powers /v6/events-teacher/*.
+    Only instantiated on the box that physically holds the DB file (T1);
+    other Titans proxy to T1 over HTTP at the api layer.
+    """
+
+    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+        self._db_path = db_path
+
+    def _ro_connect(self) -> sqlite3.Connection:
+        # uri=True + mode=ro → fails fast (OperationalError) if the file is
+        # absent rather than silently creating an empty DB.
+        conn = sqlite3.connect(
+            f"file:{self._db_path}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @staticmethod
+    def _loads(blob):
+        """Parse a JSON TEXT column to a real object; tolerate NULL/garbage."""
+        if not blob:
+            return None
+        try:
+            return json.loads(blob)
+        except (ValueError, TypeError):
+            return blob
+
+    def feed(self, titan_id: str, n: int = 30, since: float | None = None) -> list[dict]:
+        """Recent felt experiences (what Titan felt about incoming social events).
+
+        Richer than EventsTeacherDB.get_social_memory: includes the affect
+        triple (sentiment/arousal/relevance), author reach, and both signal
+        maps parsed to real objects."""
+        n = max(1, min(int(n), 200))
+        clauses = ["titan_id=?"]
+        params: list = [titan_id]
+        if since is not None:
+            clauses.append("created_at>=?")
+            params.append(float(since))
+        params.append(n)
+        conn = self._ro_connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, source, author, author_followers, topic, "
+                "sentiment, arousal, relevance, concept_signals, "
+                "semantic_concepts, felt_summary, contagion_type, mode, "
+                "window_id, created_at "
+                "FROM felt_experiences "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY created_at DESC LIMIT ?",
+                params).fetchall()
+        finally:
+            conn.close()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["concept_signals"] = self._loads(d.get("concept_signals"))
+            d["semantic_concepts"] = self._loads(d.get("semantic_concepts"))
+            out.append(d)
+        return out
+
+    def followers(self, titan_id: str, n: int = 25) -> list[dict]:
+        """Kin registry + affinity — merges follower_interactions (relevance,
+        topics seen) with user_valence (running emotional valence EMA) keyed
+        by handle, ordered by accumulated relevance."""
+        n = max(1, min(int(n), 200))
+        conn = self._ro_connect()
+        try:
+            fol = conn.execute(
+                "SELECT handle, times_checked, accumulated_relevance, "
+                "last_sentiment, topics_seen, last_checked_at, created_at "
+                "FROM follower_interactions WHERE titan_id=? "
+                "ORDER BY accumulated_relevance DESC LIMIT ?",
+                (titan_id, n)).fetchall()
+            val = conn.execute(
+                "SELECT handle, valence, interaction_count, last_sentiment, "
+                "last_arousal, last_contagion_type, updated_at "
+                "FROM user_valence WHERE titan_id=?",
+                (titan_id,)).fetchall()
+        finally:
+            conn.close()
+        valence_by_handle = {v["handle"]: dict(v) for v in val}
+        out = []
+        for r in fol:
+            d = dict(r)
+            d["topics_seen"] = self._loads(d.get("topics_seen")) or []
+            v = valence_by_handle.get(d["handle"])
+            d["valence"] = v["valence"] if v else None
+            d["interaction_count"] = v["interaction_count"] if v else None
+            d["last_contagion_type"] = v["last_contagion_type"] if v else None
+            out.append(d)
+        return out
+
+    def impact(self, titan_id: str, window_hours: int = 24) -> dict:
+        """Window-bounded social-perception impact: how the incoming stream
+        moved Titan's affect, plus pipeline throughput + source effectiveness.
+
+        Honest grounding note: events_teacher.db does NOT persist per-event
+        neuromodulator deltas, so this surfaces the *affect signal*
+        (sentiment/arousal/relevance) that the affective-grounding loop
+        consumes — not a fabricated modulator attribution."""
+        window_hours = max(1, min(int(window_hours), 24 * 90))
+        cutoff = time.time() - window_hours * 3600.0
+        conn = self._ro_connect()
+        try:
+            totals = {
+                "felt_experiences": conn.execute(
+                    "SELECT COUNT(*) c FROM felt_experiences WHERE titan_id=?",
+                    (titan_id,)).fetchone()["c"],
+                "followers_tracked": conn.execute(
+                    "SELECT COUNT(*) c FROM follower_interactions WHERE titan_id=?",
+                    (titan_id,)).fetchone()["c"],
+                "windows_completed": conn.execute(
+                    "SELECT COUNT(*) c FROM window_log "
+                    "WHERE titan_id=? AND status='complete'",
+                    (titan_id,)).fetchone()["c"],
+            }
+            agg = conn.execute(
+                "SELECT COUNT(*) n, AVG(sentiment) sentiment, AVG(arousal) arousal, "
+                "AVG(relevance) relevance FROM felt_experiences "
+                "WHERE titan_id=? AND created_at>=?",
+                (titan_id, cutoff)).fetchone()
+            by_contagion = conn.execute(
+                "SELECT contagion_type, COUNT(*) c FROM felt_experiences "
+                "WHERE titan_id=? AND created_at>=? AND contagion_type IS NOT NULL "
+                "GROUP BY contagion_type ORDER BY c DESC",
+                (titan_id, cutoff)).fetchall()
+            by_mode = conn.execute(
+                "SELECT mode, COUNT(*) c FROM felt_experiences "
+                "WHERE titan_id=? AND created_at>=? AND mode IS NOT NULL "
+                "GROUP BY mode ORDER BY c DESC",
+                (titan_id, cutoff)).fetchall()
+            top_topics = conn.execute(
+                "SELECT topic, COUNT(*) c, AVG(relevance) relevance "
+                "FROM felt_experiences WHERE titan_id=? AND created_at>=? "
+                "GROUP BY topic ORDER BY relevance DESC, c DESC LIMIT 8",
+                (titan_id, cutoff)).fetchall()
+            pipeline = conn.execute(
+                "SELECT COUNT(*) windows, "
+                "COALESCE(SUM(mentions_new),0) mentions_new, "
+                "COALESCE(SUM(follower_tweets_new),0) follower_tweets_new, "
+                "COALESCE(SUM(items_distilled),0) items_distilled, "
+                "COALESCE(SUM(events_stored),0) events_stored, "
+                "COALESCE(SUM(api_calls_used),0) api_calls_used "
+                "FROM window_log WHERE titan_id=? AND started_at>=?",
+                (titan_id, cutoff)).fetchone()
+            sources = conn.execute(
+                "SELECT source_type, "
+                "SUM(CASE WHEN score>0 THEN 1 ELSE 0 END) landed, "
+                "SUM(CASE WHEN score<=0 THEN 1 ELSE 0 END) empty, "
+                "COALESCE(SUM(items_stored),0) items_stored "
+                "FROM source_cycle_scores WHERE titan_id=? AND timestamp>=? "
+                "GROUP BY source_type ORDER BY items_stored DESC",
+                (titan_id, cutoff)).fetchall()
+        finally:
+            conn.close()
+        return {
+            "window_hours": window_hours,
+            "totals": totals,
+            "affect": {
+                "count": agg["n"] or 0,
+                "avg_sentiment": round(agg["sentiment"], 4) if agg["sentiment"] is not None else None,
+                "avg_arousal": round(agg["arousal"], 4) if agg["arousal"] is not None else None,
+                "avg_relevance": round(agg["relevance"], 4) if agg["relevance"] is not None else None,
+                "by_contagion": [dict(r) for r in by_contagion],
+                "by_mode": [dict(r) for r in by_mode],
+                "top_topics": [dict(r) for r in top_topics],
+            },
+            "pipeline": dict(pipeline) if pipeline else {},
+            "sources": [dict(r) for r in sources],
+        }
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Events Teacher
 # ═══════════════════════════════════════════════════════════════════════
