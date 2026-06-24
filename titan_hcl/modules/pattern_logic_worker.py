@@ -356,13 +356,27 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
         db_path, c0=float(cfg["c0"]), promote_floor=float(cfg["promote_floor"]),
         min_transitions=int(cfg["min_transitions"]), f_floor=float(cfg["f_floor"]))
 
-    # Embedder — ONE shared 384-d space for both substrates.
-    try:
-        from titan_hcl.utils.text_embedder import get_text_embedder
-        embedder = get_text_embedder()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[pattern_logic] embedder unavailable (%s) — OBSERVE inert", exc)
-        embedder = None
+    # Embedder — ONE shared 384-d space for both substrates, LAZY-LOADED on first
+    # actual use (a verdict to record, or the first contemplate pass). Loading the
+    # bge embedder (~130 MB) eagerly at boot put TWO embedders on the shared T2+T3
+    # box at once → a cold-boot memory/CPU spike that flapped both workers
+    # (2026-06-24). Lazy load eliminates the boot spike; on a low-traffic Titan the
+    # embedder may never load. Cached after first load (kept — llama.cpp models
+    # don't cheaply unload; the steady-state ~130 MB is acceptable, the boot spike
+    # was not).
+    _embedder_box = {"e": None, "tried": False}
+
+    def _embedder():
+        if _embedder_box["e"] is None and not _embedder_box["tried"]:
+            _embedder_box["tried"] = True
+            try:
+                from titan_hcl.utils.text_embedder import get_text_embedder
+                _embedder_box["e"] = get_text_embedder()
+                logger.info("[pattern_logic] embedder lazy-loaded on first use")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[pattern_logic] embedder unavailable (%s) — "
+                               "OBSERVE inert", exc)
+        return _embedder_box["e"]
 
     trigger = threading.Event()
     stop = threading.Event()
@@ -392,10 +406,13 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
             trigger.clear()
             if stop.is_set():
                 break
-            if embedder is None or not cfg.get("enabled", True):
+            if not cfg.get("enabled", True):
+                continue
+            _emb = _embedder()  # lazy — loads on the first pass that has work
+            if _emb is None:
                 continue
             try:
-                n_inner = ingest_inner_snapshot(store, embedder, haov_snapshot_path,
+                n_inner = ingest_inner_snapshot(store, _emb, haov_snapshot_path,
                                                 inner_seen)
                 stats = recognise_and_construct(store, cfg, _offer_sink)
                 if n_inner or any(stats.values()):
@@ -429,8 +446,8 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
     except Exception as _rs:  # noqa: BLE001
         logger.debug("[pattern_logic] register_shutdown_save skipped: %s", _rs)
 
-    logger.info("[pattern_logic] booted — db=%s embedder=%s cadence=%.0fs",
-                db_path, embedder is not None, float(cfg["min_interval_s"]))
+    logger.info("[pattern_logic] booted — db=%s embedder=lazy cadence=%.0fs",
+                db_path, float(cfg["min_interval_s"]))
 
     last_heartbeat = 0.0
     recorded = 0
@@ -507,10 +524,11 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
             continue
 
         if msg_type == bus.VERIFIED_TRANSITION:
-            if embedder is not None and cfg.get("enabled", True):
+            _emb = _embedder() if cfg.get("enabled", True) else None  # lazy load on first verdict
+            if _emb is not None:
                 try:
                     _pl = msg.get("payload") or {}
-                    _tid = record_outer_transition(store, embedder, _pl)
+                    _tid = record_outer_transition(store, _emb, _pl)
                     if _tid is not None:
                         recorded += 1
                     logger.info("[pattern_logic] VERIFIED_TRANSITION recv ctx=%r op<-%s "
