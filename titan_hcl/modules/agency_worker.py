@@ -373,6 +373,24 @@ def _make_research_gap_provider(snapshot_path: str, ttl_s: float = 120.0):
     return _provider
 
 
+def _wire_research_curiosity(agency, synth_cfg: dict, snapshot_path: str) -> bool:
+    """Wire/unwire `agency._research_gap_provider` from the live
+    `synthesis.self_learning.research_curiosity_enabled` flag (RFP_titan_research_agent
+    §1.4). Idempotent: only (re)creates the provider on an OFF→ON transition and clears
+    it on ON→OFF — so it is safe to call at boot AND from the config-reload heartbeat.
+    The attribute swap is a single GIL-atomic assignment → safe against the dispatch
+    thread reading it. Returns the resulting ON/OFF state."""
+    on = bool((synth_cfg.get("self_learning", {}) or {}).get(
+        "research_curiosity_enabled", False))
+    cur = getattr(agency, "_research_gap_provider", None)
+    if on and cur is None:
+        agency._research_gap_provider = _make_research_gap_provider(snapshot_path)
+    elif not on and cur is not None:
+        agency._research_gap_provider = None
+        agency._last_research_gap = None
+    return on
+
+
 def _p8_problem_text(intent: dict, action_result: dict) -> str:
     """The TASK the judge scores against — the self-intent's posture + selection
     reasoning (what Titan was TRYING to do), not the output."""
@@ -713,16 +731,44 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # curiosity). Kill-switch `synthesis.self_learning.research_curiosity_enabled`:
     # default OFF until step-3 (synthesis-side verify+credit) lands — without it 2b is
     # inert and would only force research onto gaps the LLM judge still scores -0.5.
-    _sl_cfg = get_params("synthesis").get("self_learning", {}) or {}
+    _snapshot_path = os.path.join("data", "spine_snapshot.json")
     _research_gap_provider = None
-    if bool(_sl_cfg.get("research_curiosity_enabled", False)):
-        _research_gap_provider = _make_research_gap_provider(
-            os.path.join("data", "spine_snapshot.json"))
+    if bool(get_params("synthesis").get("self_learning", {}).get(
+            "research_curiosity_enabled", False)):
+        _research_gap_provider = _make_research_gap_provider(_snapshot_path)
         logger.info("[AgencyWorker] research-curiosity ON — research postures will "
                     "target knowledge-graph gaps")
     agency = AgencyModule(registry=registry, llm_fn=llm_fn,
                           budget_per_hour=budget_per_hour,
                           research_gap_provider=_research_gap_provider)
+
+    # RFP_titan_research_agent §1.4 — HOT-APPLY research-curiosity (config-as-SHM
+    # §7.B). agency DERIVES `_research_gap_provider` from the flag at boot, which is
+    # precisely the case `params.register_config_reload` exists for: flipping
+    # `synthesis.self_learning.research_curiosity_enabled` then takes effect LIVE on
+    # the config-watch heartbeat — NO agency restart needed. This is the SANCTIONED
+    # activation path: `restart-module agency_worker` cascades (agency doesn't handle
+    # SAVE_NOW → the guardian's 30s save-wait + a shm_pid_dead-during-restart race
+    # flap-loops it), so we AVOID the restart for a flag flip rather than incur it.
+    def _apply_research_curiosity(_synth_cfg: dict) -> None:
+        try:
+            _was_on = getattr(agency, "_research_gap_provider", None) is not None
+            _on = _wire_research_curiosity(agency, _synth_cfg, _snapshot_path)
+            if _on != _was_on:
+                logger.info("[AgencyWorker] research-curiosity %s (hot-applied via "
+                            "config-reload)", "ON" if _on else "OFF")
+        except Exception as _rc_err:  # noqa: BLE001 — never break the watch thread
+            logger.warning(
+                "[AgencyWorker] research-curiosity hot-apply failed: %s", _rc_err)
+
+    try:
+        from titan_hcl.params import register_config_reload
+        register_config_reload("synthesis", _apply_research_curiosity)
+    except Exception as _reg_err:  # noqa: BLE001
+        logger.debug(
+            "[AgencyWorker] research-curiosity config-reload registration "
+            "failed (flag will require a restart to apply): %s", _reg_err)
+
     assessment = SelfAssessment(llm_fn=llm_fn)
 
     # P8 (RFP_emergent_mastery_curriculum §7.P8) — the TaskCompletionJudge for

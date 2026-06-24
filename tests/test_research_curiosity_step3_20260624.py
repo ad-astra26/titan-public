@@ -173,6 +173,53 @@ def test_3c_name_fn_override_refines_target_not_sibling():
     assert store2.created == ["liquid_staking_general"] and store2.bumped == []
 
 
+class _FakeAgencyModule:
+    def __init__(self, provider=None):
+        self._research_gap_provider = provider
+        self._last_research_gap = "stale"
+
+
+def test_hot_apply_wires_provider_on_off_to_on():
+    """RFP §1.4 — flipping research_curiosity_enabled hot-applies via the config-reload
+    callback (NO agency restart → avoids the restart-module flap). OFF→ON wires the
+    gap provider live."""
+    from titan_hcl.modules.agency_worker import _wire_research_curiosity
+    ag = _FakeAgencyModule(provider=None)
+    on = _wire_research_curiosity(
+        ag, {"self_learning": {"research_curiosity_enabled": True}}, "x.json")
+    assert on is True
+    assert callable(ag._research_gap_provider)   # wired live, no restart
+
+
+def test_hot_apply_clears_provider_on_to_off():
+    from titan_hcl.modules.agency_worker import _wire_research_curiosity
+    ag = _FakeAgencyModule(provider=lambda: [])
+    on = _wire_research_curiosity(
+        ag, {"self_learning": {"research_curiosity_enabled": False}}, "x.json")
+    assert on is False
+    assert ag._research_gap_provider is None
+    assert ag._last_research_gap is None          # anti-repeat state reset too
+
+
+def test_hot_apply_idempotent_when_already_on():
+    """Calling repeatedly with the flag ON must NOT recreate the provider (idempotent —
+    the config-watch heartbeat fires on every version bump)."""
+    from titan_hcl.modules.agency_worker import _wire_research_curiosity
+    cfg = {"self_learning": {"research_curiosity_enabled": True}}
+    ag = _FakeAgencyModule(provider=None)
+    _wire_research_curiosity(ag, cfg, "x.json")
+    first = ag._research_gap_provider
+    _wire_research_curiosity(ag, cfg, "x.json")
+    assert ag._research_gap_provider is first     # same instance, not recreated
+
+
+def test_hot_apply_off_stays_off_noop():
+    from titan_hcl.modules.agency_worker import _wire_research_curiosity
+    ag = _FakeAgencyModule(provider=None)
+    on = _wire_research_curiosity(ag, {"self_learning": {}}, "x.json")
+    assert on is False and ag._research_gap_provider is None
+
+
 def test_3c_override_lambda_returns_target_identity():
     rt = _RT
     override = (lambda c, _t=rt: (_t["concept_id"], _t.get("name") or _t["concept_id"],
