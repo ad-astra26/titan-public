@@ -141,3 +141,46 @@ def test_social_sentiment_delta_via_outcome_context(tmp_path):
     t = [x for x in cgn._buffer._buffer if x.concept_id == "u"][-1]
     assert t.metadata.get("sentiment_delta") == -0.1
     assert extract_effect("social", t, 0.3) == "reply_colder"
+
+
+def test_self_model_prediction_confirmed_effect():
+    """Phase 3 / D2: self_model forms on prediction confirmed/falsified (the emit's
+    already-present `confirmed` bool), NOT introspection-depth — no MSL wiring."""
+    import numpy as np
+    from titan_hcl.logic.haov_causal_generator import extract_effect
+    from titan_hcl.logic.cgn_types import CGNTransition
+
+    def _t(md):
+        return CGNTransition(consumer="self_model", concept_id="p",
+                             state=np.zeros(30, dtype=np.float32), action=1,
+                             action_params=np.zeros(4, dtype=np.float32),
+                             reward=0.5, metadata=md)
+
+    assert extract_effect("self_model", _t({"confirmed": True}), 0.5) == "prediction_confirmed"
+    assert extract_effect("self_model", _t({"confirmed": False}), -0.1) == "prediction_falsified"
+
+
+def test_coding_runtime_delta_via_outcome_context(tmp_path):
+    """Phase 2 (coding): the prior-runtime cache → sandbox_runtime_delta_ms (negative
+    = faster) reaches the extractor → runtime_faster."""
+    from titan_hcl.logic.haov_causal_generator import extract_effect
+    cgn = _mk_cgn(tmp_path)
+    cgn.register_consumer(CGNConsumerConfig(name="coding"))
+    cgn.record_experience(consumer="coding", concept_id="f", reward=0.5,
+                          outcome_context={"sandbox_runtime_delta_ms": -50})
+    t = [x for x in cgn._buffer._buffer if x.concept_id == "f"][-1]
+    assert t.metadata.get("sandbox_runtime_delta_ms") == -50
+    assert extract_effect("coding", t, 0.5) == "runtime_faster"
+
+
+def test_knowledge_quality_delta_via_metadata(tmp_path):
+    """Phase 2 (knowledge): the per-topic quality_delta (in metadata via the helper)
+    reaches the extractor → concept_quality_rose."""
+    from titan_hcl.logic.haov_causal_generator import extract_effect
+    cgn = _mk_cgn(tmp_path)
+    cgn.register_consumer(CGNConsumerConfig(name="knowledge"))
+    cgn.record_experience(consumer="knowledge", concept_id="t", reward=0.1,
+                          metadata={"quality_delta": 0.2})
+    t = [x for x in cgn._buffer._buffer if x.concept_id == "t"][-1]
+    assert t.metadata.get("quality_delta") == 0.2
+    assert extract_effect("knowledge", t, 0.1) == "concept_quality_rose"

@@ -656,7 +656,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                             _send_transition(
                                 send_queue, name, cgn_client,
                                 topic, action_idx, neuromods,
-                                reward=-0.05)
+                                reward=-0.05, quality=quality)
                             continue
 
                         # Ground as concept — `source` field records the
@@ -813,7 +813,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                         _send_transition(
                             send_queue, name, cgn_client,
                             topic, action_idx, neuromods,
-                            reward=0.1)
+                            reward=0.1, quality=quality)
 
                         logger.info("[KnowledgeWorker] Grounded '%s' "
                                     "(quality=%.2f, %d chars)",
@@ -1559,10 +1559,23 @@ def _log_concept_lifecycle(send_queue, name: str, topic: str,
 
 # ── CGN Transition ────────────────────────────────────────────────────
 
+# Fix 2 knowledge effect-delta (RFP_cgn_causal_effect_deltas): per-topic prior
+# concept-quality so the grounding sites emit a real quality_delta (the change in
+# researched concept quality) that _extract_knowledge reads (abs>=0.05 →
+# concept_quality_rose/dropped). First grounding of a topic → no delta (0.0).
+_KNOWLEDGE_PRIOR_QUALITY: dict = {}
+
+
 def _send_transition(send_queue, name: str, cgn_client,
                      topic: str, action_idx: int,
-                     neuromods: dict, reward: float = 0.0) -> None:
-    """Send a CGN transition for the knowledge consumer."""
+                     neuromods: dict, reward: float = 0.0,
+                     quality=None) -> None:
+    """Send a CGN transition for the knowledge consumer.
+
+    `quality` (the new _quality_score; pass at grounding sites only) → emit a
+    quality_delta vs this topic's prior quality so the causal extractor forms on
+    concept-quality shifts instead of the degenerate reward-bucket.
+    """
     try:
         import numpy as np
         # Build minimal 30D state vector from neuromods
@@ -1572,6 +1585,13 @@ def _send_transition(send_queue, name: str, cgn_client,
             state[i] = float(neuromods.get(k, 0.5))
         # Topic hash as feature (deterministic)
         state[6] = (hash(topic) % 1000) / 1000.0
+
+        _md = {"topic": topic[:100]}
+        if quality is not None:
+            _prior_q = _KNOWLEDGE_PRIOR_QUALITY.get(topic)
+            _md["quality_delta"] = round(
+                (float(quality) - _prior_q) if _prior_q is not None else 0.0, 4)
+            _KNOWLEDGE_PRIOR_QUALITY[topic] = float(quality)
 
         _send_msg(send_queue, "CGN_TRANSITION", name, "cgn", {
             "type": "experience",  # (b) complete transition → record_experience → observe_for (DEFERRED G1)
@@ -1583,7 +1603,7 @@ def _send_transition(send_queue, name: str, cgn_client,
             "reward": reward,
             "timestamp": time.time(),
             "epoch": 0,
-            "metadata": {"topic": topic[:100]},
+            "metadata": _md,
         })
         # Upgrade III peer publishing (audit 2026-04-23 Q2) — broadcast
         # knowledge chain-outcome so emot_cgn + other peer consumers can

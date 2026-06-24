@@ -122,11 +122,15 @@ def _extract_reasoning(transition: "CGNTransition", reward: float) -> Optional[s
 
 
 def _extract_self_model(transition: "CGNTransition", reward: float) -> Optional[str]:
+    # RFP_cgn_causal_effect_deltas D2 (Maker-greenlit): self_model's action is
+    # predict_transition; the TRUE causal effect is prediction-accuracy, not
+    # introspection-depth. The emit (self_reflection_worker.py) already carries the
+    # `confirmed` verdict in outcome_context → read it directly (mirrors meta's
+    # chain_success), avoiding any MSL i_depth wiring / prev-snapshot.
     md = transition.metadata or {}
-    id_ = md.get("introspection_depth_delta")
-    if isinstance(id_, (int, float)) and abs(id_) >= 1:
-        sign = "deeper" if id_ > 0 else "shallower"
-        return f"introspection_{sign}"
+    cf = md.get("confirmed")
+    if isinstance(cf, bool):
+        return "prediction_confirmed" if cf else "prediction_falsified"
     return _bucket_reward(reward)
 
 

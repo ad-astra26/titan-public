@@ -370,6 +370,9 @@ class CodingExplorer:
         self._total_successes = 0
         self._concept_attempts: Dict[str, int] = {}
         self._concept_successes: Dict[str, int] = {}
+        # Fix 2 coding effect-delta: per-concept prior sandbox runtime (ms) for the
+        # sandbox_runtime_delta_ms causal effect (RFP_cgn_causal_effect_deltas).
+        self._concept_prior_runtime_ms: Dict[str, float] = {}
         # Layer B state — wallclock anchors for time-based fallback
         self._boot_ts: float = time.time()
         self._last_exercise_ts: float = 0.0  # 0 = never; boot_ts is fallback anchor
@@ -835,6 +838,15 @@ class CodingExplorer:
                         _nm.get(_k, _nm.get(_k.replace("-", ""), 0.5)))
                 _state[6] = (hash(result.concept) % 1000) / 1000.0
                 _state[7] = float(result.difficulty)
+                # Fix 2 coding effect-delta (RFP_cgn_causal_effect_deltas): real runtime
+                # delta vs THIS concept's prior run (negative ms = faster = good).
+                # _extract_coding reads sandbox_runtime_delta_ms (abs>=10) →
+                # runtime_faster/slower. First run of a concept → no delta (0.0).
+                _prior_rt = self._concept_prior_runtime_ms.get(result.concept)
+                _rt_delta = (float(result.execution_time_ms) - _prior_rt
+                             if _prior_rt is not None else 0.0)
+                self._concept_prior_runtime_ms[result.concept] = float(
+                    result.execution_time_ms)
                 self._send_queue.put_nowait({
                     "type": "CGN_TRANSITION",
                     "src": "spirit",
@@ -855,6 +867,8 @@ class CodingExplorer:
                             "tests_total": result.tests_total,
                             "difficulty": result.difficulty,
                             "execution_time_ms": result.execution_time_ms,
+                            # Fix 2 coding effect-delta
+                            "sandbox_runtime_delta_ms": _rt_delta,
                         },
                     },
                 })
