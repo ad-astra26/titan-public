@@ -4754,6 +4754,12 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                     meta_wisdom=state_refs.get("meta_wisdom"),
                     exp_orchestrator=state_refs.get("exp_orchestrator"),
                     meta_autoencoder=state_refs.get("meta_autoencoder"),
+                    # RFP_phase_c_actr_memory_rehoming §5.2 (Recall) — the ACT-R
+                    # Episodic faculty, so meta-reasoning's RECALL.episodic_specific
+                    # / .autobiographical_relevant dispatch to real episodes
+                    # (recall_by_feeling / get_autobiography) instead of the
+                    # session-1 exp_orchestrator stub.
+                    episodic_mem=state_refs.get("episodic_mem"),
                 )
                 # §4.Q (2026-05-15) META reward nudges — emit via bus events.
                 # Replaces in-process spirit_worker.py:7238-7275 (eureka DA
@@ -5432,6 +5438,43 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
         except Exception as _d6_err:
             logger.debug(
                 "[CognitiveWorker] D6 waking-recall raised: %s", _d6_err)
+
+    # ── §5.2 (Recall) Leg 1 — ambient EPISODIC resonance ─────────────────
+    # RFP_phase_c_actr_memory_rehoming §5.2: the twin of D6, over the
+    # autobiographical EPISODIC store (not e_mem dream-insights). During waking
+    # cognition, recall the life-episodes Titan FELT resonant-with right now and
+    # pin the SIGNIFICANT one to working memory as `episodic_echo`, so
+    # reasoning.get_context() grounds the current turn in lived experience ("this
+    # resonates with [past moment]"). In-proc (episodic_mem + working_mem +
+    # consciousness all here); recall_by_feeling stores/probes the SAME full
+    # state_vector space (so the cosine is valid by construction). Never raises.
+    _er_mem = state_refs.get("episodic_mem")
+    if (_er_mem is not None and not _epoch_is_dreaming
+            and working_mem is not None and latest):
+        try:
+            _er_sv = latest.get("state_vector", []) or []
+            if hasattr(_er_sv, "to_list"):
+                _er_sv = _er_sv.to_list()
+            _er_sv = list(_er_sv) if _er_sv else []
+            if _er_sv:
+                for _er in (_er_mem.recall_by_feeling(_er_sv, top_k=3) or []):
+                    # Significant + genuinely resonant (the recall is recency-biased,
+                    # so require both a real similarity AND episodic significance).
+                    if (float(_er.get("significance", 0) or 0) >= 0.5
+                            and float(_er.get("similarity", 0) or 0) >= 0.5):
+                        working_mem.attend(
+                            "episodic_echo",
+                            (_er.get("description")
+                             or _er.get("event_type", "a past moment")),
+                            {"event_type": _er.get("event_type"),
+                             "significance": _er.get("significance"),
+                             "similarity": _er.get("similarity"),
+                             "person_id": _er.get("person_id")},
+                            epoch_id)
+                        break  # the single most-resonant significant echo
+        except Exception as _er_err:
+            logger.debug(
+                "[CognitiveWorker] episodic_echo recall raised: %s", _er_err)
 
     # prediction_engine driver REMOVED — Track 2 drift correction (rFP §2.C
     # + commit B8). PredictionEngine now lives in self_reflection_worker;

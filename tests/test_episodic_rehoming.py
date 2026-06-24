@@ -388,3 +388,72 @@ def test_emit_turn_context_targeted_coalesced_anon_skip():
     assert bus.emit_turn_context(q, "synthesis", "alice") is False
     assert bus.emit_turn_context(q, "synthesis", "bob") is True
     assert len(q.items) == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §5.2 — Recall wired into cognition (Leg 1 ambient + Leg 2 meta-reasoning RECALL)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── R.1 — Leg 2: meta_reasoning RECALL dispatches to the REAL episodic faculty ──
+def test_meta_reasoning_recall_dispatches_to_episodic_faculty():
+    """`autobiographical_relevant` → get_autobiography (significance-ranked);
+    `episodic_specific` → recall_by_feeling (resonant). Both leave the session-1
+    stub (recruitment_resolved=True / session_1_stub=False). Without the faculty,
+    they gracefully fall back to the exp_orchestrator stub."""
+    from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
+    with tempfile.TemporaryDirectory() as d:
+        mem = EpisodicMemory(db_path=os.path.join(d, "episodic_memory.db"))
+        for i, sig in enumerate([0.9, 1.5, 0.7]):
+            mem.record_episode(event_type="conversation", description=f"talk {i}",
+                               felt_state=[0.2] * 130, significance=sig,
+                               person_id=f"person{i}")
+        eng = MetaReasoningEngine()
+        eng._episodic_mem = mem
+        eng._cur_state_132d = [0.2] * 130
+        eng.state.formulate_output = {"domain": "general"}
+
+        # autobiographical_relevant → the life story (top by significance)
+        out = eng._prim_recall("autobiographical_relevant", None, None, None)
+        assert out["recruitment_resolved"] is True, "must resolve to the real faculty"
+        assert out["session_1_stub"] is False, "no longer a session-1 stub"
+        assert out["count"] >= 1 and out["best_match"] is True
+        assert eng.state.recalled_data["results"][0]["significance"] == 1.5, \
+            "get_autobiography ranks by significance (1.5 first)"
+
+        # episodic_specific → resonant recall over the current felt-state
+        out2 = eng._prim_recall("episodic_specific", None, None, None)
+        assert out2["recruitment_resolved"] is True and out2["count"] >= 1
+        assert "similarity" in eng.state.recalled_data["results"][0]
+
+        # No faculty wired → graceful fallback (the old stub path, no crash)
+
+        class _Orch:
+            def recall_similar(self, domain, top_k=5):
+                return []
+
+        eng._episodic_mem = None
+        out3 = eng._prim_recall("autobiographical_relevant", None, None, _Orch())
+        assert out3["session_1_stub"] is True, "stub again without the faculty"
+        assert out3["recruitment_resolved"] is False
+
+
+# ── R.2 — Leg 1 condition: recall_by_feeling yields the (sig + similarity) the ──
+#          ambient `episodic_echo` attend gates on ─────────────────────────────
+def test_recall_by_feeling_yields_significant_resonant_echo():
+    """The Leg-1 episodic_echo attend fires only for episodes that are BOTH
+    significant (≥0.5) AND resonant (similarity ≥0.5). Assert recall_by_feeling
+    surfaces such a row when one exists, carrying both fields."""
+    with tempfile.TemporaryDirectory() as d:
+        mem = EpisodicMemory(db_path=os.path.join(d, "episodic_memory.db"))
+        # a significant episode whose felt_state matches the probe exactly
+        mem.record_episode(event_type="kin_exchange", description="kin",
+                           felt_state=[0.5] * 130, significance=0.9)
+        # a non-resonant low-sig one
+        mem.record_episode(event_type="pi_cluster", description="pi",
+                           felt_state=[-0.5] * 130, significance=0.4)
+        hits = mem.recall_by_feeling([0.5] * 130, top_k=3)
+        assert hits, "recall must return candidates"
+        top = hits[0]
+        assert top["event_type"] == "kin_exchange"
+        assert top["similarity"] >= 0.5 and top["significance"] >= 0.5, \
+            "the most-resonant hit clears both gates → episodic_echo would attend"

@@ -863,6 +863,9 @@ class PrimitiveHandlersMixin:
         """Query memory sources."""
         results = []
         best_match = None
+        # §5.2 — set True when episodic_specific/autobiographical_relevant resolve to
+        # the real ACT-R Episodic faculty (no longer the session-1 exp_orchestrator stub).
+        _episodic_resolved = False
 
         if sub == "chain_archive" and chain_archive:
             domain = self.state.formulate_output.get("domain", "general")
@@ -936,16 +939,38 @@ class PrimitiveHandlersMixin:
         # Session 1: each new sub-mode falls back to the closest existing
         # retrieval path. Session 2 dispatches through Recruitment Layer
         # to episodic_memory / semantic_graph / chain_archive / timechain.
-        elif sub == "episodic_specific" and exp_orchestrator:
-            try:
-                domain = self.state.formulate_output.get("domain", "general")
-                results = exp_orchestrator.recall_similar(domain, top_k=5)
-                if results:
-                    best_match = (results[0] if isinstance(results[0], dict)
-                                  else {"score": results[0]})
-            except Exception as _swallow_exc:
-                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
-                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3653', throttle=100)
+        elif sub == "episodic_specific":
+            # §5.2 (Recall) — resonant autobiographical recall: the episodes where
+            # Titan FELT like he does now (cosine over the current state_vector).
+            # Dispatches to the real ACT-R Episodic faculty; falls back to the
+            # session-1 exp_orchestrator stub only if the faculty is unwired.
+            _em = getattr(self, "_episodic_mem", None)
+            _sv = getattr(self, "_cur_state_132d", None)
+            if _em is not None and _sv:
+                try:
+                    _sv_list = (_sv.to_list() if hasattr(_sv, "to_list")
+                                else list(_sv))
+                    results = _em.recall_by_feeling(_sv_list, top_k=5)
+                    if results:
+                        best_match = results[0]
+                    _episodic_resolved = True
+                except Exception as _swallow_exc:
+                    swallow_warn("[logic.meta_reasoning] _prim_recall.episodic_specific "
+                                 "recall_by_feeling", _swallow_exc,
+                                 key='logic.meta_reasoning._prim_recall.episodic_specific',
+                                 throttle=100)
+            elif exp_orchestrator:
+                try:
+                    domain = self.state.formulate_output.get("domain", "general")
+                    results = exp_orchestrator.recall_similar(domain, top_k=5)
+                    if results:
+                        best_match = (results[0] if isinstance(results[0], dict)
+                                      else {"score": results[0]})
+                except Exception as _swallow_exc:
+                    swallow_warn("[logic.meta_reasoning] _prim_recall.episodic_specific "
+                                 "fallback", _swallow_exc,
+                                 key='logic.meta_reasoning._prim_recall.episodic_specific_fb',
+                                 throttle=100)
 
         elif sub == "semantic_neighbors":
             pass  # Session 2: semantic_graph.neighbors resolver
@@ -957,16 +982,33 @@ class PrimitiveHandlersMixin:
             if results:
                 best_match = results[0]
 
-        elif sub == "autobiographical_relevant" and exp_orchestrator:
-            try:
-                domain = self.state.formulate_output.get("domain", "general")
-                results = exp_orchestrator.recall_similar(domain, top_k=10)
-                if results:
-                    best_match = (results[0] if isinstance(results[0], dict)
-                                  else {"score": results[0]})
-            except Exception as _swallow_exc:
-                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
-                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3673', throttle=100)
+        elif sub == "autobiographical_relevant":
+            # §5.2 (Recall) — the life story: Titan's most SIGNIFICANT episodes
+            # (get_autobiography, significance-ranked). Real faculty; stub fallback.
+            _em = getattr(self, "_episodic_mem", None)
+            if _em is not None:
+                try:
+                    results = _em.get_autobiography(limit=10)
+                    if results:
+                        best_match = results[0]
+                    _episodic_resolved = True
+                except Exception as _swallow_exc:
+                    swallow_warn("[logic.meta_reasoning] _prim_recall.autobiographical "
+                                 "get_autobiography", _swallow_exc,
+                                 key='logic.meta_reasoning._prim_recall.autobiographical',
+                                 throttle=100)
+            elif exp_orchestrator:
+                try:
+                    domain = self.state.formulate_output.get("domain", "general")
+                    results = exp_orchestrator.recall_similar(domain, top_k=10)
+                    if results:
+                        best_match = (results[0] if isinstance(results[0], dict)
+                                      else {"score": results[0]})
+                except Exception as _swallow_exc:
+                    swallow_warn("[logic.meta_reasoning] _prim_recall.autobiographical "
+                                 "fallback", _swallow_exc,
+                                 key='logic.meta_reasoning._prim_recall.autobiographical_fb',
+                                 throttle=100)
 
         is_new_mode = sub in ("episodic_specific", "semantic_neighbors",
                                "procedural_matching",
@@ -979,8 +1021,9 @@ class PrimitiveHandlersMixin:
                "count": len(results), "best_match": best_match is not None,
                "confidence": min(0.7, 0.4 + len(results) * 0.03)}
         if is_new_mode:
-            out["session_1_stub"] = True
-            out["recruitment_resolved"] = False
+            # §5.2 — episodic sub-modes are no longer stubs once the faculty resolves.
+            out["session_1_stub"] = not _episodic_resolved
+            out["recruitment_resolved"] = _episodic_resolved
         return out
 
     def _prim_hypothesize(self, sub, nm):
@@ -2240,8 +2283,16 @@ class MetaReasoningEngine(PrimitiveHandlersMixin):
     # ── Public API ────────────────────────────────────────────────
 
     def tick(self, state_132d, neuromods, reasoning_engine,
-             chain_archive, meta_wisdom, exp_orchestrator, meta_autoencoder) -> dict:
+             chain_archive, meta_wisdom, exp_orchestrator, meta_autoencoder,
+             episodic_mem=None) -> dict:
         """One meta-reasoning step per epoch."""
+        # RFP_phase_c_actr_memory_rehoming §5.2 (Recall) — stash the ACT-R Episodic
+        # faculty + the current felt-state so _prim_recall's episodic_specific /
+        # autobiographical_relevant sub-modes dispatch to real episodes
+        # (recall_by_feeling over `state_132d`; get_autobiography by significance)
+        # instead of the session-1 exp_orchestrator stub.
+        self._episodic_mem = episodic_mem
+        self._cur_state_132d = state_132d
         # Cache the lower reasoning layer's lifetime commit telemetry — the
         # counter lives on reasoning_engine, and tick() is where we hold the
         # reference. get_stats() exposes it (was always 0 via getattr(self,…)).
