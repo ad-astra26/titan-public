@@ -377,29 +377,46 @@ def build_shared_chat_context(
         agent_config = (
             getattr(plugin, "_full_config", {}) or {}
         ).get("agent", {})
-    inference_cfg = (getattr(plugin, "_full_config", {}) or {}).get(
+    # Inference config: the CANONICAL source is get_params("inference") (the
+    # config-as-SHM read every worker shares) — it always carries the full
+    # [inference] section incl. `inference_provider`. plugin._full_config can be a
+    # REDUCED subset in the agno_worker subprocess, which is exactly why the old
+    # hardcoded "venice" default was silently winning (chat → depleted Venice 402,
+    # BUG fixed 2026-06-24). Canonical first; plugin._full_config only refines it.
+    from titan_hcl.params import get_params
+    _canon_inf = get_params("inference") or {}
+    _plugin_inf = (getattr(plugin, "_full_config", {}) or {}).get(
         "inference", {}
-    )
+    ) or {}
+    inference_cfg = {**_canon_inf, **_plugin_inf}
     merged_cfg: dict[str, Any] = {**inference_cfg, **agent_config}
 
     # ── Build LLM model via the canonical inference module (D-SPEC-72 §9.C.1) ──
-    provider_name = merged_cfg.get(
-        "provider", inference_cfg.get("inference_provider", "venice")
+    # NO hardcoded provider: resolve strictly from config ([inference]
+    # inference_provider, or an explicit `provider` override). A missing value is
+    # a config error we surface loudly — never a silent default. (Maker rule
+    # 2026-06-24: "no hardcoded values for the inference provider in the codebase".)
+    provider_name = merged_cfg.get("provider") or inference_cfg.get(
+        "inference_provider"
     )
+    if not provider_name:
+        raise ValueError(
+            "[AgnoFactory] No inference provider configured — set "
+            "[inference] inference_provider in config.toml (no hardcoded default)."
+        )
     try:
         provider = inference.get_provider(provider_name, merged_cfg)
         model = provider.get_agno_model()
     except Exception as e:
-        # Fall back to venice if the configured provider can't construct.
-        # This preserves the historical behaviour where unknown / mis-typed
-        # providers degraded to a default rather than refusing to boot.
-        logger.warning(
-            "[AgnoFactory] Provider '%s' failed to construct (%s) — "
-            "falling back to venice", provider_name, e,
+        # NO silent degrade to a hardcoded provider. The old code fell back to
+        # "venice", which masked the real provider failure AND hit depleted Venice
+        # credits (BUG fixed 2026-06-24). Surface the real error; the agno_worker
+        # has a higher-level shared-agent guard (agno_worker.py per-call build).
+        logger.error(
+            "[AgnoFactory] configured inference provider '%s' failed to "
+            "construct: %s", provider_name, e,
         )
-        provider = inference.get_provider("venice", merged_cfg)
-        model = provider.get_agno_model()
-        provider_name = "venice"
+        raise
 
     logger.info(
         "[AgnoFactory] LLM provider: %s (model: %s, base_url: %s, key: %s...)",
