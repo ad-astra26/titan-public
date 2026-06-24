@@ -118,6 +118,32 @@ ollama_cloud_light_model = "gemma4:31b"
 # Main Model — Primary model for thoughtful, detailed replies.
 ollama_cloud_heavy_model = "gemma4:31b"
 
+# ── Load-adaptive inference routing (RFP_load_adaptive_inference_routing) ──
+# Keeps multi-user chat responsive under concurrency. (A) keepalive keeps the chat
+# model warm on Ollama Cloud so a concurrency burst never pays the ~60s cold-start
+# tax; (B) the bandit router (Phase B) offloads to fast fallback models under load.
+# Defaults make A active + B inert until Phase B ships. ON for our fleet (T1-T3);
+# a single-user install may set keepalive_enabled = false (low concurrency → no cold
+# bursts → not needed).
+[inference.autoscale]
+# Phase A — keepalive warmth (LIVE)
+keepalive_enabled       = true
+keepalive_model         = "gemma4:31b"   # the chat model to keep warm
+keepalive_interval_s    = 25.0           # ping cadence while chat-active
+keepalive_idle_after_s  = 120.0          # only keepalive within this window of last chat
+keepalive_scale_with_load = true         # warm ~recent-peak in_flight units (not just 1)
+ladder_warm_cap         = 8              # max concurrent warm pings per tick
+# Phase B — bandit router (NOT YET LIVE — leave false until Phase B ships)
+router_enabled          = false
+model_ladder            = ["gemma4:31b", "ministral-3:14b", "gemini-3-flash-preview"]
+# composite-reward weights (chat = latency-tight; task = quality-tight)
+w_latency_chat = 0.6 ; w_quality_chat = 0.3 ; w_cost_chat = 0.1
+w_latency_task = 0.25 ; w_quality_task = 0.55 ; w_cost_task = 0.2
+target_latency_chat_s = 12.0 ; target_latency_task_s = 40.0
+enter_latency_s = 12.0 ; exit_latency_s = 7.0 ; in_flight_ceiling = 8
+explore_eps = 0.08 ; min_samples = 20 ; min_dwell_s = 20.0
+router_state_path = "data/inference_router_state.json"
+
 [memory_and_storage]
 # Memory Location — Folder where Titan stores its graph memory.
 cognee_db_path = "./cognee_data"

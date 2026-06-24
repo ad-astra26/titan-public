@@ -1313,6 +1313,72 @@ def _install_phase9_baseline_hook() -> None:
     t.start()
 
 
+def _keepalive_gap(in_flight: int, recent_peak: float, warm_cap: int,
+                   scale: bool) -> int:
+    """Pure helper (§7.A) — how many gemma warm-pings to fire this tick. We keep
+    ~`recent_peak` units warm total; live chats already warm `in_flight`, so we only
+    fill the GAP. `scale=False` → keep just 1 unit warm. Capped at `warm_cap`."""
+    target_warm = (max(1, min(int(round(recent_peak)), warm_cap)) if scale else 1)
+    return max(0, target_warm - max(0, int(in_flight)))
+
+
+def _keepalive_loop(worker_plugin, stats_ref: dict,
+                    stop_event: threading.Event, ka_cfg: dict) -> None:
+    """Phase A — RFP_load_adaptive_inference_routing §7.A. Keeps the chat model
+    (`gemma4:31b`) WARM on Ollama Cloud while the Titan is chat-active, so a
+    concurrency burst never pays the ~60s cold-start tax (Ad-A verified: 180s idle →
+    105s/2-timeout burst vs keepalive → 21s/0-fail). Concurrency-scaled: warms ~the
+    recent-peak `in_flight` units (1 ping ≈ 1 warm unit). Off the chat hot path, soft
+    (a ping failure is logged + ignored), activity-gated (no warming an idle Titan →
+    no wasted cloud tokens). Runs its OWN asyncio loop — `provider.chat` is async."""
+    import asyncio
+    model = str(ka_cfg.get("keepalive_model", "gemma4:31b"))
+    interval = float(ka_cfg.get("keepalive_interval_s", 25.0) or 25.0)
+    idle_after = float(ka_cfg.get("keepalive_idle_after_s", 120.0) or 120.0)
+    warm_cap = int(ka_cfg.get("ladder_warm_cap", 8) or 8)
+    scale = bool(ka_cfg.get("keepalive_scale_with_load", True))
+    _msgs = [{"role": "user", "content": "ping"}]
+
+    async def _warm(provider, n):
+        async def _one():
+            try:
+                await provider.chat(_msgs, model=model, max_tokens=8, timeout=30.0)
+            except Exception:
+                pass  # soft — keepalive never affects chat
+        await asyncio.gather(*[_one() for _ in range(n)])
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    recent_peak = 1.0
+    _fired = 0
+    try:
+        while not stop_event.is_set():
+            try:
+                provider = getattr(worker_plugin, "_inference_provider", None)
+                in_flight = int(stats_ref.get("in_flight", 0) or 0)
+                # decaying recent-peak of in_flight (warm for the NEXT burst, not just now)
+                recent_peak = max(float(in_flight), recent_peak * 0.7)
+                active = (time.time()
+                          - float(stats_ref.get("last_chat_ts", 0) or 0)) < idle_after
+                gap = _keepalive_gap(in_flight, recent_peak, warm_cap, scale)
+                if provider is not None and active and gap > 0:
+                    loop.run_until_complete(_warm(provider, gap))
+                    _fired += 1
+                    if _fired == 1 or _fired % 20 == 0:
+                        logger.info(
+                            "[AgnoWorker] keepalive #%d — warmed %d gemma unit(s) "
+                            "(in_flight=%d recent_peak=%.1f)",
+                            _fired, gap, in_flight, recent_peak)
+            except Exception as _ka_err:  # noqa: BLE001
+                logger.debug("[AgnoWorker] keepalive tick failed: %s", _ka_err)
+            stop_event.wait(interval)
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
 @with_error_envelope(module_name="agno_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def agno_worker_main(recv_queue, send_queue, name: str,
                      config: dict[str, Any]) -> None:
@@ -1487,6 +1553,30 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             "[AgnoWorker] Agent construction failed — chat handler will "
             "return error responses: %s", e,
         )
+
+    # ── Phase A — keepalive warmth (RFP_load_adaptive_inference_routing §7.A) ──
+    # Start the gemma-warmth daemon once the provider exists (lazily re-read each
+    # tick, so boot-order is irrelevant). Flag-gated (keepalive_enabled), soft, and
+    # off the chat hot path. ON for the fleet (all-flags-default-on); a single-user
+    # install can disable it. The thread no-ops while the Titan is chat-idle.
+    ka_stop = threading.Event()
+    try:
+        _ka_cfg = (get_params("inference").get("autoscale", {}) or {})
+    except Exception:
+        _ka_cfg = {}
+    if worker_plugin is not None and bool(_ka_cfg.get("keepalive_enabled", True)):
+        ka_thread = threading.Thread(
+            target=_keepalive_loop,
+            args=(worker_plugin, stats, ka_stop, _ka_cfg),
+            daemon=True, name="agno-keepalive",
+        )
+        ka_thread.start()
+        logger.info(
+            "[AgnoWorker] keepalive daemon started (§7.A — gemma warmth, "
+            "interval=%ss idle_after=%ss scale=%s)",
+            _ka_cfg.get("keepalive_interval_s", 25.0),
+            _ka_cfg.get("keepalive_idle_after_s", 120.0),
+            _ka_cfg.get("keepalive_scale_with_load", True))
 
     # ── D-SPEC-138 (v1.63.1, 2026-05-26) — Eager OVG warmup ──
     # OutputVerifier construction (Solana keypair load + TimeChain.open) is
