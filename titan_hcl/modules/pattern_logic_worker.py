@@ -475,11 +475,16 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
         if msg_type == bus.VERIFIED_TRANSITION:
             if embedder is not None and cfg.get("enabled", True):
                 try:
-                    if record_outer_transition(store, embedder,
-                                               msg.get("payload") or {}) is not None:
+                    _pl = msg.get("payload") or {}
+                    _tid = record_outer_transition(store, embedder, _pl)
+                    if _tid is not None:
                         recorded += 1
+                    logger.info("[pattern_logic] VERIFIED_TRANSITION recv ctx=%r op<-%s "
+                                "verdict=%s recorded=%s total=%d",
+                                str(_pl.get("context", ""))[:40], _pl.get("oracle_id"),
+                                _pl.get("verdict"), _tid is not None, recorded)
                 except Exception:  # noqa: BLE001
-                    logger.debug("[pattern_logic] outer record failed", exc_info=True)
+                    logger.warning("[pattern_logic] outer record failed", exc_info=True)
             continue
 
         if msg_type == "CGN_IMPASSE":
