@@ -72,6 +72,7 @@ class AdaptiveRouter:
         # flap guardrail state
         self._current_arm = managed_model
         self._switched_at = 0.0
+        self._last_logged: Optional[str] = None   # §8 G3 — log only on route change
         # quality / cost priors (B; B.2 will LEARN quality from the turn-judge).
         # gemma is the strongest + priciest; fallbacks descend.
         _q = [1.0, 0.72, 0.66, 0.6]
@@ -108,7 +109,16 @@ class AdaptiveRouter:
         if not self._enabled() or not is_chat or base != self.managed:
             return base
         try:
-            return self._bandit_choose(int(in_flight), bool(is_chat))
+            chosen = self._bandit_choose(int(in_flight), bool(is_chat))
+            if chosen != self._last_logged:
+                # §8 G3 observability — log every change of routing decision (offload
+                # to a fallback, or revert to gemma). Low-frequency (only on change).
+                logger.info(
+                    "[AdaptiveRouter] route → %s (was %s, in_flight=%d gemma_ema=%.1fs)",
+                    chosen, self._last_logged or self.managed, int(in_flight),
+                    self.monitor.ema(self.managed))
+                self._last_logged = chosen
+            return chosen
         except Exception as e:  # noqa: BLE001
             logger.debug("[AdaptiveRouter] choose soft-fail → passthrough: %s", e)
             return base
