@@ -35,11 +35,16 @@ from titan_hcl import bus
 from titan_hcl.synthesis import pattern_op_taxonomy as taxo
 from titan_hcl.synthesis.pattern_particle_store import PatternParticleStore
 from titan_hcl.synthesis.consolidation import _default_cosine
+from titan_hcl.modules._heartbeat_grace import (
+    boot_deadline_from_now, shm_heartbeat_allowed)
 
 logger = logging.getLogger(__name__)
 
 _HEARTBEAT_INTERVAL_S = 30.0
 _POLL_INTERVAL_S = 0.2
+# Phase 11 §11.I.5 boot-grace heartbeat state (set per-boot in the entry fn).
+_WORKER_READY: bool = False
+_BOOT_DEADLINE = None
 
 # Defaults — mirror config.toml [pattern_logic]; emergence over determinism.
 _DEFAULTS = {
@@ -322,6 +327,10 @@ def _resolve_cfg(config: dict) -> Dict[str, Any]:
 def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """L2 worker entry. recv loop = drain + record outer + arm the pass; a daemon
     thread runs the bounded-cadence RECOGNISE→CONSTRUCT→OFFER pass."""
+    # Phase 11 §11.I.5 — boot-grace heartbeat state (reset before the loop).
+    global _WORKER_READY, _BOOT_DEADLINE
+    _WORKER_READY = False
+    _BOOT_DEADLINE = boot_deadline_from_now()
     cfg = _resolve_cfg(config)
     if not cfg.get("enabled", True):
         logger.info("[pattern_logic] disabled by config — idle heartbeat only")
@@ -401,6 +410,7 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
                                    daemon=True)
     contemplate.start()
 
+    _WORKER_READY = True
     if _state_writer is not None:
         try:
             _state_writer.write_state("booted")
@@ -421,7 +431,8 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
                     "ts": now})
             except Exception:  # noqa: BLE001
                 pass
-            if _state_writer is not None:
+            if _state_writer is not None and shm_heartbeat_allowed(
+                    _WORKER_READY, _BOOT_DEADLINE):
                 try:
                     _state_writer.heartbeat()
                 except Exception:  # noqa: BLE001
@@ -437,6 +448,14 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
 
         msg_type = msg.get("type") if isinstance(msg, dict) else None
         if msg_type is None:
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch (REQUIRED
+        # for every spawn-mode worker; BUS_HANDOFF/ADOPT_ACK/HANDOFF_CANCELED). Its
+        # absence is what made this worker fail the supervision handshake → the
+        # in-process watcher SIGTERM'd it ~28s after boot → shm_pid_dead restart loop.
+        from titan_hcl.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
