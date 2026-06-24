@@ -627,21 +627,30 @@ def _emit_research_confirmed(plugin, node) -> None:
         if _bus is None:
             return
         _felt = node.get("neuromod_context")
-        # dst="all" (type-filtered broadcast — the _synth_bus_emit idiom), NOT
-        # dst="memory": BOTH memory_worker (fact promotion) AND synthesis_worker
-        # (P3 — research query-shape → ProceduralSkill, BUG-RESEARCH-LANE) subscribe
-        # to RESEARCH_CONFIRMED; the bus is dst-routed, so a targeted dst="memory"
-        # never reaches synthesis. (Caught live 2026-06-21: subscription alone gave
-        # 0 skill cells until the emit broadcast.)
-        _bus.publish(_mk(
-            _bus_mod.RESEARCH_CONFIRMED, "pre_hook", "all", {
-                "node_id": node.get("id"),
-                "user_prompt": str(node.get("user_prompt", "") or ""),
-                "agent_response": str(node.get("agent_response", "") or ""),
-                "acquired_source": node.get("acquired_source"),
-                "felt": _felt if isinstance(_felt, dict) else {},
-                "ts": _t.time(),
-            }))
+        # RESEARCH_CONFIRMED has TWO consumers with DIFFERENT subscriber intents, so
+        # emit TWO TARGETED messages — NOT one dst="all" broadcast (the bus is
+        # dst-routed, so a single targeted dst reaches only one of them):
+        #   • memory_worker — fact promotion + the durable anchor (→ tx_hash →
+        #     RESEARCH_CONCEPT_SEED → declarative-Engram concept seed). memory is
+        #     reply_only=True (module_catalog.py) → it receives ONLY targeted
+        #     dst="memory" and is SILENTLY SKIPPED from every dst="all" broadcast
+        #     fan-out (D-SPEC-42; bus.py publish() reply_only skip).
+        #   • synthesis_worker — P3 research query-shape → ProceduralSkill cell.
+        # ⚠ BUG-RESEARCH-CONFIRMED-DST-ALL (regression 942e2652e, 2026-06-21): the
+        # emit was flipped dst="memory"→"all" to reach synthesis, which silently
+        # broke memory reception (reply_only) → chat-path concept-seeding dead.
+        # Two targeted emits restore BOTH and avoid the broadcast flood.
+        _payload = {
+            "node_id": node.get("id"),
+            "user_prompt": str(node.get("user_prompt", "") or ""),
+            "agent_response": str(node.get("agent_response", "") or ""),
+            "acquired_source": node.get("acquired_source"),
+            "felt": _felt if isinstance(_felt, dict) else {},
+            "ts": _t.time(),
+        }
+        for _dst in ("memory", "synthesis"):
+            _bus.publish(_mk(
+                _bus_mod.RESEARCH_CONFIRMED, "pre_hook", _dst, dict(_payload)))
     except Exception as e:  # noqa: BLE001 — never break chat
         logger.debug("[PreHook][A2] research-confirmed emit skipped: %s", e)
 
