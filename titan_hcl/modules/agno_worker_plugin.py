@@ -339,13 +339,15 @@ class WorkerPlugin:
     @property
     def metabolism(self):
         from titan_hcl.proxies.metabolism_proxy import MetabolismProxy
-        # MetabolismProxy may require a network or guardian arg — pass None
-        # and rely on the proxy's defensive init. Adjust signature per the
-        # actual MetabolismProxy.__init__ if needed during smoke test.
-        try:
-            return self._proxy("metabolism", lambda b: MetabolismProxy(b))
-        except TypeError:
-            return self._proxy("metabolism", lambda b: MetabolismProxy(b, None))
+        # MetabolismProxy.__init__(bus, guardian). The agno subprocess has no
+        # in-process Guardian, so pass None — guardian is only touched in
+        # _ensure_started(), which degrades gracefully on None (same contract as
+        # the sibling proxies above, all constructed `(b, None)`).
+        # BUGFIX 2026-06-24: the prior `MetabolismProxy(b)` (1 arg) raised
+        # TypeError on EVERY access; `_proxy()` caught it internally and cached
+        # None, so the 2-arg `except TypeError` fallback was DEAD CODE and
+        # `plugin.metabolism` was permanently None. One correct call, no retry.
+        return self._proxy("metabolism", lambda b: MetabolismProxy(b, None))
 
     @property
     def agency(self):

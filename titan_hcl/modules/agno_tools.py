@@ -282,7 +282,13 @@ def create_tools(plugin):
                 import hashlib, time
                 tx_signature = hashlib.sha256(str(time.time()).encode()).hexdigest()
             if sol_balance <= 0:
-                sol_balance = plugin.metabolism._last_balance or 1.0
+                # BUGFIX 2026-06-24: `plugin.metabolism._last_balance` was broken
+                # twice — `plugin.metabolism` was permanently None (see the
+                # property), AND `_last_balance` is a private attr of the
+                # in-process MetabolismController (core/metabolism.py), never
+                # exposed on the bus-RPC proxy. Use the worker-side balance cache
+                # the hooks already read (`_last_sol_balance`), falling back to 1.0.
+                sol_balance = getattr(plugin, "_last_sol_balance", None) or 1.0
 
             # v1.8.3 / D-SPEC-57: StudioProxy._with_completion variant returns
             # completion envelope; bundle paths live under envelope["paths"].
