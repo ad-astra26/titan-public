@@ -1024,6 +1024,17 @@ class PrimitiveHandlersMixin:
             # §5.2 — episodic sub-modes are no longer stubs once the faculty resolves.
             out["session_1_stub"] = not _episodic_resolved
             out["recruitment_resolved"] = _episodic_resolved
+            if _episodic_resolved:
+                # Verifiability (§5.2) — throttled confirmation the deliberate recall
+                # leg dispatched to the real Episodic faculty live (not the stub).
+                _rn = int(getattr(self, "_episodic_recall_log_n", 0)) + 1
+                self._episodic_recall_log_n = _rn
+                if _rn == 1 or _rn % 10 == 0:
+                    _bm = best_match if isinstance(best_match, dict) else {}
+                    logger.info(
+                        "[MetaReasoning] RECALL.%s #%d → episodic faculty: "
+                        "%d episode(s), top sig=%.2f", sub, _rn, len(results),
+                        float(_bm.get("significance", 0) or 0))
         return out
 
     def _prim_hypothesize(self, sub, nm):

@@ -5471,6 +5471,18 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                              "similarity": _er.get("similarity"),
                              "person_id": _er.get("person_id")},
                             epoch_id)
+                        # Verifiability (§5.2) — throttled confirmation the leg fires
+                        # live (the Phase-1 lesson: prove recall RETURNS, not just wired).
+                        _ec_n = int(state_refs.get("_episodic_echo_n", 0)) + 1
+                        state_refs["_episodic_echo_n"] = _ec_n
+                        if _ec_n == 1 or _ec_n % 25 == 0:
+                            logger.info(
+                                "[CognitiveWorker] episodic_echo #%d → working_mem: "
+                                "'%s' (sig=%.2f sim=%.2f)", _ec_n,
+                                (_er.get("description")
+                                 or _er.get("event_type", ""))[:40],
+                                float(_er.get("significance", 0) or 0),
+                                float(_er.get("similarity", 0) or 0))
                         break  # the single most-resonant significant echo
         except Exception as _er_err:
             logger.debug(
