@@ -197,6 +197,37 @@ def test_inner_offer_corroboration_events():
         s.close()
 
 
+def test_restart_safety_inner_dedup_from_store():
+    """Kill-respawn safety: after ingesting a HAOV snapshot, a fresh worker that
+    reconstructs inner_seen from the store must NOT re-ingest the same confirmations."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "pattern_logic.duckdb")
+        s, e = PatternParticleStore(path, c0=1.0), FakeEmbedder()
+        snap = os.path.join(d, "haov.json")
+        with open(snap, "w") as f:
+            json.dump({"hypotheses": [{"rule": "research_fresh", "action_context": {},
+                       "predicted_effect": "research", "confirmations": 3,
+                       "falsifications": 2, "source": "impasse"}]}, f)
+        assert plw.ingest_inner_snapshot(s, e, snap, {}) == 5
+        n_before = s.get_stats()["transitions"]
+        s.close()
+
+        # "respawn": new store handle, reconstruct dedup from the durable store.
+        s2 = PatternParticleStore(path, c0=1.0)
+        seen = s2.inner_ingest_counts()
+        assert seen["research_fresh"] == (3, 2)
+        # Re-reading the SAME snapshot ingests ZERO (no double-count).
+        assert plw.ingest_inner_snapshot(s2, e, snap, seen) == 0
+        assert s2.get_stats()["transitions"] == n_before
+        # A genuine new confirmation IS ingested.
+        with open(snap, "w") as f:
+            json.dump({"hypotheses": [{"rule": "research_fresh", "action_context": {},
+                       "predicted_effect": "research", "confirmations": 4,
+                       "falsifications": 2, "source": "impasse"}]}, f)
+        assert plw.ingest_inner_snapshot(s2, e, snap, seen) == 1
+        s2.close()
+
+
 def test_haov_corroborate_boosts_confidence_only():
     """The CGN side of OFFER-inner: corroborate() raises a hypothesis's confidence by
     rule name, records it in action_context, and leaves the in-process tally honest."""

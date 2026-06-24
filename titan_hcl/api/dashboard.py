@@ -4914,6 +4914,13 @@ _RESTART_MODULE_ALLOWLIST = {
     "social_worker",                  # §P2: circuit-breaker vestigial-cleanup (state already durable)
     "warning_monitor",                # §P2: add shutdown handler + persist rate_window/spike_alerts
     "media",                          # §P1 held → §P4: audit reload_ok (eager-durable-write; scanner FP)
+    # ── pattern_logic (RFP_pattern_logic, 2026-06-24) ─────────────────────────
+    "pattern_logic",  # KILL-RESPAWN ONLY (heavy: bge embedder ~130MB + duckdb + a
+                      #   contemplate daemon thread → NOT reload). Persistence: all
+                      #   transitions/particles write-through to data/pattern_logic.duckdb
+                      #   immediately (autocommit-durable); the in-memory HAOV-dedup map
+                      #   is reconstructed from the store on boot (inner_ingest_counts) →
+                      #   no re-ingest on respawn. Verified restart-safe.
     # REMOVED 2026-06-01 (§P3): "spirit" — DEAD ENTRY (spirit_worker_main RETIRED
     #   D-SPEC-116; no ModuleSpec → restart would fail at guardian). (AUDIT §(D).)
 }

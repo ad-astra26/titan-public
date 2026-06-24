@@ -355,7 +355,12 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
 
     trigger = threading.Event()
     stop = threading.Event()
-    inner_seen: Dict[str, tuple] = {}
+    # Restart-safety (kill-respawn allowlist): reconstruct the HAOV-snapshot dedup
+    # state from the durable store so a respawn never re-ingests the snapshot.
+    try:
+        inner_seen: Dict[str, tuple] = store.inner_ingest_counts()
+    except Exception:  # noqa: BLE001
+        inner_seen = {}
 
     def _offer_sink(model: Dict[str, Any]) -> None:
         # OFFER-outer: persist the MODEL as a reasoning-composite (→ OML composite_match).

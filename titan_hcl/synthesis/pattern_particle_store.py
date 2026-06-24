@@ -375,6 +375,18 @@ class PatternParticleStore:
             "WHERE particle_id = ? AND substrate = 'inner'", (particle_id,)).fetchall()
         return [(r[0], r[1]) for r in rows if r[1]]
 
+    def inner_ingest_counts(self) -> Dict[str, tuple]:
+        """Restart-safety (kill-respawn): reconstruct the per-rule (n_true, n_false)
+        already-ingested counts of INNER transitions from the durable store, so the
+        worker's HAOV-snapshot delta dedup survives a respawn (the duckdb is the single
+        source of truth — no separate sidecar). Keyed by `source` (= the HAOV rule)."""
+        rows = self._conn.execute(
+            "SELECT source, "
+            "SUM(CASE WHEN verdict THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN verdict THEN 0 ELSE 1 END) "
+            "FROM transitions WHERE substrate = 'inner' GROUP BY source").fetchall()
+        return {r[0]: (int(r[1] or 0), int(r[2] or 0)) for r in rows if r[0]}
+
     def get_particle(self, particle_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT id, parent_id, kind, status, signature, operation, frame, alpha, "
