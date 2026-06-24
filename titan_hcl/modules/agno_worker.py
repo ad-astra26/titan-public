@@ -1330,16 +1330,16 @@ def _keepalive_loop(worker_plugin, stats_ref: dict,
     105s/2-timeout burst vs keepalive → 21s/0-fail). Concurrency-scaled: warms ~the
     recent-peak `in_flight` units (1 ping ≈ 1 warm unit). Off the chat hot path, soft
     (a ping failure is logged + ignored), activity-gated (no warming an idle Titan →
-    no wasted cloud tokens). Runs its OWN asyncio loop — `provider.chat` is async."""
+    no wasted cloud tokens). Runs its OWN asyncio loop — `provider.chat` is async.
+
+    CONFIG-HOT-RELOADABLE: re-reads `[inference.autoscale]` EACH tick, so every tunable
+    (interval / idle / scale / cap, even toggling `keepalive_enabled` off) takes effect
+    via a config hot-reload — NEVER a restart (feedback_dont_reflexively_restart…)."""
     import asyncio
-    model = str(ka_cfg.get("keepalive_model", "gemma4:31b"))
-    interval = float(ka_cfg.get("keepalive_interval_s", 25.0) or 25.0)
-    idle_after = float(ka_cfg.get("keepalive_idle_after_s", 120.0) or 120.0)
-    warm_cap = int(ka_cfg.get("ladder_warm_cap", 8) or 8)
-    scale = bool(ka_cfg.get("keepalive_scale_with_load", True))
+    from titan_hcl.params import get_params as _gp
     _msgs = [{"role": "user", "content": "ping"}]
 
-    async def _warm(provider, n):
+    async def _warm(provider, model, n):
         async def _one():
             try:
                 await provider.chat(_msgs, model=model, max_tokens=8, timeout=30.0)
@@ -1351,9 +1351,23 @@ def _keepalive_loop(worker_plugin, stats_ref: dict,
     asyncio.set_event_loop(loop)
     recent_peak = 1.0
     _fired = 0
+    interval = float(ka_cfg.get("keepalive_interval_s", 25.0) or 25.0)
     try:
         while not stop_event.is_set():
             try:
+                # re-read config live → tuning is a config hot-reload, not a restart
+                try:
+                    ka = (_gp("inference").get("autoscale", {}) or {})
+                except Exception:
+                    ka = ka_cfg
+                interval = float(ka.get("keepalive_interval_s", 25.0) or 25.0)
+                if not bool(ka.get("keepalive_enabled", True)):
+                    stop_event.wait(interval)
+                    continue  # toggled off live → stay idle (no restart to disable)
+                model = str(ka.get("keepalive_model", "gemma4:31b"))
+                idle_after = float(ka.get("keepalive_idle_after_s", 120.0) or 120.0)
+                warm_cap = int(ka.get("ladder_warm_cap", 8) or 8)
+                scale = bool(ka.get("keepalive_scale_with_load", True))
                 provider = getattr(worker_plugin, "_inference_provider", None)
                 in_flight = int(stats_ref.get("in_flight", 0) or 0)
                 # decaying recent-peak of in_flight (warm for the NEXT burst, not just now)
@@ -1362,7 +1376,7 @@ def _keepalive_loop(worker_plugin, stats_ref: dict,
                           - float(stats_ref.get("last_chat_ts", 0) or 0)) < idle_after
                 gap = _keepalive_gap(in_flight, recent_peak, warm_cap, scale)
                 if provider is not None and active and gap > 0:
-                    loop.run_until_complete(_warm(provider, gap))
+                    loop.run_until_complete(_warm(provider, model, gap))
                     _fired += 1
                     if _fired == 1 or _fired % 20 == 0:
                         logger.info(
