@@ -208,6 +208,10 @@ def compute_groundedness(
 
 _AXIS_NAMES = ("used", "verified", "felt", "fluent")
 
+# RFP_titan_research_agent §1.4 — how many top research-curiosity gaps ride in the
+# spine snapshot for agency to pick/rotate over (a small pool, not the whole tail).
+_RESEARCH_GAPS_TOP_N = 12
+
 
 @dataclass
 class _BlendParams:
@@ -1016,10 +1020,27 @@ class EngramStore:
                     rel, e,
                 )
 
+        # RFP_titan_research_agent §1.4 step 2 — the autonomous research-curiosity
+        # GAPS ride in this same snapshot (no extra Kuzu read; computed from the
+        # `concepts` already fetched). agency_worker reads them cross-process to pick
+        # a target concept Z + its groundedness BASELINE for the verifiable loop.
+        try:
+            research_gaps = rank_research_gaps(
+                [{"concept_id": c["concept_id"], "version": c["version"],
+                  "name": c["name"], "used": c.get("axis_used", 0.0),
+                  "groundedness": c["groundedness"],
+                  "domain_hint": c.get("domain_hint") or "general"}
+                 for c in concepts if c.get("memory_type") == "declarative"],
+                n=_RESEARCH_GAPS_TOP_N)
+        except Exception as e:  # noqa: BLE001 — gaps are advisory; never break export
+            logger.debug("[EngramStore] export_snapshot: gap rank failed: %s", e)
+            research_gaps = []
+
         payload = {
             "version": 1,
             "exported_at": self._clock(),
             "concepts": concepts,
+            "research_gaps": research_gaps,
             "composition_edges": {
                 "from": edges_from,
                 "into": edges_into,
