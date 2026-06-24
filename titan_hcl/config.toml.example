@@ -96,6 +96,11 @@ hybrid_inference = true
 # AI Provider — Which AI service powers Titan's main responses.
 # Tip: Switch if your current provider runs out of credits.
 inference_provider = "ollama_cloud"
+# Internal-ops provider (distillation, meditation scoring, synthesis proposers,
+# perturbation) — OPTIONAL. When unset, internal ops follow `inference_provider`
+# above. Set this only to pin internal ops to a provider independent of the
+# user-facing chat provider. (No hardcoded provider literals live in code.)
+# internal_inference_provider = "ollama_cloud"
 # OpenRouter API key (used for Cognee LLM + embedder, meditation scoring, guardian Tier 3)
 openrouter_api_key = ""
 # Venice AI API key (paid API credits — alternative to session auth)

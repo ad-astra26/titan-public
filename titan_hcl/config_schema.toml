@@ -145,6 +145,7 @@
 "inference.custom_llm_api_key" = {type="str", constraint="", reload="hot", owner=["agno_worker", "llm"], sensitive=true}
 "inference.hybrid_inference" = {type="bool", constraint="", reload="hot", owner=["agno_worker", "llm"], sensitive=false}
 "inference.inference_provider" = {type="str", constraint="", reload="hot", owner=["agno_worker", "llm"], sensitive=false}
+"inference.internal_inference_provider" = {type="str", constraint="", reload="hot", owner=["synthesis", "felt_teaching", "llm"], sensitive=false}
 "inference.ollama_cloud_api_key" = {type="str", constraint="", reload="hot", owner=["agno_worker", "llm"], sensitive=true}
 "inference.ollama_cloud_base_url" = {type="str", constraint="", reload="restart_required", owner=["agno_worker", "llm"], sensitive=false}
 "inference.ollama_cloud_fast_model" = {type="str", constraint="", reload="hot", owner=["agno_worker", "llm"], sensitive=false}

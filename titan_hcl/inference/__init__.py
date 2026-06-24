@@ -32,6 +32,7 @@ __all__ = [
     "OllamaCloudProvider",
     "CustomProvider",
     "get_provider",
+    "resolve_internal_provider_name",
     "TASK_MODEL_MAP",
     "get_model_for_task",
 ]
@@ -73,3 +74,33 @@ def get_provider(name: str, cfg: dict[str, Any]) -> InferenceProvider:
             f"To add a new provider, see titan_hcl/inference/__init__.py."
         )
     return _PROVIDER_MAP[name](cfg)
+
+
+def resolve_internal_provider_name(cfg: dict[str, Any] | None = None) -> str:
+    """Config-driven provider name for INTERNAL-ops workers (distillation,
+    meditation scoring, perturbation, synthesis proposers) — NO hardcoded literal.
+
+    Maker rule (2026-06-24): no hardcoded inference-provider values anywhere in
+    the codebase. Resolution order (all from config):
+      1. `internal_inference_provider` — optional [inference] key to pin internal
+         ops to a provider independent of the user-facing chat provider.
+      2. `inference_provider` — the global provider (internal follows chat).
+    `cfg` is checked first; the canonical `get_params("inference")` is consulted
+    when `cfg` lacks the keys (a reduced subset reaches some worker subprocesses).
+    Raises loudly if neither is configured — never a silent default.
+    """
+    cfg = cfg or {}
+    name = cfg.get("internal_inference_provider") or cfg.get("inference_provider")
+    if not name:
+        from titan_hcl.params import get_params
+        _inf = get_params("inference") or {}
+        name = _inf.get("internal_inference_provider") or _inf.get(
+            "inference_provider"
+        )
+    if not name:
+        raise ValueError(
+            "No inference provider configured — set [inference] "
+            "inference_provider (or internal_inference_provider) in config.toml "
+            "(no hardcoded default)."
+        )
+    return name

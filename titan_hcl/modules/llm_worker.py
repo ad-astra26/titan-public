@@ -84,8 +84,10 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     try:
         ollama_key = config.get("ollama_cloud_api_key", "")
         if ollama_key:
-            from titan_hcl.inference import get_provider
-            ollama_cloud = get_provider("ollama_cloud", config)
+            from titan_hcl.inference import (
+                get_provider, resolve_internal_provider_name)
+            ollama_cloud = get_provider(
+                resolve_internal_provider_name(config), config)
             logger.info(
                 "[LLMWorker] Ollama Cloud provider initialized via inference module"
             )

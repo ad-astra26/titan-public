@@ -2365,10 +2365,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         decompose_fn = None  # Bridge §7.1 — Engram→Object decompose (same provider)
         inference_cfg = get_params("inference") or {}
         try:
-            from titan_hcl.inference import get_provider as _get_provider
+            from titan_hcl.inference import (
+                get_provider as _get_provider, resolve_internal_provider_name)
             api_key = inference_cfg.get("ollama_cloud_api_key", "") or ""
             if api_key:
-                provider = _get_provider("ollama_cloud", inference_cfg)
+                provider = _get_provider(
+                    resolve_internal_provider_name(inference_cfg), inference_cfg)
                 propose_fn = make_default_llm_propose(provider)
                 decompose_fn = make_default_decompose(provider)  # Bridge §7.1
                 model = inference_cfg.get(
@@ -3438,8 +3440,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             def _llm_judge_call(prompt: str, timeout_s: float) -> str:
                 try:
                     import asyncio as _aio
-                    from titan_hcl.inference import get_provider as _get_provider
-                    provider = _get_provider("ollama_cloud", get_params("inference") or {})
+                    from titan_hcl.inference import (
+                        get_provider as _get_provider,
+                        resolve_internal_provider_name)
+                    _inf_cfg = get_params("inference") or {}
+                    provider = _get_provider(
+                        resolve_internal_provider_name(_inf_cfg), _inf_cfg)
                     # provider.complete is ASYNC — bridge via asyncio.run (same
                     # class of bug as the miner proposer: calling it synchronously
                     # returned an un-awaited coroutine → judge scored 0 TXs →
@@ -3486,8 +3492,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             def _miner_llm_propose(cluster_meta: dict, kind: str):
                 try:
                     import asyncio as _aio
-                    from titan_hcl.inference import get_provider as _get_provider
-                    provider = _get_provider("ollama_cloud", get_params("inference") or {})
+                    from titan_hcl.inference import (
+                        get_provider as _get_provider,
+                        resolve_internal_provider_name)
+                    _inf_cfg = get_params("inference") or {}
+                    provider = _get_provider(
+                        resolve_internal_provider_name(_inf_cfg), _inf_cfg)
                     seq_str = " → ".join(
                         f"{tool}({args_shape})" for tool, args_shape in cluster_meta.get("sequence", [])
                     )

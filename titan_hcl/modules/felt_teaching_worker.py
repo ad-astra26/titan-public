@@ -236,8 +236,10 @@ def felt_teaching_worker_main(recv_queue, send_queue, name: str,
     try:
         inference_cfg = (get_params("inference") or {})
         if inference_cfg.get("ollama_cloud_api_key"):
-            from titan_hcl.inference import get_provider as _get_provider
-            provider = _get_provider("ollama_cloud", inference_cfg)
+            from titan_hcl.inference import (
+                get_provider as _get_provider, resolve_internal_provider_name)
+            provider = _get_provider(
+                resolve_internal_provider_name(inference_cfg), inference_cfg)
     except Exception as e:  # noqa: BLE001
         logger.info("[felt_teaching] perturbation provider unavailable "
                     "(record_outcome still flows): %s", e)
