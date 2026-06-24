@@ -26,6 +26,10 @@ if TYPE_CHECKING:  # avoid circular import — cgn.py depends on this module
 
 logger = logging.getLogger(__name__)
 
+# TEMP INSTRUMENTATION (RFP_cgn_causal_effect_deltas live-verify, 2026-06-24) —
+# per-consumer throttle for the [CausalDBG] md_keys probe in _record. Remove after.
+_CAUSAL_DBG_COUNTS: Dict[str, int] = {}
+
 
 # ── Effect bucketing — α-style reward buckets ──────────────────────────────
 # Shared across all consumers as the default effect-signature.  Per-consumer
@@ -400,6 +404,19 @@ class CausalGenerator:
     def _record(self, transition: "CGNTransition", reward: float, *, is_anti: bool) -> None:
         action_sig = action_signature(transition)
         effect_sig = extract_effect(self._consumer, transition, reward)
+        # TEMP INSTRUMENTATION (RFP_cgn_causal_effect_deltas live-verify, 2026-06-24):
+        # log the ACTUAL metadata keys reaching the extractor + the resulting effect,
+        # first N per consumer, so we can distinguish "delta key absent (bug)" from
+        # "key present but sub-threshold (benign)". Remove after the gate is verified.
+        try:
+            _dc = _CAUSAL_DBG_COUNTS.get(self._consumer, 0)
+            if _dc < 10:
+                _CAUSAL_DBG_COUNTS[self._consumer] = _dc + 1
+                _md = transition.metadata or {}
+                logger.warning("[CausalDBG] consumer=%s md_keys=%s effect=%s reward=%.3f",
+                               self._consumer, sorted(_md.keys()), effect_sig, reward)
+        except Exception:
+            pass
         if effect_sig is None:  # below-threshold — extractor returned None
             self._stats["below_threshold"] += 1
             return
