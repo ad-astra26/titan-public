@@ -177,6 +177,56 @@ def test_monitor_tick_skips_heartbeat_timeout_restart_during_reload():
     g.stop_all()
 
 
+def test_monitor_tick_skips_stale_old_pid_slot():
+    """SPEC §11.B.3 — monitor_tick MUST NOT restart when the SHM slot holds a
+    STALE old (dead) pid that ≠ info.pid (the expected current pid). This is the
+    restart-module flap cascade root cause: after kill→respawn the slot lingers
+    with the killed OLD pid for seconds until the NEW process overwrites it;
+    policing that stale dead pid issues a spurious shm_pid_dead restart that races
+    the respawn (live: agency_worker, 2026-06-24)."""
+    import os
+    from titan_hcl.core.module_state import BootPriority, ModuleStateEntry
+    g, info = _make_guardian_with_running_module()
+    info.pid = os.getpid()  # the CURRENT expected process is THIS (alive) pid
+
+    class _FakeBank:
+        def read(self, _n):
+            return ModuleStateEntry(
+                name="fake_worker", layer="L2",
+                boot_priority=BootPriority.MANDATORY,
+                state="running", pid=999999)  # STALE old dead pid (≠ info.pid)
+    g._module_state_reader_bank = _FakeBank()
+
+    sup = Supervisor(g.bus, g)
+    sup.publish_module_restart_request = MagicMock()
+    sup.monitor_tick()
+    sup.publish_module_restart_request.assert_not_called(), (
+        "stale old-pid slot must NOT trigger a restart (else restart-module flaps)")
+    g.stop_all()
+
+
+def test_monitor_tick_restarts_dead_current_pid():
+    """Inverse — a genuinely dead CURRENT pid (slot pid == info.pid) MUST still
+    fault → restart. The §11.B.3 stale-slot guard must not mask real deaths."""
+    from titan_hcl.core.module_state import BootPriority, ModuleStateEntry
+    g, info = _make_guardian_with_running_module()
+    info.pid = 999999  # the expected current process is dead
+
+    class _FakeBank:
+        def read(self, _n):
+            return ModuleStateEntry(
+                name="fake_worker", layer="L2",
+                boot_priority=BootPriority.MANDATORY,
+                state="running", pid=999999)  # slot == info.pid AND dead → fault
+    g._module_state_reader_bank = _FakeBank()
+
+    sup = Supervisor(g.bus, g)
+    sup.publish_module_restart_request = MagicMock()
+    sup.monitor_tick()
+    sup.publish_module_restart_request.assert_called_once()
+    g.stop_all()
+
+
 # ── Message routing into in-flight reload queues ─────────────────────────
 
 

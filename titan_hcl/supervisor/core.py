@@ -390,6 +390,20 @@ class Supervisor:
             if sstate in ("stopped", "disabled"):
                 continue
 
+            # SPEC §11.B.3 — only police the pid the orchestrator currently expects
+            # (info.pid). During a kill→respawn (restart-module / restart()) the SHM
+            # slot transiently holds the OLD (now-dead) pid for a few seconds until
+            # the NEW process boots and overwrites the slot. Reading that stale dead
+            # pid as a fault issues a SPURIOUS restart that races the in-flight
+            # respawn → a flap cascade (live: agency_worker restart-module flap,
+            # 2026-06-24; agency is reply_only so its 30s SAVE_NOW-timeout widens the
+            # window). A slot pid that doesn't match the expected pid is a stale
+            # pre-respawn slot, NOT a fault — skip until the new process writes it.
+            # (Only when an expected pid is known; info.pid==0 ⇒ best-effort police.)
+            _expected_pid = int(info.pid or 0)
+            if spid > 0 and _expected_pid > 0 and spid != _expected_pid:
+                continue
+
             # ── Fault detection ──
             fault_reason: Optional[str] = None
 

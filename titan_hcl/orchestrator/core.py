@@ -1198,11 +1198,23 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                              name, backoff - since_last)
                 return False
 
-            self.stop(name, reason=f"restart:{reason}")
-            info.restart_timestamps.append(now)
-            info.restart_count += 1
-            info.last_restart = now
-            ok = self.start(name)
+            # SPEC §11.B.3 — suppress L1 Supervisor policing of this module for the
+            # whole kill→respawn window. Without it, monitor_tick reads the OLD
+            # (killed) pid's stale slot mid-restart and fires a SPURIOUS shm_pid_dead
+            # restart that races this respawn → a flap cascade (live: agency_worker
+            # restart-module, 2026-06-24). Mirrors reload_module's reload_in_flight
+            # guard (reload.py); the try/finally guarantees the flag clears even if
+            # start() raises/fails. The post-start slot-write gap is additionally
+            # covered by monitor_tick's spid==info.pid stale-slot guard.
+            info.reload_in_flight = True
+            try:
+                self.stop(name, reason=f"restart:{reason}")
+                info.restart_timestamps.append(now)
+                info.restart_count += 1
+                info.last_restart = now
+                ok = self.start(name)
+            finally:
+                info.reload_in_flight = False
             if ok:
                 # Phase C C-S7 — emit SUPERVISION_CHILD_RESTARTED on success.
                 self.bus.publish(make_msg(
