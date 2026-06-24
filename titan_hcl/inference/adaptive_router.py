@@ -59,9 +59,18 @@ class AdaptiveRouter:
                  managed_model: str = "gemma4:31b") -> None:
         self.cfg = cfg or {}
         self.managed = managed_model
+        # The offload ladder MUST be models the live provider actually serves.
+        # The prior default ([ministral-3:14b, gemini-3-flash-preview]) was
+        # aspirational — Ollama Cloud serves NEITHER (gemini is a different
+        # provider; ministral-3:14b doesn't exist) → enabling the router with it
+        # would offload chat to dead model IDs. Verified-servable fast fallbacks
+        # on the fleet's Ollama Cloud (2026-06-24, from live logs): gemma3:4b
+        # (4B, ~7-9s) is a separate pool from gemma4:31b, so under concurrency
+        # traffic spreads across pools instead of contending on one. Override
+        # per-install via [inference.autoscale] model_ladder.
         self.ladder = list(self.cfg.get(
             "model_ladder",
-            [managed_model, "ministral-3:14b", "gemini-3-flash-preview"]))
+            [managed_model, "gemma3:4b"]))
         if self.managed not in self.ladder:
             self.ladder = [self.managed] + self.ladder
         self.monitor = InferenceLatencyMonitor()
@@ -89,7 +98,14 @@ class AdaptiveRouter:
             return d
 
     def _enabled(self) -> bool:
-        return bool(self.cfg.get("router_enabled", False))
+        # Default ON (Maker 2026-06-24): the §7.B0 concurrency prereq has landed
+        # + is verified, so the load-balancing the router provides is meaningful.
+        # Per the all-flags-default-on rule, ship ON fleet-wide; router_enabled=
+        # false is a kill-switch only. choose() is still a no-op for a single
+        # warm request (gemma_ema < enter_latency, in_flight low) → it only
+        # offloads when gemma is actually slow/saturated, so full-quality gemma
+        # serves the common case and fast fallbacks absorb concurrent spikes.
+        return bool(self.cfg.get("router_enabled", True))
 
     def update_cfg(self, cfg: dict) -> None:
         """Live config hot-reload — adopt new knobs without a restart."""

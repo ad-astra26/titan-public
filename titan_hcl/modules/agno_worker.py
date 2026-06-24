@@ -1568,8 +1568,17 @@ def _keepalive_loop(worker_plugin, stats_ref: dict,
                 in_flight = int(stats_ref.get("in_flight", 0) or 0)
                 # decaying recent-peak of in_flight (warm for the NEXT burst, not just now)
                 recent_peak = max(float(in_flight), recent_peak * 0.7)
-                active = (time.time()
-                          - float(stats_ref.get("last_chat_ts", 0) or 0)) < idle_after
+                # ALWAYS-WARM (Maker 2026-06-24): the pitch / chat is viewed
+                # sporadically after long idle gaps; the idle gate let gemma go
+                # cold between visits → the next viewer ate the 15-28s cold spike.
+                # Keep gemma continuously warm so a sporadic viewer always lands on
+                # a ~3-8s WARM gemma at full quality. Costs a trickle of idle tokens
+                # (1 ping/interval) — worth it for the flagship investor demo. Flag
+                # ON by default (kill-switch only); idle_after still applies when off.
+                always_warm = bool(ka.get("keepalive_always_warm", True))
+                active = always_warm or (
+                    time.time()
+                    - float(stats_ref.get("last_chat_ts", 0) or 0)) < idle_after
                 gap = _keepalive_gap(in_flight, recent_peak, warm_cap, scale)
                 if provider is not None and active and gap > 0:
                     loop.run_until_complete(_warm(provider, model, gap))
