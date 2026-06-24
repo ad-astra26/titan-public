@@ -94,6 +94,7 @@ class AgencyModule:
         registry=None,
         llm_fn=None,
         budget_per_hour: int = 10,
+        research_gap_provider=None,
     ):
         """
         Args:
@@ -101,11 +102,18 @@ class AgencyModule:
             llm_fn: Async callable(prompt: str) -> str for LLM inference.
                      If None, uses a no-op that returns {"helper": "none"}.
             budget_per_hour: Max LLM calls for Agency per hour
+            research_gap_provider: optional `() -> list[dict]` returning the current
+                knowledge-graph research gaps (RFP_titan_research_agent §1.4 step 2b).
+                When present + a gap exists, a `research` posture TARGETS the
+                least-grounded concept Z instead of an open-ended deficit, so the
+                outcome is verifiable (groundedness-delta). None → legacy behaviour.
         """
         from .registry import HelperRegistry
         self._registry = registry or HelperRegistry()
         self._llm_fn = llm_fn
         self._budget_per_hour = budget_per_hour
+        self._research_gap_provider = research_gap_provider
+        self._last_research_gap: Optional[str] = None  # anti-repeat across dispatches
 
         # State
         self._action_counter = 0
@@ -238,6 +246,28 @@ class AgencyModule:
         params["trinity_snapshot"] = trinity_snapshot
         params["posture"] = posture
 
+        # RFP_titan_research_agent §1.4 step 2b — TARGET the least-grounded concept Z
+        # so autonomous research is VERIFIABLE (groundedness-delta), not open-ended.
+        # Only fires when the gap provider is wired (agency_worker passes it only when
+        # the kill-switch `research_curiosity_enabled` is on) AND this is a research
+        # helper AND a gap exists. Fallback-safe: otherwise the LLM-chosen query stands.
+        if (self._research_gap_provider is not None
+                and _derive_action_type(helper_name, posture) == "research"):
+            _gap = self._pick_research_gap()
+            if _gap is not None:
+                _cn = _gap.get("name") or _gap.get("concept_id")
+                params["query"] = (
+                    f"{_cn}: what is it, how does it work, and the key facts and "
+                    f"context worth knowing — a clear, well-sourced explanation.")
+                params["_research_target"] = {
+                    "concept_id": _gap["concept_id"],
+                    "version": int(_gap.get("version", 1) or 1),
+                    "baseline_groundedness": float(_gap.get("groundedness", 0.0) or 0.0),
+                    "domain_hint": _gap.get("domain_hint", "general") or "general",
+                    "name": _cn,
+                }
+                reasoning = (reasoning or "") + f" [curiosity: ground concept '{_cn}']"
+
         # Special handling: coding_sandbox needs LLM-generated code
         if helper_name == "coding_sandbox" and not params.get("code"):
             params = await self._generate_sandbox_code(posture, source_layer,
@@ -259,6 +289,26 @@ class AgencyModule:
 
         return self._build_result(impulse_id, posture, helper_name, result,
                                   reasoning, trinity_snapshot, helper_params=params)
+
+    def _pick_research_gap(self) -> Optional[dict]:
+        """Pick a knowledge-graph gap to ground (RFP_titan_research_agent §1.4 step
+        2b): the highest-salience gap that isn't the one just researched (simple
+        anti-repeat so curiosity rotates instead of fixating). None on no gaps / a
+        provider error (research then falls back to the LLM-chosen topic). Soft."""
+        try:
+            gaps = self._research_gap_provider() or []
+        except Exception as e:  # noqa: BLE001 — provider is advisory, never fatal
+            logger.debug("[Agency] research_gap_provider failed: %s", e)
+            return None
+        if not gaps:
+            return None
+        for g in gaps:
+            if g.get("concept_id") and g.get("concept_id") != self._last_research_gap:
+                self._last_research_gap = g["concept_id"]
+                return g
+        g = gaps[0]
+        self._last_research_gap = g.get("concept_id")
+        return g
 
     async def _select_helper(
         self,

@@ -345,6 +345,34 @@ def _maybe_emit_onchain_anchor_catalyst(
             _err)
 
 
+def _make_research_gap_provider(snapshot_path: str, ttl_s: float = 120.0):
+    """RFP_titan_research_agent §1.4 step 2b — a throttled `() -> list[dict]` over the
+    `research_gaps` synthesis_worker exports in `spine_snapshot.json` (G18-pure: a file
+    read, no cross-process call). Re-reads at most every `ttl_s`, and only when the
+    file mtime changed; keeps last-good on any error. Returned to AgencyModule so a
+    `research` posture can target the least-grounded concept Z."""
+    import json
+    cache = {"gaps": [], "mtime": -1.0, "checked": 0.0}
+
+    def _provider() -> list:
+        now = time.time()
+        if now - cache["checked"] < ttl_s and cache["checked"] > 0.0:
+            return cache["gaps"]
+        cache["checked"] = now
+        try:
+            mt = os.path.getmtime(snapshot_path)
+            if mt != cache["mtime"]:
+                with open(snapshot_path, "r", encoding="utf-8") as f:
+                    snap = json.load(f)
+                cache["gaps"] = snap.get("research_gaps", []) or []
+                cache["mtime"] = mt
+        except (OSError, ValueError) as e:  # missing/locked/corrupt → keep last-good
+            logger.debug("[AgencyWorker] research-gap snapshot read failed: %s", e)
+        return cache["gaps"]
+
+    return _provider
+
+
 def _p8_problem_text(intent: dict, action_result: dict) -> str:
     """The TASK the judge scores against — the self-intent's posture + selection
     reasoning (what Titan was TRYING to do), not the output."""
@@ -635,8 +663,21 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     llm_fn = _build_llm_fn(inference_cfg, api_base=_api_base,
                            internal_key=_internal_key)
+    # RFP_titan_research_agent §1.4 step 2b — wire the knowledge-graph research-gap
+    # provider so a `research` posture targets the least-grounded concept (verifiable
+    # curiosity). Kill-switch `synthesis.self_learning.research_curiosity_enabled`:
+    # default OFF until step-3 (synthesis-side verify+credit) lands — without it 2b is
+    # inert and would only force research onto gaps the LLM judge still scores -0.5.
+    _sl_cfg = get_params("synthesis").get("self_learning", {}) or {}
+    _research_gap_provider = None
+    if bool(_sl_cfg.get("research_curiosity_enabled", False)):
+        _research_gap_provider = _make_research_gap_provider(
+            os.path.join("data", "spine_snapshot.json"))
+        logger.info("[AgencyWorker] research-curiosity ON — research postures will "
+                    "target knowledge-graph gaps")
     agency = AgencyModule(registry=registry, llm_fn=llm_fn,
-                          budget_per_hour=budget_per_hour)
+                          budget_per_hour=budget_per_hour,
+                          research_gap_provider=_research_gap_provider)
     assessment = SelfAssessment(llm_fn=llm_fn)
 
     # P8 (RFP_emergent_mastery_curriculum §7.P8) — the TaskCompletionJudge for
