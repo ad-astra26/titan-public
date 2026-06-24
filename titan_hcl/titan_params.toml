@@ -3836,3 +3836,18 @@ net_enabled = true    # use the learned net once trained; false → stay on the 
 net_lr = 0.05         # numpy-SGD learning rate (the net's only learning gain)
 net_l2 = 0.0001       # gentle weight decay
 net_hidden = 16       # hidden width (12→16→1)
+
+# ── pattern_logic (RFP_pattern_logic §6/§7.1, LOCKED 2026-06-24) ──────────────
+# The cross-substrate pattern/model faculty. All gains are emergent tunables, NOT
+# hardcoded floors (feedback_no_hardcoded_values). Flag defaults ON (all-flags-on).
+[pattern_logic]
+enabled = true            # kill-switch only; the faculty ships ON fleet-wide
+min_interval_s = 300.0    # bounded-cadence floor (also fired by CGN_IMPASSE) — never per-tick
+cos_thresh = 0.85         # signature-cluster gate (ConsolidationPass parity)
+min_cluster_size = 3      # transitions needed to form a PATTERN
+min_sources = 2           # distinct sources/domains to PROPOSE (Q2 / INV-PL-4)
+max_cluster_window = 500  # cap the pass size (GIL-safe)
+c0 = 1.0                  # confidence saturation constant: c = n/(n+c0)
+promote_floor = 0.85      # PROMOTE c-gate (Q2)
+min_transitions = 5       # PROMOTE evidence-mass gate (Q2)
+f_floor = 0.7             # PROMOTE truth-fraction gate (a MODEL must actually work)

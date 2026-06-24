@@ -26,6 +26,8 @@ __all__ = [
     "OpSpec",
     "SEED_OPS",
     "op_for_outer_action",
+    "op_for_oracle",
+    "oml_action_for_op",
     "register_op",
     "is_known_op",
     "all_ops",
@@ -90,6 +92,47 @@ def op_for_outer_action(action: Optional[str]) -> Optional[str]:
     if not action:
         return None
     return _OUTER_ACTION_TO_OP.get(action)
+
+
+# ── Oracle/helper id → abstract op (the verdict-stream projection) ───────────
+# A TOOL_CALL_VERDICT_RECORD / AUTONOMOUS_SKILL_SCORE names the oracle/helper that
+# produced the verified outcome. Map it to the op the operation embodied.
+_ORACLE_TO_OP: Dict[str, str] = {
+    "coding_sandbox": "TOOL",
+    "web_search": "RESEARCH",
+    "code_knowledge": "RESEARCH",
+    "solana_rpc": "TOOL",
+    "x_oracle": "TOOL",
+    "math": "COMPUTE",
+    "task_completion": "SKILL",
+}
+
+
+def op_for_oracle(oracle_id: Optional[str]) -> str:
+    """Map a verdict's oracle/helper id to an abstract op. Falls back to TOOL (a
+    verdict always reflects *some* tool/oracle operation having been run)."""
+    if not oracle_id:
+        return "TOOL"
+    return _ORACLE_TO_OP.get(oracle_id.strip(), "TOOL")
+
+
+# ── abstract op → OML routing action (the OFFER-outer projection) ────────────
+# A MODEL offered as a reasoning-composite carries an `action` so the OML
+# `composite_match_action_norm` φ(s) feature points at the right routing lane.
+# Ops with no direct OML lane fall back to 'tool' (the generic execute lane).
+_OP_TO_OUTER_ACTION: Dict[str, str] = {
+    "RECALL": "direct",
+    "RESEARCH": "research",
+    "TOOL": "tool",
+    "SKILL": "skill_delegate",
+}
+
+
+def oml_action_for_op(op: Optional[str]) -> str:
+    """Map an abstract op back to the OML routing action for the OFFER composite."""
+    if not op:
+        return "tool"
+    return _OP_TO_OUTER_ACTION.get(op.strip().upper(), "tool")
 
 
 def register_op(name: str, description: str, *, phase: int = 2) -> OpSpec:

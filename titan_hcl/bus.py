@@ -271,13 +271,23 @@ TOOL_CALL_VERDICT_RECORD = "TOOL_CALL_VERDICT_RECORD"
 RETRIEVAL_SAMPLE = "RETRIEVAL_SAMPLE"
 # ── pattern_logic cross-substrate feed (RFP_pattern_logic §7.1, 2026-06-24) ──
 # A normalized VERIFIED-TRANSITION ("in CONTEXT, OPERATION led to OUTCOME, verified
-# true/false") broadcast for the pattern_logic_worker (a SEPARATE process) to observe
-# the OUTER substrate. Emitted ADDITIVELY + try-wrapped by synthesis_worker right where
-# it already handles a tool-call / skill-score verdict (cannot affect that handler's own
-# logic). dst="all" so any observer can subscribe; today only pattern_logic does.
-# Payload: {context: str, frame: str, oracle_id: str, tool_id: str, verdict: bool,
-#           substrate: "outer", source: str}.
+# true/false") for the pattern_logic_worker (a SEPARATE process) to observe the OUTER
+# substrate. Emitted ADDITIVELY + try-wrapped by synthesis_worker right where it already
+# handles a tool-call / skill-score verdict (cannot affect that handler's own logic).
+# 🔒 TARGETED dst="pattern_logic" (NOT dst="all") — a targeted msg bypasses the broadcast
+# path entirely (delivered only to pattern_logic's queue), so it never floods other
+# workers (avoids the dst="all" broadcast-flood pattern; the per-worker broadcast_topics
+# filter migration is still incomplete — BUG-BUS-PER-WORKER-BROADCAST-FILTER-...). Drops
+# harmlessly if pattern_logic is down (flag off). Payload: {context, frame, oracle_id,
+# tool_id, verdict: bool, substrate: "outer", source}.
 VERIFIED_TRANSITION = "VERIFIED_TRANSITION"
+# pattern_logic_worker → synthesis_worker (OFFER-outer). A promoted cross-substrate
+# MODEL, persisted as a Reasoning(kind='macro_strategy') composite via the single
+# SynthesisWriter (mirrors SELF_LEARN_MACRO_READY; INV-Syn-19) so EngineRecall + the
+# OML `composite_match` φ(s) features surface it. source="pattern_logic" tags
+# provenance. Payload: {reasoning_id, goal_class, action, signature (float list),
+#                       c, use_count, ts}.
+PATTERN_MODEL_READY = "PATTERN_MODEL_READY"
 
 # ── Outer Meta-Reasoning Self-Learning (RFP_synthesis_self_learning_meta_
 # reasoning Phase 1 / §7.A) — the verifiable-lane closed loop. The reward is

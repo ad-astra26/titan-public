@@ -336,6 +336,38 @@ def build_catalog(bus, guardian, *, titan_id: str, kernel=None) -> None:
         boot_priority="mandatory",
     ))
 
+    # pattern_logic_worker — RFP_pattern_logic §7.1 (LOCKED 2026-06-24). The
+    # cross-substrate pattern/model faculty: observes OUTER verdicts (targeted
+    # VERIFIED_TRANSITION) + INNER reasoning_strategy HAOV (read-only snapshot),
+    # clusters → PATTERNs → promotes → MODELs, offers back (composite + vec[17]
+    # cache). G21 sole-writer of data/pattern_logic.duckdb. Flag-gated, default ON
+    # (feedback_all_flags_default_on). broadcast_topics = ONLY the broadcasts it
+    # consumes (CGN_IMPASSE emergent trigger + MODULE_SHUTDOWN) — VERIFIED_TRANSITION
+    # + MODULE_PROBE_REQUEST are TARGETED (bypass the broadcast filter), so it never
+    # eats the wildcard flood.
+    from titan_hcl.modules.pattern_logic_worker import pattern_logic_worker_main
+    try:
+        _pl_cfg = dict(get_params("pattern_logic") or {})
+    except Exception:  # noqa: BLE001
+        _pl_cfg = {}
+    _pl_enabled = bool(_pl_cfg.get("enabled", True))  # all-flags-default-ON
+    guardian.register(ModuleSpec(
+        name="pattern_logic",
+        layer="L2",
+        entry_fn=pattern_logic_worker_main,
+        config={"pattern_logic": _pl_cfg,
+                "memory_and_storage": dict(get_params("memory_and_storage") or {})},
+        rss_limit_mb=600,    # bge-small embedder (~130MB) + duckdb + numpy passes
+        autostart=_pl_enabled,
+        lazy=False,
+        heartbeat_timeout=120.0,  # the bounded-cadence pass can hold the GIL briefly
+        reply_only=False,         # needs the CGN_IMPASSE broadcast trigger
+        broadcast_topics=["CGN_IMPASSE", _bus_constants.MODULE_SHUTDOWN],
+        start_method="spawn" if _spawn_grad else "fork",
+        b2_1_swap_critical=False,  # respawn-OK; duckdb reloads, snapshots re-read
+        boot_priority="post_boot",  # depends on synthesis/cgn feeds; degrades gracefully
+    ))
+
     # Observatory Writer Service — second IMW instance for observatory.db.
     # Same imw_main entry function, different config: own socket, own WAL,
     # own metrics file (auto-namespaced by name), own primary+shadow DBs.

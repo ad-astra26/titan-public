@@ -4332,7 +4332,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         if _pl_ctx:
                             send_queue.put_nowait({
                                 "type": bus.VERIFIED_TRANSITION, "src": name,
-                                "dst": "all", "ts": time.time(),
+                                "dst": "pattern_logic", "ts": time.time(),
                                 "payload": {
                                     "context": _pl_ctx,
                                     "frame": str(payload.get("parent_goal", "") or "")
@@ -4741,7 +4741,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     if _pl_g:
                         send_queue.put_nowait({
                             "type": bus.VERIFIED_TRANSITION, "src": name,
-                            "dst": "all", "ts": time.time(),
+                            "dst": "pattern_logic", "ts": time.time(),
                             "payload": {
                                 "context": _pl_g,
                                 "frame": _pl_g,
@@ -4850,6 +4850,43 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                 bool(_macro_recipe))
                 except Exception as _macro_err:  # noqa: BLE001
                     logger.debug("[synthesis_worker] macro store failed: %s", _macro_err)
+                continue
+
+            if msg_type == bus.PATTERN_MODEL_READY:
+                # OFFER-outer (RFP_pattern_logic §7.1): pattern_logic_worker promoted a
+                # cross-substrate MODEL → persist it as a Reasoning(kind='macro_strategy')
+                # composite via the single writer (INV-Syn-19) so EngineRecall + the OML
+                # `composite_match` φ(s) features surface it. source="pattern_logic" tags
+                # provenance. Additive — mirrors the SELF_LEARN_MACRO_READY path.
+                if reasoning_store is None:
+                    continue
+                try:
+                    _pl_rid = str(payload.get("reasoning_id") or "")
+                    _pl_gc = str(payload.get("goal_class", "") or "")
+                    _pl_action = str(payload.get("action", "tool") or "tool")
+                    if not (_pl_rid and _pl_gc):
+                        continue
+                    _pl_anchor = ""
+                    try:
+                        _pl_anchor = writer.write_reasoning_composite(
+                            reasoning_id=_pl_rid, goal_class=_pl_gc, action=_pl_action,
+                            use_count=int(payload.get("use_count", 1)))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    reasoning_store.write_macro(
+                        reasoning_id=_pl_rid, goal_class=_pl_gc, action=_pl_action,
+                        signature=list(payload.get("signature") or []),
+                        b_i=float(payload.get("use_count", 1)),
+                        c=float(payload.get("c", 0.85)),
+                        time_cost=float(payload.get("time_cost", 0.5)),
+                        use_count=int(payload.get("use_count", 1)),
+                        anchor_tx=_pl_anchor, source="pattern_logic")
+                    logger.info("[synthesis_worker] pattern_logic MODEL persisted as "
+                                "composite: %s (gc=%s action=%s anchored=%s)",
+                                _pl_rid, _pl_gc, _pl_action, bool(_pl_anchor))
+                except Exception as _pl_err:  # noqa: BLE001
+                    logger.debug("[synthesis_worker] pattern_logic model persist "
+                                 "failed: %s", _pl_err)
                 continue
 
             if msg_type == RESEARCH_CONCEPT_SEED:
