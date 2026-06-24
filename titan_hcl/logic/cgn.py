@@ -2031,6 +2031,37 @@ class ConceptGroundingNetwork:
                         _json.dump(payload, _hf)
                 except Exception:
                     pass  # Non-critical
+
+            # ── pattern_logic inner feed (RFP_pattern_logic §7.1) — ADDITIVE +
+            # READ-ONLY. Export the FULL reasoning_strategy hypothesis set (NOT
+            # just _verified_rules — pattern_logic needs the falsified ones too, as
+            # NEGATIVE verified-transitions) so the pattern_logic_worker (separate
+            # process) observes the inner substrate. Serializes tracker state only;
+            # touches no consumer net / buffer / reward → cannot affect grounding or
+            # the cgn_beta_state→emot_cgn coupling (the CRITICAL-NO blast radius).
+            try:
+                import json as _json2
+                _rs_tracker = self._haov_trackers.get("reasoning_strategy")
+                if _rs_tracker is not None:
+                    _rs_hyps = [
+                        {"rule": h.rule, "action_context": h.action_context,
+                         "predicted_effect": h.predicted_effect,
+                         "confidence": h.confidence, "tests": h.tests,
+                         "confirmations": h.confirmations,
+                         "falsifications": h.falsifications, "source": h.source}
+                        for h in list(_rs_tracker._hypotheses)
+                    ]
+                    _rs_payload = {"version": 1, "exported_at": time.time(),
+                                   "consumer": "reasoning_strategy",
+                                   "hypotheses": _rs_hyps}
+                    _rs_path = os.path.join(
+                        self._state_dir, "haov_reasoning_strategy_snapshot.json")
+                    _rs_tmp = _rs_path + ".tmp"
+                    with open(_rs_tmp, "w") as _rf:
+                        _json2.dump(_rs_payload, _rf)
+                    os.replace(_rs_tmp, _rs_path)
+            except Exception:
+                pass  # Non-critical — additive feed
         except Exception as e:
             logger.warning("[CGN] Save failed: %s", e)
 

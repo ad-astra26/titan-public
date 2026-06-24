@@ -4317,6 +4317,35 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 continue
 
             if msg_type == TOOL_CALL_VERDICT_RECORD:
+                # ── pattern_logic feed (RFP_pattern_logic §7.1) — ADDITIVE, try-
+                # wrapped, dst="all". Broadcast the verified-transition so the
+                # pattern_logic_worker (separate process) can observe the outer
+                # substrate. Fires before any branch below so it is independent of
+                # this handler's own control flow; cannot affect it. Only true/false
+                # verdicts (not "unknown") are real transitions.
+                try:
+                    _pl_v = str(payload.get("verdict", ""))
+                    if _pl_v in ("true", "false"):
+                        _pl_ctx = (str(payload.get("parent_goal", "") or "")
+                                   or str(payload.get("tool_id", "") or "")
+                                   or str(payload.get("oracle_id", "") or ""))
+                        if _pl_ctx:
+                            send_queue.put_nowait({
+                                "type": bus.VERIFIED_TRANSITION, "src": name,
+                                "dst": "all", "ts": time.time(),
+                                "payload": {
+                                    "context": _pl_ctx,
+                                    "frame": str(payload.get("parent_goal", "") or "")
+                                    or "general",
+                                    "oracle_id": str(payload.get("oracle_id", "") or ""),
+                                    "tool_id": str(payload.get("tool_id", "") or ""),
+                                    "verdict": _pl_v == "true",
+                                    "substrate": "outer",
+                                    "source": "tool_verdict",
+                                },
+                            })
+                except Exception:
+                    pass
                 # Operator-closure C2 (W7) — a chat-time self-oracle tool
                 # (coding_sandbox in agno) shipped its pre-computed verdict.
                 # Buffer it into the OracleRouter companion buffer for the
@@ -4704,6 +4733,27 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     except Exception as _ass_err:  # noqa: BLE001
                         logger.debug("[synthesis_worker][P1] autonomous skill "
                                      "score enqueue failed: %s", _ass_err)
+                # ── pattern_logic feed (RFP_pattern_logic §7.1) — ADDITIVE, try-
+                # wrapped. An autonomous skill outcome is a verified-transition
+                # (success → TRUE) — broadcast it for pattern_logic_worker.
+                try:
+                    _pl_g = str(payload.get("goal_class", "") or "")
+                    if _pl_g:
+                        send_queue.put_nowait({
+                            "type": bus.VERIFIED_TRANSITION, "src": name,
+                            "dst": "all", "ts": time.time(),
+                            "payload": {
+                                "context": _pl_g,
+                                "frame": _pl_g,
+                                "oracle_id": str(payload.get("oracle_id", "") or ""),
+                                "tool_id": str(payload.get("task_shape", "") or ""),
+                                "verdict": bool(payload.get("success")),
+                                "substrate": "outer",
+                                "source": "skill_score",
+                            },
+                        })
+                except Exception:
+                    pass
                 continue
 
             if msg_type == bus.RESEARCH_CONFIRMED:

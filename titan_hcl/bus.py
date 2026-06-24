@@ -269,6 +269,15 @@ TOOL_CALL_VERDICT_RECORD = "TOOL_CALL_VERDICT_RECORD"
 # derived, non-authoritative). Payload: {latency_ms, chi_spent, evaluations,
 # hits, fork, source, ts}.
 RETRIEVAL_SAMPLE = "RETRIEVAL_SAMPLE"
+# ── pattern_logic cross-substrate feed (RFP_pattern_logic §7.1, 2026-06-24) ──
+# A normalized VERIFIED-TRANSITION ("in CONTEXT, OPERATION led to OUTCOME, verified
+# true/false") broadcast for the pattern_logic_worker (a SEPARATE process) to observe
+# the OUTER substrate. Emitted ADDITIVELY + try-wrapped by synthesis_worker right where
+# it already handles a tool-call / skill-score verdict (cannot affect that handler's own
+# logic). dst="all" so any observer can subscribe; today only pattern_logic does.
+# Payload: {context: str, frame: str, oracle_id: str, tool_id: str, verdict: bool,
+#           substrate: "outer", source: str}.
+VERIFIED_TRANSITION = "VERIFIED_TRANSITION"
 
 # ── Outer Meta-Reasoning Self-Learning (RFP_synthesis_self_learning_meta_
 # reasoning Phase 1 / §7.A) — the verifiable-lane closed loop. The reward is
