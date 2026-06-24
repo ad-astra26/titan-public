@@ -288,6 +288,14 @@ VERIFIED_TRANSITION = "VERIFIED_TRANSITION"
 # provenance. Payload: {reasoning_id, goal_class, action, signature (float list),
 #                       c, use_count, ts}.
 PATTERN_MODEL_READY = "PATTERN_MODEL_READY"
+# pattern_logic_worker → cgn_worker (OFFER-inner, the rule-keyed corroboration). A
+# promoted cross-substrate MODEL corroborates the inner HAOV hypotheses it was built
+# from: cgn routes this to `cgn.get_haov(consumer).corroborate(rule, strength)` →
+# boosts each hypothesis's `confidence` via the existing merge path. Touches HAOV
+# confidence ONLY — never reward_ema/Q-net/cgn_beta_state (emot-coupling safe;
+# RFP_pattern_logic §VC-2). TARGETED dst="cgn" (the cgn_worker's registered name).
+# Payload: {consumer: str, rules: [str], strength: float in [0,1]}.
+CGN_MODEL_CORROBORATION = "CGN_MODEL_CORROBORATION"
 
 # ── Outer Meta-Reasoning Self-Learning (RFP_synthesis_self_learning_meta_
 # reasoning Phase 1 / §7.A) — the verifiable-lane closed loop. The reward is

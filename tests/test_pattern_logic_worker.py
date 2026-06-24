@@ -135,7 +135,7 @@ def test_single_substrate_single_domain_not_proposed():
         s.close()
 
 
-def test_model_reuse_citation_and_cache_export():
+def test_model_reuse_citation():
     with tempfile.TemporaryDirectory() as d:
         s, e = _store(d), FakeEmbedder()
         cfg = _cfg()
@@ -158,13 +158,81 @@ def test_model_reuse_citation_and_cache_export():
             "frame": "general-lookup", "verdict": True, "source": "tool_verdict"})
         plw.recognise_and_construct(s, cfg, lambda m: None)
         assert s.get_stats()["models_cited"] == 1
+        s.close()
 
-        # Cache export for the CGN inner hook (vec[17]).
-        cache = os.path.join(d, "pattern_model_sigs.json")
-        n = plw.export_model_sig_cache(s, cache, min_c=0.85)
-        assert n == 1
-        with open(cache) as f:
-            payload = json.load(f)
-        assert "general-lookup" in payload["frames"]
-        assert payload["models"][0]["operation"] == "RESEARCH"
+
+def test_inner_offer_corroboration_events():
+    """OFFER-inner: a promoted MODEL with inner HAOV provenance emits a
+    CGN_MODEL_CORROBORATION naming the contributing rule(s) (rule-keyed, §VC-2)."""
+    with tempfile.TemporaryDirectory() as d:
+        s, e = _store(d), FakeEmbedder()
+        cfg = _cfg()
+        for i in range(4):
+            plw.record_outer_transition(s, e, {
+                "context": f"current price {i}", "oracle_id": "web_search",
+                "frame": "general-lookup", "verdict": True, "source": "tool_verdict"})
+        snap = os.path.join(d, "haov.json")
+        with open(snap, "w") as f:
+            json.dump({"hypotheses": [{"rule": "research_beats_direct_on_fresh",
+                       "action_context": {}, "predicted_effect": "research wins",
+                       "confirmations": 3, "falsifications": 0, "source": "impasse"}]}, f)
+        plw.ingest_inner_snapshot(s, e, snap, {})
+
+        offered = []
+        plw.recognise_and_construct(s, cfg, offered.append)
+        assert offered, "a model should have been promoted"
+        model = offered[0]
+        # provenance: the inner rule name is recorded as the inner transition source.
+        rules = s.inner_rules_for_particle(model["parent_id"])
+        assert ("reasoning_strategy", "research_beats_direct_on_fresh") in rules
+
+        evs = plw.build_corroboration_events(s, model, "pattern_logic")
+        assert len(evs) == 1
+        ev = evs[0]
+        assert ev["type"].endswith("CGN_MODEL_CORROBORATION")
+        assert ev["dst"] == "cgn"
+        assert ev["payload"]["consumer"] == "reasoning_strategy"
+        assert "research_beats_direct_on_fresh" in ev["payload"]["rules"]
+        assert 0.85 <= ev["payload"]["strength"] <= 1.0
+        s.close()
+
+
+def test_haov_corroborate_boosts_confidence_only():
+    """The CGN side of OFFER-inner: corroborate() raises a hypothesis's confidence by
+    rule name, records it in action_context, and leaves the in-process tally honest."""
+    from titan_hcl.logic.cgn_types import GeneralizedHAOVTracker
+    t = GeneralizedHAOVTracker("reasoning_strategy")
+    h = t.hypothesize(action_context={}, observation={
+        "effect": "research", "magnitude": 0.5,
+        "rule_name": "research_beats_direct_on_fresh", "source": "impasse"})
+    assert h is not None
+    c0 = h.confidence
+    assert t.corroborate("research_beats_direct_on_fresh", 1.0) is True
+    assert h.confidence > c0
+    assert h.confirmations == 0 and h.falsifications == 0  # in-process tally untouched
+    assert h.action_context["corroborations"] == 1
+    assert t.corroborate("nonexistent_rule", 1.0) is False     # unknown rule → no-op
+    c1 = h.confidence
+    assert t.corroborate("research_beats_direct_on_fresh", 0.0) is False  # zero strength
+    assert h.confidence == c1
+
+
+def test_purely_outer_model_no_corroboration():
+    """A model with NO inner provenance emits no corroboration (validity guard)."""
+    with tempfile.TemporaryDirectory() as d:
+        s, e = _store(d), FakeEmbedder()
+        # Two distinct OUTER frames (cross-DOMAIN, not cross-substrate) so a pattern
+        # can form without any inner transition.
+        for i in range(3):
+            plw.record_outer_transition(s, e, {
+                "context": f"current price {i}", "oracle_id": "web_search",
+                "frame": "general-lookup", "verdict": True, "source": "tool_verdict"})
+        for i in range(3):
+            plw.record_outer_transition(s, e, {
+                "context": f"current price time {i}", "oracle_id": "web_search",
+                "frame": "time-lookup", "verdict": True, "source": "skill_score"})
+        offered = []
+        plw.recognise_and_construct(s, _cfg(), offered.append)
+        if offered:  # if a cross-domain model formed, it must have no inner provenance
+            assert plw.build_corroboration_events(s, offered[0], "pattern_logic") == []
         s.close()

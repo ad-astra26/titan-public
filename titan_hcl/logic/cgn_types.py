@@ -416,6 +416,37 @@ class GeneralizedHAOVTracker:
             "tests": h.tests,
         }
 
+    def corroborate(self, rule: str, strength: float) -> bool:
+        """Cross-substrate corroboration (RFP_pattern_logic §7.1 OFFER-inner /
+        §VC-2): a pattern_logic MODEL built FROM this hypothesis — i.e. oracle-
+        grounded OUTER evidence agreeing with it — raises its confidence. This is the
+        external, more-reliable evidence that lets a confidence-starved-but-true inner
+        rule finally earn confidence (directly attacks Prereq-2.A, where the in-process
+        verifier ignores topic and the rule can never confirm). Boosts `confidence`
+        ONLY (via the same dynamics as a confirmation, scaled by `strength`) — never
+        reward_ema / Q-net / cgn_beta_state, so the emot-coupling is untouched. The
+        in-process tally (`confirmations`/`falsifications`) is left HONEST; the
+        corroboration is recorded separately in the free-form `action_context` (NOT a
+        schema change). Returns True iff a hypothesis with this `rule` was found.
+        """
+        s = max(0.0, min(1.0, float(strength)))
+        if s <= 0.0 or not rule:
+            return False
+        for h in self._hypotheses:
+            if h.rule == rule:
+                h.confidence = min(
+                    0.95, h.confidence + s * self._confirmation_boost * (1.0 - h.confidence))
+                ac = h.action_context if isinstance(h.action_context, dict) else {}
+                ac["corroborations"] = int(ac.get("corroborations", 0)) + 1
+                ac["last_corroboration_strength"] = s
+                h.action_context = ac
+                self._stats["corroborated"] = self._stats.get("corroborated", 0) + 1
+                if (h.confidence > self._verification_threshold
+                        and h not in self._verified_rules):
+                    self._verified_rules.append(h)
+                return True
+        return False
+
     def suggest(self, available_context: dict) -> Optional[dict]:
         """Use verified rules to suggest an action context."""
         available_actions = available_context.get("available_actions", [])

@@ -1240,6 +1240,35 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 swallow_warn('[CGNWorker] HAOV rule-applied error', e,
                              key="modules.cgn_worker.haov_rule_applied_error", throttle=100)
 
+        # ── CGN_MODEL_CORROBORATION — OFFER-inner (RFP_pattern_logic §7.1/§VC-2) ─
+        # A promoted cross-substrate MODEL corroborates the inner HAOV hypotheses it
+        # was built from → boost each named rule's confidence via the tracker merge
+        # path. HAOV-confidence ONLY — never reward_ema / Q-net / cgn_beta_state, so
+        # the emot-coupling (the CRITICAL-NO blast radius) is untouched.
+        elif msg_type == bus.CGN_MODEL_CORROBORATION:
+            try:
+                _consumer = str(payload.get("consumer", "") or "")
+                _tracker = cgn._haov_trackers.get(_consumer) if _consumer else None
+                _strength = float(payload.get("strength", 0.0) or 0.0)
+                if _tracker is not None and _strength > 0.0:
+                    _rules = [str(r) for r in (payload.get("rules") or []) if r]
+                    _hit = sum(1 for _r in _rules if _tracker.corroborate(_r, _strength))
+                    if _hit:
+                        _stats["haov_corroborations"] = (
+                            _stats.get("haov_corroborations", 0) + _hit)
+                        _write_incremental_shm(cgn, shm_writer)
+                        logger.info(
+                            "[CGNWorker] cross-substrate corroboration — consumer=%s "
+                            "rules_hit=%d/%d strength=%.3f", _consumer, _hit,
+                            len(_rules), _strength)
+                else:
+                    logger.debug(
+                        "[CGNWorker] CGN_MODEL_CORROBORATION unknown consumer=%s or "
+                        "zero strength — dropped", _consumer)
+            except Exception as e:
+                swallow_warn('[CGNWorker] model-corroboration error', e,
+                             key="modules.cgn_worker.model_corroboration_error", throttle=100)
+
         # ── CGN_INFERENCE_REQ — policy inference for remote processes ─
         # API_STUB: handler ready, awaits remote process senders (T2/T3
         # delegate path). Tracked I-003.

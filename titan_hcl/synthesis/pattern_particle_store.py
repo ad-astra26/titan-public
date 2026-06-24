@@ -364,6 +364,17 @@ class PatternParticleStore:
                   if min_c is None or p["c"] >= min_c]
         return models
 
+    def inner_rules_for_particle(self, particle_id: str) -> List[tuple]:
+        """Provenance for the INNER offer: the distinct (consumer, rule) pairs of
+        the INNER transitions that fed this particle. For an inner transition the
+        `frame` is the CGN consumer name and `source` is the HAOV rule name (set by
+        the collector). Pass the PATTERN id (a MODEL's parent_id) — transitions are
+        attached to the pattern, not its model successor."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT frame, source FROM transitions "
+            "WHERE particle_id = ? AND substrate = 'inner'", (particle_id,)).fetchall()
+        return [(r[0], r[1]) for r in rows if r[1]]
+
     def get_particle(self, particle_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT id, parent_id, kind, status, signature, operation, frame, alpha, "

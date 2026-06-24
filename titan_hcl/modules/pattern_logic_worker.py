@@ -55,7 +55,6 @@ _DEFAULTS = {
     "f_floor": 0.7,                 # PROMOTE truth-fraction gate (a MODEL must work)
 }
 
-_SIG_CACHE_NAME = "pattern_model_sigs.json"
 _HAOV_SNAPSHOT_NAME = "haov_reasoning_strategy_snapshot.json"
 
 
@@ -140,17 +139,17 @@ def ingest_inner_snapshot(store: PatternParticleStore, embedder: Any,
         if sig is None:
             continue
         op = _inner_op(rule, str(h.get("predicted_effect", "") or ""))
+        # PROVENANCE: frame = the CGN consumer; source = the HAOV `rule` name (so a
+        # model built from this transition knows which inner rule to corroborate).
         for _ in range(d_conf):
             store.record_transition(signature=sig.tolist(), operation=op,
                                     frame="reasoning_strategy", verdict=True,
-                                    substrate="inner", source="reasoning_strategy",
-                                    context_label=ctx)
+                                    substrate="inner", source=rule, context_label=ctx)
             recorded += 1
         for _ in range(d_fals):
             store.record_transition(signature=sig.tolist(), operation=op,
                                     frame="reasoning_strategy", verdict=False,
-                                    substrate="inner", source="reasoning_strategy",
-                                    context_label=ctx)
+                                    substrate="inner", source=rule, context_label=ctx)
             recorded += 1
         seen[rule] = (conf, fals)
     return recorded
@@ -284,29 +283,28 @@ def build_offer_event(model: Dict[str, Any], name: str) -> Dict[str, Any]:
     }
 
 
-def export_model_sig_cache(store: PatternParticleStore, cache_path: str,
-                           min_c: float) -> int:
-    """Export high-c MODEL signatures + a frame→max-c map for the CGN inner hook
-    (vec[17]). Atomic (tmp + os.replace). Returns the model count."""
-    import json
-    models = store.get_models(min_c=min_c)
-    frames: Dict[str, float] = {}
-    out_models = []
-    for m in models:
-        fr = m["frame"]
-        frames[fr] = max(frames.get(fr, 0.0), float(m["c"]))
-        out_models.append({
-            "id": m["id"], "operation": m["operation"], "frame": fr,
-            "c": float(m["c"]), "signature": [float(x) for x in m["signature"]],
+def build_corroboration_events(store: PatternParticleStore, model: Dict[str, Any],
+                               name: str) -> List[Dict[str, Any]]:
+    """OFFER-inner (rule-keyed corroboration, RFP §7.1/§VC-2): one CGN_MODEL_
+    CORROBORATION per CGN consumer whose HAOV rules fed this MODEL. The shared key is
+    the symbolic HAOV `rule` name (no embedding-space match). strength = model.c (the
+    promoted confidence; the cluster already passed the cos_thresh join gate). Empty
+    list if the model had no inner provenance (a purely-outer cluster)."""
+    parent = model.get("parent_id")
+    if not parent:
+        return []
+    rules_by_consumer: Dict[str, List[str]] = {}
+    for consumer, rule in store.inner_rules_for_particle(parent):
+        rules_by_consumer.setdefault(consumer, []).append(rule)
+    strength = max(0.0, min(1.0, float(model.get("c", 0.0))))
+    events: List[Dict[str, Any]] = []
+    for consumer, rules in rules_by_consumer.items():
+        events.append({
+            "type": bus.CGN_MODEL_CORROBORATION, "src": name, "dst": "cgn",
+            "ts": time.time(),
+            "payload": {"consumer": consumer, "rules": rules, "strength": strength},
         })
-    payload = {"version": 1, "exported_at": time.time(),
-               "frames": frames, "models": out_models}
-    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-    tmp = cache_path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(payload, f)
-    os.replace(tmp, cache_path)
-    return len(out_models)
+    return events
 
 
 # ── the process entry point ──────────────────────────────────────────────────
@@ -331,7 +329,6 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
     # State dir / paths.
     data_dir = ((config or {}).get("memory_and_storage") or {}).get("data_dir") or "data"
     db_path = os.path.join(data_dir, "pattern_logic.duckdb")
-    sig_cache_path = os.path.join(data_dir, _SIG_CACHE_NAME)
     haov_snapshot_path = os.path.join(data_dir, _HAOV_SNAPSHOT_NAME)
 
     # Lifecycle SHM slot (Phase 11).
@@ -361,10 +358,17 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
     inner_seen: Dict[str, tuple] = {}
 
     def _offer_sink(model: Dict[str, Any]) -> None:
+        # OFFER-outer: persist the MODEL as a reasoning-composite (→ OML composite_match).
         try:
             send_queue.put_nowait(build_offer_event(model, name))
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[pattern_logic] offer emit failed: %s", exc)
+            logger.debug("[pattern_logic] outer offer emit failed: %s", exc)
+        # OFFER-inner: corroborate the contributing inner HAOV rules (→ confidence boost).
+        try:
+            for ev in build_corroboration_events(store, model, name):
+                send_queue.put_nowait(ev)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[pattern_logic] inner corroboration emit failed: %s", exc)
 
     def _contemplate_loop() -> None:
         while not stop.is_set():
@@ -378,14 +382,13 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
                 n_inner = ingest_inner_snapshot(store, embedder, haov_snapshot_path,
                                                 inner_seen)
                 stats = recognise_and_construct(store, cfg, _offer_sink)
-                n_models = export_model_sig_cache(store, sig_cache_path,
-                                                  float(cfg["promote_floor"]))
                 if n_inner or any(stats.values()):
+                    st = store.get_stats()
                     logger.info("[pattern_logic] pass: inner+=%d matched=%d "
-                                "patterns+=%d models+=%d cited=%d (models_cached=%d) "
+                                "patterns+=%d models+=%d cited=%d (models_active=%d) "
                                 "trigger=%s", n_inner, stats["matched"],
                                 stats["patterns"], stats["models"], stats["cited"],
-                                n_models, "event" if fired else "interval")
+                                st["models_active"], "event" if fired else "interval")
             except Exception:  # noqa: BLE001
                 logger.exception("[pattern_logic] contemplate pass failed")
 
