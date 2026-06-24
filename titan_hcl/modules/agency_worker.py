@@ -946,6 +946,35 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     "failed: %s", _probe_err)
             continue
 
+        # ── SAVE_NOW → flush + SAVE_DONE (root-cause fix for the restart-module flap) ──
+        # agency_worker was MISSED in the 2026-06-01 persistence rollout
+        # (same class as backup, D-SPEC-146): with NO SAVE_NOW handler the Guardian's
+        # restart save_first waited the FULL 30s save_timeout for a SAVE_DONE that never
+        # came — EVERY restart-module. That 30s window races the shm_pid_dead detector
+        # → a cascade flap (observed live 2026-06-24 enabling research-curiosity; worse
+        # under load). Reply SAVE_DONE right after the fast batched-history flush (the
+        # same flush MODULE_SHUTDOWN does) so the orchestrator proceeds immediately.
+        if msg_type == bus.SAVE_NOW:
+            _save_rid = (msg.get("payload") or {}).get("request_id")
+            _save_t0 = time.time()
+            _save_ok, _save_errs = True, 0
+            try:
+                agency.flush()
+            except Exception as _save_err:  # noqa: BLE001
+                _save_ok, _save_errs = False, 1
+                logger.warning("[AgencyWorker] SAVE_NOW flush failed: %s", _save_err)
+            try:
+                send_queue.put({
+                    "type": bus.SAVE_DONE, "src": name, "dst": "guardian",
+                    "payload": {"module": name, "request_id": _save_rid,
+                                "saved": _save_ok, "errors": _save_errs,
+                                "duration_ms": int((time.time() - _save_t0) * 1000)},
+                    "ts": time.time(),
+                })
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[AgencyWorker] Shutdown received — "
                         "flushing action history + exiting")
