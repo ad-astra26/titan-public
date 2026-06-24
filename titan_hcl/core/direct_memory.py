@@ -1245,6 +1245,35 @@ class TitanKnowledgeGraph:
             logger.warning("[KnowledgeGraph] spine_read_engram_axes failed: %s", e)
         return out
 
+    def spine_research_gap_candidates(self) -> list[dict]:
+        """Read every DECLARATIVE Engram's gap-relevant fields for autonomous
+        research-curiosity targeting (RFP_titan_research_agent §1.4 step 1):
+        [{concept_id, version, name, used, groundedness, domain_hint}]. Declarative
+        only — research grounds declarative concepts, not procedural/episodic. All
+        versions are returned; the caller dedups to the latest per concept_id before
+        ranking (a low-groundedness OLD version must not mask a grounded latest).
+        Soft-fail → []."""
+        out: list[dict] = []
+        try:
+            qr = self._conn.execute(
+                "MATCH (c:Engram) WHERE c.memory_type = 'declarative' "
+                "RETURN c.concept_id, c.version, c.name, c.axis_used, "
+                "c.groundedness, c.domain_hint"
+            )
+            while qr.has_next():
+                row = qr.get_next()
+                out.append({
+                    "concept_id": row[0],
+                    "version": int(row[1]) if row[1] is not None else 1,
+                    "name": row[2] or "",
+                    "used": float(row[3]) if row[3] is not None else 0.0,
+                    "groundedness": float(row[4]) if row[4] is not None else 0.0,
+                    "domain_hint": row[5] or "general",
+                })
+        except Exception as e:
+            logger.warning("[KnowledgeGraph] spine_research_gap_candidates failed: %s", e)
+        return out
+
     def spine_read_engram_domain_rows(self) -> list[dict]:
         """Read every Engram's identity + name + memory_type + current
         `domain_hint` for the one-time §7.F content backfill of pre-Phase-F

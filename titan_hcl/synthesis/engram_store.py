@@ -322,6 +322,50 @@ def reduce_population_to_scalars(
     return out
 
 
+def rank_research_gaps(
+    candidates: list[dict], *, n: int = 5, min_used: float = 1e-9,
+) -> list[dict]:
+    """Rank declarative concepts as autonomous research-curiosity GAPS
+    (`RFP_titan_research_agent` §1.4 step 1). Each candidate is
+    `{concept_id, version, name, used, groundedness, domain_hint}`; multiple
+    versions may appear → dedup to the LATEST version per concept_id first (a
+    low-groundedness OLD version must not mask a grounded latest). Salience =
+    `used` × (1 − groundedness) — *"I keep meeting Z but don't grasp it"*: prefers
+    OFTEN-encountered AND poorly-grounded concepts; `min_used` drops never-
+    encountered noise. Returns the top-n by salience, each carrying its current
+    `groundedness` as the verifiable-research BASELINE. PURE (no I/O) — unit-tested.
+
+    Self-emergent (no magic threshold): the ranking is purely relative to the live
+    population's own `used`/`groundedness`; the absolute cut is only `min_used > 0`
+    (encountered-at-all). `feedback_no_hardcoded_values_emergence_over_determinism`."""
+    latest: dict[str, dict] = {}
+    for c in candidates:
+        cid = c.get("concept_id")
+        if not cid:
+            continue
+        v = int(c.get("version", 1) or 1)
+        if cid not in latest or v > int(latest[cid].get("version", 1) or 1):
+            latest[cid] = c
+    scored: list[dict] = []
+    for c in latest.values():
+        used = float(c.get("used", 0.0) or 0.0)
+        if used <= float(min_used):
+            continue
+        g = max(0.0, min(1.0, float(c.get("groundedness", 0.0) or 0.0)))
+        scored.append({
+            "concept_id": c["concept_id"],
+            "version": int(c.get("version", 1) or 1),
+            "name": c.get("name", "") or "",
+            "domain_hint": c.get("domain_hint", "general") or "general",
+            "groundedness": g,              # the verifiable-research BASELINE
+            "used": used,
+            "salience": used * (1.0 - g),
+        })
+    # primary: salience DESC; tie-break: lowest groundedness (bigger gap) first.
+    scored.sort(key=lambda r: (r["salience"], -r["groundedness"]), reverse=True)
+    return scored[: max(1, int(n))]
+
+
 # ── EngramStore ────────────────────────────────────────────────────
 
 
@@ -1026,6 +1070,21 @@ class EngramStore:
         except Exception as e:  # noqa: BLE001
             logger.debug("[EngramStore] list_declarative_concepts failed: %s", e)
             return []
+
+    @on_writer
+    def lowest_grounded_concepts(self, n: int = 5, *,
+                                 min_used: float = 1e-9) -> list[dict]:
+        """The top-n autonomous research-curiosity GAPS (`RFP_titan_research_agent`
+        §1.4 step 1): declarative concepts Titan has ENCOUNTERED but understands
+        LEAST, each carrying its current groundedness BASELINE for the verifiable
+        before/after measurement. Reads the Kuzu spine (writer-owned) → ranks via
+        the pure `rank_research_gaps`. Soft-fail → []."""
+        try:
+            candidates = self._graph.spine_research_gap_candidates()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[EngramStore] lowest_grounded_concepts read failed: %s", e)
+            return []
+        return rank_research_gaps(candidates, n=int(n), min_used=float(min_used))
 
     @on_writer
     def concept_has_consumers(self, concept_id: str) -> bool:
