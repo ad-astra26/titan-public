@@ -1369,6 +1369,19 @@
 "outer_trinity.expected_interactions_per_day" = {type="int", constraint=">=0", reload="hot", owner=["outer_interface_worker"], sensitive=false}
 "outer_trinity.expected_research_per_day" = {type="int", constraint=">=0", reload="hot", owner=["outer_interface_worker"], sensitive=false}
 "outer_trinity.max_latency_seconds" = {type="float", constraint=">0", reload="hot", owner=["outer_interface_worker"], sensitive=false}
+# pattern_logic — cross-substrate pattern/model faculty (rFP_pattern_logic). cfg is
+# captured once at worker boot (pattern_logic_worker.py:319, from the ModuleSpec arg,
+# not live get_params) → reload=restart_required is honest until it is SHM-migrated.
+"pattern_logic.c0" = {type="float", constraint=">0", reload="restart_required", owner=["pattern_logic"], sensitive=false}
+"pattern_logic.cos_thresh" = {type="float", constraint="0..1", reload="restart_required", owner=["pattern_logic"], sensitive=false}
+"pattern_logic.enabled" = {type="bool", constraint="", reload="restart_required", owner=["pattern_logic"], sensitive=false}
+"pattern_logic.f_floor" = {type="float", constraint="0..1", reload="restart_required", owner=["pattern_logic"], sensitive=false}
+"pattern_logic.max_cluster_window" = {type="int", constraint=">=1", reload="restart_required", owner=["pattern_logic"], sensitive=false}
+"pattern_logic.min_cluster_size" = {type="int", constraint=">=1", reload="restart_required", owner=["pattern_logic"], sensitive=false}
+"pattern_logic.min_interval_s" = {type="float", constraint=">0", reload="restart_required", owner=["pattern_logic"], sensitive=false}
+"pattern_logic.min_sources" = {type="int", constraint=">=1", reload="restart_required", owner=["pattern_logic"], sensitive=false}
+"pattern_logic.min_transitions" = {type="int", constraint=">=1", reload="restart_required", owner=["pattern_logic"], sensitive=false}
+"pattern_logic.promote_floor" = {type="float", constraint="0..1", reload="restart_required", owner=["pattern_logic"], sensitive=false}
 "persona_social.adversary_session_pct" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
 "persona_social.companion_session_pct" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
 "persona_social.enabled" = {type="bool", constraint="", reload="hot", owner=["social_worker"], sensitive=false}

@@ -41,6 +41,7 @@ MODULE_NAMES = {
     "knowledge", "language", "life_force", "llm", "media", "meditation",
     "memory", "meta_teacher", "metabolism", "mind", "neuromod_module",
     "ns_module", "observatory", "observatory_writer", "outer_interface_worker",
+    "pattern_logic",
     "output_verifier", "reflex", "self_learning", "self_reflection_worker",
     "social_graph", "social_worker", "soul_diary", "sovereignty", "studio",
     "synthesis", "timechain", "warning_monitor", "kernel",

@@ -55,21 +55,34 @@ def test_audit_against_bus_constants_clean_with_b2():
 
 
 def test_bus_ipc_socket_enabled_flag_registered():
-    """Verify titan_params.toml registers the flag.
+    """Verify the microkernel bus-mode flag is registered.
 
-    Original test asserted default=False. Flipped to True on 2026-05-01
-    (commit 45d469fe — T1 graduated back to socket-broker mode after A.S8
-    + msgpack fix). Test now just verifies the flag is present and is a
-    bool — matches whatever the config currently declares (True under
-    microkernel v2 mode).
+    RELOCATED 2026-04-27 from titan_params.toml → config.toml (box-tunable
+    microkernel flag; see the titan_params.toml note at the old site). It is now
+    declared fleet-wide in config_schema.toml [config] (type=bool) and set
+    per-box in config.toml. The old test loaded ONLY titan_params.toml → it broke
+    the moment the flag moved (stale test). This checks the canonical schema
+    registration (box-agnostic, always present) + that the box config.toml, when
+    resolvable, declares the live value as a bool.
     """
-    from titan_hcl.params import load_titan_params as load_titan_config
-    cfg = load_titan_config()
-    micro = cfg.get("microkernel", {})
-    assert "bus_ipc_socket_enabled" in micro, \
-        "microkernel.bus_ipc_socket_enabled flag not registered"
-    assert isinstance(micro["bus_ipc_socket_enabled"], bool), \
-        f"flag must be bool, got {type(micro['bus_ipc_socket_enabled']).__name__}"
+    import tomllib
+    from pathlib import Path
+    repo = Path(__file__).resolve().parents[1]
+    schema = tomllib.load(open(repo / "titan_hcl" / "config_schema.toml", "rb"))
+    key = "microkernel.bus_ipc_socket_enabled"
+    assert key in schema["config"], \
+        f"{key} must be registered in config_schema.toml [config]"
+    assert schema["config"][key]["type"] == "bool", \
+        f"{key} schema type must be bool"
+    # When a box config.toml is resolvable, the live value must be a bool.
+    for cand in (repo / "titan_hcl" / "config.toml",
+                 Path("/home/youruser/projects/titan/titan_hcl/config.toml")):
+        if cand.exists():
+            cfg = tomllib.load(open(cand, "rb"))
+            val = cfg.get("microkernel", {}).get("bus_ipc_socket_enabled")
+            assert val is None or isinstance(val, bool), \
+                f"flag must be bool, got {type(val).__name__}"
+            break
 
 
 # ── DivineBus dual-mode behavior ───────────────────────────────────────────
