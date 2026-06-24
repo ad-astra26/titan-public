@@ -1011,6 +1011,14 @@ class EmotCGNConsumer:
             # Failsafe: client None OR queue None → skip silently without
             # incrementing counter (no silent lies about sends).
             if self._cgn_client is not None and self._send_queue is not None:
+                # Fix 2 emotional effect-delta (RFP_cgn_causal_effect_deltas, D1):
+                # urgency = arousal composite of the DA+NE neuromod EMA deltas
+                # (get_neuromod_deltas = EMA-now − EMA-100-epochs). _extract_emotional
+                # reads urgency_delta (abs>=0.05) → next_urgency_rose/fell, so the
+                # causal candidate forms on a real arousal shift, not reward-bucket.
+                _nm_d = self.get_neuromod_deltas()
+                _urgency_delta = round(
+                    (_nm_d.get("DA", 0.0) + _nm_d.get("NE", 0.0)) / 2.0, 4)
                 for prim_id in {dominant_at_start, dominant_at_end}:
                     if prim_id not in self._primitives:
                         continue
@@ -1030,6 +1038,7 @@ class EmotCGNConsumer:
                             "metadata": {
                                 "action_name": prim_id,
                                 "chain_id": chain_id,
+                                "urgency_delta": _urgency_delta,  # Fix 2 emotional
                                 "encounter_type": (
                                     "chain_start" if prim_id == dominant_at_start
                                     else "chain_end"),
@@ -1128,6 +1137,10 @@ class EmotCGNConsumer:
             if self._cgn_client is not None and self._send_queue is not None:
                 try:
                     state_30d = self.encode_state_30d("MAKER_PRESENCE", ctx)
+                    # Fix 2 emotional effect-delta (D1) — arousal composite of DA+NE.
+                    _nm_d = self.get_neuromod_deltas()
+                    _urgency_delta = round(
+                        (_nm_d.get("DA", 0.0) + _nm_d.get("NE", 0.0)) / 2.0, 4)
                     self._cgn_client.send_transition({
                         "type": "experience",
                         "consumer": CGN_CONSUMER_NAME,
@@ -1140,6 +1153,7 @@ class EmotCGNConsumer:
                         "epoch": int(ctx.get("epoch", 0)),
                         "metadata": {"action_name": "MAKER_PRESENCE",
                                      "channel": str(channel),
+                                     "urgency_delta": _urgency_delta,  # Fix 2
                                      "encounter_type": "maker_presence"},
                     })
                     self._cgn_transitions_sent += 1

@@ -102,3 +102,42 @@ def test_reasoning_strategy_depth_delta_via_outcome_context(tmp_path):
     txs = [t for t in cgn._buffer._buffer if t.concept_id == "c"]
     assert txs and txs[-1].metadata.get("depth_delta") == 2
     assert extract_effect("reasoning_strategy", txs[-1], 0.5) == "chain_deeper"
+
+
+def test_language_conf_delta_via_outcome_context(tmp_path):
+    """Phase 1 (language): the client's confidence_delta, added to the outcome_context,
+    reaches the extractor → next_conf_rose (not reward-bucket)."""
+    from titan_hcl.logic.haov_causal_generator import extract_effect
+    cgn = _mk_cgn(tmp_path)
+    cgn.register_consumer(CGNConsumerConfig(name="language"))
+    cgn.record_experience(consumer="language", concept_id="w", reward=0.4,
+                          outcome_context={"conf_delta": 0.08})
+    t = [x for x in cgn._buffer._buffer if x.concept_id == "w"][-1]
+    assert t.metadata.get("conf_delta") == 0.08
+    assert extract_effect("language", t, 0.4) == "next_conf_rose"
+
+
+def test_emotional_urgency_delta_via_metadata(tmp_path):
+    """Phase 1 (emotional, D1): the DA+NE arousal composite, in the metadata field,
+    reaches the extractor → next_urgency_rose."""
+    from titan_hcl.logic.haov_causal_generator import extract_effect
+    cgn = _mk_cgn(tmp_path)
+    cgn.register_consumer(CGNConsumerConfig(name="emotional"))
+    cgn.record_experience(consumer="emotional", concept_id="joy", reward=0.6,
+                          metadata={"urgency_delta": 0.1})
+    t = [x for x in cgn._buffer._buffer if x.concept_id == "joy"][-1]
+    assert t.metadata.get("urgency_delta") == 0.1
+    assert extract_effect("emotional", t, 0.6) == "next_urgency_rose"
+
+
+def test_social_sentiment_delta_via_outcome_context(tmp_path):
+    """Phase 1 (social): the signed valence delta (DA+5HT after−before), in the
+    outcome_context, reaches the extractor → reply_warmer/colder."""
+    from titan_hcl.logic.haov_causal_generator import extract_effect
+    cgn = _mk_cgn(tmp_path)
+    cgn.register_consumer(CGNConsumerConfig(name="social"))
+    cgn.record_experience(consumer="social", concept_id="u", reward=0.3,
+                          outcome_context={"sentiment_delta": -0.1})
+    t = [x for x in cgn._buffer._buffer if x.concept_id == "u"][-1]
+    assert t.metadata.get("sentiment_delta") == -0.1
+    assert extract_effect("social", t, 0.3) == "reply_colder"

@@ -1320,7 +1320,9 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                 _cgn_forward_outcome("language", _cgn_w,
                                                      _cgn_reward,
                                                      {"type": "production",
-                                                      "level": _cgn_level})
+                                                      "level": _cgn_level,
+                                                      # Fix 2 language effect-delta (RFP_cgn_causal_effect_deltas)
+                                                      "conf_delta": _cgn_action.confidence_delta})
                                 _cgn_grounded += 1
                         if _cgn_grounded > 0:
                             logger.info("[CGN] SPEAK grounding: %d words (L%d, %s)",
@@ -1641,7 +1643,9 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                     _cgn_forward_outcome("language", _cw,
                                                          _cgn_teach_reward,
                                                          {"type": "comprehension",
-                                                          "mode": _cgn_mode})
+                                                          "mode": _cgn_mode,
+                                                          # Fix 2 language effect-delta
+                                                          "conf_delta": _cgn_a.confidence_delta})
                     except Exception as _cgn_tr_err:
                         logger.debug("[CGN] Teacher grounding error: %s", _cgn_tr_err)
             except Exception as _tr_err:
@@ -1700,6 +1704,8 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                                            "type": "reasoning",
                                                            "chain_length": _ml_chain_len,
                                                            "assoc_type": _ml_assoc_type,
+                                                           # Fix 2 language effect-delta
+                                                           "conf_delta": _ml_action.confidence_delta,
                                                          })
                                     _ml_grounded += 1
 
@@ -2087,6 +2093,8 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                                    "type": "social",
                                                    "author": _sp_author,
                                                    "contagion": _sp_contagion,
+                                                   # Fix 2 language effect-delta
+                                                   "conf_delta": _sp_action.confidence_delta,
                                                })
                             _sp_grounded += 1
 
@@ -2332,6 +2340,18 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                     _soc_user = _soc_p.get("user_id", "unknown")
                     _soc_reward = float(_soc_p.get("reward", 0.0))
                     _soc_nm_before = _soc_p.get("neuromod_before", {})
+                    _soc_nm_after = _soc_p.get("neuromod_after", {})
+                    # Fix 2 social effect-delta (RFP_cgn_causal_effect_deltas; D1 pattern):
+                    # signed valence delta = positive-affect composite (DA reward +
+                    # 5HT contentment) after − before. _extract_social reads
+                    # sentiment_delta (abs>=0.05) → reply_warmer/colder. felt_distance
+                    # is magnitude-only, so a signed valence composite is required here.
+                    _soc_sentiment_delta = round(
+                        ((float(_soc_nm_after.get("DA", 0.5))
+                          + float(_soc_nm_after.get("5HT", 0.5)))
+                         - (float(_soc_nm_before.get("DA", 0.5))
+                            + float(_soc_nm_before.get("5HT", 0.5)))) / 2.0,
+                        4) if _soc_nm_after else 0.0
 
                     # Build concept dict for CGNConsumerClient
                     _soc_concept = {
@@ -2364,6 +2384,8 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                            "type": _soc_p.get("encounter_type", "chat"),
                                            "action_selected": _soc_action.action_name,
                                            "quality": _soc_p.get("quality", 0),
+                                           # Fix 2 social effect-delta
+                                           "sentiment_delta": _soc_sentiment_delta,
                                          })
 
                     logger.info("[CGN:Social] %s → %s (reward=%+.4f, fam=%.2f)",
