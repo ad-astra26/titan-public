@@ -537,7 +537,12 @@ class AgencyModule:
             # that already failed. RFP §7.P9.
             "helper_params": {k: v for k, v in (helper_params or {}).items()
                               if k in ("query", "what", "file", "page",
-                                       "refinement", "topic", "url", "max_results")},
+                                       "refinement", "topic", "url", "max_results",
+                                       # RFP_titan_research_agent §1.4 step 2b — the
+                                       # research-curiosity target (concept_id +
+                                       # baseline) MUST survive to the scorer (3a) +
+                                       # the synthesis seed/credit (3c).
+                                       "_research_target")},
             "ts": time.time(),
         }
 

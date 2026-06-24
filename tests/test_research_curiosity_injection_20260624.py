@@ -7,6 +7,7 @@ last-good snapshot read of `research_gaps`).
 from __future__ import annotations
 
 import json
+from collections import deque
 
 from titan_hcl.logic.agency.module import AgencyModule
 from titan_hcl.modules.agency_worker import _make_research_gap_provider
@@ -71,3 +72,25 @@ def test_provider_throttle_caches_within_ttl(tmp_path):
     # overwrite the file; within TTL the provider must serve the cached value
     snap.write_text(json.dumps({"research_gaps": [{"concept_id": "b"}]}))
     assert provider()[0]["concept_id"] == "a"   # throttled → cached, not re-read
+
+
+# ── allowlist survival (the bug the 100%-lock caught) ────────────────────────
+
+def test_research_target_survives_build_result_allowlist():
+    """_build_result's helper_params allowlist MUST keep `_research_target` — else
+    2b's target never reaches the 3a scorer / 3c credit (silent drop)."""
+    m = AgencyModule.__new__(AgencyModule)
+    m._action_counter = 0
+    m._history = deque()
+    m._history_store = None
+    m._action_timestamps = deque()
+    m._retry_window_s = 60.0
+    m._retry_history = deque()
+    rt = {"concept_id": "z", "baseline_groundedness": 0.1, "domain_hint": "defi"}
+    res = m._build_result(
+        1, "research", "web_search",
+        {"success": True, "result": "evidence"}, "reason", {},
+        helper_params={"query": "q", "_research_target": rt, "code": "DROP"})
+    hp = res["helper_params"]
+    assert hp.get("_research_target") == rt   # survives the allowlist
+    assert "code" not in hp                    # non-allowlisted still dropped
