@@ -416,6 +416,25 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
             _state_writer.write_state("booted")
         except Exception:  # noqa: BLE001
             pass
+
+    # ── parent_watcher: enter relaxed-mode (RFP_pattern_logic live-fix 2026-06-24).
+    # A spawn-respawned worker (restart-module) is reparented to init (ppid==1)
+    # WITHOUT a re-adoption BUS_HANDOFF → the parent_watcher self-SIGTERMs it at the
+    # 30s poll (worker_lifecycle.py:339) → shm_pid_dead loop. Relaxed-mode is what
+    # adoption sets (worker_swap_handler.py:283): ppid==1 alone no longer kills us —
+    # the BUS (the real supervision channel) does, after supervision_timeout. Safe: a
+    # dead kernel also makes the bus unreachable → still caught, with the grace window.
+    try:
+        from titan_hcl.core.worker_swap_handler import get_active_swap_state
+        from titan_hcl.core.worker_lifecycle import resume_parent_watcher
+        _sw_state = get_active_swap_state()
+        if _sw_state is not None and getattr(_sw_state, "watcher_state", None) is not None:
+            resume_parent_watcher(_sw_state.watcher_state, relaxed=True)
+            logger.info("[pattern_logic] parent_watcher relaxed-mode engaged "
+                        "(survives restart-module reparenting)")
+    except Exception as _rx:  # noqa: BLE001
+        logger.debug("[pattern_logic] relaxed-mode setup skipped: %s", _rx)
+
     logger.info("[pattern_logic] booted — db=%s embedder=%s cadence=%.0fs",
                 db_path, embedder is not None, float(cfg["min_interval_s"]))
 

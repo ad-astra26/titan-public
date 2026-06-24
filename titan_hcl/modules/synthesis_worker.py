@@ -4396,6 +4396,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                                     "source": "tool_verdict",
                                 },
                             })
+                            logger.info("[synthesis_worker] pattern_logic feed → "
+                                        "VERIFIED_TRANSITION emit ctx=%r verdict=%s",
+                                        _pl_ctx[:40], _pl_v)
                 except Exception:
                     pass
                 # Operator-closure C2 (W7) — a chat-time self-oracle tool
