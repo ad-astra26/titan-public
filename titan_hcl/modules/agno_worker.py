@@ -327,7 +327,29 @@ def _classify_message_tier(worker_plugin, message_text):
     if classifier is None:
         return None
     try:
-        return classifier.classify(message_text).tier
+        tier = classifier.classify(message_text).tier
+        # ── Pitch route — generous reply budget (Maker 2026-06-25) ──
+        # The text classifier lands introspective VC-pitch questions ("are you
+        # conscious?", "what makes you different?") in the `casual` tier
+        # (max_tokens=500 ≈ 375 words), so a thorough answer gets HARD-CUT
+        # mid-sentence. The pitch demo must let the Titan finish its thought.
+        # When the turn arrived on the pitch channel (set in _handle_chat_request
+        # before this runs), raise the ceiling + reshape guidance to "complete
+        # but concise". We keep the classified model_class + features (latency
+        # unchanged — only the reply budget grows). channel is request-scoped
+        # (RFP §7.B0), so concurrent web turns are unaffected.
+        if tier is not None and getattr(
+                worker_plugin, "_current_channel", "") == "pitch":
+            import dataclasses as _dc
+            tier = _dc.replace(
+                tier,
+                name="pitch",
+                max_tokens=800,
+                reply_guidance=(
+                    "Answer fully and substantively but concisely — finish your "
+                    "thought cleanly in ~300 words. Never trail off mid-sentence."),
+            )
+        return tier
     except Exception as _cls_err:
         logger.debug("[AgnoWorker] classify failed: %s", _cls_err)
         return None

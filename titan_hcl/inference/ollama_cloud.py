@@ -321,10 +321,20 @@ class OllamaCloudProvider(InferenceProvider):
                 _t_parse = time.perf_counter()
 
             content = data["choices"][0]["message"]["content"].strip()
+            # finish_reason="length" ⇒ the model hit max_tokens and was HARD-CUT
+            # mid-reply (the silent truncation behind "Titan got cut off"). Surface
+            # it loudly so it's never invisible again (directive_error_visibility).
+            _finish = (data["choices"][0].get("finish_reason") or "").strip()
             usage = data.get("usage", {})
             self._track(use_model, usage.get("total_tokens", 0))
             self._record_success()
             _t_done = time.perf_counter()
+            if _finish == "length":
+                logger.warning(
+                    "[OllamaCloud] reply TRUNCATED by max_tokens (model=%s "
+                    "tokens=%d) — the tier's max_tokens ceiling cut the reply "
+                    "mid-sentence; raise it for this lane if replies trail off",
+                    use_model, usage.get("total_tokens", 0))
 
             # Stage timings (debug-level for routine, info-level when slow)
             stage_pool_ms = (_t_pool - _t0) * 1000
@@ -336,10 +346,10 @@ class OllamaCloudProvider(InferenceProvider):
             log_fn(
                 "[OllamaCloud] chat %s done in %.0fms "
                 "(pool=%.0f net=%.0f parse=%.0f post=%.0f) "
-                "tokens=%d chars=%d shared_client=%s",
+                "tokens=%d chars=%d finish=%s shared_client=%s",
                 use_model, total_ms,
                 stage_pool_ms, stage_net_ms, stage_parse_ms, stage_post_ms,
-                usage.get("total_tokens", 0), len(content),
+                usage.get("total_tokens", 0), len(content), _finish or "?",
                 "yes" if self._shared_client is not None else "no",
             )
             return content
