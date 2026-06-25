@@ -340,7 +340,15 @@ def pattern_logic_worker_main(recv_queue, send_queue, name: str, config: dict) -
     # State dir / paths.
     data_dir = ((config or {}).get("memory_and_storage") or {}).get("data_dir") or "data"
     db_path = os.path.join(data_dir, "pattern_logic.duckdb")
-    haov_snapshot_path = os.path.join(data_dir, _HAOV_SNAPSHOT_NAME)
+    # INNER feed — CGN writes the reasoning_strategy HAOV snapshot into ITS OWN
+    # state_dir (cgn_worker.py:282 → config.get("state_dir", "data/cgn")), NOT the
+    # data root. Reading data_dir/<name> looked one level too high and silently
+    # found nothing → zero inner transitions fleet-wide (fixed 2026-06-25). Mirror
+    # CGN's resolution: honour an explicit cgn.state_dir if this worker can see it,
+    # else fall back to the canonical <data_dir>/cgn subdir.
+    _cgn_state_dir = (((config or {}).get("cgn") or {}).get("state_dir")
+                      or os.path.join(data_dir, "cgn"))
+    haov_snapshot_path = os.path.join(_cgn_state_dir, _HAOV_SNAPSHOT_NAME)
 
     # Lifecycle SHM slot (Phase 11).
     _state_writer = None
