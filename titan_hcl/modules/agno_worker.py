@@ -464,11 +464,22 @@ def _make_chat_agent(worker_plugin, message_text, shared_agent):
         # three genuinely distinct perspectives. Fixed per Titan (bypasses the
         # bandit router) — T1 keeps flagship gemma4:31b quality; T2/T3 use faster
         # models. channel is request-scoped (§7.B0) so web chat is unaffected.
-        if getattr(worker_plugin, "_current_channel", "") == "pitch":
+        _is_pitch = getattr(worker_plugin, "_current_channel", "") == "pitch"
+        if _is_pitch:
             _pm = _pitch_model_for_titan(worker_plugin)
             if _pm:
                 override = _pm
-        return make_agent(worker_plugin._chat_ctx, tier, model_override=override)
+        _agent = make_agent(worker_plugin._chat_ctx, tier, model_override=override)
+        if _is_pitch:
+            # VERIFIABLE: log the agent's ACTUAL model.id + max_tokens for pitch
+            # turns (agno uses an OpenAILike model whose POST log carries no model
+            # name, so this is the only place the per-Titan spread is observable).
+            _m = getattr(_agent, "model", None)
+            logger.info(
+                "[AgnoWorker] PITCH agent → model=%s max_tokens=%s (override=%s tier=%s)",
+                getattr(_m, "id", None), getattr(_m, "max_tokens", None),
+                override, getattr(tier, "name", None))
+        return _agent
     except Exception as _mk_err:  # noqa: BLE001
         logger.warning(
             "[AgnoWorker] per-call agent build failed (%s) — using shared agent",
