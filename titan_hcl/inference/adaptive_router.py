@@ -154,8 +154,12 @@ class AdaptiveRouter:
 
     def _heuristic(self, in_flight: int) -> str:
         """Cold-start threshold prior: offload when gemma is saturated/cold."""
+        # enter_latency lowered 12s→7s (Maker 2026-06-25): gemma4:31b on Ollama
+        # Cloud jitters 3.5s↔21s; a 12s trigger let the slow turns pay nearly
+        # full price before offloading. 7s offloads to the fast ladder model as
+        # soon as gemma trends slow, absorbing the spikes (config-overridable).
         if (in_flight > int(self._f("in_flight_ceiling", 8))
-                or self.monitor.ema(self.managed) > self._f("enter_latency_s", 12.0)):
+                or self.monitor.ema(self.managed) > self._f("enter_latency_s", 7.0)):
             for m in self.ladder:
                 if m != self.managed:
                     return m

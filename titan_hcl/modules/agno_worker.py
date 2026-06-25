@@ -410,6 +410,33 @@ def _router_feedback(model_id, latency_s, in_flight):
         pass
 
 
+# Per-Titan pitch-route model spread (Maker 2026-06-25). Each Titan answers the
+# pitch Compare-mode fan-out on its OWN model → the three simultaneous requests
+# land on three separate Ollama Cloud pools (no contention) and show three
+# distinct perspectives. All verified servable + fast (gemma4:31b 0.7s,
+# ministral-3:8b 1.1s, gemma3:4b 1.1s). Keyed on the box's titan_id (the pitch
+# Compare UI is inherently the three named Titans); a per-box [inference]
+# pitch_model config value overrides; an unknown titan_id → gemma4:31b.
+_PITCH_MODEL_BY_TITAN = {
+    "T1": "gemma4:31b",      # mainnet flagship — top quality
+    "T2": "ministral-3:8b",  # fast, solid mid quality
+    "T3": "gemma3:4b",       # fastest — the "speed" card
+}
+
+
+def _pitch_model_for_titan(worker_plugin):
+    """Concrete Ollama Cloud model for THIS Titan's pitch turns, or None to fall
+    back to normal resolution. Config override: [inference] pitch_model."""
+    try:
+        _cfgm = (get_params("inference") or {}).get("pitch_model")
+        if isinstance(_cfgm, str) and _cfgm.strip():
+            return _cfgm.strip()
+    except Exception:
+        pass
+    tid = getattr(worker_plugin, "_titan_id", "") or os.environ.get("TITAN_ID", "")
+    return _PITCH_MODEL_BY_TITAN.get(tid, "gemma4:31b")
+
+
 def _make_chat_agent(worker_plugin, message_text, shared_agent):
     """Mint a fresh per-call agent for this chat (INV-CC-2: own instance per
     concurrent call). Falls back to `shared_agent` if the chat context or
@@ -421,6 +448,18 @@ def _make_chat_agent(worker_plugin, message_text, shared_agent):
         # Phase B — let the bandit router pick the model for the chat heavy class
         # (passthrough/None unless enabled). make_agent uses the override or resolves.
         override = _adaptive_model_override(worker_plugin, tier)
+        # ── Pitch route — per-Titan model spread (Maker 2026-06-25) ──
+        # The pitch UI's Compare mode fans out to T1+T2+T3 at once; if all three
+        # hit the same gemma4:31b cloud pool they queue + the turn waits for the
+        # slowest. Give each Titan its OWN model so the three requests land on
+        # three separate pools (no contention) AND the side-by-side compare shows
+        # three genuinely distinct perspectives. Fixed per Titan (bypasses the
+        # bandit router) — T1 keeps flagship gemma4:31b quality; T2/T3 use faster
+        # models. channel is request-scoped (§7.B0) so web chat is unaffected.
+        if getattr(worker_plugin, "_current_channel", "") == "pitch":
+            _pm = _pitch_model_for_titan(worker_plugin)
+            if _pm:
+                override = _pm
         return make_agent(worker_plugin._chat_ctx, tier, model_override=override)
     except Exception as _mk_err:  # noqa: BLE001
         logger.warning(
