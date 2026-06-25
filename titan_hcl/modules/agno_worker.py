@@ -418,10 +418,16 @@ def _router_feedback(model_id, latency_s, in_flight):
 # Compare UI is inherently the three named Titans); a per-box [inference]
 # pitch_model config value overrides; an unknown titan_id → gemma4:31b.
 _PITCH_MODEL_BY_TITAN = {
-    "T1": "gemma4:31b",      # mainnet flagship — top quality
-    "T2": "ministral-3:8b",  # fast, solid mid quality
-    "T3": "gemma3:4b",       # fastest — the "speed" card
+    "T1": "gemma4:31b",        # mainnet flagship — top quality
+    "T2": "deepseek-v4-flash", # fast (~3s warm) + strong substance (NOT the heavy
+                               #   deepseek-v3.1:671b reasoning model — that's 90s+)
+    "T3": "gpt-oss:20b",       # distinct perspective, ~10s, no guard-tripping
 }
+# Rejected after the 2026-06-25 quality pass: ministral-3:8b (slow+verbose),
+# gemma3:4b (low quality — tripped the OVG injection guard), gemma3:27b (20s),
+# glm-5 (empty), gemini-3-flash-preview (weak/short raw — revisit in-context).
+# NEVER use the heavy reasoning models here (deepseek-v3.1:671b / mistral-large-3:675b
+# / qwen3.5:397b) — they are 90s+ and unusable for a live demo.
 
 
 def _pitch_model_for_titan(worker_plugin):
@@ -1660,14 +1666,28 @@ def _keepalive_loop(worker_plugin, stats_ref: dict,
                     time.time()
                     - float(stats_ref.get("last_chat_ts", 0) or 0)) < idle_after
                 gap = _keepalive_gap(in_flight, recent_peak, warm_cap, scale)
+                # Warm gemma4:31b (the /chat model) AND this box's per-Titan PITCH
+                # model (Maker 2026-06-25). Before this, only gemma4:31b was kept
+                # warm, so the Compare-mode pitch models (deepseek-v4-flash on T2 /
+                # gpt-oss:20b on T3) hit a COLD cloud pool on every visit → slow.
+                # Warm both so all Compare cards are ready. T1's pitch model IS
+                # gemma4:31b → the set dedups to one ping.
+                _warm_models = {model}
+                try:
+                    _pmw = _pitch_model_for_titan(worker_plugin)
+                    if _pmw:
+                        _warm_models.add(_pmw)
+                except Exception:
+                    pass
                 if provider is not None and active and gap > 0:
-                    loop.run_until_complete(_warm(provider, model, gap))
+                    for _wm in _warm_models:
+                        loop.run_until_complete(_warm(provider, _wm, gap))
                     _fired += 1
                     if _fired == 1 or _fired % 20 == 0:
                         logger.info(
-                            "[AgnoWorker] keepalive #%d — warmed %d gemma unit(s) "
+                            "[AgnoWorker] keepalive #%d — warmed %d unit(s) of %s "
                             "(in_flight=%d recent_peak=%.1f)",
-                            _fired, gap, in_flight, recent_peak)
+                            _fired, gap, sorted(_warm_models), in_flight, recent_peak)
             except Exception as _ka_err:  # noqa: BLE001
                 logger.debug("[AgnoWorker] keepalive tick failed: %s", _ka_err)
             stop_event.wait(interval)

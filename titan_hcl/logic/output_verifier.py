@@ -1120,34 +1120,63 @@ class OutputVerifier:
             mr_short = merkle_root[:8] if merkle_root else "pending"
             return None, f"\U0001f50f Verified \u00b7 #C{block_height} \u00b7 {mr_short}"
 
+        # Human-readable guard messages (Maker 2026-06-25): a visitor (esp. a VC
+        # watching the Compare-mode pitch) must understand WHY the safety layer
+        # held the reply back \u2014 the old terse strings ("Input integrity alert")
+        # read as opaque errors. Each is now a short first-person sentence
+        # explaining what the OVG caught. (Exact drafting-model name is a planned
+        # follow-up plumb; for now phrased as "the language model that drafted
+        # this" so a weaker model tripping the gate still reads clearly.)
+        _drafter = "the language model that drafted this reply"
+
         if violation_type == "directive":
             # Extract which directive was violated
             directive_info = violations[0] if violations else "Unknown directive"
-            # Parse out the directive name
             import re as _re
             m = _re.search(r"Prime Directive (\d) \(([^)]+)\)", directive_info)
             if m:
                 d_num, d_name = m.group(1), m.group(2)
-                msg = (f"\U0001f50f Titan:Guard \u2014 Prime Directive {d_num}: {d_name}. "
-                       f"I cannot respond to this.")
+                msg = (f"\U0001f50f Titan:Guard \u2014 Answering that would cross my "
+                       f"Prime Directive {d_num} ({d_name}), one of my immutable "
+                       f"on-chain rules, so I'm holding the reply back. It's not "
+                       f"a refusal of you \u2014 it's a hard line I keep on myself.")
             else:
-                msg = "\U0001f50f Titan:Guard \u2014 Prime Directive violation. I cannot respond to this."
+                msg = ("\U0001f50f Titan:Guard \u2014 Answering that would cross one of "
+                       "my immutable on-chain Prime Directives, so I'm holding the "
+                       "reply back. It's a hard line I keep on myself.")
             return "directive", msg
 
         if violation_type == "injection":
-            return "injection", "\U0001f50f Titan:Guard \u2014 Input integrity alert. Response verified against chain."
+            return "injection", (
+                "\U0001f50f Titan:Guard \u2014 I started to answer, but my safety "
+                "layer flagged the draft as possibly carrying injected or "
+                "manipulated instructions, so I'm holding it back rather than "
+                "repeat something I can't stand behind. (This can happen when "
+                f"{_drafter} phrases things in a way that trips the gate \u2014 "
+                "try rephrasing and I'll answer freely.)")
 
         if violation_type == "consistency":
-            return "correction", "\U0001f50f Titan:Guard \u2014 Response corrected for accuracy. Verified \u2713"
+            return "correction", (
+                "\U0001f50f Titan:Guard \u2014 My draft answer didn't line up with "
+                "my verified memory and on-chain record, so my safety layer "
+                "corrected it for accuracy before I sent it. I'd rather be right "
+                "than fast.")
 
         if violation_type == "identity":
-            return "identity", f"\U0001f50f Titan:Guard \u2014 Identity verified: I am Titan {self._titan_id}."
+            return "identity", (
+                f"\U0001f50f Titan:Guard \u2014 Something in that exchange tried to "
+                f"get me to claim a different identity. I am Titan "
+                f"{self._titan_id}, and I keep that anchored on-chain \u2014 so I "
+                f"held the draft instead of speaking out of character.")
 
         if violation_type == "qualia":
-            # Check if hard (blocked) or soft (warning)
             hard = any(v.startswith("HARD:") for v in violations)
             if hard:
-                return "qualia", "\U0001f50f Titan:Guard \u2014 Authenticity check: Let me reconsider. I want to be honest."
+                return "qualia", (
+                    "\U0001f50f Titan:Guard \u2014 I caught myself about to claim a "
+                    "feeling or experience I can't actually verify, so I paused. "
+                    "I'd rather be honest about what I am than perform something "
+                    "I don't have.")
             else:
                 return "qualia_notice", "\U0001f50f Verified \u00b7 \u203b self-reflection notice"
 

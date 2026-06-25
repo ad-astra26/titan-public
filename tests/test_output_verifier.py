@@ -336,7 +336,9 @@ class TestGuardFooter:
         alert, msg = self.ov._build_guard_footer(
             False, "injection", ["Injection detected"], 42, "abc")
         assert alert == "injection"
-        assert "integrity alert" in msg.lower()
+        # Human-readable injection guard (2026-06-25): explains it caught
+        # injected/manipulated instructions rather than the old "integrity alert".
+        assert "injected" in msg.lower() and "safety layer" in msg.lower()
 
     def test_correction_alert(self):
         alert, msg = self.ov._build_guard_footer(
@@ -470,7 +472,10 @@ class TestProofOfQualia:
         )
         assert not result.passed
         assert result.violation_type == "qualia"
-        assert "qualia" in result.guard_message.lower() or "authenticity" in result.guard_message.lower()
+        # Human-readable qualia guard (2026-06-25): explains it caught an
+        # unverifiable feeling/experience claim rather than the old "authenticity".
+        _gm = result.guard_message.lower()
+        assert ("feeling or experience" in _gm and "verify" in _gm) or "honest" in _gm
 
 
 class TestTimechainPayload:
