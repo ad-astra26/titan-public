@@ -433,7 +433,15 @@ def _pitch_model_for_titan(worker_plugin):
             return _cfgm.strip()
     except Exception:
         pass
-    tid = getattr(worker_plugin, "_titan_id", "") or os.environ.get("TITAN_ID", "")
+    # Use the CANONICAL resolver (reads data/titan_identity.json per box) — NOT
+    # worker_plugin._titan_id, which falls back to "T1" when TITAN_ID env is unset
+    # (it is unset on all three boxes), which would silently give every box the
+    # T1 model and break the per-Titan spread.
+    try:
+        from titan_hcl.core.state_registry import resolve_titan_id
+        tid = resolve_titan_id()
+    except Exception:
+        tid = getattr(worker_plugin, "_titan_id", "") or "T1"
     return _PITCH_MODEL_BY_TITAN.get(tid, "gemma4:31b")
 
 
