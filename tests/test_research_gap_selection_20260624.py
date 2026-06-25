@@ -17,6 +17,34 @@ def _c(cid, *, used, g, version=1, name="", domain="general"):
 
 # ── rank_research_gaps (pure) ────────────────────────────────────────────────
 
+def test_hypothesis_fork_hash_concepts_excluded():
+    """RFP §1.4 — internal hypothesis-fork concepts (16-hex sha256 concept_id from
+    hypothesis_fork_store) must NOT be picked as research gaps, even though they're
+    low-grounded + high-used. Only named knowledge concepts are valid targets."""
+    rows = [
+        _c("1e1c02d9c4f333cc", used=0.9, g=0.01),   # hypothesis-fork hash — exclude
+        _c("3ad272386d8e8ec3", used=0.9, g=0.02),   # hypothesis-fork hash — exclude
+        _c("ai_consciousness", used=0.3, g=0.20),   # real knowledge gap — keep
+    ]
+    out = rank_research_gaps(rows, n=5)
+    ids = [r["concept_id"] for r in out]
+    assert ids == ["ai_consciousness"], ids   # only the named knowledge concept survives
+
+
+def test_non_hash_named_concepts_kept():
+    """A non-hex / shorter / prefixed id is a real concept — must NOT be filtered."""
+    rows = [
+        _c("research_quantum_entanglement", used=0.5, g=0.1),
+        _c("summary::sociology", used=0.5, g=0.1),
+        _c("philosophy", used=0.5, g=0.1),
+        _c("1e1c02d9c4f333", used=0.5, g=0.1),      # 14-hex (not 16) → kept
+    ]
+    out = rank_research_gaps(rows, n=10)
+    ids = sorted(r["concept_id"] for r in out)
+    assert ids == ["1e1c02d9c4f333", "philosophy", "research_quantum_entanglement",
+                   "summary::sociology"]
+
+
 def test_high_used_low_grounded_ranks_first():
     rows = [
         _c("well_understood", used=0.9, g=0.9),    # met a lot, grasped → salience 0.09

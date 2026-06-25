@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Protocol
@@ -326,6 +327,15 @@ def reduce_population_to_scalars(
     return out
 
 
+# RFP_titan_research_agent §1.4 — hypothesis_fork_store mints net-new fork concepts
+# with a 16-hex sha256 concept_id (`hypothesis_fork_store.py:968`). Those are INTERNAL
+# reasoning hypotheses, not external-knowledge gaps Titan "keeps meeting" — and being
+# unverified they're low-grounded, so they'd dominate the gap rank and send autonomous
+# web-research at internal artifacts. Exclude them: a research-curiosity gap must be a
+# named knowledge concept, never a raw fork hash.
+_HYPOTHESIS_FORK_ID = re.compile(r"[0-9a-f]{16}\Z")
+
+
 def rank_research_gaps(
     candidates: list[dict], *, n: int = 5, min_used: float = 1e-9,
 ) -> list[dict]:
@@ -347,6 +357,8 @@ def rank_research_gaps(
         cid = c.get("concept_id")
         if not cid:
             continue
+        if _HYPOTHESIS_FORK_ID.fullmatch(str(cid)):
+            continue  # internal hypothesis-fork hash — not a knowledge gap (§1.4)
         v = int(c.get("version", 1) or 1)
         if cid not in latest or v > int(latest[cid].get("version", 1) or 1):
             latest[cid] = c
