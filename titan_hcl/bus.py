@@ -369,6 +369,17 @@ RESEARCH_CONCEPT_SEED = "RESEARCH_CONCEPT_SEED"
 #   Payload: {query, content, _research_target:{concept_id,version,baseline_groundedness,
 #   domain_hint,name}, ts}.
 RESEARCH_CURIOSITY_GROUNDED = "RESEARCH_CURIOSITY_GROUNDED"
+# INTROSPECT_REQUEST (RFP_text_extraction_introspection §7.B — the autonomous trigger):
+#   self_learning_worker (Inner Turn) → agency_worker. The §5 SHARED emergent trigger:
+#   when the Inner Turn's `IntrospectiveDrive.should_fire(...)` fires (great-pulse-gated,
+#   at rest), the SAME gate also asks the agency to grep his OWN telemetry → ground a
+#   SELF:<aspect> concept (research pointed inward). The agency runs IntrospectHelper
+#   (damper-bounded — INV-TX-6) and, on a substantive+novel read, emits
+#   RESEARCH_CURIOSITY_GROUNDED → memory (the helper-agnostic 3b→3c grounding path).
+#   TARGETED dst="agency" (reply_only=True — broadcast would be skipped). The Inner Turn
+#   PREDICTS (felt); introspection VERIFIES+GROUNDS (factual): the two halves of the
+#   self-model. Payload: {aspect?, src_gp, ts}.  Aspect omitted ⇒ agency rotates aspects.
+INTROSPECT_REQUEST = "INTROSPECT_REQUEST"
 # ── Phase B (§7.B, C1′) — the NON-verifiable lane. agno PostHook → synthesis_worker
 # AFTER the response is generated (a direct/research/IDK turn has no oracle). The
 # synthesis single-writer graphs a `Reasoning(kind='turn')` record under SELF →

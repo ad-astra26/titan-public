@@ -2146,6 +2146,13 @@ class _IntrospectionRoutine:
             if self.drive.should_fire(drive=d, great_pulse_fired=True,
                                       metabolic_ok=True):
                 self._seed(gp, s_raw, s_norm, phi, neuro)
+                # §7.P-B (the §5 SHARED trigger) — the SAME emergent gate that
+                # seeds the felt self-PREDICTION also asks the agency to grep his
+                # OWN telemetry → ground a factual SELF concept (introspection =
+                # research pointed inward). Purely additive + targeted dst="agency"
+                # (reply_only); the agency's IntrospectHelper damper (INV-TX-6)
+                # bounds it. Wrapped so it can NEVER perturb the inner loop / OML.
+                self._request_agency_introspection(gp)
         except Exception as e:  # noqa: BLE001
             logger.debug("[inner_turn] seed soft-fail: %s", e)
 
@@ -2165,6 +2172,19 @@ class _IntrospectionRoutine:
             gp_count=gp, stance=stance, phi=phi.tolist(),
             s0_norm=s_norm.tolist(), descr=descr.tolist(), delta=delta.tolist(),
             narration=narration)
+
+    def _request_agency_introspection(self, gp) -> None:
+        """§7.P-B — emit the targeted INTROSPECT_REQUEST → agency (the §5 shared
+        trigger). One-way fire-and-forget (G19-safe, mirrors _emit_self_anchor);
+        aspect omitted ⇒ the agency rotates aspects. Never raises."""
+        try:
+            self.send_queue.put({
+                "type": bus.INTROSPECT_REQUEST, "src": self.name, "dst": "agency",
+                "payload": {"src_gp": int(gp)},
+                "ts": time.time(),
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[inner_turn] introspect-request put soft-fail: %s", e)
 
     def _verify(self, pending, s1_norm, _phi_now) -> None:
         import numpy as _np

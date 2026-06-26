@@ -61,7 +61,7 @@ class IntrospectHelper:
             headers = {"X-Titan-Internal-Key": self._internal_key}
             async with aiohttp.ClientSession() as s:
                 async with s.get(url, headers=headers,
-                                 timeout=aiohttp.ClientTimeout(total=15)) as r:
+                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status != 200:
                         return ""
                     body = await r.text()

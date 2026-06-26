@@ -839,6 +839,16 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     last_stats_publish = 0.0
     poll_interval_s = 0.2
 
+    # §7.P-B — autonomous introspection: rotate aspects across successive
+    # INTROSPECT_REQUESTs so each grep covers a different facet of himself (and
+    # so the per-aspect novelty gate doesn't refuse back-to-back identical reads).
+    try:
+        from titan_hcl.logic.agency.helpers.introspect import _ASPECTS as _INTRO_ASPECTS_MAP
+        _introspect_aspects = tuple(_INTRO_ASPECTS_MAP.keys())
+    except Exception:  # noqa: BLE001
+        _introspect_aspects = ("skills",)
+    _introspect_rr = 0
+
     # Phase C Session 3 (rFP §4.B.2 + §4.B.3) — SHM-direct state publishers
     # for agency_state.bin + assessment_state.bin. Replaces the deadlock-
     # prone sync bus.request(action="get_agency_stats" / "get_assessment_stats")
@@ -1001,6 +1011,47 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             except Exception:  # noqa: BLE001
                 pass
             return
+        # ── §7.P-B — autonomous introspection (the §5 shared should_fire trigger) ──
+        # The Inner Turn fired its emergent gate → grep his OWN telemetry (lock-safe,
+        # via IntrospectHelper) → on a substantive+novel read, ride the helper-agnostic
+        # 3b grounding path (RESEARCH_CURIOSITY_GROUNDED → memory anchors SELF:<aspect>
+        # → synthesis seeds it). The damper (INV-TX-6) bounds it; this never blocks.
+        if msg_type == bus.INTROSPECT_REQUEST:
+            try:
+                _ih = registry.get_helper("introspect")
+                if _ih is not None:
+                    _ip = msg.get("payload") or {}
+                    _aspect = str(_ip.get("aspect") or "").strip()
+                    if not _aspect and _introspect_aspects:
+                        _aspect = _introspect_aspects[_introspect_rr % len(_introspect_aspects)]
+                        _introspect_rr += 1
+                    _ires = _run_async(_ih.execute({"aspect": _aspect}))
+                    if isinstance(_ires, dict) and _ires.get("introspection_grounded"):
+                        _hp = _ires.get("helper_params") or {}
+                        _rt = _hp.get("_research_target")
+                        if _rt:
+                            send_queue.put({
+                                "type": bus.RESEARCH_CURIOSITY_GROUNDED,
+                                "src": name, "dst": "memory",
+                                "payload": {
+                                    "query": str(_hp.get("query", "")),
+                                    "content": str(_ires.get("result", "")),
+                                    "_research_target": _rt,
+                                },
+                                "ts": time.time(),
+                            })
+                            logger.info(
+                                "[AgencyWorker][P-B/introspect] grounded SELF:%s → "
+                                "memory anchor (autonomous introspection)", _aspect)
+                    elif isinstance(_ires, dict):
+                        logger.debug(
+                            "[AgencyWorker][P-B/introspect] aspect=%s not grounded: %s",
+                            _aspect, _ires.get("introspection_reason"))
+            except Exception as _intro_err:  # noqa: BLE001
+                logger.warning("[AgencyWorker] INTROSPECT_REQUEST failed: %s",
+                               _intro_err)
+            continue
+
         if msg_type != bus.QUERY:
             continue
 

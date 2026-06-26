@@ -147,3 +147,41 @@ def test_introspect_helper_empty_endpoint_safe():
         assert r["introspection_grounded"] is False
         assert "_research_target" not in r["helper_params"]
     asyncio.run(_go())
+
+
+# ── the autonomous grounding event (the fix: introspect is non-routing, so the P8
+#    routing-coupled 3a emit BAILS for it → it needs its OWN RESEARCH_CURIOSITY_GROUNDED
+#    emit; this asserts the event the agency INTROSPECT_REQUEST handler builds is a
+#    well-formed 3b payload the memory consumer accepts) ──────────────────────────
+def test_autonomous_grounding_event_is_valid_3b_payload():
+    import asyncio
+    from titan_hcl.logic.agency.helpers.introspect import IntrospectHelper
+    h = IntrospectHelper(damper=IntrospectionDamper())
+    corpus = ('{"skills":[{"goal_class":"ground-concept:self"},'
+              '{"goal_class":"ground-concept:biology"}]}')
+    async def _mock(_a):
+        return corpus
+    h._read_corpus = _mock
+
+    async def _go():
+        r = await h.execute({"aspect": "skills"})
+        assert r["introspection_grounded"] is True
+        # build the event EXACTLY as agency_worker's INTROSPECT_REQUEST handler does
+        hp = r["helper_params"]
+        event_payload = {
+            "query": str(hp.get("query", "")),
+            "content": str(r.get("result", "")),
+            "_research_target": hp.get("_research_target"),
+        }
+        # the 3b memory consumer requires non-empty (query+"\n"+content) + a target
+        assert (event_payload["query"] + "\n" + event_payload["content"]).strip()
+        rt = event_payload["_research_target"]
+        assert rt and rt["concept_id"] == "SELF:skills"
+        assert rt["source"] == "introspection" and rt["domain_hint"] == "self"
+    asyncio.run(_go())
+
+
+# ── the bus trigger constant exists (the §5 shared should_fire wire) ──────────
+def test_introspect_request_bus_constant_exists():
+    from titan_hcl import bus
+    assert bus.INTROSPECT_REQUEST == "INTROSPECT_REQUEST"
