@@ -418,10 +418,16 @@ def _router_feedback(model_id, latency_s, in_flight):
 # Compare UI is inherently the three named Titans); a per-box [inference]
 # pitch_model config value overrides; an unknown titan_id → gemma4:31b.
 _PITCH_MODEL_BY_TITAN = {
-    "T1": "gemma4:31b",        # mainnet flagship — top quality
-    "T2": "deepseek-v4-flash", # fast (~3s warm) + strong substance (NOT the heavy
-                               #   deepseek-v3.1:671b reasoning model — that's 90s+)
-    "T3": "gpt-oss:20b",       # distinct perspective, ~10s, no guard-tripping
+    # Mix tuned to LIVE pitch latency (Maker 2026-06-26). In the REAL pitch (800
+    # tokens + full persona) gemma4:31b WARM is the fastest at ~5s — the small
+    # models that looked fast on a raw short prompt are actually slower in
+    # context (deepseek-v4-flash ~15s, gpt-oss:20b 33-44s). But running ALL three
+    # on gemma4:31b reintroduces the 3-concurrent-pool contention we fought
+    # earlier this session. So keep TWO on gemma4:31b + ONE on a separate pool:
+    "T1": "gemma4:31b",        # flagship — ~5s warm, top quality
+    "T2": "deepseek-v4-flash", # separate pool → avoids 3x concurrent gemma; ~15s
+                               #   (acceptable) + a genuinely distinct perspective
+    "T3": "gemma4:31b",        # flagship — ~5s warm (was gpt-oss:20b = 33-44s, dropped)
 }
 # Rejected after the 2026-06-25 quality pass: ministral-3:8b (slow+verbose),
 # gemma3:4b (low quality — tripped the OVG injection guard), gemma3:27b (20s),
