@@ -338,7 +338,11 @@ _REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3,
                        # it defaults to rank-0 and loses to llm_judge on a contended
                        # tx (INV-MC-8) — defeating the whole point of out-competing
                        # the quality judge. Ranks peer to the other oracles.
-                       "curiosity": 3}
+                       "curiosity": 3,
+                       # Introspection (§7.P-B): grepping his OWN telemetry → a
+                       # verifiable self-fact = a correctness-grounded oracle reward,
+                       # same rank as curiosity (it IS curiosity pointed inward).
+                       "introspection": 3}
 # (_SURVIVAL_STATES removed 2026-06-20 — survival/starvation no longer gates the
 #  mastery explore tick; metabolism is not design-complete. See _explore_tick.)
 

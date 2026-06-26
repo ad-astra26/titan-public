@@ -50,6 +50,8 @@ _HELPER_ACTION_TYPES = {
     "coding_sandbox": "compute",
     "infra_inspect": "infra",
     "memo_inscribe": "inscription",
+    # §7.P-B — introspection (research pointed inward: grep own telemetry → SELF concept).
+    "introspect": "introspect",
 }
 
 
