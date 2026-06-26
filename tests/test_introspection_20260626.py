@@ -185,3 +185,19 @@ def test_autonomous_grounding_event_is_valid_3b_payload():
 def test_introspect_request_bus_constant_exists():
     from titan_hcl import bus
     assert bus.INTROSPECT_REQUEST == "INTROSPECT_REQUEST"
+
+
+# ── the standalone-helper manifest contract (HelperRegistry calls these
+#    synchronously — a missing status()/capabilities/etc. logged a live warning
+#    on T3 boot + excluded introspect from list_available; regression guard) ──
+def test_introspect_helper_satisfies_registry_manifest_contract():
+    from titan_hcl.logic.agency.helpers.introspect import IntrospectHelper
+    h = IntrospectHelper()
+    assert h.status() == "available"           # must not raise (sync /health path)
+    assert isinstance(h.capabilities, list) and h.capabilities
+    assert isinstance(h.enriches, list) and "self" in h.enriches
+    assert isinstance(h.description, str) and h.description
+    assert h.resource_cost in ("low", "medium", "high")
+    assert h.latency in ("low", "medium", "high")
+    assert h.requires_sandbox is False         # read-only own telemetry (INV-TX-2)
+    assert h.name == "introspect" and h.action_type == "introspect"

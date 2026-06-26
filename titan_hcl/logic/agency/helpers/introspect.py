@@ -50,6 +50,39 @@ class IntrospectHelper:
         self._internal_key = internal_key or ""
         self._damper = damper or IntrospectionDamper()
 
+    # ── standalone-helper manifest contract (mirrors WebSearchHelper; the
+    #    HelperRegistry calls these synchronously for /health + get_status) ──
+    @property
+    def description(self) -> str:
+        return "Grep my own telemetry → a verifiable self-observation (introspection)"
+
+    @property
+    def capabilities(self) -> list[str]:
+        return ["introspect", "self-observe", "extract"]
+
+    @property
+    def resource_cost(self) -> str:
+        return "low"      # a local HTTP GET to own endpoint + deterministic regex
+
+    @property
+    def latency(self) -> str:
+        return "low"
+
+    @property
+    def enriches(self) -> list[str]:
+        return ["self"]   # grounds SELF:<aspect> concepts → the self_model
+
+    @property
+    def requires_sandbox(self) -> bool:
+        return False      # read-only own telemetry (INV-TX-2)
+
+    def status(self) -> str:
+        """Always available — a read-only local introspection. Must NOT block
+        (called synchronously by /health + agency stats); the corpus read
+        degrades to '' if the endpoint is down, it never makes the helper
+        unavailable."""
+        return "available"
+
     async def _read_corpus(self, aspect: str) -> str:
         """LOCK-SAFE corpus: GET the synthesis read endpoint for `aspect`. The owner
         process serves it → no DuckDB writer-lock conflict. Returns "" on any failure
