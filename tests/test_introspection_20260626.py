@@ -108,3 +108,42 @@ def test_run_introspection_flaky_provider_never_crashes():
         raise RuntimeError("reader down")
     r = run_introspection("routing", _Q, _boom, d)
     assert r.grounded is False and "corpus unavailable" in r.reason
+
+
+# ── IntrospectHelper end-to-end (mocked lock-safe corpus) ────────────────────
+def test_introspect_helper_grounds_and_novelty_gates():
+    import asyncio
+    from titan_hcl.logic.agency.helpers.introspect import IntrospectHelper
+    h = IntrospectHelper(damper=IntrospectionDamper())
+    corpus = ('{"skills":[{"goal_class":"ground-concept:self"},'
+              '{"goal_class":"ground-concept:self"},{"goal_class":"coding"}]}')
+    async def _mock(_a):
+        return corpus
+    h._read_corpus = _mock
+
+    async def _go():
+        r1 = await h.execute({"aspect": "skills"})
+        assert r1["introspection_grounded"] is True
+        rt = r1["helper_params"]["_research_target"]
+        assert rt["concept_id"] == "SELF:skills" and rt["source"] == "introspection"
+        assert r1["helper_params"]["query"] == "introspect:skills"   # string for 3a
+        assert len(r1["result"]) >= 40 and "SELF:skills" in r1["result"]
+        # novelty gate — same corpus must NOT re-ground
+        r2 = await h.execute({"aspect": "skills"})
+        assert r2["introspection_grounded"] is False
+        assert "novelty gate" in r2["introspection_reason"]
+    asyncio.run(_go())
+
+
+def test_introspect_helper_empty_endpoint_safe():
+    import asyncio
+    from titan_hcl.logic.agency.helpers.introspect import IntrospectHelper
+    h = IntrospectHelper(damper=IntrospectionDamper())
+    async def _empty(_a):
+        return ""
+    h._read_corpus = _empty
+    async def _go():
+        r = await h.execute({"aspect": "skills"})
+        assert r["introspection_grounded"] is False
+        assert "_research_target" not in r["helper_params"]
+    asyncio.run(_go())

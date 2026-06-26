@@ -220,6 +220,18 @@ def _register_helpers(registry, full_config: dict) -> int:
         logger.warning("[AgencyWorker] MemoInscribe helper failed: %s", e)
 
     try:
+        # §7.P-B — introspection: grep own telemetry (lock-safe, via the synthesis read
+        # endpoints) → ground a SELF:<aspect> concept. agency-only action (RFP D8).
+        from titan_hcl.logic.agency.helpers.introspect import IntrospectHelper
+        _api = get_params("api") or {}
+        _ib = f"http://127.0.0.1:{int(_api.get('port', 7777))}"
+        registry.register(IntrospectHelper(
+            api_base=_ib, internal_key=str(_api.get("internal_key", "") or "")))
+        n += 1
+    except Exception as e:
+        logger.warning("[AgencyWorker] Introspect helper failed: %s", e)
+
+    try:
         from titan_hcl.logic.agency.helpers.kin_sense import KinSenseHelper
         try:
             import tomllib as _tomllib_kin
@@ -480,7 +492,10 @@ def _maybe_emit_autonomous_experience(
                     "action": int(action_idx),
                     "reward": _rew,
                     "goal_class": _gc,
-                    "source": "curiosity",
+                    # source-aware: introspection (research pointed inward) rides this
+                    # same path with source="introspection"; external curiosity stays
+                    # "curiosity". Both rank-3 (INV-MC-8). §7.P-B.
+                    "source": str(_rt.get("source") or "curiosity"),
                 },
                 "ts": time.time(),
             })
