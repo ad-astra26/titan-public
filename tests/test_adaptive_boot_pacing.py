@@ -12,12 +12,12 @@ from unittest.mock import patch
 
 from titan_hcl.orchestrator.core import (
     Orchestrator, BOOT_PACING_CAP_FLOOR, BOOT_PACING_STAGGER_MAX_S,
-    BOOT_PACING_MEM_FLOOR_MB)
+    BOOT_PACING_MEM_FLOOR_MB, BOOT_PACING_SWAP_FLOOR_MB)
 from titan_hcl.orchestrator.boot_throttle import BoxPressure
 
 
-def _pace(mem_mb, load1, *, base_cap=8, base_stagger=1.5, ncpu=4):
-    box = BoxPressure(mem_available_mb=mem_mb, swap_used_mb=0.0,
+def _pace(mem_mb, load1, *, swap_mb=0.0, base_cap=8, base_stagger=1.5, ncpu=4):
+    box = BoxPressure(mem_available_mb=mem_mb, swap_used_mb=swap_mb,
                       swap_total_mb=0.0, load1=load1, ncpu=ncpu)
     with patch("titan_hcl.orchestrator.boot_throttle.read_box_pressure",
                return_value=box), \
@@ -41,7 +41,7 @@ def test_calm_box_just_under_thresholds():
 # ── 2. CONTENDED box → throttled, BOUNDED ──────────────────────────────────────
 
 def test_mem_tight_only_halves_cap():
-    cap, stagger = _pace(mem_mb=500.0, load1=2.0)     # mem < 768 floor
+    cap, stagger = _pace(mem_mb=500.0, load1=2.0)     # mem < floor
     assert cap == 4                                   # base//2
     assert 1.5 < stagger <= BOOT_PACING_STAGGER_MAX_S
 
@@ -56,6 +56,41 @@ def test_severe_both_drops_to_floor():
     cap, stagger = _pace(mem_mb=400.0, load1=12.0, ncpu=4)   # tight AND high
     assert cap == BOOT_PACING_CAP_FLOOR               # == 2
     assert stagger == min(1.5 * 2.5, BOOT_PACING_STAGGER_MAX_S)
+
+
+# ── 2b. SWAP-THRASH signal (2026-07-01 needrestart boot-storm post-mortem) ──────
+
+def test_swap_thrash_throttles_even_with_mem_above_floor():
+    # The exact storm shape: MemAvailable 1409MB (ABOVE the raised 1536? no —
+    # above the OLD 768 floor) but swap thrashing 5.4GB. Use mem ABOVE the new
+    # floor to prove SWAP alone engages the guard (the old mem/load guard missed it).
+    cap, stagger = _pace(mem_mb=3000.0, load1=2.0, swap_mb=5461.0, ncpu=4)
+    assert cap == 4                                   # base//2 — single signal
+    assert 1.5 < stagger <= BOOT_PACING_STAGGER_MAX_S
+
+
+def test_swap_below_floor_stays_calm():
+    # Incidental/baseline swap below the floor must NOT throttle a calm box.
+    cap, stagger = _pace(mem_mb=3000.0, load1=2.0,
+                         swap_mb=BOOT_PACING_SWAP_FLOOR_MB - 1, ncpu=4)
+    assert (cap, stagger) == (8, 1.5)
+
+
+def test_swap_plus_mem_tight_is_severe():
+    # Two signals (swap thrash AND mem below floor) → tightest floor cap.
+    cap, stagger = _pace(mem_mb=800.0, load1=2.0, swap_mb=5000.0, ncpu=4)
+    assert cap == BOOT_PACING_CAP_FLOOR               # == 2
+    assert stagger == min(1.5 * 2.5, BOOT_PACING_STAGGER_MAX_S)
+
+
+def test_raised_mem_floor_engages_at_1409mb():
+    # The storm's MemAvailable (1409MB) is now BELOW the raised 1536 floor → the
+    # mem signal alone engages (it did NOT under the old 768 floor). swap=0 to
+    # isolate the mem signal.
+    assert 1409.0 < BOOT_PACING_MEM_FLOOR_MB          # floor was raised past it
+    cap, stagger = _pace(mem_mb=1409.0, load1=2.0, ncpu=4)
+    assert cap == 4                                   # base//2 — single signal
+    assert stagger > 1.5
 
 
 # ── 3. HARD BOUNDS — never a runaway boot ──────────────────────────────────────

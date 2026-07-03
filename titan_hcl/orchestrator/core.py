@@ -136,8 +136,19 @@ BOOT_THROTTLE_HEAVY_MIN_RSS_MB = 400.0
 # boots exactly as fast as today; a CONTENDED box throttles the wave so it doesn't
 # over-subscribe. HARD-BOUNDED so a boot can NEVER drag (cap floor + stagger
 # ceiling) — a slow-but-smooth boot, never a 10-minute one.
-BOOT_PACING_MEM_FLOOR_MB = 768.0   # MemAvailable below this → throttle the wave
+# NOTE (2026-07-01, needrestart boot-storm post-mortem): the MemAvailable-only
+# read is transiently WRONG right after a restart — the stopped instance frees
+# its RAM, so t0 reads calm even though the box will thrash once the wave loads.
+# Two hardenings landed: (a) the floor raised 768→1536 (an 8GB box booting ~40
+# modules is already deep in swap by 768MB); (b) a SWAP-USED signal, because the
+# storm boot read MemAvailable≈1409MB (> the old floor → "calm") while swap≈5.4GB
+# was thrashing → the guard never engaged → 33-module shm_pid_dead cascade. Harm
+# is asymmetric (a false throttle = a bounded slow-but-smooth boot; a false calm =
+# the storm), so the signals are deliberately sensitive.
+BOOT_PACING_MEM_FLOOR_MB = 1536.0  # MemAvailable below this → throttle the wave
 BOOT_PACING_LOAD_FACTOR = 1.5      # load1 > cores×this → throttle the wave
+BOOT_PACING_SWAP_FLOOR_MB = 3072.0 # swap_used above this → box is thrashing →
+                                   # throttle even when MemAvailable reads OK
 BOOT_PACING_CAP_FLOOR = 2          # never drop in-flight below this (keeps progress)
 BOOT_PACING_STAGGER_MAX_S = 4.0    # hard ceiling on the adaptive stagger
 REENABLE_COOLDOWN_S = 180.0    # RFP_supervision_lifecycle §7.C — 3min (was 600) auto-re-enable cooldown
@@ -1802,8 +1813,14 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             cores = os.cpu_count() or 4
             mem_tight = 0.0 < box.mem_available_mb < BOOT_PACING_MEM_FLOOR_MB
             load_high = box.load1 > cores * BOOT_PACING_LOAD_FACTOR
-            if mem_tight or load_high:
-                severe = mem_tight and load_high
+            # Swap-thrash signal (2026-07-01): a box actively using heavy swap
+            # during boot is over-subscribed even when MemAvailable is nominally
+            # above the floor — the needrestart storm boot thrashed 5.4GB swap
+            # while MemAvailable read 1409MB and the mem/load guard stayed calm.
+            swap_pressure = box.swap_used_mb > BOOT_PACING_SWAP_FLOOR_MB
+            if mem_tight or load_high or swap_pressure:
+                # SEVERE = ≥2 independent distress signals → tightest (floor) cap.
+                severe = sum((mem_tight, load_high, swap_pressure)) >= 2
                 cap = (BOOT_PACING_CAP_FLOOR if severe
                        else max(BOOT_PACING_CAP_FLOOR, base_cap // 2))
                 eff_stagger = min(base_stagger * (2.5 if severe else 1.7),
@@ -1812,10 +1829,11 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                     _state[0] = True
                     logger.info(
                         "[Guardian] boot-wave pacing ENGAGED — cap %d→%d, "
-                        "stagger %.1f→%.1fs (MemAvailable=%.0fMB load1=%.2f "
-                        "cores=%d) — smooth boot under box pressure (RFP §7.B)",
+                        "stagger %.1f→%.1fs (MemAvailable=%.0fMB swap=%.0fMB "
+                        "load1=%.2f cores=%d) — smooth boot under box pressure "
+                        "(RFP §7.B)",
                         base_cap, cap, base_stagger, eff_stagger,
-                        box.mem_available_mb, box.load1, cores)
+                        box.mem_available_mb, box.swap_used_mb, box.load1, cores)
                 return cap, eff_stagger
             if _state is not None and _state[0]:
                 _state[0] = False
