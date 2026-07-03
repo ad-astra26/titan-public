@@ -201,3 +201,45 @@ def test_introspect_helper_satisfies_registry_manifest_contract():
     assert h.latency in ("low", "medium", "high")
     assert h.requires_sandbox is False         # read-only own telemetry (INV-TX-2)
     assert h.name == "introspect" and h.action_type == "introspect"
+
+
+# ── §7.P-B AUTONOMOUS-TRIGGER TRANSPORT FIX (2026-07-03) ────────────────────────
+# Regression for the dead-letter bug: should_fire emitted INTROSPECT_REQUEST
+# dst="agency" ~38x/10min but 0 were delivered — the agency A.8.6 subprocess
+# ("agency_worker") never receives raw bus app-messages (they go to the PARENT
+# "agency" loop) AND is reply_only (its drain drops all but SHUTDOWN/QUERY). The
+# fix: the parent forwards INTROSPECT_REQUEST into the subprocess as a fire-and-
+# forget QUERY action="introspect" (QUERY passes the drain), reusing the already-
+# correct subprocess grounding logic.
+def test_parent_forwards_introspect_request_as_query_to_subprocess():
+    from types import SimpleNamespace
+    from titan_hcl.core.plugin import TitanHCL
+    from titan_hcl import bus
+
+    published = []
+    fake = SimpleNamespace(bus=SimpleNamespace(publish=published.append))
+    msg = {"type": bus.INTROSPECT_REQUEST, "src": "self_learning", "dst": "agency",
+           "payload": {"src_gp": 4242, "aspect": "skills"}}
+    TitanHCL._forward_introspect_request(fake, msg)
+
+    assert len(published) == 1
+    out = published[0]
+    assert out["type"] == bus.QUERY                # QUERY passes the reply_only drain
+    assert out["dst"] == "agency_worker"           # the SUBPROCESS name, not "agency"
+    assert out["payload"]["action"] == "introspect"
+    assert out["payload"]["src_gp"] == 4242        # original payload carried through
+    assert out["payload"]["aspect"] == "skills"
+    assert out.get("rid") is None                  # fire-and-forget → no RESPONSE
+
+
+def test_forward_introspect_request_never_raises_on_bus_error():
+    from types import SimpleNamespace
+    from titan_hcl.core.plugin import TitanHCL
+    from titan_hcl import bus
+
+    def _boom(_m):
+        raise RuntimeError("bus down")
+    fake = SimpleNamespace(bus=SimpleNamespace(publish=_boom))
+    # Must swallow the error — a forward failure can never crash the agency loop.
+    TitanHCL._forward_introspect_request(
+        fake, {"type": bus.INTROSPECT_REQUEST, "payload": {}})

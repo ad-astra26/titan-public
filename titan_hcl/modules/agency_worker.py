@@ -1016,42 +1016,6 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # via IntrospectHelper) → on a substantive+novel read, ride the helper-agnostic
         # 3b grounding path (RESEARCH_CURIOSITY_GROUNDED → memory anchors SELF:<aspect>
         # → synthesis seeds it). The damper (INV-TX-6) bounds it; this never blocks.
-        if msg_type == bus.INTROSPECT_REQUEST:
-            try:
-                _ih = registry.get_helper("introspect")
-                if _ih is not None:
-                    _ip = msg.get("payload") or {}
-                    _aspect = str(_ip.get("aspect") or "").strip()
-                    if not _aspect and _introspect_aspects:
-                        _aspect = _introspect_aspects[_introspect_rr % len(_introspect_aspects)]
-                        _introspect_rr += 1
-                    _ires = _run_async(_ih.execute({"aspect": _aspect}))
-                    if isinstance(_ires, dict) and _ires.get("introspection_grounded"):
-                        _hp = _ires.get("helper_params") or {}
-                        _rt = _hp.get("_research_target")
-                        if _rt:
-                            send_queue.put({
-                                "type": bus.RESEARCH_CURIOSITY_GROUNDED,
-                                "src": name, "dst": "memory",
-                                "payload": {
-                                    "query": str(_hp.get("query", "")),
-                                    "content": str(_ires.get("result", "")),
-                                    "_research_target": _rt,
-                                },
-                                "ts": time.time(),
-                            })
-                            logger.info(
-                                "[AgencyWorker][P-B/introspect] grounded SELF:%s → "
-                                "memory anchor (autonomous introspection)", _aspect)
-                    elif isinstance(_ires, dict):
-                        logger.debug(
-                            "[AgencyWorker][P-B/introspect] aspect=%s not grounded: %s",
-                            _aspect, _ires.get("introspection_reason"))
-            except Exception as _intro_err:  # noqa: BLE001
-                logger.warning("[AgencyWorker] INTROSPECT_REQUEST failed: %s",
-                               _intro_err)
-            continue
-
         if msg_type != bus.QUERY:
             continue
 
@@ -1116,6 +1080,51 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         _maybe_emit_autonomous_experience(
                             send_queue, name, titan_id, _intent_for_ar, _ar,
                             agency, _p8_judge)
+
+            elif action == "introspect":
+                # §7.P-B autonomous introspection. Delivered here via the parent's
+                # INTROSPECT_REQUEST→QUERY forward (A.8.6 transport: the subprocess
+                # never receives raw app-messages; QUERY passes the reply_only drain).
+                # Runs the introspect helper + emits the SELF grounding (the helper-
+                # agnostic 3b memory consumer anchors Z=SELF:<aspect>). Fire-and-forget:
+                # `continue` skips the RESPONSE send below (introspection is one-way).
+                try:
+                    _ih = registry.get_helper("introspect")
+                    if _ih is not None:
+                        _aspect = str(payload.get("aspect") or "").strip()
+                        if not _aspect and _introspect_aspects:
+                            _aspect = _introspect_aspects[
+                                _introspect_rr % len(_introspect_aspects)]
+                            _introspect_rr += 1
+                        _ires = _run_async(_ih.execute({"aspect": _aspect}))
+                        if isinstance(_ires, dict) and _ires.get(
+                                "introspection_grounded"):
+                            _hp = _ires.get("helper_params") or {}
+                            _rt = _hp.get("_research_target")
+                            if _rt:
+                                send_queue.put({
+                                    "type": bus.RESEARCH_CURIOSITY_GROUNDED,
+                                    "src": name, "dst": "memory",
+                                    "payload": {
+                                        "query": str(_hp.get("query", "")),
+                                        "content": str(_ires.get("result", "")),
+                                        "_research_target": _rt,
+                                    },
+                                    "ts": time.time(),
+                                })
+                                logger.info(
+                                    "[AgencyWorker][P-B/introspect] grounded SELF:%s "
+                                    "→ memory anchor (autonomous introspection)",
+                                    _aspect)
+                        elif isinstance(_ires, dict):
+                            logger.debug(
+                                "[AgencyWorker][P-B/introspect] aspect=%s not "
+                                "grounded: %s", _aspect,
+                                _ires.get("introspection_reason"))
+                except Exception as _intro_err:  # noqa: BLE001
+                    logger.warning("[AgencyWorker] introspect action failed: %s",
+                                   _intro_err)
+                continue  # fire-and-forget — no RESPONSE for an introspect request
 
             elif action == "assess":
                 action_result = payload.get("action_result") or {}

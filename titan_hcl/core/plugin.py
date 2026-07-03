@@ -780,6 +780,7 @@ class TitanHCL:
                 "agency",
                 types=[
                     IMPULSE, bus.OUTER_DISPATCH, bus.QUERY,
+                    bus.INTROSPECT_REQUEST,
                     AGENCY_STATS, ASSESSMENT_STATS, AGENCY_READY,
                 ],
             )
@@ -1188,6 +1189,8 @@ class TitanHCL:
                     await self._handle_outer_dispatch(msg)
                 elif msg_type == bus.QUERY:
                     self._handle_agency_query(msg)
+                elif msg_type == bus.INTROSPECT_REQUEST:
+                    self._forward_introspect_request(msg)
                 elif msg_type == AGENCY_STATS:
                     # L3 §A.8.6 — refresh proxy stats cache
                     if hasattr(self._agency, "update_cached_stats"):
@@ -1550,6 +1553,25 @@ class TitanHCL:
                     }))
             except Exception as e:
                 logger.warning("[TitanHCL] OUTER_OBSERVATION publish error: %s", e)
+
+    def _forward_introspect_request(self, msg: dict) -> None:
+        """§7.P-B autonomous introspection delivery (A.8.6 transport fix).
+
+        The agency SUBPROCESS (bus name "agency_worker") never receives raw bus
+        application-messages — only the PARENT ("agency") does. So an
+        INTROSPECT_REQUEST that reaches this parent loop is forwarded into the
+        subprocess as a fire-and-forget QUERY action="introspect" (QUERY passes
+        the subprocess's reply_only drain, which drops everything but SHUTDOWN/
+        QUERY). The subprocess then runs the introspect helper + emits the SELF
+        grounding. `INTROSPECT_REQUEST dst="agency"` is the named delivery
+        contract any feature can emit to request introspection (self_learning's
+        §5 shared should_fire trigger is caller #1). Never raises."""
+        try:
+            self.bus.publish(make_msg(
+                bus.QUERY, "core", "agency_worker",
+                {"action": "introspect", **(msg.get("payload") or {})}))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[TitanHCL] introspect forward soft-fail: %s", e)
 
     def _handle_agency_query(self, msg: dict) -> None:
         """Handle agency status queries.
