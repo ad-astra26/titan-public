@@ -171,6 +171,13 @@ TITAN_HCL_BROADCAST_TOPICS: tuple[str, ...] = (
     "AGENCY_STATS",                     # agency_worker → AgencyProxy.update_cached_stats
     "ASSESSMENT_STATS",                 # agency_worker → AssessmentProxy.update_cached_stats
     "AGENCY_READY",                     # agency_worker boot → ExpressionTranslator helpers list
+    # INTROSPECT_REQUEST (2026-07-03, RFP_text_extraction_introspection §7.P-B) —
+    # same dead-letter class as IMPULSE above (BUG-IMPULSE-PIPELINE-DEAD-PHASE-C):
+    # self_learning's §5 should_fire trigger broadcasts INTROSPECT_REQUEST but the
+    # broker dropped it for titan_HCL (not opt-in) → _agency_loop never received it
+    # → the autonomous introspection loop never grounded. Opt-in here so the parent
+    # forwards it into the agency subprocess (plugin._forward_introspect_request).
+    "INTROSPECT_REQUEST",               # self_learning → _agency_loop._forward_introspect_request
     # V4 frontend SSE event bridge — RELOCATED to observatory_worker 2026-05-21
     # (RFP_phase_c_titan_hcl_cleanup Phase A). The parent's "v4_bridge"
     # subscriber + its 7 SSE broadcast types (BIG_PULSE, GREAT_PULSE,

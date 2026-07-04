@@ -2178,8 +2178,17 @@ class _IntrospectionRoutine:
         trigger). One-way fire-and-forget (G19-safe, mirrors _emit_self_anchor);
         aspect omitted ⇒ the agency rotates aspects. Never raises."""
         try:
+            # dst="all" (NOT "agency"): under socket mode the kernel-rs broker
+            # only cross-process-delivers to the parent's `_agency_loop` via the
+            # BROADCAST path (its "agency" subscription is a dst="all" type-filter,
+            # now incl. INTROSPECT_REQUEST) — a targeted dst="agency" from a
+            # subprocess reaches neither the parent NOR the reply_only agency
+            # subprocess (proven live 2026-07-03: dst="agency" emit fired 3x, 0
+            # received). This mirrors how IMPULSE reaches the same loop
+            # (ns_worker emits IMPULSE dst="all"). The parent then forwards it
+            # into the subprocess as a QUERY (see plugin._forward_introspect_request).
             self.send_queue.put({
-                "type": bus.INTROSPECT_REQUEST, "src": self.name, "dst": "agency",
+                "type": bus.INTROSPECT_REQUEST, "src": self.name, "dst": "all",
                 "payload": {"src_gp": int(gp)},
                 "ts": time.time(),
             })
