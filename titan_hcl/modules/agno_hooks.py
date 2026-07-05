@@ -3520,6 +3520,10 @@ def create_post_hook(plugin):
                         # permanently None in the agno process, which made this gate
                         # dead fleet-wide (BUG-MAKER-FACT-EXTRACTOR-GATE-DEAD).
                         "is_maker": bool(getattr(plugin, "_current_is_maker", False)),
+                        # B.2 — the concrete model the adaptive router served this
+                        # turn; the turn-judge attributes its quality reward to it
+                        # (MODEL_QUALITY_FEEDBACK → router per-model quality EMA).
+                        "served_model": str(getattr(plugin, "_current_served_model", "") or ""),
                     }))
         except Exception as _trr_err:
             logger.debug("[PostHook] §7.B turn record emit skipped: %s", _trr_err)

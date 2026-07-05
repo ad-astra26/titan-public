@@ -66,6 +66,7 @@ from titan_hcl.bus import (
     KNOWLEDGE_MOMENT,
     MEMORY_RETRIEVAL_USED,
     RETRIEVAL_SAMPLE,
+    MODEL_QUALITY_FEEDBACK,
     MODULE_HEARTBEAT,
     MODULE_SHUTDOWN,
     SAVE_NOW,
@@ -222,6 +223,12 @@ async def _route_model_for_tier(agent, worker_plugin, prompt_text: str):
         if _ar is not None:
             target_id = _ar.choose(provider, model_class,
                                    in_flight=int(_AGNO_IN_FLIGHT["n"]), is_chat=True)
+    except Exception:
+        pass
+    # B.2 — record the concrete served model (request-scoped) for turn-judge quality
+    # attribution in the PostHook. Soft — never affects the swap below.
+    try:
+        worker_plugin._current_served_model = target_id
     except Exception:
         pass
     original_id = getattr(agent.model, "id", None)
@@ -390,8 +397,15 @@ def _adaptive_model_override(worker_plugin, tier):
         provider = getattr(worker_plugin, "_inference_provider", None)
         if router is None or provider is None:
             return None
-        return router.choose(provider, getattr(tier, "model_class", None),
-                             in_flight=int(_AGNO_IN_FLIGHT["n"]), is_chat=True)
+        chosen = router.choose(provider, getattr(tier, "model_class", None),
+                               in_flight=int(_AGNO_IN_FLIGHT["n"]), is_chat=True)
+        # B.2 — record the concrete served model (request-scoped) so the PostHook's
+        # TURN_REASONING_RECORD carries it → turn-judge quality attribution. Soft.
+        try:
+            worker_plugin._current_served_model = chosen
+        except Exception:
+            pass
+        return chosen
     except Exception as _ov_err:  # noqa: BLE001
         logger.debug("[AgnoWorker] adaptive override soft-fail: %s", _ov_err)
         return None
@@ -2362,6 +2376,25 @@ def agno_worker_main(recv_queue, send_queue, name: str,
                     logger.debug(
                         "[AgnoWorker] CGN_LEXICON_UPDATED handler failed: %s",
                         _lu_err,
+                    )
+                continue
+
+            # B.2 (RFP_load_adaptive_inference_routing §7.B.2) — the synthesis
+            # turn-judge attributes a quality reward to the model the router served;
+            # fold it into the router's per-model quality EMA. Off the chat hot path,
+            # soft — a bad payload never disrupts chat serving.
+            if msg_type == MODEL_QUALITY_FEEDBACK:
+                try:
+                    _payload = msg.get("payload") or {}
+                    _sm = str(_payload.get("served_model", "") or "")
+                    if _sm:
+                        _router = _get_adaptive_router()
+                        if _router is not None:
+                            _router.feedback_quality(_sm, float(_payload.get("reward", 0.0)))
+                except Exception as _mqf_err:  # noqa: BLE001
+                    logger.debug(
+                        "[AgnoWorker] MODEL_QUALITY_FEEDBACK handler failed: %s",
+                        _mqf_err,
                     )
                 continue
 

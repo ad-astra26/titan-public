@@ -1106,7 +1106,8 @@ def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
     stashed decision + trains. OFF the recv loop (LLM is network I/O on its own
     thread → no GIL/heartbeat starvation; INV-OML-12 continuous, NOT dream-gated).
     Late user/Maker feedback supersedes via the self_learning corrective-delta. Soft."""
-    from titan_hcl.bus import SELF_LEARN_REWARD, emit_episode_record
+    from titan_hcl.bus import (SELF_LEARN_REWARD, MODEL_QUALITY_FEEDBACK,
+                               emit_episode_record)
     # §7.2 (Phase 2) — the `conversation` episode rides the judge: a turn's
     # memorability = its judged reward (NULL at turn-completion → scored here). Lazy
     # epoch reader (cheap SHM), soft.
@@ -1163,6 +1164,15 @@ def _turn_judge_loop(turn_queue, judge, send_queue, name: str,
                     "goal_class": item.get("goal_class", ""),
                     "source": "llm_judge",
                 })
+                # B.2 (RFP_load_adaptive_inference_routing §7.B.2) — attribute this
+                # quality reward to the CONCRETE model the router served → agno_worker
+                # folds it into the router's per-model quality EMA. Targeted, soft.
+                _served_model = str(item.get("served_model", "") or "")
+                if _served_model:
+                    _send(send_queue, MODEL_QUALITY_FEEDBACK, name, "agno_worker", {
+                        "served_model": _served_model,
+                        "reward": float(out["reward"]),
+                    })
                 # §7.2 — the `conversation` episode. metric = the judged reward →
                 # surprise on cognitive_worker's _SignalBaseline("conversation") (no
                 # net — not an affective signal). person_id links it to the
@@ -4628,6 +4638,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             # episode can link to the interlocutor + skip the Maker.
                             "user_id": str(payload.get("user_id", "") or ""),
                             "is_maker": bool(payload.get("is_maker", False)),
+                            # B.2 — carried so the turn-judge can attribute its quality
+                            # reward to the model the router served (MODEL_QUALITY_FEEDBACK).
+                            "served_model": str(payload.get("served_model", "") or ""),
                         })
                     # §7.2 — conversation_context working-memory leg (the 2nd deferred
                     # WM item-type). UNGATED + per-turn (unlike the judge-deferred,

@@ -97,6 +97,10 @@ _REQUEST_SCOPED_FIELDS: dict[str, Any] = {
     "_current_chat_tier": None,
     "_current_chat_model_class": None,
     "_current_chat_features": None,
+    # B.2 — the CONCRETE model id the adaptive router served this turn (not the
+    # coarse `_current_chat_model_class`); read in the PostHook to attribute the
+    # turn-judge quality reward to the serving model. Per-turn ⇒ request-scoped.
+    "_current_served_model": None,
     # ── the 16 scalar `_last_*` (reset/set each turn, read in PostHook /
     #    handler tail) ──
     "_last_perceptual_field": None,

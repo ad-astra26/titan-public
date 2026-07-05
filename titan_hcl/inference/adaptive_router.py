@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-_STATE_SCHEMA = 1
+_STATE_SCHEMA = 2   # v2 (B.2) — adds learned per-model quality EMA to the state
 
 
 def load_bucket(in_flight: int) -> str:
@@ -74,6 +74,11 @@ class AdaptiveRouter:
         if self.managed not in self.ladder:
             self.ladder = [self.managed] + self.ladder
         self.monitor = InferenceLatencyMonitor()
+        # B.2 — LEARNED per-model quality, folded from the synthesis turn-judge reward
+        # (MODEL_QUALITY_FEEDBACK). Replaces the static `_qprior` once a model has
+        # `min_quality_samples` observations; prior is the fallback until then.
+        self._quality_ema: dict[str, float] = {}
+        self._quality_n: dict[str, int] = {}
         self.state_path = str(self.cfg.get(
             "router_state_path", "data/inference_router_state.json"))
         # reward tables: {bucket: {arm: {"r": ema_reward, "n": count}}}
@@ -200,6 +205,32 @@ class AdaptiveRouter:
         except Exception as e:  # noqa: BLE001
             logger.debug("[AdaptiveRouter] feedback soft-fail: %s", e)
 
+    # ── B.2 — learned quality (turn-judge) ──
+    def feedback_quality(self, model_id: str, judge_reward: float) -> None:
+        """Fold a synthesis turn-judge reward for `model_id` into its quality EMA.
+        The judge reward is in [-1, +1] (good/ok/poor × confidence); normalize to the
+        [0,1] quality scale (good→1.0, ok→0.5, poor→0.0) so it is comparable to the
+        static `_qprior` band it displaces. Async, off the chat hot path, soft-fail."""
+        if not self._enabled() or not model_id:
+            return
+        try:
+            q_obs = max(0.0, min(1.0, (float(judge_reward) + 1.0) / 2.0))
+            a = self._f("quality_alpha", 0.2)
+            prev = self._quality_ema.get(model_id)
+            self._quality_ema[model_id] = (q_obs if prev is None
+                                           else (1.0 - a) * prev + a * q_obs)
+            self._quality_n[model_id] = self._quality_n.get(model_id, 0) + 1
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[AdaptiveRouter] feedback_quality soft-fail: %s", e)
+
+    def _q_for(self, model_id: str) -> float:
+        """The quality term for the composite reward: the LEARNED EMA once the model
+        has `min_quality_samples` judged turns, else the static prior (cold-start)."""
+        if (self._quality_n.get(model_id, 0) >= int(self._f("min_quality_samples", 15))
+                and model_id in self._quality_ema):
+            return self._quality_ema[model_id]
+        return self._qprior.get(model_id, 0.6)
+
     def _reward(self, model_id: str, latency_s: float, is_chat: bool) -> float:
         sfx = "chat" if is_chat else "task"
         wl = self._f(f"w_latency_{sfx}", 0.6 if is_chat else 0.25)
@@ -208,7 +239,7 @@ class AdaptiveRouter:
         target = self._f(f"target_latency_{sfx}_s", 12.0 if is_chat else 40.0)
         # responsiveness: 1.0 at 0s, 0.5 at target, 0.0 at ≥2×target
         responsiveness = max(0.0, min(1.0, 1.0 - latency_s / (2.0 * max(1e-6, target))))
-        q = self._qprior.get(model_id, 0.6)
+        q = self._q_for(model_id)          # B.2 — learned quality, prior as fallback
         c = self._cprior.get(model_id, 0.5)
         return wl * responsiveness + wq * q + wc * c
 
@@ -217,8 +248,12 @@ class AdaptiveRouter:
         try:
             if os.path.exists(self.state_path):
                 d = json.load(open(self.state_path))
-                if int(d.get("schema", 0)) == _STATE_SCHEMA:
+                # Accept v1 AND v2 — a v1 file (bandit table only) upgrades in place;
+                # its learned buckets are preserved, quality starts empty (re-learns).
+                if int(d.get("schema", 0)) in (1, _STATE_SCHEMA):
                     self._table = d.get("buckets", {}) or {}
+                    self._quality_ema = d.get("quality_ema", {}) or {}   # B.2 (absent in v1)
+                    self._quality_n = d.get("quality_n", {}) or {}
         except Exception as e:  # noqa: BLE001
             logger.debug("[AdaptiveRouter] state load failed (fresh start): %s", e)
 
@@ -229,7 +264,9 @@ class AdaptiveRouter:
                 os.makedirs(d, exist_ok=True)
             tmp = self.state_path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"schema": _STATE_SCHEMA, "buckets": self._table}, f)
+                json.dump({"schema": _STATE_SCHEMA, "buckets": self._table,
+                           "quality_ema": self._quality_ema,
+                           "quality_n": self._quality_n}, f)
             os.replace(tmp, self.state_path)
         except Exception as e:  # noqa: BLE001
             logger.debug("[AdaptiveRouter] state save failed: %s", e)

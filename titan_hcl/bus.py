@@ -311,6 +311,13 @@ SELF_LEARN_DECISION = "SELF_LEARN_DECISION"
 # joined reward for a stashed decision. Payload: {parent_tool_call_tx, reward
 # (+1 verified-true / −1 false), oracle_id, goal_class, ts}.
 SELF_LEARN_REWARD = "SELF_LEARN_REWARD"
+# synthesis_worker (turn-judge, RFP_load_adaptive_inference_routing §7.B.2) →
+# agno_worker. Attributes the turn-judge quality reward to the CONCRETE model the
+# adaptive router served that turn, so the router learns a per-model quality EMA
+# (displaces the static prior). Targeted (dst="agno_worker") subprocess→subprocess,
+# mirrors SELF_LEARN_REWARD — needs NO TITAN_HCL_BROADCAST_TOPICS opt-in. Payload:
+# {served_model (str), reward (float, judge [-1,+1]), ts}.
+MODEL_QUALITY_FEEDBACK = "MODEL_QUALITY_FEEDBACK"
 # self_learning_worker → synthesis_worker. A distilled winning macro-strategy to
 # persist under the `Self` spine node (Reasoning node + SELF_HAS_REASONING edge)
 # via the single SynthesisWriter (INV-Syn-19/28 / INV-OML-8). Payload:
