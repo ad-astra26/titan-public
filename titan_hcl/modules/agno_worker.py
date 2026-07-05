@@ -221,8 +221,14 @@ async def _route_model_for_tier(agent, worker_plugin, prompt_text: str):
     try:
         _ar = _get_adaptive_router()
         if _ar is not None:
+            _heav = _compute_session_heaviness(worker_plugin, model_class)
             target_id = _ar.choose(provider, model_class,
-                                   in_flight=int(_AGNO_IN_FLIGHT["n"]), is_chat=True)
+                                   in_flight=int(_AGNO_IN_FLIGHT["n"]), is_chat=True,
+                                   heaviness=_heav)
+            try:
+                worker_plugin._current_turn_heaviness = _heav
+            except Exception:
+                pass
     except Exception:
         pass
     # B.2 — record the concrete served model (request-scoped) for turn-judge quality
@@ -397,12 +403,18 @@ def _adaptive_model_override(worker_plugin, tier):
         provider = getattr(worker_plugin, "_inference_provider", None)
         if router is None or provider is None:
             return None
+        heaviness = _compute_session_heaviness(
+            worker_plugin, getattr(tier, "model_class", ""))
         chosen = router.choose(provider, getattr(tier, "model_class", None),
-                               in_flight=int(_AGNO_IN_FLIGHT["n"]), is_chat=True)
-        # B.2 — record the concrete served model (request-scoped) so the PostHook's
-        # TURN_REASONING_RECORD carries it → turn-judge quality attribution. Soft.
+                               in_flight=int(_AGNO_IN_FLIGHT["n"]), is_chat=True,
+                               heaviness=heaviness)
+        # B.2 + §7.C — record the concrete served model + the turn's heaviness
+        # (request-scoped) so the PostHook's TURN_REASONING_RECORD carries the model
+        # (quality attribution) and the completion-feedback reuses the SAME heaviness
+        # (same bucket as the decision). Soft.
         try:
             worker_plugin._current_served_model = chosen
+            worker_plugin._current_turn_heaviness = heaviness
         except Exception:
             pass
         return chosen
@@ -411,17 +423,41 @@ def _adaptive_model_override(worker_plugin, tier):
         return None
 
 
-def _router_feedback(model_id, latency_s, in_flight):
-    """Fold an observed completion (model + latency) into the router's learning. Soft."""
+def _router_feedback(model_id, latency_s, in_flight, heaviness=0.0):
+    """Fold an observed completion (model + latency) into the router's learning. Soft.
+    `heaviness` must be the value STASHED at this turn's routing decision (§7.C) — the
+    session tracker has since counted this turn, so recomputing here would drift the
+    bucket off the decision's bucket."""
     if not model_id:
         return
     try:
         router = _get_adaptive_router()
         if router is not None:
             router.feedback(model_id, float(latency_s),
-                            in_flight=int(in_flight or 0), is_chat=True)
+                            in_flight=int(in_flight or 0), is_chat=True,
+                            heaviness=float(heaviness or 0.0))
     except Exception:
         pass
+
+
+def _compute_session_heaviness(worker_plugin, goal_signal=""):
+    """Session heaviness ∈ [0,1] for the current turn's routing decision (§7.C). Reads
+    the in-memory tracker by the request-scoped session id — NEVER queries
+    agno_sessions.db (§Ad-4 / G18 / off the chat hot path). Soft → 0.0 (light) on any
+    error, so heaviness never breaks routing."""
+    try:
+        from titan_hcl.inference import session_heaviness as _sh
+        sid = str(getattr(worker_plugin, "_current_session_id", "") or "")
+        if not sid:
+            return 0.0
+        turns, dur, toks = _sh.raw(sid)
+        try:
+            cfg = (get_params("inference").get("autoscale", {}) or {})
+        except Exception:
+            cfg = {}
+        return _sh.compute_heaviness(turns, dur, toks, str(goal_signal or ""), cfg)
+    except Exception:
+        return 0.0
 
 
 # Per-Titan pitch-route model spread (Maker 2026-06-25). Each Titan answers the
@@ -921,7 +957,8 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         # §7.B — fold this turn's (model, latency) into the bandit (soft, no-op unless
         # router_enabled). in_flight read live (this turn is still counted).
         _router_feedback(_route_model, time.time() - _rt0,
-                         stats_ref.get("in_flight", 0))
+                         stats_ref.get("in_flight", 0),
+                         heaviness=getattr(worker_plugin, "_current_turn_heaviness", 0.0))
 
         if hasattr(run_output, "content"):
             response_text = str(run_output.content)

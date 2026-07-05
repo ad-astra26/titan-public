@@ -101,6 +101,10 @@ _REQUEST_SCOPED_FIELDS: dict[str, Any] = {
     # coarse `_current_chat_model_class`); read in the PostHook to attribute the
     # turn-judge quality reward to the serving model. Per-turn ⇒ request-scoped.
     "_current_served_model": None,
+    # §7.C — the session heaviness ∈ [0,1] used at THIS turn's routing decision;
+    # carried to the completion-feedback so the reward lands in the same
+    # (load × heaviness) bucket the decision used. Per-turn ⇒ request-scoped.
+    "_current_turn_heaviness": 0.0,
     # ── the 16 scalar `_last_*` (reset/set each turn, read in PostHook /
     #    handler tail) ──
     "_last_perceptual_field": None,

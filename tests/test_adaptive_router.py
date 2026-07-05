@@ -19,7 +19,7 @@ def _cfg(**over):
     c = {"router_enabled": True, "min_samples": 4, "explore_eps": 0.0,
          "in_flight_ceiling": 8, "enter_latency_s": 12.0, "exit_latency_s": 7.0,
          "min_dwell_s": 0.0, "model_ladder":
-         ["gemma4:31b", "ministral-3:14b", "gemini-3-flash-preview"]}
+         ["gemma4:31b", "ministral-3:14b", "gemma3:12b"]}
     c.update(over)
     return c
 
@@ -101,7 +101,9 @@ def test_state_save_load_roundtrip():
         r.save()
         r2 = AdaptiveRouter(_cfg(router_state_path=sp))
         assert r2._table, "loaded a non-empty learned table"
-        assert "high|chat" in r2._table and "ministral-3:14b" in r2._table["high|chat"]
+        # §7.C — buckets are now 3-part (load|heaviness|kind); default heaviness=0 → light
+        assert ("high|light|chat" in r2._table
+                and "ministral-3:14b" in r2._table["high|light|chat"])
 
 
 def test_monitor_ema_and_bucket():

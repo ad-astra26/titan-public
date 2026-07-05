@@ -59,18 +59,22 @@ class AdaptiveRouter:
                  managed_model: str = "gemma4:31b") -> None:
         self.cfg = cfg or {}
         self.managed = managed_model
-        # The offload ladder MUST be models the live provider actually serves.
-        # The prior default ([ministral-3:14b, gemini-3-flash-preview]) was
-        # aspirational — Ollama Cloud serves NEITHER (gemini is a different
-        # provider; ministral-3:14b doesn't exist) → enabling the router with it
-        # would offload chat to dead model IDs. Verified-servable fast fallbacks
-        # on the fleet's Ollama Cloud (2026-06-24, from live logs): gemma3:4b
-        # (4B, ~7-9s) is a separate pool from gemma4:31b, so under concurrency
-        # traffic spreads across pools instead of contending on one. Override
-        # per-install via [inference.autoscale] model_ladder.
+        # The offload ladder MUST be models the live provider serves AND whose
+        # quality holds under load. Re-probed live 2026-07-04 (ollama_cloud_probe
+        # sweep N=1..16 + a 6-register quality read):
+        #   • ministral-3:14b — served 16/16, p95 7.7s @ N=16, GOOD quality (warm,
+        #     coherent, safe refusal-with-redirect). (The earlier "doesn't exist"
+        #     claim was FALSE — it serves fine; it had been dropped in error.)
+        #   • gemma3:12b — p95 12.6s @ N=16, same-family, good quality — 2nd offload.
+        #   • gemini-3-flash-preview — DROPPED: fast but returned broken ~6-token
+        #     output (quality-disqualified).
+        #   • gemma3:4b — DROPPED as offload target: ministral is strictly better
+        #     quality at comparable speed (quality-safe offload, not a downgrade).
+        # B.2 learns each arm's REAL in-situ quality from the turn-judge, so a poor
+        # arm self-corrects. Override per-install via [inference.autoscale] model_ladder.
         self.ladder = list(self.cfg.get(
             "model_ladder",
-            [managed_model, "gemma3:4b"]))
+            [managed_model, "ministral-3:14b", "gemma3:12b"]))
         if self.managed not in self.ladder:
             self.ladder = [self.managed] + self.ladder
         self.monitor = InferenceLatencyMonitor()
@@ -117,40 +121,57 @@ class AdaptiveRouter:
         if cfg:
             self.cfg = cfg
 
-    def _bucket(self, in_flight: int, is_chat: bool) -> str:
-        return f"{load_bucket(int(in_flight))}|{'chat' if is_chat else 'task'}"
+    def _heaviness_bucket(self, heaviness: float) -> str:
+        """Coarse session-depth dim (§7.C). 2-level keeps the contextual bandit's
+        bucket space small → fast convergence; the reward-modulation carries the
+        nuance (heavier ⇒ quality weighted up)."""
+        return "heavy" if float(heaviness) >= self._f("heaviness_threshold", 0.5) else "light"
+
+    def _bucket(self, in_flight: int, is_chat: bool, heaviness: float = 0.0) -> str:
+        return (f"{load_bucket(int(in_flight))}|{self._heaviness_bucket(heaviness)}"
+                f"|{'chat' if is_chat else 'task'}")
 
     # ── the routing decision ──
     def choose(self, provider: Any, model_class: str,
-               in_flight: int = 0, is_chat: bool = True) -> str:
+               in_flight: int = 0, is_chat: bool = True,
+               heaviness: float = 0.0) -> str:
         """Concrete model id for `model_class`. PASSTHROUGH (zero change) unless the
         router is enabled, the call is chat, AND the class resolves to the managed
-        model. Soft-fails to the plain resolution."""
+        model. `heaviness` ∈ [0,1] (§7.C) makes the bandit keep gemma for deep sessions
+        (context dim + reward-modulation). Soft-fails to the plain resolution."""
         base = provider.resolve_model_class(model_class)
         if not self._enabled() or not is_chat or base != self.managed:
             return base
         try:
-            chosen = self._bandit_choose(int(in_flight), bool(is_chat))
+            chosen = self._bandit_choose(int(in_flight), bool(is_chat), float(heaviness))
             if chosen != self._last_logged:
                 # §8 G3 observability — log every change of routing decision (offload
                 # to a fallback, or revert to gemma). Low-frequency (only on change).
                 logger.info(
-                    "[AdaptiveRouter] route → %s (was %s, in_flight=%d gemma_ema=%.1fs)",
+                    "[AdaptiveRouter] route → %s (was %s, in_flight=%d gemma_ema=%.1fs "
+                    "heaviness=%.2f)",
                     chosen, self._last_logged or self.managed, int(in_flight),
-                    self.monitor.ema(self.managed))
+                    self.monitor.ema(self.managed), float(heaviness))
                 self._last_logged = chosen
             return chosen
         except Exception as e:  # noqa: BLE001
             logger.debug("[AdaptiveRouter] choose soft-fail → passthrough: %s", e)
             return base
 
-    def _bandit_choose(self, in_flight: int, is_chat: bool) -> str:
-        bucket = self._bucket(in_flight, is_chat)
+    def _bandit_choose(self, in_flight: int, is_chat: bool,
+                       heaviness: float = 0.0) -> str:
+        bucket = self._bucket(in_flight, is_chat, heaviness)
         arms = self._table.get(bucket, {})
         n_total = sum(int(a.get("n", 0)) for a in arms.values())
+        # INV-AR-EXPLORE-BOUNDED (§7.C extension) — never offload a DEEP session to a
+        # fallback purely to explore when load is high; a wrong exploration there costs
+        # the most (a long, invested conversation gets a weaker model). Clamp ε to 0.
+        heavy = self._heaviness_bucket(heaviness) == "heavy"
+        high_load = in_flight > int(self._f("in_flight_ceiling", 8))
+        eff_eps = 0.0 if (heavy and high_load) else self._f("explore_eps", 0.08)
         if n_total < int(self._f("min_samples", 20)):
             chosen = self._heuristic(in_flight)            # cold-start prior
-        elif random.random() < self._f("explore_eps", 0.08):
+        elif random.random() < eff_eps:
             chosen = random.choice(self.ladder)            # bounded exploration
         else:
             chosen = max(self.ladder,
@@ -189,14 +210,18 @@ class AdaptiveRouter:
 
     # ── the reward loop ──
     def feedback(self, model_id: str, latency_s: float,
-                 in_flight: int = 0, is_chat: bool = True) -> None:
-        """Fold an observed completion into the monitor + the bandit reward table."""
+                 in_flight: int = 0, is_chat: bool = True,
+                 heaviness: float = 0.0) -> None:
+        """Fold an observed completion into the monitor + the bandit reward table.
+        `heaviness` must be the SAME value used at the routing decision for this turn
+        (§7.C) so the reward lands in the right (load × heaviness) bucket and the
+        quality-weighted composite matches the decision context."""
         if not self._enabled():
             return
         try:
             self.monitor.record(model_id, float(latency_s))
-            bucket = self._bucket(int(in_flight), bool(is_chat))
-            r = self._reward(model_id, float(latency_s), bool(is_chat))
+            bucket = self._bucket(int(in_flight), bool(is_chat), float(heaviness))
+            r = self._reward(model_id, float(latency_s), bool(is_chat), float(heaviness))
             arms = self._table.setdefault(bucket, {})
             arm = arms.setdefault(model_id, {"r": r, "n": 0})
             a = 0.2
@@ -231,12 +256,21 @@ class AdaptiveRouter:
             return self._quality_ema[model_id]
         return self._qprior.get(model_id, 0.6)
 
-    def _reward(self, model_id: str, latency_s: float, is_chat: bool) -> float:
+    def _reward(self, model_id: str, latency_s: float, is_chat: bool,
+                heaviness: float = 0.0) -> float:
         sfx = "chat" if is_chat else "task"
         wl = self._f(f"w_latency_{sfx}", 0.6 if is_chat else 0.25)
         wq = self._f(f"w_quality_{sfx}", 0.3 if is_chat else 0.55)
         wc = self._f(f"w_cost_{sfx}", 0.1 if is_chat else 0.2)
         target = self._f(f"target_latency_{sfx}_s", 12.0 if is_chat else 40.0)
+        # §7.C reward-modulation (fully-emergent, no deterministic pin): a heavier
+        # session weights QUALITY up and RELAXES the latency target, so — within the
+        # heavy bucket — the bandit LEARNS to keep gemma (its quality dominates the
+        # composite) while light sessions stay latency-tight and offload first. Both
+        # scales are 0 at heaviness=0 → identical to the pre-C reward.
+        h = max(0.0, min(1.0, float(heaviness)))
+        wq = wq * (1.0 + h * self._f("heaviness_quality_boost", 1.0))
+        target = target * (1.0 + h * self._f("heaviness_latency_relax", 1.5))
         # responsiveness: 1.0 at 0s, 0.5 at target, 0.0 at ≥2×target
         responsiveness = max(0.0, min(1.0, 1.0 - latency_s / (2.0 * max(1e-6, target))))
         q = self._q_for(model_id)          # B.2 — learned quality, prior as fallback

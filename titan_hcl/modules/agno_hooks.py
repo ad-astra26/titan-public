@@ -3528,6 +3528,19 @@ def create_post_hook(plugin):
         except Exception as _trr_err:
             logger.debug("[PostHook] §7.B turn record emit skipped: %s", _trr_err)
 
+        # ── §7.C session-aware routing — fold this completed turn into the in-memory
+        # heaviness tracker (turn count + wall-duration + token-volume proxy) so the
+        # NEXT turn's routing decision sees the session's accumulated depth. O(1),
+        # off any DB, soft — never affects the turn. Fires every turn (ungated).
+        try:
+            from titan_hcl.inference import session_heaviness as _sh_mod
+            _sid = str(getattr(plugin, "_current_session_id", "") or "")
+            if _sid:
+                _tok_proxy = (len(user_prompt or "") + len(response_text or "")) // 4
+                _sh_mod.note_turn(_sid, _tok_proxy)
+        except Exception as _sh_err:  # noqa: BLE001
+            logger.debug("[PostHook] §7.C heaviness note_turn skipped: %s", _sh_err)
+
         # ── RFP_verifiable_autobiographical_presence_memory §7.A — non-Maker
         # presence atom. A completed chat turn = a person was present; emit it to
         # synthesis (PresenceCapture → episodic TX + person_interactions row). SKIP
