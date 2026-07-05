@@ -161,6 +161,44 @@
 "inference.venice_heavy_model" = {type="str", constraint="", reload="hot", owner=["agno_worker", "llm"], sensitive=false}
 "inference.venice_light_model" = {type="str", constraint="", reload="hot", owner=["agno_worker", "llm"], sensitive=false}
 "inference.venice_session_token" = {type="str", constraint="", reload="hot", owner=["agno_worker", "llm"], sensitive=true}
+# [inference.autoscale] — Load-adaptive inference routing (RFP_load_adaptive_inference_routing).
+# All hot-reloadable (router/keepalive re-read live); owner agno_worker (router+keepalive live there).
+"inference.autoscale.router_enabled" = {type="bool", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.keepalive_enabled" = {type="bool", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.keepalive_model" = {type="str", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.keepalive_interval_s" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.keepalive_idle_after_s" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.keepalive_scale_with_load" = {type="bool", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.keepalive_always_warm" = {type="bool", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.ladder_warm_cap" = {type="int", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.model_ladder" = {type="list", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.router_state_path" = {type="str", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.enter_latency_s" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.exit_latency_s" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.in_flight_ceiling" = {type="int", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.explore_eps" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.min_samples" = {type="int", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.min_dwell_s" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.w_latency_chat" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.w_quality_chat" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.w_cost_chat" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.w_latency_task" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.w_quality_task" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.w_cost_task" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.target_latency_chat_s" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.target_latency_task_s" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.quality_alpha" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.min_quality_samples" = {type="int", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_threshold" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_quality_boost" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_latency_relax" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_turns_cap" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_duration_cap_s" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_tokens_cap" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_w_turns" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_w_duration" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_w_tokens" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.heaviness_w_goal_class" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
 "info_banner.enabled" = {type="bool", constraint="", reload="hot", owner=["kernel"], sensitive=false}
 "info_banner.style" = {type="str", constraint="", reload="hot", owner=["kernel"], sensitive=false}
 "mainnet_budget.backup_arweave_enabled" = {type="bool", constraint="", reload="hot", owner=["backup"], sensitive=false}
