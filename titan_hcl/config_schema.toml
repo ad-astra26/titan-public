@@ -445,6 +445,13 @@
 # min_interval_s is the cadence floor + the P2b GIL-coupling A/B lever. Default ON.
 "synthesis.spine_export.throttle_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.spine_export.min_interval_s" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+# boot_wiring — self-healing deferred re-wire of sub-store wiring that timed out
+# under a contended boot (OracleSpendStore/fork-store/ActrBuffer DDL submit_sync).
+# deferred_rewire_enabled=false is the kill-switch (falls back to pre-fix: a boot
+# timeout disables the subsystem for the session). max_deferred_attempts bounds
+# the export-thread retry so a permanently-broken dep stops retrying.
+"synthesis.boot_wiring.deferred_rewire_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.boot_wiring.max_deferred_attempts" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.recall.augment_chat" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 # secrets-only key (lives in ~/.titan/secrets.toml, no config/params placeholder) — declared manually; the generator only sees params+config.
 "synthesis.user_id_hash_salt" = {type="str", constraint="", reload="restart_required", owner=["synthesis"], sensitive=true}

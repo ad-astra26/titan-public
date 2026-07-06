@@ -854,7 +854,7 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                             affective_cfg: Any = None,
                             affective_state_path: Optional[str] = None,
                             affective_runtime: Any = None,
-                            solana_oracle: Any = None,
+                            solana_oracle_holder: Optional[dict] = None,
                             maker_pubkey: str = "",
                             data_dir: str = "") -> None:
     """Daemon thread — drain the `skill_score_events` queue into `skill_cells`
@@ -1018,10 +1018,12 @@ def _skill_score_drain_loop(skill_store: Any, stop_event: threading.Event,
                                 # scale as the chat/app/TCC taps). The SOL amount
                                 # stays sol_receipt's concern; the bond's meaning is
                                 # the Maker being PRESENT, not the lamport count.
-                                if (_delta > 0.0 and solana_oracle is not None
+                                # Live holder ref (heals if phase6 re-wired later).
+                                _sol_oracle = (solana_oracle_holder or {}).get("ref")
+                                if (_delta > 0.0 and _sol_oracle is not None
                                         and maker_pubkey):
                                     _wallet = str((_ns or {}).get("pubkey") or "")
-                                    _fp = (solana_oracle.latest_funding_feepayer(
+                                    _fp = (_sol_oracle.latest_funding_feepayer(
                                         _wallet) if _wallet else None)
                                     if _fp and _fp == maker_pubkey:
                                         _n_bond = (affective_runtime
@@ -1595,6 +1597,86 @@ def _recompute_loop(store: "ActivationStore",
         stop_event.wait(remaining)
 
 
+class DeferredWiringRegistry:
+    """Self-healing bookkeeping for sub-store boot wirings that time out under a
+    contended boot (a `submit_sync` DDL on a saturated SynthesisWriter). Each
+    wiring is a re-callable closure returning tri-state: True=wired,
+    False=transient TimeoutError (retry later), None=permanent failure (drop, no
+    retry). A wiring that returns False is retried by `run_deferred()` (driven
+    from the export daemon each pass) until it wires — the subsystem comes ONLINE
+    mid-session with NO restart — or the bounded attempt cap is hit. `enabled_fn`
+    / `max_attempts_fn` are read live each pass (config hot-reload + kill-switch).
+    Pure + side-effect-testable (no module state); see
+    tests/test_synthesis_boot_deferred_rewire.py.
+    """
+
+    def __init__(self, *, enabled_fn, max_attempts_fn, log=None):
+        self._pending: dict = {}      # name -> wire_fn (transient, retry)
+        self._attempts: dict = {}     # name -> attempts so far
+        self._gaveup: set = set()     # names past the attempt cap
+        self._finalize: dict = {}     # name -> one-shot finalize hook
+        self._enabled_fn = enabled_fn
+        self._max_attempts_fn = max_attempts_fn
+        self._log = log if log is not None else logger
+
+    def register_finalize(self, name: str, fn) -> None:
+        """A one-shot hook re-run after a DEFERRED wire of `name` succeeds
+        (idempotent on its own; the boot path calls it inline separately)."""
+        self._finalize[name] = fn
+
+    @property
+    def pending_names(self) -> set:
+        return set(self._pending.keys())
+
+    def attempt(self, name: str, wire_fn, *, deferred: bool) -> bool:
+        """Run one wiring closure once; returns True iff it wired."""
+        try:
+            outcome = wire_fn()
+        except TimeoutError:
+            outcome = False
+        if outcome is True:
+            self._pending.pop(name, None)
+            if deferred:
+                _fin = self._finalize.get(name)
+                if _fin is not None:
+                    try:
+                        _fin()
+                    except Exception:  # noqa: BLE001
+                        self._log.warning(
+                            "[synthesis_worker] deferred finalize for %s failed",
+                            name, exc_info=True)
+            return True
+        if outcome is False:
+            self._pending[name] = wire_fn
+            return False
+        self._pending.pop(name, None)   # None → permanent, no retry
+        return False
+
+    def run_deferred(self) -> None:
+        """Export-daemon step — retry pending (timed-out) wirings, bounded."""
+        if not self._pending:
+            return
+        if not self._enabled_fn():
+            return
+        max_att = self._max_attempts_fn()
+        for name in list(self._pending.keys()):
+            self._attempts[name] = self._attempts.get(name, 0) + 1
+            if self._attempts[name] > max_att:
+                if name not in self._gaveup:
+                    self._gaveup.add(name)
+                    self._log.warning(
+                        "[synthesis_worker] deferred re-wire GAVE UP on %s after "
+                        "%d attempts — subsystem stays degraded until restart",
+                        name, max_att)
+                self._pending.pop(name, None)
+                continue
+            if self.attempt(name, self._pending[name], deferred=True):
+                self._log.info(
+                    "[synthesis_worker] deferred re-wire SUCCEEDED for %s on "
+                    "attempt %d — subsystem now ONLINE (no restart)",
+                    name, self._attempts[name])
+
+
 def _export_loop(store: "ActivationStore",
                  bundle_store: "StandingBundleStore",
                  snapshot_path: str,
@@ -1605,6 +1687,7 @@ def _export_loop(store: "ActivationStore",
                  oracle_exporter_holder: dict,
                  metrics_exporter_holder: dict,
                  kuzu_checkpoint_holder: dict,
+                 deferred_wire_holder: dict,
                  send_queue, name: str,
                  interval_s: float,
                  stop_event: threading.Event,
@@ -1693,6 +1776,9 @@ def _export_loop(store: "ActivationStore",
         _timed("oracle", lambda: oracle_exporter_holder["fn"]())
         _timed("metrics", lambda: metrics_exporter_holder["fn"]())
         _timed("kuzu_checkpoint", lambda: kuzu_checkpoint_holder["fn"]())
+        # Self-healing: retry any boot wirings that timed out (bounded; no-op
+        # once none pending). Off the recompute/heartbeat path like the exports.
+        _timed("deferred_wire", lambda: deferred_wire_holder["fn"]())
 
         total_ms = int((time.monotonic() - t0) * 1000)
         pass_count += 1
@@ -1968,6 +2054,38 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # WAL so its replay-on-open can never grow into the OOM-loop danger zone.
     kuzu_checkpoint_holder: dict = {"fn": lambda: None}
 
+    # ── Boot-wiring self-healing (deferred re-wire) ─────────────────────
+    # A sub-store whose boot wiring times out (a `submit_sync` DDL under a
+    # saturated writer during a contended boot — the OracleSpendStore /
+    # HypothesisForkStore / ActrBufferStore constructors) USED to disable
+    # its subsystem for the whole session with no retry. Now the wiring is a
+    # re-callable closure that, on a `TimeoutError`, registers here; the
+    # export daemon retries it (bounded) each pass until the writer drains and
+    # it wires — the subsystem comes ONLINE mid-session with NO restart. A
+    # genuine (non-timeout) wiring bug still fails fast to the degrade path.
+    # deferred_wire_holder is driven from the existing _export_loop holder
+    # pattern (no new thread). Kill-switch + attempt cap are config-homed
+    # (`synthesis.boot_wiring.deferred_rewire_enabled` / `.max_deferred_attempts`).
+    deferred_wire_holder: dict = {"fn": lambda: None}
+    # solana_oracle is captured by the skill-score drain loop at boot; route it
+    # via a holder so a deferred phase6 re-wire heals the drain loop's feePayer
+    # lookup too (INV-Syn-13 / §7.C maker_bond) without a restart.
+    solana_oracle_holder: dict = {"ref": None}
+
+    def _boot_wiring_cfg() -> tuple:
+        """Per-call config read (hot-reload). Soft-fails to (enabled, 15)."""
+        try:
+            _bw = (get_params("synthesis") or {}).get("boot_wiring", {}) or {}
+            return (bool(_bw.get("deferred_rewire_enabled", True)),
+                    int(_bw.get("max_deferred_attempts", 15)))
+        except Exception:  # noqa: BLE001
+            return (True, 15)
+
+    _deferred = DeferredWiringRegistry(
+        enabled_fn=lambda: _boot_wiring_cfg()[0],
+        max_attempts_fn=lambda: _boot_wiring_cfg()[1])
+    deferred_wire_holder["fn"] = _deferred.run_deferred
+
     # Operator-closure Phase A — ONE shared embedder for the whole worker (the
     # tx_hash FAISS store, EngineRecall's query embed, the consolidation cosine
     # path, AND skill_store). Routed to the fleet-standard llama.cpp embedder
@@ -2045,6 +2163,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
               spine_exporter_holder, fork_exporter_holder,
               fork_activation_updater_holder, oracle_exporter_holder,
               metrics_exporter_holder, kuzu_checkpoint_holder,
+              deferred_wire_holder,
               send_queue, name, interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-export-{name}")
     export_thread.start()
@@ -2565,96 +2684,119 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # synthesis_worker keeps running.
     hypothesis_fork_store: Optional[Any] = None
     fork_gc: Optional[Any] = None
-    try:
-        if (kuzu_graph_obj is None
-                or engram_store is None
-                or 'writer' not in locals()):
-            raise RuntimeError(
-                "missing dependency: kuzu_graph / engram_store / writer "
-                "not wired — hypothesis-fork lifecycle disabled this session"
-            )
-        from titan_hcl.synthesis.hypothesis_fork_store import (
-            HypothesisForkStore,
-        )
-        from titan_hcl.synthesis.fork_gc import ForkGC
+    # Normalize deps assigned inside boot try-blocks above (writer @OuterMemoryWriter,
+    # kuzu_graph_obj, engram_store) so they are ALWAYS bound — the wiring closures
+    # below reference them via `is None` (a nested closure's `locals()` cannot see
+    # enclosing-scope names, so the old `'writer' not in locals()` guard is invalid
+    # inside a closure).
+    writer = writer if 'writer' in locals() else None
+    kuzu_graph_obj = kuzu_graph_obj if 'kuzu_graph_obj' in locals() else None
+    engram_store = engram_store if 'engram_store' in locals() else None
 
-        hypothesis_fork_store = HypothesisForkStore(
-            writer=db_writer,           # single-writer-thread (Option C)
-            duckdb_conn=store._conn,    # same DuckDB conn as ActivationStore
-            kuzu_graph=kuzu_graph_obj,
-            engram_store=engram_store,
-            outer_memory_writer=writer,
-            activation_store=store,      # ActivationStore from above
-            # P8.X (D-SPEC-PHASE8 fold-in): write-through snapshot path so
-            # every create/record/graduate/abandon synchronously refreshes
-            # forks_snapshot.json. Closes the "new fork visible in snapshot
-            # never appeared after 6s" P5 cascade flake. The 60s recompute-
-            # loop snapshot stays as a heartbeat but is no longer load-
-            # bearing for visibility.
-            snapshot_path=forks_snapshot_path,
-        )
-
-        # Wire forks snapshot exporter into the recompute loop's late-bind
-        # slot — the next 60s tick begins writing forks_snapshot.json.
-        fork_exporter_holder["fn"] = (
-            lambda: hypothesis_fork_store.export_snapshot(forks_snapshot_path)
-        )
-        # Initial export so the snapshot is non-empty/present immediately.
+    def _wire_forks():
+        """Re-callable HypothesisForkStore + ForkGC wiring. Returns True=wired,
+        False=transient TimeoutError (retry), None=permanent failure (degraded)."""
+        nonlocal hypothesis_fork_store, fork_gc
         try:
-            initial_forks = hypothesis_fork_store.export_snapshot(
-                forks_snapshot_path,
+            if (kuzu_graph_obj is None
+                    or engram_store is None
+                    or writer is None):
+                raise RuntimeError(
+                    "missing dependency: kuzu_graph / engram_store / writer "
+                    "not wired — hypothesis-fork lifecycle disabled this session"
+                )
+            from titan_hcl.synthesis.hypothesis_fork_store import (
+                HypothesisForkStore,
+            )
+            from titan_hcl.synthesis.fork_gc import ForkGC
+
+            hypothesis_fork_store = HypothesisForkStore(
+                writer=db_writer,           # single-writer-thread (Option C)
+                duckdb_conn=store._conn,    # same DuckDB conn as ActivationStore
+                kuzu_graph=kuzu_graph_obj,
+                engram_store=engram_store,
+                outer_memory_writer=writer,
+                activation_store=store,      # ActivationStore from above
+                # P8.X (D-SPEC-PHASE8 fold-in): write-through snapshot path so
+                # every create/record/graduate/abandon synchronously refreshes
+                # forks_snapshot.json. Closes the "new fork visible in snapshot
+                # never appeared after 6s" P5 cascade flake. The 60s recompute-
+                # loop snapshot stays as a heartbeat but is no longer load-
+                # bearing for visibility.
+                snapshot_path=forks_snapshot_path,
+            )
+
+            # Wire forks snapshot exporter into the recompute loop's late-bind
+            # slot — the next 60s tick begins writing forks_snapshot.json.
+            fork_exporter_holder["fn"] = (
+                lambda: hypothesis_fork_store.export_snapshot(forks_snapshot_path)
+            )
+            # Initial export so the snapshot is non-empty/present immediately.
+            try:
+                initial_forks = hypothesis_fork_store.export_snapshot(
+                    forks_snapshot_path,
+                )
+                logger.info(
+                    "[synthesis_worker] initial forks snapshot exported "
+                    "(%d fork rows) → %s",
+                    initial_forks, forks_snapshot_path,
+                )
+            except Exception as _initial_fexp_err:
+                logger.warning(
+                    "[synthesis_worker] initial forks snapshot failed: %s",
+                    _initial_fexp_err,
+                )
+
+            # Wire per-tick fork-activation pusher: for every open fork, look
+            # up its current B_i in the ActivationStore cache and persist via
+            # hypothesis_fork_store.update_activation. Cheap because the open-
+            # fork count is bounded (active probationary set is small —
+            # graduation/abandonment removes them).
+            def _push_fork_activations() -> None:
+                if hypothesis_fork_store is None:
+                    return
+                with cache_lock:
+                    fork_ids = [
+                        f.fork_id for f in hypothesis_fork_store.list_active()
+                    ]
+                    bi_map = store.bulk_base_level(
+                        [f"fork:{fid}" for fid in fork_ids]
+                    )
+                for fid in fork_ids:
+                    bi = bi_map.get(f"fork:{fid}")
+                    if bi is None:
+                        continue
+                    hypothesis_fork_store.update_activation(fid, bi)
+            fork_activation_updater_holder["fn"] = _push_fork_activations
+
+            fork_gc = ForkGC(
+                fork_store=hypothesis_fork_store,
+                writer=db_writer,           # single-writer-thread (Option C)
+                synthesis_duckdb_conn=store._conn,
+                kuzu_graph=kuzu_graph_obj,
+                activation_store=store,
+                memory_db_conn=None,   # Phase 5 v1: synthesis.duckdb scope only
             )
             logger.info(
-                "[synthesis_worker] initial forks snapshot exported "
-                "(%d fork rows) → %s",
-                initial_forks, forks_snapshot_path,
+                "[synthesis_worker] HypothesisForkStore + ForkGC ready — "
+                "DREAM_STATE_CHANGED subscription will trigger nightly sweep",
             )
-        except Exception as _initial_fexp_err:
+            return True
+        except TimeoutError:
+            # Transient: writer saturated during a contended boot. Leave forks
+            # degraded THIS pass; the deferred driver retries until it wires.
+            logger.info(
+                "[synthesis_worker] HypothesisForkStore wiring timed out "
+                "(writer saturated) — deferred re-wire will retry")
+            return False
+        except Exception as exc:
             logger.warning(
-                "[synthesis_worker] initial forks snapshot failed: %s",
-                _initial_fexp_err,
+                "[synthesis_worker] HypothesisForkStore wiring failed: %s — "
+                "hypothesis-fork lifecycle disabled this session",
+                exc, exc_info=True,
             )
-
-        # Wire per-tick fork-activation pusher: for every open fork, look
-        # up its current B_i in the ActivationStore cache and persist via
-        # hypothesis_fork_store.update_activation. Cheap because the open-
-        # fork count is bounded (active probationary set is small —
-        # graduation/abandonment removes them).
-        def _push_fork_activations() -> None:
-            if hypothesis_fork_store is None:
-                return
-            with cache_lock:
-                fork_ids = [
-                    f.fork_id for f in hypothesis_fork_store.list_active()
-                ]
-                bi_map = store.bulk_base_level(
-                    [f"fork:{fid}" for fid in fork_ids]
-                )
-            for fid in fork_ids:
-                bi = bi_map.get(f"fork:{fid}")
-                if bi is None:
-                    continue
-                hypothesis_fork_store.update_activation(fid, bi)
-        fork_activation_updater_holder["fn"] = _push_fork_activations
-
-        fork_gc = ForkGC(
-            fork_store=hypothesis_fork_store,
-            writer=db_writer,           # single-writer-thread (Option C)
-            synthesis_duckdb_conn=store._conn,
-            kuzu_graph=kuzu_graph_obj,
-            activation_store=store,
-            memory_db_conn=None,   # Phase 5 v1: synthesis.duckdb scope only
-        )
-        logger.info(
-            "[synthesis_worker] HypothesisForkStore + ForkGC ready — "
-            "DREAM_STATE_CHANGED subscription will trigger nightly sweep",
-        )
-    except Exception as exc:
-        logger.warning(
-            "[synthesis_worker] HypothesisForkStore wiring failed: %s — "
-            "hypothesis-fork lifecycle disabled this session",
-            exc, exc_info=True,
-        )
+            return None
+    _deferred.attempt("forks", _wire_forks, deferred=False)
 
     # Sweep mode: per Maker decision 2026-05-27 + PLAN §P5.H, first 24h
     # of T3 soak runs in dry-run. Production behavior is set by the
@@ -2703,229 +2845,244 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # maker_bond feePayer lookup (§7.C). It is assigned inside the oracle-init
     # try below, which may raise before binding it → keep it always-defined.
     solana_oracle: Optional[Any] = None
-    try:
-        if 'writer' not in locals() or writer is None:
-            raise RuntimeError(
-                "missing dependency: OuterMemoryWriter not wired — "
-                "Phase 6 oracle/proof middleware disabled this session"
-            )
-        from titan_hcl.synthesis.oracle_gate import (
-            OracleGate, build_gate_config, ensure_oracle_daily_spend_table,
-            zk_privacy_domains,
-        )
-        from titan_hcl.synthesis.oracle_router import (
-            OracleRouter, OracleSpendStore,
-        )
-        from titan_hcl.synthesis.oracle_coverage import CoverageAnalyzer
-        from titan_hcl.synthesis.oracle_snapshot import OracleSnapshotExporter
-        from titan_hcl.synthesis.proofs.merkle_proof import MerkleProofStrategy
-        from titan_hcl.synthesis.proofs.zk_proof import ZKProofStrategy
-        from titan_hcl.synthesis.proofs.registry import ProofStrategyRegistry
-        from titan_hcl.synthesis.cgn_meaning_oracle import CGNMeaningOracle
-        from titan_hcl.synthesis.oracles.coding_sandbox_oracle import (
-            CodingSandboxOracle,
-        )
-        from titan_hcl.synthesis.oracles.solana_rpc_oracle import SolanaRpcOracle
-        from titan_hcl.synthesis.oracles.web_api_oracle import WebApiOracle
-        from titan_hcl.synthesis.oracles.x_oracle import XOracle
-        from titan_hcl.synthesis.tools.coding_sandbox_tool import (
-            CodingSandboxTool,
-        )
-        from titan_hcl.synthesis.tools.events_teacher_tool import (
-            EventsTeacherTool,
-        )
-        from titan_hcl.synthesis.tools.knowledge_tool import KnowledgeTool
-        from titan_hcl.synthesis.tools.x_research_tool import XResearchTool
-
-        # Merged config (the worker received `config` from the kernel).
-        gate_config = build_gate_config(config or {})
-        gate = OracleGate(gate_config)
-
-        # Spend store shares the synthesis_worker's existing DuckDB connection
-        # (INV-Syn-3 sole writer). OracleSpendStore.__init__ ensures the table
-        # exists ON the writer thread — no standalone DDL here (the guarded
-        # conn rejects off-writer-thread .execute by design, Option C).
-        spend_store = OracleSpendStore(store._conn, writer=db_writer)
-
-        # ── Balance provider (INV-Syn-13) — LIVE SOL via G18 SHM read (G10) ──
-        # Reads balance_sol from network_state.bin (kernel monitor_tick = G21
-        # single writer) through ShmReaderBank — replaces the static 1.0 that
-        # made admit_score == importance always (the gate never tightened on
-        # low balance). Short monotonic TTL so a burst of metered claims in one
-        # dream pass shares one SHM read. Pure SHM read → does NOT route through
-        # db_writer. Soft-fail to gate_config.balance_sol_baseline (the neutral
-        # "balance unknown, don't penalize" value, NOT a magic 1.0) on
-        # cold-boot / torn-read / decode-fail.
-        _balance_refresh_s = 2.0
-        _balance_cache: dict = {"value": None, "mono": 0.0}
-
-        def _balance_lookup() -> float:
-            baseline = gate_config.balance_sol_baseline
-            if _shm_bank is None:
-                return baseline
-            now = time.monotonic()
-            if (_balance_cache["value"] is not None
-                    and (now - _balance_cache["mono"]) < _balance_refresh_s):
-                return _balance_cache["value"]
-            bal = baseline
-            try:
-                st = _shm_bank.read_network_state()
-                if isinstance(st, dict) and st.get("balance_sol") is not None:
-                    bal = float(st["balance_sol"])
-            except Exception:  # noqa: BLE001 — cold slot / torn read → baseline
-                bal = baseline
-            _balance_cache["value"] = bal
-            _balance_cache["mono"] = now
-            return bal
-
-        oracle_router = OracleRouter(
-            gate=gate,
-            spend_store=spend_store,
-            outer_memory_writer=writer,
-            balance_provider=_balance_lookup,
-        )
-
-        # Proof strategy registry — Merkle default; ZK injected via the
-        # ZK Vault commit/verify functions. Phase 6 v1 leaves the ZK
-        # callables as no-ops (they raise if invoked); ZK fires only
-        # when INV-Syn-14 triggers AND the worker has wired the ZK
-        # Vault submitter via a follow-up integration commit.
-        proof_registry = ProofStrategyRegistry(
-            merkle=MerkleProofStrategy(),
-            zk=ZKProofStrategy(),
-            privacy_domains=zk_privacy_domains(config or {}),
-        )
-
-        # CGN meaning oracle — concept_reader bound to EngramStore;
-        # cgn_grounder reserved for the bus-RPC follow-up (returns None
-        # for now → degraded grounding per the P6.H defensive contract).
-        def _concept_reader(concept_id: str, version: int):
-            # G3 (AUDIT §5.3): EngramStore.read_spine_strands now exists (the
-            # getattr probe used to silently return None → meaning_of empty
-            # fleet-wide). Call it directly; it runs on the writer thread
-            # (@on_writer) and returns the four Timechain-anchor strands, or
-            # None for a missing concept. Soft-fail so a Kuzu hiccup on this
-            # dream-orchestrator path never crash-loops the worker.
-            if engram_store is None:
-                return None
-            try:
-                return engram_store.read_spine_strands(concept_id, version)
-            except Exception:
-                logger.exception("[synthesis_worker] concept_reader failed")
-                return None
-
-        cgn_meaning_oracle = CGNMeaningOracle(
-            concept_reader=_concept_reader,
-        )
-
-        # Concrete truth oracles
-        sandbox_oracle = CodingSandboxOracle()
-        solana_oracle = SolanaRpcOracle(
-            rpc_url=get_params("network").get("premium_rpc_url"),
-            fallback_urls=list(get_params("network").get("public_rpc_urls", [])),
-        )
-        web_api_oracle = WebApiOracle()  # default search_fn + judge_fn
-        # x_oracle / x_research need a real SocialXGateway instance — best-
-        # effort wire from existing plugin path (if available via config).
-        # Sandbox-as-tool and sandbox-as-oracle share the same helper.
-
-        # Register truth oracles with the router.
-        oracle_router.register(sandbox_oracle)
-        oracle_router.register(solana_oracle)
-        oracle_router.register(web_api_oracle)
-        oracle_router.register(cgn_meaning_oracle)  # MeaningOraclePlug — for /v6/synthesis/oracles/router visibility
-
-        # Coverage analyzer — wired to the procedural-fork tool_call TXs on the
-        # chain so /v6/synthesis/oracles/coverage reflects REAL invocations.
-        # (2026-06-01) The analyzer was previously left on the no-op default
-        # reader, so the Observatory coverage endpoint always read 0 even when
-        # tool_call TXs were on chain — the deferred "follow-up" never landed.
-        # Now exposed once the tool-backstop actually produces tool_call TXs.
-        from titan_hcl.synthesis.procedural_tx_reader import (
-            default_procedural_tool_call_reader as _cov_tc_reader,
-        )
-        _cov_data_dir = os.environ.get("TITAN_DATA_DIR", "data")
-        _cov_timechain_dir = os.path.join(_cov_data_dir, "timechain")
-        coverage_analyzer = CoverageAnalyzer(
-            tool_call_reader=lambda since_ts, lim: _cov_tc_reader(
-                since_ts, lim,
-                index_db_path=os.path.join(_cov_timechain_dir, "index.db"),
-                chain_dir=_cov_timechain_dir,
-            ),
-        )
-
-        # Snapshot exporter — wired to the 60s tick via a holder pattern
-        # (mirrors forks_snapshot pattern). Buffers for recent verdicts
-        # + proofs are constructed here so the router/proof paths can
-        # push entries when they fire.
-        recent_verdict_buffer: list = []
-        recent_proof_buffer: list = []
-        oracle_snapshot_path = os.path.join(
-            os.environ.get("TITAN_DATA_DIR", "data"),
-            "oracles_snapshot.json",
-        )
-        oracle_snapshot_exporter = OracleSnapshotExporter(
-            router=oracle_router,
-            spend_store=spend_store,
-            gate_config=gate_config,
-            coverage_analyzer=coverage_analyzer,
-            snapshot_path=oracle_snapshot_path,
-            recent_verdict_buffer=recent_verdict_buffer,
-            recent_proof_buffer=recent_proof_buffer,
-        )
-
-        # Initial export so the file exists from boot — Observatory
-        # routes get a real (possibly empty) payload immediately.
+    def _wire_phase6():
+        """Re-callable Phase 6 oracle/proof/CGN wiring. True=wired,
+        False=transient TimeoutError (retry), None=permanent failure."""
+        nonlocal oracle_router
         try:
-            oracle_snapshot_exporter.export()
+            if writer is None:
+                raise RuntimeError(
+                    "missing dependency: OuterMemoryWriter not wired — "
+                    "Phase 6 oracle/proof middleware disabled this session"
+                )
+            from titan_hcl.synthesis.oracle_gate import (
+                OracleGate, build_gate_config, ensure_oracle_daily_spend_table,
+                zk_privacy_domains,
+            )
+            from titan_hcl.synthesis.oracle_router import (
+                OracleRouter, OracleSpendStore,
+            )
+            from titan_hcl.synthesis.oracle_coverage import CoverageAnalyzer
+            from titan_hcl.synthesis.oracle_snapshot import OracleSnapshotExporter
+            from titan_hcl.synthesis.proofs.merkle_proof import MerkleProofStrategy
+            from titan_hcl.synthesis.proofs.zk_proof import ZKProofStrategy
+            from titan_hcl.synthesis.proofs.registry import ProofStrategyRegistry
+            from titan_hcl.synthesis.cgn_meaning_oracle import CGNMeaningOracle
+            from titan_hcl.synthesis.oracles.coding_sandbox_oracle import (
+                CodingSandboxOracle,
+            )
+            from titan_hcl.synthesis.oracles.solana_rpc_oracle import SolanaRpcOracle
+            from titan_hcl.synthesis.oracles.web_api_oracle import WebApiOracle
+            from titan_hcl.synthesis.oracles.x_oracle import XOracle
+            from titan_hcl.synthesis.tools.coding_sandbox_tool import (
+                CodingSandboxTool,
+            )
+            from titan_hcl.synthesis.tools.events_teacher_tool import (
+                EventsTeacherTool,
+            )
+            from titan_hcl.synthesis.tools.knowledge_tool import KnowledgeTool
+            from titan_hcl.synthesis.tools.x_research_tool import XResearchTool
+
+            # Merged config (the worker received `config` from the kernel).
+            gate_config = build_gate_config(config or {})
+            gate = OracleGate(gate_config)
+
+            # Spend store shares the synthesis_worker's existing DuckDB connection
+            # (INV-Syn-3 sole writer). OracleSpendStore.__init__ ensures the table
+            # exists ON the writer thread — no standalone DDL here (the guarded
+            # conn rejects off-writer-thread .execute by design, Option C).
+            spend_store = OracleSpendStore(store._conn, writer=db_writer)
+
+            # ── Balance provider (INV-Syn-13) — LIVE SOL via G18 SHM read (G10) ──
+            # Reads balance_sol from network_state.bin (kernel monitor_tick = G21
+            # single writer) through ShmReaderBank — replaces the static 1.0 that
+            # made admit_score == importance always (the gate never tightened on
+            # low balance). Short monotonic TTL so a burst of metered claims in one
+            # dream pass shares one SHM read. Pure SHM read → does NOT route through
+            # db_writer. Soft-fail to gate_config.balance_sol_baseline (the neutral
+            # "balance unknown, don't penalize" value, NOT a magic 1.0) on
+            # cold-boot / torn-read / decode-fail.
+            _balance_refresh_s = 2.0
+            _balance_cache: dict = {"value": None, "mono": 0.0}
+
+            def _balance_lookup() -> float:
+                baseline = gate_config.balance_sol_baseline
+                if _shm_bank is None:
+                    return baseline
+                now = time.monotonic()
+                if (_balance_cache["value"] is not None
+                        and (now - _balance_cache["mono"]) < _balance_refresh_s):
+                    return _balance_cache["value"]
+                bal = baseline
+                try:
+                    st = _shm_bank.read_network_state()
+                    if isinstance(st, dict) and st.get("balance_sol") is not None:
+                        bal = float(st["balance_sol"])
+                except Exception:  # noqa: BLE001 — cold slot / torn read → baseline
+                    bal = baseline
+                _balance_cache["value"] = bal
+                _balance_cache["mono"] = now
+                return bal
+
+            oracle_router = OracleRouter(
+                gate=gate,
+                spend_store=spend_store,
+                outer_memory_writer=writer,
+                balance_provider=_balance_lookup,
+            )
+
+            # Proof strategy registry — Merkle default; ZK injected via the
+            # ZK Vault commit/verify functions. Phase 6 v1 leaves the ZK
+            # callables as no-ops (they raise if invoked); ZK fires only
+            # when INV-Syn-14 triggers AND the worker has wired the ZK
+            # Vault submitter via a follow-up integration commit.
+            proof_registry = ProofStrategyRegistry(
+                merkle=MerkleProofStrategy(),
+                zk=ZKProofStrategy(),
+                privacy_domains=zk_privacy_domains(config or {}),
+            )
+
+            # CGN meaning oracle — concept_reader bound to EngramStore;
+            # cgn_grounder reserved for the bus-RPC follow-up (returns None
+            # for now → degraded grounding per the P6.H defensive contract).
+            def _concept_reader(concept_id: str, version: int):
+                # G3 (AUDIT §5.3): EngramStore.read_spine_strands now exists (the
+                # getattr probe used to silently return None → meaning_of empty
+                # fleet-wide). Call it directly; it runs on the writer thread
+                # (@on_writer) and returns the four Timechain-anchor strands, or
+                # None for a missing concept. Soft-fail so a Kuzu hiccup on this
+                # dream-orchestrator path never crash-loops the worker.
+                if engram_store is None:
+                    return None
+                try:
+                    return engram_store.read_spine_strands(concept_id, version)
+                except Exception:
+                    logger.exception("[synthesis_worker] concept_reader failed")
+                    return None
+
+            cgn_meaning_oracle = CGNMeaningOracle(
+                concept_reader=_concept_reader,
+            )
+
+            # Concrete truth oracles
+            sandbox_oracle = CodingSandboxOracle()
+            solana_oracle = SolanaRpcOracle(
+                rpc_url=get_params("network").get("premium_rpc_url"),
+                fallback_urls=list(get_params("network").get("public_rpc_urls", [])),
+            )
+            web_api_oracle = WebApiOracle()  # default search_fn + judge_fn
+            # x_oracle / x_research need a real SocialXGateway instance — best-
+            # effort wire from existing plugin path (if available via config).
+            # Sandbox-as-tool and sandbox-as-oracle share the same helper.
+
+            # Register truth oracles with the router.
+            oracle_router.register(sandbox_oracle)
+            oracle_router.register(solana_oracle)
+            # Route solana_oracle to the drain loop via a live holder so a
+            # deferred phase6 re-wire heals its feePayer lookup (INV-Syn-13).
+            solana_oracle_holder["ref"] = solana_oracle
+            oracle_router.register(web_api_oracle)
+            oracle_router.register(cgn_meaning_oracle)  # MeaningOraclePlug — for /v6/synthesis/oracles/router visibility
+
+            # Coverage analyzer — wired to the procedural-fork tool_call TXs on the
+            # chain so /v6/synthesis/oracles/coverage reflects REAL invocations.
+            # (2026-06-01) The analyzer was previously left on the no-op default
+            # reader, so the Observatory coverage endpoint always read 0 even when
+            # tool_call TXs were on chain — the deferred "follow-up" never landed.
+            # Now exposed once the tool-backstop actually produces tool_call TXs.
+            from titan_hcl.synthesis.procedural_tx_reader import (
+                default_procedural_tool_call_reader as _cov_tc_reader,
+            )
+            _cov_data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+            _cov_timechain_dir = os.path.join(_cov_data_dir, "timechain")
+            coverage_analyzer = CoverageAnalyzer(
+                tool_call_reader=lambda since_ts, lim: _cov_tc_reader(
+                    since_ts, lim,
+                    index_db_path=os.path.join(_cov_timechain_dir, "index.db"),
+                    chain_dir=_cov_timechain_dir,
+                ),
+            )
+
+            # Snapshot exporter — wired to the 60s tick via a holder pattern
+            # (mirrors forks_snapshot pattern). Buffers for recent verdicts
+            # + proofs are constructed here so the router/proof paths can
+            # push entries when they fire.
+            recent_verdict_buffer: list = []
+            recent_proof_buffer: list = []
+            oracle_snapshot_path = os.path.join(
+                os.environ.get("TITAN_DATA_DIR", "data"),
+                "oracles_snapshot.json",
+            )
+            oracle_snapshot_exporter = OracleSnapshotExporter(
+                router=oracle_router,
+                spend_store=spend_store,
+                gate_config=gate_config,
+                coverage_analyzer=coverage_analyzer,
+                snapshot_path=oracle_snapshot_path,
+                recent_verdict_buffer=recent_verdict_buffer,
+                recent_proof_buffer=recent_proof_buffer,
+            )
+
+            # Initial export so the file exists from boot — Observatory
+            # routes get a real (possibly empty) payload immediately.
+            try:
+                oracle_snapshot_exporter.export()
+                logger.info(
+                    "[synthesis_worker] initial oracle snapshot exported → %s",
+                    oracle_snapshot_path,
+                )
+            except Exception as _osx_err:
+                logger.warning(
+                    "[synthesis_worker] initial oracle snapshot failed: %s",
+                    _osx_err,
+                )
+
+            # Wire the exporter into the 60s recompute tick.
+            oracle_exporter_holder["fn"] = lambda: oracle_snapshot_exporter.export()
+
+            # ToolPlugs — same OuterMemoryWriter (so procedural TXs anchor
+            # via the single canonical write path per INV-4); router is
+            # passed in so companion-verdict triggers fire.
+            sandbox_tool = CodingSandboxTool(
+                writer=writer, router=oracle_router, oracle=sandbox_oracle,
+                skill_outcome_sink=_skill_outcome_sink,
+            )
+            events_teacher_tool = EventsTeacherTool(
+                writer=writer, router=oracle_router,
+                skill_outcome_sink=_skill_outcome_sink,
+            )
+            knowledge_tool = KnowledgeTool(
+                writer=writer, router=oracle_router,
+                skill_outcome_sink=_skill_outcome_sink,
+            )
+            # x_research_tool needs a gateway — leave unwired here; the
+            # main plugin (TitanHCL) constructs it with the live
+            # SocialXGateway. agno_tools fall-back gracefully when missing.
+            synthesis_tool_plugs = {
+                "coding_sandbox": sandbox_tool,
+                "events_teacher": events_teacher_tool,
+                "knowledge": knowledge_tool,
+            }
             logger.info(
-                "[synthesis_worker] initial oracle snapshot exported → %s",
-                oracle_snapshot_path,
+                "[synthesis_worker] Phase 6 oracle/proof middleware ready — "
+                "router=%d plugs, proof_registry=Merkle+ZK, exporter=on",
+                len(oracle_router.registered_oracles()),
             )
-        except Exception as _osx_err:
+            return True
+        except TimeoutError:
+            # Transient: writer saturated during a contended boot.
+            logger.info(
+                "[synthesis_worker] Phase 6 wiring timed out "
+                "(writer saturated) — deferred re-wire will retry")
+            return False
+        except Exception as exc:
             logger.warning(
-                "[synthesis_worker] initial oracle snapshot failed: %s",
-                _osx_err,
+                "[synthesis_worker] Phase 6 wiring failed: %s — "
+                "oracle/proof middleware disabled this session",
+                exc, exc_info=True,
             )
-
-        # Wire the exporter into the 60s recompute tick.
-        oracle_exporter_holder["fn"] = lambda: oracle_snapshot_exporter.export()
-
-        # ToolPlugs — same OuterMemoryWriter (so procedural TXs anchor
-        # via the single canonical write path per INV-4); router is
-        # passed in so companion-verdict triggers fire.
-        sandbox_tool = CodingSandboxTool(
-            writer=writer, router=oracle_router, oracle=sandbox_oracle,
-            skill_outcome_sink=_skill_outcome_sink,
-        )
-        events_teacher_tool = EventsTeacherTool(
-            writer=writer, router=oracle_router,
-            skill_outcome_sink=_skill_outcome_sink,
-        )
-        knowledge_tool = KnowledgeTool(
-            writer=writer, router=oracle_router,
-            skill_outcome_sink=_skill_outcome_sink,
-        )
-        # x_research_tool needs a gateway — leave unwired here; the
-        # main plugin (TitanHCL) constructs it with the live
-        # SocialXGateway. agno_tools fall-back gracefully when missing.
-        synthesis_tool_plugs = {
-            "coding_sandbox": sandbox_tool,
-            "events_teacher": events_teacher_tool,
-            "knowledge": knowledge_tool,
-        }
-        logger.info(
-            "[synthesis_worker] Phase 6 oracle/proof middleware ready — "
-            "router=%d plugs, proof_registry=Merkle+ZK, exporter=on",
-            len(oracle_router.registered_oracles()),
-        )
-    except Exception as exc:
-        logger.warning(
-            "[synthesis_worker] Phase 6 wiring failed: %s — "
-            "oracle/proof middleware disabled this session",
-            exc, exc_info=True,
-        )
-        synthesis_tool_plugs = {}
+            return None
+    _deferred.attempt("phase6", _wire_phase6, deferred=False)
 
     # ── Phase 7 §P7.A/H — ActrBufferStore wiring (D-SPEC-PHASE7) ─────────
     # Sole writer of `actr_buffers` (INV-Syn-16). Constructed AFTER
@@ -2937,62 +3094,75 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         os.environ.get("TITAN_DATA_DIR", "data"),
         "buffers_snapshot.json",
     )
-    try:
-        from titan_hcl.synthesis.buffer_store import ActrBufferStore
-
-        def _actr_degraded(*, avg_ms, max_ms, samples):
-            # D-SPEC-154 early-warning: actr_buffers persist latency is creeping —
-            # the DuckDB ART-index-churn signature that precedes the FATAL
-            # crash-loop by days. Surface on the SPEC error cascade (INV-SDA-12)
-            # → MODULE_ERROR → kernel journal, so a recurrence is VISIBLE long
-            # before the next Abort (the Abort itself is an uncatchable C++
-            # terminate; this is the catchable precursor).
-            logger.warning(
-                "[synthesis_worker] actr_buffers DEGRADED — persist avg=%.1fms "
-                "max=%.1fms over %d samples (DuckDB ART-index churn re-accruing? "
-                "— INV-Syn-30 / D-SPEC-154)", avg_ms, max_ms, samples)
-            try:
-                publish_module_error(send_queue, ModuleError(
-                    module_name=name, subsystem="actr_buffers",
-                    error_code=ModuleErrorCode.STORAGE_DEGRADED,
-                    severity=_phase11_sev.WARN,
-                    message="actr_buffers persist latency degraded — possible DuckDB ART-index churn re-accruing",
-                    detail=(f"rolling persist avg={avg_ms:.1f}ms max={max_ms:.1f}ms over {samples} samples "
-                            f"(healthy is sub-ms). A full Titan restart self-heals any stray secondary "
-                            f"index (INV-Syn-30); if it persists, inspect synthesis.duckdb::actr_buffers."),
-                    suggested_remediation="full Titan restart (self-heals secondary ART indexes)"))
-            except Exception:
-                pass
-
-        actr_buffer_store = ActrBufferStore(
-            duckdb_conn=store._conn,           # share synthesis.duckdb (INV-Syn-3)
-            snapshot_path=buffers_snapshot_path,
-            writer=db_writer,                  # single-writer-thread (Option C)
-            on_degraded=_actr_degraded,        # D-SPEC-154 degradation → MODULE_ERROR cascade
-        )
-        # Initial export so the snapshot file exists from boot — agno's
-        # BufferCache.hydrate + Observatory routes get a real (possibly
-        # empty) payload immediately. The 60s recompute does NOT need
-        # to re-export buffers (every set/clear already triggers an
-        # atomic export inside ActrBufferStore.persist/clear).
+    def _wire_actr():
+        """Re-callable Phase 7 ActrBufferStore wiring. True=wired,
+        False=transient TimeoutError (retry), None=permanent failure."""
+        nonlocal actr_buffer_store
         try:
-            actr_buffer_store.snapshot_export()
+            from titan_hcl.synthesis.buffer_store import ActrBufferStore
+
+            def _actr_degraded(*, avg_ms, max_ms, samples):
+                # D-SPEC-154 early-warning: actr_buffers persist latency is creeping —
+                # the DuckDB ART-index-churn signature that precedes the FATAL
+                # crash-loop by days. Surface on the SPEC error cascade (INV-SDA-12)
+                # → MODULE_ERROR → kernel journal, so a recurrence is VISIBLE long
+                # before the next Abort (the Abort itself is an uncatchable C++
+                # terminate; this is the catchable precursor).
+                logger.warning(
+                    "[synthesis_worker] actr_buffers DEGRADED — persist avg=%.1fms "
+                    "max=%.1fms over %d samples (DuckDB ART-index churn re-accruing? "
+                    "— INV-Syn-30 / D-SPEC-154)", avg_ms, max_ms, samples)
+                try:
+                    publish_module_error(send_queue, ModuleError(
+                        module_name=name, subsystem="actr_buffers",
+                        error_code=ModuleErrorCode.STORAGE_DEGRADED,
+                        severity=_phase11_sev.WARN,
+                        message="actr_buffers persist latency degraded — possible DuckDB ART-index churn re-accruing",
+                        detail=(f"rolling persist avg={avg_ms:.1f}ms max={max_ms:.1f}ms over {samples} samples "
+                                f"(healthy is sub-ms). A full Titan restart self-heals any stray secondary "
+                                f"index (INV-Syn-30); if it persists, inspect synthesis.duckdb::actr_buffers."),
+                        suggested_remediation="full Titan restart (self-heals secondary ART indexes)"))
+                except Exception:
+                    pass
+
+            actr_buffer_store = ActrBufferStore(
+                duckdb_conn=store._conn,           # share synthesis.duckdb (INV-Syn-3)
+                snapshot_path=buffers_snapshot_path,
+                writer=db_writer,                  # single-writer-thread (Option C)
+                on_degraded=_actr_degraded,        # D-SPEC-154 degradation → MODULE_ERROR cascade
+            )
+            # Initial export so the snapshot file exists from boot — agno's
+            # BufferCache.hydrate + Observatory routes get a real (possibly
+            # empty) payload immediately. The 60s recompute does NOT need
+            # to re-export buffers (every set/clear already triggers an
+            # atomic export inside ActrBufferStore.persist/clear).
+            try:
+                actr_buffer_store.snapshot_export()
+                logger.info(
+                    "[synthesis_worker] Phase 7 working-memory buffers ready — "
+                    "store=ok, snapshot=%s",
+                    buffers_snapshot_path,
+                )
+            except Exception as _bsx_err:
+                logger.warning(
+                    "[synthesis_worker] initial buffers snapshot failed: %s",
+                    _bsx_err,
+                )
+            return True
+        except TimeoutError:
+            # Transient: writer saturated during a contended boot.
             logger.info(
-                "[synthesis_worker] Phase 7 working-memory buffers ready — "
-                "store=ok, snapshot=%s",
-                buffers_snapshot_path,
-            )
-        except Exception as _bsx_err:
+                "[synthesis_worker] Phase 7 ActrBufferStore wiring timed "
+                "out (writer saturated) — deferred re-wire will retry")
+            return False
+        except Exception as exc:
             logger.warning(
-                "[synthesis_worker] initial buffers snapshot failed: %s",
-                _bsx_err,
+                "[synthesis_worker] Phase 7 ActrBufferStore wiring failed: %s — "
+                "working-memory buffers disabled this session",
+                exc, exc_info=True,
             )
-    except Exception as exc:
-        logger.warning(
-            "[synthesis_worker] Phase 7 ActrBufferStore wiring failed: %s — "
-            "working-memory buffers disabled this session",
-            exc, exc_info=True,
-        )
+            return None
+    _deferred.attempt("actr", _wire_actr, deferred=False)
 
     # ── Phase 8 §P8.A-G — Procedural pipeline (D-SPEC-PHASE8) ──────────
     # Constructs: ProceduralSkillStore (INV-Syn-19) → SkillVerifier
@@ -3126,7 +3296,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             args=(procedural_skill_store, stop_event, interval_s, name),
             kwargs={"send_queue": send_queue, "shm_bank": _shm_bank,
                     "affective_runtime": _affective_runtime,
-                    "solana_oracle": solana_oracle,
+                    "solana_oracle_holder": solana_oracle_holder,
                     "maker_pubkey": _maker_pubkey_str,
                     "data_dir": _affective_data_dir},
             daemon=True, name=f"synthesis-skill-drain-{name}")
@@ -3413,7 +3583,15 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # capture to the store. At each companion-batch flush, every canonical
     # verdict naming its (goal, tool) is forwarded here → derive (outcome,
     # task-shape) → enqueue an off-hot-path score event (synthesis sole-writer).
-    if procedural_skill_store is not None and oracle_router is not None:
+    # EEL B1 (D-SPEC-153 / INV-Syn-29) — extracted as a finalize hook so a
+    # deferred phase6 re-wire re-runs it once oracle_router comes online
+    # post-boot (idempotent via _ran). At boot it runs inline right here.
+    _phase6_hooks_ran = {"v": False}
+    def _finalize_phase6_hooks():
+        if _phase6_hooks_ran["v"]:
+            return
+        if procedural_skill_store is None or oracle_router is None:
+            return
         from titan_hcl.synthesis.goal_class import (
             goal_class as _derive_goal_class,
             task_shape_for_goal as _derive_task_shape,
@@ -3458,6 +3636,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         except Exception as _sw_err:
             logger.warning(
                 "[synthesis_worker] skill-score sink wiring failed: %s", _sw_err)
+        _phase6_hooks_ran["v"] = True
+    _deferred.register_finalize("phase6", _finalize_phase6_hooks)
+    _finalize_phase6_hooks()
 
     if procedural_skill_store is not None:
         try:
@@ -3659,7 +3840,18 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             def _skill_concept_resolver(skill_id: str):
                 return None
 
-            if hypothesis_fork_store is not None:
+            # The tracker needs hypothesis_fork_store. Extracted as a finalize
+            # hook (idempotent via _ran) so a DEFERRED fork re-wire brings the
+            # repair-fork tracker ONLINE mid-session — the tracker rides the
+            # late-bound _skill_outcome_holder, so setting it here is live.
+            _fork_hooks_ran = {"v": False}
+
+            def _finalize_fork_hooks():
+                nonlocal skill_failure_tracker
+                if _fork_hooks_ran["v"]:
+                    return
+                if hypothesis_fork_store is None or procedural_skill_store is None:
+                    return
                 skill_failure_tracker = SkillFailureTracker(
                     fork_store=hypothesis_fork_store,
                     concept_resolver=_skill_concept_resolver,
@@ -3667,22 +3859,29 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     failure_threshold=int(
                         meta_cfg.get("repair_fork_failure_threshold", 3)),
                 )
+                _skill_outcome_holder["tracker"] = skill_failure_tracker
+                _fork_hooks_ran["v"] = True
+                logger.info(
+                    "[synthesis_worker] Phase 9 repair-fork tracker ONLINE "
+                    "(fork_store wired; failure_threshold=%s)",
+                    meta_cfg.get("repair_fork_failure_threshold", 3))
+            _deferred.register_finalize("forks", _finalize_fork_hooks)
+            _finalize_fork_hooks()   # boot inline: builds tracker iff fork_store present
+
             user_feedback_override = UserFeedbackOverride(
                 outer_memory_writer=writer,
                 skill_store=procedural_skill_store,
                 user_feedback_delta=float(meta_cfg.get("user_feedback_delta", 0.15)),
             )
-            # Fill the late-bound holder so the ToolPlug skill-outcome sink
-            # (built in the Phase 6 block) now drives the P8 utility loop +
-            # the failure tracker.
+            # Fill the late-bound holder (store part is fork-independent; the
+            # tracker part is set by _finalize_fork_hooks above).
             _skill_outcome_holder["store"] = procedural_skill_store
-            _skill_outcome_holder["tracker"] = skill_failure_tracker
             logger.info(
                 "[synthesis_worker] Phase 9 repair-fork + Tier-2 override ready "
                 "(failure_threshold=%s, feedback_delta=%s, tracker=%s)",
                 meta_cfg.get("repair_fork_failure_threshold", 3),
                 meta_cfg.get("user_feedback_delta", 0.15),
-                "on" if skill_failure_tracker is not None else "off(no fork store)",
+                "on" if skill_failure_tracker is not None else "off(no fork store yet)",
             )
         except Exception as exc:
             logger.warning(
