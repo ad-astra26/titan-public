@@ -550,6 +550,18 @@ max_posts_per_hour = 4              # Global hourly cap (T1:2 + T2:1 + T3:1)
 max_posts_per_day = 30              # ~10 per Titan per day
 # Minimum Post Gap — Shortest time between any two posts, in seconds.
 min_post_interval = 1800            # 30 min between any two posts (any Titan)
+# ── Fleet coordination (SPEC §23.15.2 / RFP_social_x §5) — the 3 Titans share ONE
+#    @your_x_handle account but post standalone from separate boxes (no cross-box channel). ──
+# Fleet post budget (SOFT ceiling): each box counts account-wide tweets on the shared
+# timeline before posting → self-limits the account with zero coordination (±small overshoot).
+fleet_max_posts_per_day = 12        # fleet-wide cap across ALL Titans (well under X's ~24/day line)
+fleet_max_posts_per_hour = 3        # fleet-wide hourly cap
+# Author-partition roster — deterministic sha256(author)%N owner; only the owning Titan
+# engages a given human (cross-Titan tag-dedup). MUST be identical on every box + include
+# every posting Titan (a mismatch silently disables engagement → startup WARN fires).
+engagement_fleet = ["T1", "T2", "T3"]
+engagement_partition_enabled = true # kill-switch only (=false reverts to per-box, multi-tag risk)
+author_cooldown_seconds = 86400     # 24h — owner won't re-engage the same author within this window
 # Replies Per Hour — Most X replies allowed per hour across all Titans.
 max_replies_per_hour = 10           # Global (T1:6 + T2:2 + T3:2)
 # Replies Per Day — Most X replies allowed per day across all Titans.

@@ -278,31 +278,20 @@ class OuterHeavyStatsRefresher:
         return self._events_teacher_reader.get_stats(self.titan_id)
 
     def _read_community_engagement(self) -> Optional[dict]:
-        # T1 owns social_x.db locally; T2/T3 reach T1 over HTTP (Phase 2.5.E).
-        if self.is_x_gateway and self.titan_id == "T1":
+        # Per-box topology (SPEC §23.15.2, RFP_social_x §5.FX.2): EVERY Titan owns
+        # its own local social_x.db + events_teacher.db and reads its dims LOCALLY,
+        # filtered by its own titan_id. The pre-2026-05-14 model where only T1 held
+        # the DB and T2/T3 HTTP-GET their slice from T1 is retired — that path
+        # returned stale/near-zero for T2/T3 (their engagement rows never reach T1's
+        # DB post Phase-C split). No cross-box HTTP.
+        sxg = self._social_x_reader
+        if sxg is None:
+            from titan_hcl.logic.social_x_gateway import SocialXGateway
+            self._social_x_reader = SocialXGateway()
             sxg = self._social_x_reader
-            if sxg is None:
-                from titan_hcl.logic.social_x_gateway import SocialXGateway
-                self._social_x_reader = SocialXGateway()
-                sxg = self._social_x_reader
-            if hasattr(sxg, "get_community_engagement_stats"):
-                return sxg.get_community_engagement_stats(
-                    is_x_gateway=True, titan_id="T1")
-            return None
-        try:
-            import urllib.request as _ur
-            import json as _json
-            url = (f"http://203.0.113.10:7777/v4/community-engagement-stats"
-                   f"?titan_id={self.titan_id}")
-            resp = _ur.urlopen(url, timeout=8.0)
-            body = _json.loads(resp.read())
-            if body.get("status") == "ok":
-                stats = body.get("data") or {}
-                stats["gateway_role"] = "kin-rpc"
-                stats["titan_id"] = self.titan_id
-                return stats
-        except Exception:
-            pass
+        if hasattr(sxg, "get_community_engagement_stats"):
+            return sxg.get_community_engagement_stats(
+                is_x_gateway=True, titan_id=self.titan_id)
         return None
 
 

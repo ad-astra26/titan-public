@@ -745,6 +745,76 @@ class SocialXGateway:
     _PLURALS = {"reply": "replies", "search": "searches",
                 "post": "posts", "like": "likes"}
 
+    def _check_fleet_ceiling(self, config: dict, context,
+                             *, bypass_caps: bool = False) -> "ActionResult | None":
+        """Coordination-free FLEET post-budget ceiling (SPEC §23.15.2 / RFP_social_x
+        §5.FX.1). The 3 Titans share ONE @your_x_handle account but post standalone
+        from separate boxes with NO cross-box channel (Q1). Before publishing, each
+        box reads the SHARED account timeline (external shared state — NOT a cross-box
+        transport, already wired + cached) and counts account-wide tweets in the
+        window; at the ceiling it defers, so the fleet self-limits the shared account
+        with zero coordination.
+
+        SOFT ceiling (Maker 2026-07-06): `last_tweets` is cached (~300s) + twitterapi.io
+        lags a few s → two boxes can both read under-ceiling within one window and both
+        post → ±1-2 overshoot accepted (set the ceiling under X's real limit). Counts
+        ALL account activity (posts + replies + quotes) — the true account-activity
+        measure X's limits key on. The OUTER gate; per-box `_check_rate_limits` is the
+        INNER gate. Must-post archetypes (`bypass_caps`) skip it — a must-post is
+        1/day/type, structurally safe. Fail-OPEN on any read/config error (a timeline
+        blip must never freeze posting; the per-box caps still bound each box).
+        """
+        if bypass_caps:
+            return None
+        try:
+            max_day = int(config.get("fleet_max_posts_per_day", 0) or 0)
+            max_hour = int(config.get("fleet_max_posts_per_hour", 0) or 0)
+        except Exception:
+            return None
+        if max_day <= 0 and max_hour <= 0:
+            return None  # ceiling disabled
+        try:
+            user_name = str((get_params("twitter_social") or {}).get(
+                "user_name", "") or "").strip().lstrip("@")
+        except Exception:
+            user_name = ""
+        if not user_name:
+            return None  # no shared handle → fail-open (per-box caps still apply)
+        try:
+            resp = self.fetch_recent_tweets(
+                user_name, count=40, api_key=getattr(context, "api_key", ""))
+            tweets = (((resp or {}).get("data") or {}).get("tweets")
+                      or (resp or {}).get("tweets") or [])
+        except Exception:
+            return None  # timeline read failed → fail-open
+        from email.utils import parsedate_to_datetime
+        now = time.time()
+        hour_ago, day_ago = now - 3600.0, now - 86400.0
+        day_count = hour_count = 0
+        for t in tweets:
+            created = (t or {}).get("createdAt", "")
+            if not created:
+                continue
+            try:
+                ts = parsedate_to_datetime(created).timestamp()
+            except Exception:
+                continue
+            if ts >= day_ago:
+                day_count += 1
+            if ts >= hour_ago:
+                hour_count += 1
+        if max_day > 0 and day_count >= max_day:
+            return ActionResult(
+                status="fleet_ceiling",
+                reason=f"fleet: {day_count}/{max_day} @{user_name} account "
+                       f"posts in 24h (shared-timeline ceiling)")
+        if max_hour > 0 and hour_count >= max_hour:
+            return ActionResult(
+                status="fleet_ceiling",
+                reason=f"fleet: {hour_count}/{max_hour} @{user_name} account "
+                       f"posts this hour (shared-timeline ceiling)")
+        return None
+
     def _check_rate_limits(self, action_type: str, config: dict,
                           titan_id: str = "", *,
                           bypass_caps: bool = False,
@@ -3589,9 +3659,22 @@ class SocialXGateway:
         #    the Titan is over its routine X budget (Maker 2026-06-11). The slot
         #    still commits atomically in post(); MAX_PENDING is never bypassed.
         _cand = getattr(context, "archetype_candidate", None)
+        _bypass = bool(getattr(_cand, "bypass_rate_limit", False))
+        # 5.OUTER — fleet post-budget ceiling (shared-timeline, coordination-free;
+        #           SPEC §23.15.2 / RFP_social_x §5.FX.1). Runs BEFORE the per-box
+        #           caps so the shared @your_x_handle account is bounded fleet-wide.
+        fleet_result = self._check_fleet_ceiling(
+            config, context, bypass_caps=_bypass)
+        if fleet_result:
+            self._log_telemetry({
+                "event": "post_blocked", "reason": fleet_result.status,
+                "detail": fleet_result.reason, "titan_id": context.titan_id,
+                "post_type": post_type,
+            })
+            return fleet_result, None
         limit_result = self._check_rate_limits(
             self.A_POST, config, titan_id=context.titan_id,
-            bypass_caps=bool(getattr(_cand, "bypass_rate_limit", False)),
+            bypass_caps=_bypass,
             post_type=post_type)
         if limit_result:
             self._log_telemetry({

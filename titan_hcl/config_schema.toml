@@ -356,6 +356,11 @@
 "social_presence.x_reply_max_per_hour" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
 "social_presence.x_thread_max_tweets" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
 "social_x.archetype_recency_boost_max" = {type="float", constraint="0..1", reload="hot", owner=["social_worker"], sensitive=false}
+"social_x.fleet_max_posts_per_day" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
+"social_x.fleet_max_posts_per_hour" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
+"social_x.engagement_fleet" = {type="list", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
+"social_x.engagement_partition_enabled" = {type="bool", constraint="", reload="hot", owner=["social_worker"], sensitive=false}
+"social_x.author_cooldown_seconds" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
 "social_x.archetype_recency_boost_per_day" = {type="float", constraint="0..1", reload="hot", owner=["social_worker"], sensitive=false}
 "social_x.archetype_recency_boost_threshold" = {type="float", constraint="0..1", reload="hot", owner=["social_worker"], sensitive=false}
 "social_x.auto_cycle.attribution_window_s" = {type="int", constraint=">=0", reload="hot", owner=["social_worker"], sensitive=false}
