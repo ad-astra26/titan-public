@@ -27,6 +27,8 @@ Usage:
   python scripts/arch_map.py health                  # LIVE runtime health checks against API
   python scripts/arch_map.py health --all            # Check ALL 3 Titans (T1+T2+T3)
   python scripts/arch_map.py health --t2             # Also check T2 (203.0.113.10:7777)
+  python scripts/arch_map.py synthesis               # Synthesis SUBSYSTEM deep-check across the fleet (freshness+invariants+divergence)
+  python scripts/arch_map.py synthesis --titan T2    # One box; --json for machine-readable
   python scripts/arch_map.py services                # Teacher + ARC + Persona + Events + X-HEALTH diagnostics (all Titans)
   python scripts/arch_map.py services --json         # Same, JSON output (cron-friendly)
   python scripts/arch_map.py x_check                 # Tail social_x health journal (last 24h on T1, SPEC v1.12.0)
@@ -9907,6 +9909,18 @@ def main():
                 continue
             _url, _label = _HEALTH_URLS[_t]
             run_health_checks(_url, _label)
+
+    elif cmd == "synthesis":
+        # Synthesis subsystem deep-check across the fleet — the synthesis
+        # analogue of `health`. Thin wrapper over scripts/synthesis_fleet_health.py
+        # (read-only snapshot GETs; cadence-aware freshness + invariant gates +
+        # per-box fleet-divergence). Pass-through args: --titan T1|T2|T3, --json.
+        import os as _os
+        import subprocess as _sp
+        _script = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                "synthesis_fleet_health.py")
+        _rc = _sp.call([sys.executable, _script, *sys.argv[2:]])
+        sys.exit(_rc)
 
     elif cmd == "dim-live":
         run_dim_live(sys.argv[2:])
