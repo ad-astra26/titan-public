@@ -111,6 +111,15 @@ def test_fail_open_when_no_handle(monkeypatch):
         {"fleet_max_posts_per_day": 1}, _Ctx()) is None
 
 
+def test_defaults_active_when_config_absent(monkeypatch):
+    # NO fleet_* keys in config → defaults ON (12/day, 3/hr) per all-flags-on.
+    _patch_handle(monkeypatch)
+    tweets = [{"createdAt": _created(1800 * i)} for i in range(1, 13)]  # 12 in 24h
+    gw = _FakeGW(tweets)
+    r = gw._check_fleet_ceiling({}, _Ctx())  # empty config
+    assert r is not None and r.status == "fleet_ceiling"
+
+
 def test_unparseable_createdat_skipped_not_crashed(monkeypatch):
     _patch_handle(monkeypatch)
     tweets = [{"createdAt": "garbage"}, {"createdAt": ""}, {}] + \

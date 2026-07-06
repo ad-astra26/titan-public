@@ -766,13 +766,17 @@ class SocialXGateway:
         """
         if bypass_caps:
             return None
+        # Defaults ON (12/day, 3/hr — Maker-locked 2026-07-06) per the all-flags-
+        # default-on rule: the ceiling is a SAFETY feature (protects the shared
+        # account) + fails open, so it's active fleet-wide on deploy without needing
+        # per-box config.toml edits. Kill-switch = set BOTH to 0 in [social_x].
         try:
-            max_day = int(config.get("fleet_max_posts_per_day", 0) or 0)
-            max_hour = int(config.get("fleet_max_posts_per_hour", 0) or 0)
+            max_day = int(config.get("fleet_max_posts_per_day", 12) or 0)
+            max_hour = int(config.get("fleet_max_posts_per_hour", 3) or 0)
         except Exception:
             return None
         if max_day <= 0 and max_hour <= 0:
-            return None  # ceiling disabled
+            return None  # ceiling disabled (both explicitly 0)
         try:
             user_name = str((get_params("twitter_social") or {}).get(
                 "user_name", "") or "").strip().lstrip("@")
