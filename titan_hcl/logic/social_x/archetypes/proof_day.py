@@ -222,6 +222,10 @@ class ProofDayArchetype(ArchetypeBase):
             return None
         if self.already_posted_today(titan_id=titan_id):
             return None
+        # FX.4 (RFP_social_x §5): abstain when hard-capped so a blocked must-post
+        # never monopolises dispatch + starves other archetypes.
+        if self.must_post_hard_capped(titan_id=titan_id):
+            return None
 
         anchor = _latest_anchor(titan_id)            # solana memo + archive_hash + size_mb
         arweave = _latest_arweave(titan_id)          # arweave tx_id + merkle_root

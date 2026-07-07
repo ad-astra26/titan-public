@@ -199,6 +199,38 @@ class ArchetypeBase:
         finally:
             conn.close()
 
+    def must_post_hard_capped(self, *, titan_id: str,
+                              now: float | None = None) -> bool:
+        """True if this must-post archetype is at ``MUST_POST_DAILY_HARD_CAP`` for
+        the rolling 24h (counts **ANY** status incl ``failed`` — mirrors the gateway
+        runaway backstop ``_check_rate_limits``). A hard-capped must-post MUST abstain
+        in ``find_candidate`` so it does NOT monopolise dispatch and starve every
+        other archetype — the failure that silenced a whole Titan for a day when its
+        soul_diary X-post ``failed`` 3× during the 2026-07 proxy outage (the capped
+        must-post kept being re-selected + blocked, so no other archetype ever got a
+        turn). RFP_social_x §5.FX.4. Fail-OPEN (never wrongly abstain on a read error).
+        """
+        try:
+            cfg = self.gateway._load_config() if self.gateway else {}
+            hard_cap = int(cfg.get("must_post_daily_hard_cap", 3) or 0)
+        except Exception:
+            hard_cap = 3
+        if hard_cap <= 0:
+            return False
+        n = now if now is not None else time.time()
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM actions WHERE action_type='post' "
+                "AND post_type=? AND titan_id=? AND created_at > ?",
+                (self.name, titan_id, n - 86400.0),
+            ).fetchone()
+            return bool(row) and int(row[0]) >= hard_cap
+        except Exception:
+            return False
+        finally:
+            conn.close()
+
     def cited_set(
         self,
         *,

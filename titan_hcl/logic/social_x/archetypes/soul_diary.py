@@ -77,6 +77,12 @@ class SoulDiaryArchetype(ArchetypeBase):
         titan_id = getattr(context, "titan_id", "")
         if self.already_posted_today(titan_id=titan_id):
             return None
+        # FX.4 (RFP_social_x §5): if this must-post is hard-capped (3 attempts/24h,
+        # any status), ABSTAIN so the dispatcher falls through to other archetypes
+        # instead of re-selecting a blocked must-post every tick → a capped diary
+        # can no longer silence the whole Titan (2026-07 outage lesson).
+        if self.must_post_hard_capped(titan_id=titan_id):
+            return None
 
         row = self._latest_entry()
         date = (row.get("date") or "").strip()
