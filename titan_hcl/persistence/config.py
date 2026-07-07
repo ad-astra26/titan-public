@@ -27,6 +27,12 @@ DEFAULTS = {
     "fast_path_enabled": True,
     "busy_timeout_sec": 30.0,
     "service_wal_max_mb": 64,
+    # Periodic SQLite `wal_checkpoint(TRUNCATE)` cadence (s) that shrinks the
+    # owned DB's SQLite WAL *file*. autocheckpoint keeps the WAL functionally
+    # small (passive, in-place) but never shrinks the file — a long-lived writer
+    # otherwise pins it at a historical high-water mark (consciousness.db-wal hit
+    # 2.3GB, 2026-07-07). 0 = disable (only close() truncates, the old behavior).
+    "wal_truncate_interval_s": 300.0,
     "max_in_flight_per_caller": 1000,
     "connect_timeout_sec": 5.0,
     "reconnect_backoff_min_ms": 100,
@@ -52,6 +58,7 @@ class IMWConfig:
     fast_path_enabled: bool = True
     busy_timeout_sec: float = 30.0
     service_wal_max_mb: int = 64
+    wal_truncate_interval_s: float = 300.0
     max_in_flight_per_caller: int = 1000
     connect_timeout_sec: float = 5.0
     reconnect_backoff_min_ms: int = 100

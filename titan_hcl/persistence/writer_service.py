@@ -64,6 +64,10 @@ class IMWDaemon:
         self._stop_event = asyncio.Event()
         self._last_committed_wal_offset = 0
         self._last_wal_warn_ts = 0.0  # B: throttle the "wal backing up" warning
+        # WAL-hygiene: monotonic ts of the last SQLite wal_checkpoint(TRUNCATE).
+        # 0.0 forces a truncate on (or shortly after) the first commit so a WAL
+        # inherited at a high-water mark (e.g. 2.3GB) is reclaimed promptly.
+        self._last_wal_truncate = 0.0
         # dedup cache size — keep last 50k req_ids
         self._dedup_cap = 50_000
 
@@ -537,6 +541,36 @@ class IMWDaemon:
         except Exception:  # noqa: BLE001
             pass
 
+    def _maybe_truncate_sqlite_wal(self) -> None:
+        """Periodically TRUNCATE-checkpoint the owned SQLite WAL file(s).
+
+        `_open_db` sets wal_autocheckpoint=1000 so the WAL's LIVE content stays
+        tiny (passive checkpoint, in-place), but passive autocheckpoint never
+        shrinks the *file* — only close() did. A long-lived writer therefore pins
+        `.db-wal` at a historical high-water mark (consciousness.db-wal reached
+        2.3GB, 2026-07-07). This bounds the file. Runs INLINE on the commit-loop
+        task → serialized with commits on these exact connections (no cross-thread
+        race). Best-effort: any error is swallowed so it can NEVER break the write
+        path. Cheap: the live backlog is already checkpointed by autocheckpoint,
+        so TRUNCATE just flushes the small tail + ftruncates the file.
+        """
+        interval = self._cfg.wal_truncate_interval_s
+        if interval <= 0:   # kill-switch → old behavior (only close() truncates)
+            return
+        now = time.monotonic()
+        if (now - self._last_wal_truncate) < interval:
+            return
+        self._last_wal_truncate = now
+        for conn in (self._conn, self._shadow_conn):
+            if conn is None:
+                continue
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error as e:
+                swallow_warn("[imw] periodic wal_checkpoint(TRUNCATE) failed", e,
+                             key="persistence.writer_service.wal_truncate",
+                             throttle=100)
+
     async def _commit_loop(self) -> None:
         batch_window = self._cfg.batch_window_ms / 1000.0
         max_batch = self._cfg.max_batch_size
@@ -575,6 +609,9 @@ class IMWDaemon:
                 self._metrics.incr_batches()
                 self._metrics.set_in_flight(0)
                 self._warn_if_wal_backing_up()
+                # WAL-hygiene: bound the owned SQLite WAL file (cadence-gated,
+                # best-effort). After a successful commit so it never delays a write.
+                self._maybe_truncate_sqlite_wal()
                 _consecutive_errors = 0
             except Exception as e:  # noqa: BLE001 — the commit loop must NEVER die
                 _consecutive_errors += 1
