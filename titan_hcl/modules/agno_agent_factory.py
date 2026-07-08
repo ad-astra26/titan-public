@@ -28,6 +28,21 @@ logger = logging.getLogger(__name__)
 
 _AGNO_TODICT_PATCHED = False
 
+# RFP_chat_concurrency_serialization_gil_storm §7.A (INV-SAVE-LEAN). The V5-enriched
+# SYSTEM prompt (VCB recall + [INNER STATE], ~20KB/turn — live-measured 92% of saved
+# message bytes) is elided from the PERSISTED run. agno's per-turn `upsert_session`
+# re-serializes the WHOLE session (asdict + per-message `to_dict` + `json.dumps` over
+# EVERY run) → under §7.B0 concurrency N of these deepcopies saturate the single GIL
+# and starve every turn's PreHook. Persisting lean text collapses that payload. The
+# live turn's cognition already USED the full system prompt — this is the SAVE side
+# only (history LOAD is already bypassed, `add_history_to_context=False`), and no
+# consumer reads the saved system message back (pitch-display reads a separate JSONL;
+# the backfill migration explicitly skips system prompts; agno never re-injects it).
+_ELIDED_SYSTEM_MARKER = (
+    "[system prompt elided from session persistence — INV-SAVE-LEAN "
+    "(RFP_chat_concurrency_serialization_gil_storm §7.A)]"
+)
+
 
 def _install_agno_to_dict_fastpath() -> None:
     """Skip the redundant ``asdict(self)`` in agno's per-turn session serialize.
@@ -135,7 +150,20 @@ def _install_agno_to_dict_fastpath() -> None:
                                    if isinstance(self.status, _ra.RunStatus)
                                    else self.status)
             if self.messages is not None:
-                _dict["messages"] = [m.to_dict() for m in self.messages]
+                # INV-SAVE-LEAN: elide the enriched SYSTEM prompt from the
+                # persisted run (see _ELIDED_SYSTEM_MARKER above). Keyed on
+                # role=='system' → content-agnostic → covers EVERY subsystem's
+                # VCB-enriched prompt at this single serialization chokepoint
+                # (the sole agno session-save path in the process). User/assistant
+                # text is serialized byte-identically to stock.
+                _msgs_out = []
+                for _m in self.messages:
+                    _md = _m.to_dict()
+                    if (_md.get("role") == "system"
+                            and isinstance(_md.get("content"), str)):
+                        _md["content"] = _ELIDED_SYSTEM_MARKER
+                    _msgs_out.append(_md)
+                _dict["messages"] = _msgs_out
             if self.metadata is not None:
                 _dict["metadata"] = self.metadata
             if self.additional_input is not None:
@@ -204,20 +232,58 @@ def _install_agno_to_dict_fastpath() -> None:
             _probe_run = None
 
         # Patch RunOutput first (so the AgentSession check exercises the
-        # fast run path too), each gated independently.
+        # fast run path too), each gated independently. TWO self-checks must
+        # BOTH pass before installing: (a) NON-system serialization stays
+        # byte-identical to stock (F7 invariant); (b) the INV-SAVE-LEAN
+        # system-elision fires AND leaves every other field identical to stock.
+        # Either fails → keep stock (fat but correct save) — no silent corruption.
         if _probe_run is not None:
-            if _norm(RunOutput.to_dict(_probe_run)) == _norm(
-                    _fast_run_to_dict(_probe_run)):
+            # (a) non-system probe (user+assistant only): must equal stock.
+            _nonsys_ok = _norm(RunOutput.to_dict(_probe_run)) == _norm(
+                _fast_run_to_dict(_probe_run))
+            # (b) system-elision probe: system content elided, rest identical.
+            _sys_ok = False
+            try:
+                _sys_probe = RunOutput(
+                    run_id="__probe_sys__", agent_id="a",
+                    messages=[Message(role="system", content="S" * 4096),
+                              Message(role="user", content="hi"),
+                              Message(role="assistant", content="yo")],
+                    metadata={"k": 1})
+                _stock_sys = RunOutput.to_dict(_sys_probe)
+                _fast_sys = _fast_run_to_dict(_sys_probe)
+
+                def _mask_system(_d):
+                    # deep-copy + blank system content on both sides so the
+                    # equality asserts EVERYTHING ELSE is byte-identical.
+                    _c = json.loads(json.dumps(_d, default=str))
+                    for _mm in (_c.get("messages") or []):
+                        if _mm.get("role") == "system":
+                            _mm["content"] = "<S>"
+                    return _c
+
+                _sys_ok = (
+                    _fast_sys["messages"][0].get("content")
+                    == _ELIDED_SYSTEM_MARKER
+                    and _mask_system(_fast_sys) == _mask_system(_stock_sys))
+            except Exception as _sc_err:  # noqa: BLE001
+                logger.warning(
+                    "[AgnoFactory] system-elision self-check errored on agno "
+                    "%s: %s", ver, _sc_err)
+
+            if _nonsys_ok and _sys_ok:
                 RunOutput.to_dict = _fast_run_to_dict
                 logger.info(
-                    "[AgnoFactory] RunOutput.to_dict fastpath installed "
-                    "(PROFILING.md F7; agno %s) — skips the redundant "
-                    "asdict(self) over a run's messages/metrics/tools", ver)
+                    "[AgnoFactory] RunOutput.to_dict fastpath + INV-SAVE-LEAN "
+                    "installed (PROFILING.md F7 + RFP gil_storm §7.A; agno %s) "
+                    "— skips the redundant asdict(self) AND elides the enriched "
+                    "system prompt from the per-turn session save", ver)
             else:
                 logger.warning(
-                    "[AgnoFactory] RunOutput.to_dict self-check FAILED on agno "
-                    "%s — keeping stock RunOutput.to_dict (AgentSession patch "
-                    "still attempted)", ver)
+                    "[AgnoFactory] RunOutput.to_dict self-check FAILED "
+                    "(nonsys_ok=%s sys_ok=%s) on agno %s — keeping stock "
+                    "RunOutput.to_dict (fat save retained, correct)",
+                    _nonsys_ok, _sys_ok, ver)
         else:
             logger.info(
                 "[AgnoFactory] RunOutput probe not constructable on agno %s — "
