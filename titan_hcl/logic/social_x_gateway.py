@@ -309,6 +309,11 @@ class SocialXGateway:
         # the session is genuinely dead (reads also failing) and at most 1/6h.
         self._last_read_ok_ts: float = 0.0
         self._last_refresh_ts: float = 0.0
+        # FX.5.D credit-floor safeguard: set True by social_worker's balance check
+        # when twitterapi.io credits drop below the hibernate floor → x_api_hibernated()
+        # returns True → the SOLE caller refuses every call (zero spend) until credits
+        # recover. Runtime flag (per box), not config — flips in seconds without a write.
+        self._credit_hibernated: bool = False
         # Persistent write-suspension: N consecutive decisive write rejections
         # (X-422 / 226 automated) → suspend ALL writes (no API call, no credit)
         # until `_write_suspended_until`, surviving restarts via a tiny JSON.
@@ -1147,6 +1152,17 @@ class SocialXGateway:
         import httpx
         if self.x_api_hibernated():
             return ""   # account hibernated → never spend a login credit
+        # FX.5.C: we post via the BROWSER COOKIE (project_x_posting_disabled_account_
+        # flagged) — programmatic login is Twitter-throttled + flag-risky + 500cr/call
+        # (8% of spend, ~162 logins). Default OFF: a write-422 with a stale cookie
+        # surfaces via the FX.5.D low-credit/cookie alert for a MANUAL cookie refresh,
+        # not a silent (and risky) auto re-login. Flip on only if reverting to creds-login.
+        try:
+            if not bool((get_params("social_x") or {}).get(
+                    "programmatic_login_enabled", False)):
+                return ""
+        except Exception:
+            return ""
         try:
             from titan_hcl.params import load_titan_params as load_titan_config
             full_cfg = load_titan_params()
@@ -1278,7 +1294,12 @@ class SocialXGateway:
         in seconds (config-as-SHM, no restart) — used to hibernate during the X
         account review hold and to wake it later. Default = enabled (not
         hibernated). Replaces the prior sentinel / write_enabled / api_enabled
-        levers (consolidated 2026-06-18)."""
+        levers (consolidated 2026-06-18).
+
+        FX.5.D: also honours the runtime `_credit_hibernated` flag (low twitterapi.io
+        balance) so a near-empty credit pool stops ALL spend before it runs to zero."""
+        if getattr(self, "_credit_hibernated", False):
+            return True
         try:
             return not bool((get_params("social_x") or {}).get("enabled", True))
         except Exception:

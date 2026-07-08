@@ -562,6 +562,17 @@ fleet_max_posts_per_hour = 3        # fleet-wide hourly cap
 engagement_fleet = ["T1", "T2", "T3"]
 engagement_partition_enabled = true # kill-switch only (=false reverts to per-box, multi-tag risk)
 author_cooldown_seconds = 86400     # 24h — owner won't re-engage the same author within this window
+# ── FX.5 credit-spend safeguards (twitterapi.io) ──
+# Programmatic login: OFF — we post via a browser-session cookie (auth_token+ct0 in
+# secrets.auth_session); programmatic user_login_v2 is Twitter-throttled + 500cr/call.
+programmatic_login_enabled = false
+# Credit-floor safeguard: a periodic FREE balance check (/oapi/my/info). Below the
+# hibernate floor the whole fleet auto-stops X spend + alerts the Maker; below the
+# alert floor it just warns. Auto-resumes when credits recover. (Fixes the silent
+# run-to-zero that blacked out the fleet ~23h.)
+credit_alert_floor = 20000          # warn the Maker below this
+credit_hibernate_floor = 2000       # auto-hibernate ALL X spend below this
+credit_check_interval_seconds = 900 # how often to check the balance (15 min; free call)
 # Replies Per Hour — Most X replies allowed per hour across all Titans.
 max_replies_per_hour = 10           # Global (T1:6 + T2:2 + T3:2)
 # Replies Per Day — Most X replies allowed per day across all Titans.

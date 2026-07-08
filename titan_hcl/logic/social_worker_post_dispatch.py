@@ -136,6 +136,8 @@ class PostDispatchOrchestrator:
         # used _x_gateway._last_mention_check_ts; we keep it on the
         # orchestrator instance to avoid mutating the gateway).
         self._last_mention_check_ts: float = 0.0
+        # FX.5.D credit-floor safeguard — last twitterapi.io balance check.
+        self._last_credit_check_ts: float = 0.0
         # rFP X-post PART C2 (INV-XEFF-4) — adaptive mention-poll backoff:
         # consecutive empty polls widen the effective cooldown (×2 each, capped),
         # any discovered mention resets it. ≈5% mention hit-rate ⇒ cuts most of
@@ -834,6 +836,62 @@ class PostDispatchOrchestrator:
 
     # ── Mention discovery + reply cycle ──
 
+    def _maker_alert(self, text: str, key: str, rate_limit_s: float) -> None:
+        try:
+            from titan_hcl.utils.maker_alert import send_maker_alert
+            send_maker_alert(text, alert_key=key, rate_limit_seconds=rate_limit_s)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[PostDispatch] maker_alert failed: %s", e)
+
+    def _check_credit_floor(self, now: float) -> None:
+        """FX.5.D credit-floor safeguard (RFP_social_x §5). Periodically checks the
+        twitterapi.io balance via the FREE /oapi/my/info. Below the hibernate floor →
+        set the gateway's runtime ``_credit_hibernated`` flag (every box does this, so
+        the whole fleet stops spending) + the canonical poller alerts the Maker;
+        un-hibernates + resumes automatically once credits recover. Closes the gap that
+        let the pool run to −267 and blacked out the fleet ~23h with no warning."""
+        sx = get_params("social_x") or {}
+        interval = float(sx.get("credit_check_interval_seconds", 900.0))
+        if interval <= 0 or now - self._last_credit_check_ts < interval:
+            return
+        self._last_credit_check_ts = now
+        key = (get_params("stealth_sage") or {}).get("twitterapi_io_key", "")
+        if not key:
+            return
+        try:
+            import httpx
+            bal = int(httpx.get(
+                "https://api.twitterapi.io/oapi/my/info",
+                headers={"X-API-Key": key}, timeout=15.0
+            ).json().get("recharge_credits"))
+        except Exception:
+            return  # a balance-check blip must never disturb posting
+        hib_floor = int(sx.get("credit_hibernate_floor", 2000))
+        alert_floor = int(sx.get("credit_alert_floor", 20000))
+        gw = self._gateway
+        if bal < hib_floor:
+            if not getattr(gw, "_credit_hibernated", False):
+                gw._credit_hibernated = True
+                logger.warning(
+                    "[PostDispatch] twitterapi.io credits %d < hibernate floor %d "
+                    "— X spend AUTO-HIBERNATED (zero spend until recharge).",
+                    bal, hib_floor)
+            if self._is_canonical_poller:
+                self._maker_alert(
+                    f"🛑 *twitterapi.io credits {bal:,}* (< {hib_floor:,}) — Titan X "
+                    f"posting AUTO-HIBERNATED fleet-wide to stop the spend. Recharge "
+                    f"to auto-resume.", "social_x.credit_hibernate", 3600.0)
+        else:
+            if getattr(gw, "_credit_hibernated", False):
+                gw._credit_hibernated = False
+                logger.info("[PostDispatch] twitterapi.io credits %d recovered "
+                            "≥ floor — X spend resumed.", bal)
+            if bal < alert_floor and self._is_canonical_poller:
+                self._maker_alert(
+                    f"⚠️ *twitterapi.io credits low: {bal:,}* (< {alert_floor:,}). "
+                    f"Recharge soon — the fleet auto-hibernates at {hib_floor:,}.",
+                    "social_x.credit_low", 21600.0)
+
     def _run_mention_cycle(self, *, full_config: dict,
                            grounded_words: list, neuromods: dict,
                            emotion: str, now: float) -> int:
@@ -1109,6 +1167,13 @@ class PostDispatchOrchestrator:
                 "[PostDispatch] config load failed — skipping tick: %s",
                 _err)
             return
+
+        # FX.5.D — credit-floor safeguard (throttled internally to
+        # credit_check_interval_seconds; free /oapi/my/info). Runs before any spend.
+        try:
+            self._check_credit_floor(time.time())
+        except Exception as _cf_err:  # noqa: BLE001
+            logger.debug("[PostDispatch] credit-floor check error: %s", _cf_err)
 
         # Drain catalysts the meter has accumulated since last tick.
         # The meter's drain method clears its internal list and returns
