@@ -159,6 +159,32 @@ class OllamaCloudProvider(InferenceProvider):
         # the loop each time) get a fresh client instead of one bound to a dead
         # loop. See chat() for the rebuild logic. (2026-06-02)
         self._shared_client_loop: Optional[Any] = None
+        # R2.5 (§R2 2026-07-08) — admission-control semaphore: bounds concurrent
+        # in-flight provider POSTs so a burst does not overrun ollama-cloud into
+        # the 2→30s backoff-retry storm (the real p95=90s driver). Excess requests
+        # QUEUE client-side (fair asyncio FIFO) — same model, same output, paced.
+        # Loop-bound like the shared client (rebuilt on loop change); size is
+        # config-hot-reloadable via [inference.autoscale] provider_max_concurrent.
+        self._admit_sem: Optional["asyncio.Semaphore"] = None
+        self._admit_sem_loop: Optional[Any] = None
+        self._admit_sem_limit: int = 0
+
+    def _get_admit_sem(self, loop: Any) -> "asyncio.Semaphore":
+        """R2.5 — the admission semaphore for the current loop. Rebuilt on loop
+        change or when the configured limit changes (config hot-reload)."""
+        try:
+            from titan_hcl.params import get_params
+            limit = int((get_params("inference").get("autoscale", {}) or {}).get(
+                "provider_max_concurrent", 6) or 6)
+        except Exception:
+            limit = 6
+        limit = max(1, limit)
+        if (self._admit_sem is None or self._admit_sem_loop is not loop
+                or self._admit_sem_limit != limit):
+            self._admit_sem = asyncio.Semaphore(limit)
+            self._admit_sem_loop = loop
+            self._admit_sem_limit = limit
+        return self._admit_sem
 
     # ── Identity ──
 
@@ -282,6 +308,13 @@ class OllamaCloudProvider(InferenceProvider):
                     "falling back to per-call client", _shared_err)
                 self._shared_client = None
                 self._shared_client_loop = None
+        # R2.5 — admission control: cap concurrent in-flight provider POSTs; excess
+        # requests queue here (fair FIFO) instead of overrunning ollama-cloud. Held
+        # across the POST+parse only; released in `finally` (all paths). Backoff
+        # early-return above never reaches here, so a paced request never holds a slot
+        # while merely waiting out a backoff window.
+        _sem = self._get_admit_sem(_cur_loop)
+        await _sem.acquire()
         try:
             # Phase 2 Chunk ε — reuse the shared client (set up once at
             # provider construct time). New AsyncClient per call costs
@@ -363,6 +396,8 @@ class OllamaCloudProvider(InferenceProvider):
                 (time.perf_counter() - _t0) * 1000, e,
             )
             return ""
+        finally:
+            _sem.release()   # R2.5 — always free the admission slot
 
     async def stream_chat(
         self,

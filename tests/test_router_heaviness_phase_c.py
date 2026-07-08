@@ -62,12 +62,16 @@ def test_bucket_carries_heaviness_dimension():
 
 
 def test_heaviness_zero_reward_is_identical_to_pre_c():
-    """At heaviness=0 both modulation scales vanish → the reward is the pre-C formula."""
+    """At heaviness=0 both modulation scales vanish → the reward is the base
+    (no-modulation) formula. NB: R2.4 (§R2 2026-07-08) replaced the responsiveness
+    curve with the monotonic non-saturating `target/(target+lat)`; this parity test
+    tracks that base curve — its subject is the heaviness-modulation vanishing at
+    heaviness=0, not the specific responsiveness shape."""
     r = _router()
-    # recompute the pre-C composite by hand for a mid-latency gemma turn
+    # recompute the base composite by hand for a mid-latency gemma turn
     wl, wq, wc, target = 0.6, 0.3, 0.1, 12.0
     lat = 6.0
-    resp = max(0.0, min(1.0, 1.0 - lat / (2.0 * target)))
+    resp = max(1e-6, target) / (max(1e-6, target) + max(0.0, lat))   # R2.4 curve
     q = r._qprior["gemma4:31b"]
     c = r._cprior["gemma4:31b"]
     expected = wl * resp + wq * q + wc * c

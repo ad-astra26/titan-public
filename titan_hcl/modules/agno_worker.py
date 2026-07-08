@@ -1667,10 +1667,19 @@ def _keepalive_loop(worker_plugin, stats_ref: dict,
     from titan_hcl.params import get_params as _gp
     _msgs = [{"role": "user", "content": "ping"}]
 
-    async def _warm(provider, model, n):
+    async def _warm(provider, model, n, router=None):
         async def _one():
+            _t = time.time()
             try:
                 await provider.chat(_msgs, model=model, max_tokens=8, timeout=30.0)
+                # R2.3 (§R2) — feed the ping latency into the router's WARMTH signal
+                # (separate from chat-latency ema) so the revert-when-warm gate stays
+                # live while offloaded. Soft — a monitor hiccup never affects warming.
+                if router is not None:
+                    try:
+                        router.monitor.record_warmth(model, time.time() - _t)
+                    except Exception:
+                        pass
             except Exception:
                 pass  # soft — keepalive never affects chat
         await asyncio.gather(*[_one() for _ in range(n)])
@@ -1736,15 +1745,38 @@ def _keepalive_loop(worker_plugin, stats_ref: dict,
                         _warm_models.add(_pmw)
                 except Exception:
                     pass
+                # R2.3 — the router whose WARMTH monitor the pings feed.
+                _ka_router = None
+                try:
+                    _ka_router = _get_adaptive_router()
+                except Exception:
+                    _ka_router = None
+                # R2.1 (§R2) — keep the OFFLOAD LADDER arms minimally warm too, not
+                # just gemma4 + the pitch model. Before this, an offload to ministral-
+                # 3:14b / gemma3:12b hit a COLD cloud pool → the fallback paid a
+                # cold-start that defeated the offload. Warm 1 unit of each ladder arm
+                # (config keepalive_ladder, default ON) so a mid-burst offload lands
+                # on a warm fallback. Cheap (1 ping/arm/interval), gated + soft.
+                _ladder_arms = set()
+                if bool(ka.get("keepalive_ladder", True)) and _ka_router is not None:
+                    try:
+                        _ladder_arms = {m for m in getattr(_ka_router, "ladder", [])
+                                        if m and m not in _warm_models}
+                    except Exception:
+                        _ladder_arms = set()
                 if provider is not None and active and gap > 0:
                     for _wm in _warm_models:
-                        loop.run_until_complete(_warm(provider, _wm, gap))
+                        loop.run_until_complete(_warm(provider, _wm, gap, _ka_router))
+                    # ladder arms: 1 warm unit each (keep-loaded, not load-scaled)
+                    for _la in _ladder_arms:
+                        loop.run_until_complete(_warm(provider, _la, 1, _ka_router))
                     _fired += 1
                     if _fired == 1 or _fired % 20 == 0:
                         logger.info(
                             "[AgnoWorker] keepalive #%d — warmed %d unit(s) of %s "
-                            "(in_flight=%d recent_peak=%.1f)",
-                            _fired, gap, sorted(_warm_models), in_flight, recent_peak)
+                            "+ ladder %s (in_flight=%d recent_peak=%.1f)",
+                            _fired, gap, sorted(_warm_models), sorted(_ladder_arms),
+                            in_flight, recent_peak)
             except Exception as _ka_err:  # noqa: BLE001
                 logger.debug("[AgnoWorker] keepalive tick failed: %s", _ka_err)
             stop_event.wait(interval)

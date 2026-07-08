@@ -199,6 +199,8 @@
 "inference.autoscale.heaviness_w_duration" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
 "inference.autoscale.heaviness_w_tokens" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
 "inference.autoscale.heaviness_w_goal_class" = {type="float", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.keepalive_ladder" = {type="bool", constraint="", reload="hot", owner=["agno_worker"], sensitive=false}
+"inference.autoscale.provider_max_concurrent" = {type="int", constraint=">=1", reload="hot", owner=["agno_worker"], sensitive=false}
 "info_banner.enabled" = {type="bool", constraint="", reload="hot", owner=["kernel"], sensitive=false}
 "info_banner.style" = {type="str", constraint="", reload="hot", owner=["kernel"], sensitive=false}
 "mainnet_budget.backup_arweave_enabled" = {type="bool", constraint="", reload="hot", owner=["backup"], sensitive=false}

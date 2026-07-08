@@ -41,6 +41,16 @@ class InferenceLatencyMonitor:
     def __init__(self, alpha: float = 0.3) -> None:
         self._alpha = float(alpha)
         self._ema: dict[str, float] = {}
+        # R2.3 (§R2 2026-07-08) — WARMTH signal, fed by keepalive pings, kept
+        # SEPARATE from the chat-latency ema. A keepalive ping is tiny (8 tokens)
+        # so its latency reflects model WARMTH (loaded vs cold), NOT full-turn
+        # latency; mixing it into `_ema` would make gemma look fast + corrupt the
+        # offload-enter signal + the bandit-adjacent latency. Used ONLY by the
+        # revert-when-confirmed-warm gate (which asks "is gemma loaded?", not "how
+        # slow is a real turn?"). Updates every keepalive tick → unfreezes the
+        # revert decision while offloaded (the ema alone freezes with no real
+        # gemma turns to feed it → offload was one-way/sticky).
+        self._warmth: dict[str, float] = {}
 
     def record(self, model: str, latency_s: float) -> None:
         a = self._alpha
@@ -50,6 +60,18 @@ class InferenceLatencyMonitor:
 
     def ema(self, model: str, default: float = 0.0) -> float:
         return self._ema.get(model, default)
+
+    def record_warmth(self, model: str, latency_s: float) -> None:
+        """R2.3 — fold a keepalive-ping latency into the model's warmth EMA."""
+        a = self._alpha
+        prev = self._warmth.get(model)
+        self._warmth[model] = (float(latency_s) if prev is None
+                               else (1.0 - a) * prev + a * float(latency_s))
+
+    def warmth(self, model: str, default: float = 999.0) -> float:
+        """R2.3 — ping-based warmth (seconds). Default HIGH = 'not confirmed warm'
+        (no ping seen yet → don't revert into a possibly-cold model)."""
+        return self._warmth.get(model, default)
 
 
 class AdaptiveRouter:
@@ -194,18 +216,31 @@ class AdaptiveRouter:
         return self.managed
 
     def _apply_dwell(self, chosen: str) -> str:
-        """Flap guardrail (§Ad-5): hold a fallback for min_dwell, and revert to gemma
-        ONLY when it is confirmed-warm — reverting into a cold gemma re-triggers the
-        ~60s spike."""
+        """Flap guardrail (§Ad-5 + R2.2). Three cases for a switch off `_current_arm`:
+        (a) revert TO gemma — hold `min_dwell` AND revert only when gemma is
+            confirmed-warm (< `exit_latency`); reverting into a cold gemma re-triggers
+            the ~60s spike. (b) R2.2 (§R2 2026-07-08) fallback→DIFFERENT-fallback —
+            hold `min_dwell` too: the old code guarded ONLY revert-to-gemma, so
+            ministral↔gemma3 flapped every few seconds (observed) → repeated
+            cold-starts. (c) gemma→fallback ESCALATION stays IMMEDIATE (offload the
+            moment gemma is slow — responsiveness must not be dwell-blocked)."""
         now = time.time()
+        if chosen == self._current_arm:
+            return chosen
+        held = (now - self._switched_at) < self._f("min_dwell_s", 20.0)
         if chosen == self.managed and self._current_arm != self.managed:
-            if (now - self._switched_at) < self._f("min_dwell_s", 20.0):
+            # (a) revert to gemma — R2.3: gate on WARMTH (ping-fed, live during
+            # offload), not the frozen chat-latency ema. warmth default is HIGH so
+            # a never-pinged gemma is treated as not-confirmed-warm.
+            if held or self.monitor.warmth(
+                    self.managed, 999.0) > self._f("exit_latency_s", 7.0):
                 return self._current_arm
-            if self.monitor.ema(self.managed) > self._f("exit_latency_s", 7.0):
-                return self._current_arm   # gemma not confirmed-warm → keep fallback
-        if chosen != self._current_arm:
-            self._current_arm = chosen
-            self._switched_at = now
+        elif self._current_arm != self.managed and held:
+            # (b) anti-flap between fallbacks — hold the current fallback
+            return self._current_arm
+        # (c) escalation (gemma→fallback) or a dwell-cleared switch — commit
+        self._current_arm = chosen
+        self._switched_at = now
         return chosen
 
     # ── the reward loop ──
@@ -271,8 +306,16 @@ class AdaptiveRouter:
         h = max(0.0, min(1.0, float(heaviness)))
         wq = wq * (1.0 + h * self._f("heaviness_quality_boost", 1.0))
         target = target * (1.0 + h * self._f("heaviness_latency_relax", 1.5))
-        # responsiveness: 1.0 at 0s, 0.5 at target, 0.0 at ≥2×target
-        responsiveness = max(0.0, min(1.0, 1.0 - latency_s / (2.0 * max(1e-6, target))))
+        # R2.4 (§R2, 2026-07-08) — responsiveness curve. The old form
+        #   max(0, 1 - latency/(2·target))  CLAMPED to 0 at ≥2×target, so under
+        # heavy load where every model exceeds 24s the latency signal FLATTENED
+        # (30s and 90s both scored 0) → the bandit tipped to quality (gemma4, the
+        # wrong pick under load). Replace with a monotonic, never-saturating curve:
+        #   target/(target+latency)  → 1.0 @0s, 0.5 @target, 0.33 @2×target, →0 as
+        # latency→∞ but ALWAYS strictly decreasing, so a faster model always
+        # out-scores a slower one even when both are slow. Pure latency-signal fix;
+        # quality/cost terms unchanged (INV-R2-NO-QUALITY).
+        responsiveness = max(1e-6, target) / (max(1e-6, target) + max(0.0, latency_s))
         q = self._q_for(model_id)          # B.2 — learned quality, prior as fallback
         c = self._cprior.get(model_id, 0.5)
         return wl * responsiveness + wq * q + wc * c
