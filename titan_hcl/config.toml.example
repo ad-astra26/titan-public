@@ -663,7 +663,7 @@ spam_patterns = [
 # Conversion Window — How far back to credit a post for engagement, in seconds.
 attribution_window_s = 172800   # 48h conversion lookback (on POST time, not storage)
 # Source Gate — Score a source needs to keep being used.
-gate_threshold = 0              # fetch if conversion score >= this OR exploration-due
+gate_threshold = 1              # FX.5 credit-spend: 0→1 — fetch only PROVEN converters (score≥1) + explore-due; skips neutral/non-converting sources (advanced_search is 36% of spend @ 300cr/call). explore_cycles=3 still re-probes gated sources, so never blind.
 # Re-Probe Rate — How often to retry a paused source, in cycles.
 explore_cycles = 3              # re-probe each gated source within N windows (never blind)
 # Probe Result Count — Results fetched when re-probing a paused source.

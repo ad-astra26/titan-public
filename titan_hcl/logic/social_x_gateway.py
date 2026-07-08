@@ -786,7 +786,9 @@ class SocialXGateway:
             return None  # no shared handle → fail-open (per-box caps still apply)
         try:
             resp = self.fetch_recent_tweets(
-                user_name, count=40, api_key=getattr(context, "api_key", ""))
+                # FX.5 credit-spend: 20 covers the 24h window at fleet ~12/day
+                # (twitterapi.io bills per item ~15cr → count=20 is 300cr vs 600).
+                user_name, count=20, api_key=getattr(context, "api_key", ""))
             tweets = (((resp or {}).get("data") or {}).get("tweets")
                       or (resp or {}).get("tweets") or [])
         except Exception:
@@ -3254,7 +3256,10 @@ class SocialXGateway:
                     "twitter/user/last_tweets",
                     method="GET",
                     payload={"userName": config.get("user_name", "your_x_handle"),
-                             "count": 10},
+                             # FX.5 credit-spend: recency-guard only needs to see
+                             # if OUR just-posted tweet is on the timeline → 5 is
+                             # plenty (75cr vs 150) and we just posted seconds ago.
+                             "count": 5},
                     api_key=config.get("api_key", ""),
                     bypass_cache=(attempt > 0),
                 )
@@ -4892,7 +4897,10 @@ class SocialXGateway:
             # Primary: dedicated mentions endpoint
             mention_api = self._call_x_api(
                 "twitter/user/mentions", method="GET",
-                payload={"userName": user_name, "count": 20},
+                # FX.5 credit-spend: new mentions since the last poll are few →
+                # 10 catches them (150cr vs 300); the single-owner poll + C2
+                # backoff already bound frequency.
+                payload={"userName": user_name, "count": 10},
                 api_key=context.api_key,
             )
             if mention_api.get("status") == "success" and mention_api.get("tweets"):
