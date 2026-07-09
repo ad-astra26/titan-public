@@ -174,10 +174,14 @@ class OllamaCloudProvider(InferenceProvider):
         change or when the configured limit changes (config hot-reload)."""
         try:
             from titan_hcl.params import get_params
+            # Default 8 = gemma4:31b's live-probed concurrency sweet-spot (ollama
+            # sweep 2026-07-09: gemma4 p95 3.4s @ N=8, then the tail explodes at
+            # N=16 → 36s; the fallback ladder gemma3:12b/ministral scale past 16).
+            # Config-overridable per box; re-probe as ollama raises capacity.
             limit = int((get_params("inference").get("autoscale", {}) or {}).get(
-                "provider_max_concurrent", 6) or 6)
+                "provider_max_concurrent", 8) or 8)
         except Exception:
-            limit = 6
+            limit = 8
         limit = max(1, limit)
         if (self._admit_sem is None or self._admit_sem_loop is not loop
                 or self._admit_sem_limit != limit):

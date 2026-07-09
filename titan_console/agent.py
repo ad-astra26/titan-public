@@ -37,6 +37,8 @@ import hmac
 import json
 import posixpath
 import re
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -556,6 +558,24 @@ _CONTENT_TYPES = {".html": "text/html", ".js": "text/javascript",
                   ".woff2": "font/woff2", ".ico": "image/x-icon"}
 
 
+def _stream_authorize(ctx: Context, path: str, body: bytes, headers: dict,
+                      is_local: bool) -> tuple:
+    """AD-5 auth for the SSE chat-stream route — mirrors dispatch()'s AG4 gate.
+
+    Returns (authorized, device_authed). `device_authed` = a valid device-pairing
+    Ed25519 signature → a cryptographically-verified Maker → the app-channel
+    maker_bond (D.2) is relayed. Beyond localhost a device signature OR a valid
+    operator token is required (AD-5); localhost is open (dev convenience)."""
+    device_authed = bool(headers.get("x-device-id")) and pairing.verify_request_signature(
+        ctx, device_id=headers.get("x-device-id", ""),
+        timestamp=headers.get("x-timestamp", ""),
+        signature_b64=headers.get("x-signature", ""),
+        method="POST", path=path, body=body)
+    operator_valid = bool(ctx.token) and (
+        (headers.get("x-console-token") or headers.get("X-Console-Token")) == ctx.token)
+    return (is_local or device_authed or operator_valid), device_authed
+
+
 class ConsoleHandler(BaseHTTPRequestHandler):
     server_version = f"titan-console/{__version__}"
     ctx: Context = None  # set on the server instance
@@ -568,6 +588,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         headers = {k.lower(): v for k, v in self.headers.items()}
         peer = self.client_address[0] if self.client_address else ""
         is_local = _is_loopback(peer)
+        # ── SSE chat streaming — bypasses the (status,payload) dispatch model so the
+        # app gets the SAME live progress·reasoning·writing feedback the Observatory
+        # /chat path shows (RFP app-chat-streaming, 2026-07-09). ──
+        if method == "POST" and parts.path == "/console/chat/stream":
+            self._chat_stream(parts.path, body, headers, is_local)
+            return
         try:
             status, payload = dispatch(self.server.ctx, method, parts.path,
                                        query, body, headers, is_local)
@@ -587,6 +613,82 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if method != "HEAD":
             self.wfile.write(data)
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _chat_stream(self, path: str, body: bytes, headers: dict, is_local: bool) -> None:
+        """Relay the Titan's `/chat/stream` SSE (progress·chunk·ovg-headers·meta) to the
+        app. The Titan gate still runs the full pipeline — memory + OVG + Ed25519 sign —
+        so this forwards the SAME verified stream the Observatory shows, nothing raw.
+        Owner-auth (AD-5) + the affective maker_bond (relayed when device-authed) are
+        preserved exactly as the blocking /console/chat path."""
+        ctx = self.server.ctx
+        authorized, device_authed = _stream_authorize(ctx, path, body, headers, is_local)
+        if not authorized:
+            return self._send_json(401, {"error": "device signature or operator token required (AD-5)"})
+        try:
+            data = json.loads(body.decode()) if body else {}
+        except (ValueError, UnicodeDecodeError):
+            return self._send_json(400, {"error": "bad json"})
+        message = (data.get("message") or "").strip()
+        if not message:
+            return self._send_json(400, {"error": "empty message"})
+        if not ctx.internal_key:
+            return self._send_json(503, {"error": "owner chat unavailable — no internal_key configured"})
+        session = (data.get("session") or "console-owner").strip() or "console-owner"
+        if len(session) < 8:
+            session = (session + "-console-owner")[:64]
+        up_headers = {"Content-Type": "application/json",
+                      "X-Titan-Internal-Key": ctx.internal_key,
+                      "X-Titan-User-Id": "maker"}
+        if device_authed:
+            # RFP_affective_grounding_loop §7.D (D.2) — a device-authed turn is a
+            # cryptographically-verified Maker → fire the app-channel maker_bond.
+            up_headers["X-Titan-Channel"] = "app"
+            up_headers["X-Titan-Maker-Verified"] = "1"
+        up_body = json.dumps({"message": message[:500], "user_id": "maker",
+                              "session_id": session[:64]}).encode()
+        url = f"{ctx.api_base}/chat/stream"
+        # Open upstream FIRST so a connect/HTTP failure returns a clean JSON error
+        # instead of a half-open event-stream the app can't interpret.
+        try:
+            req = urllib.request.Request(url, data=up_body, headers=up_headers, method="POST")
+            resp = urllib.request.urlopen(req, timeout=120.0)
+        except urllib.error.HTTPError as e:
+            return self._send_json(e.code if e.code else 502,
+                                   {"error": f"titan chat-stream returned {e.code}"})
+        except Exception:
+            return self._send_json(503, {"titan_down": True,
+                                         "detail": "api unreachable — Titan cannot chat while down"})
+        # Stream the event-stream through to the app, frame by frame.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")   # never buffer SSE (if nginx fronts)
+        self.end_headers()
+        try:
+            for raw in resp:            # http.client response is line-iterable (reads live)
+                self.wfile.write(raw)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass                         # app hung up mid-stream — expected, not an error
+        except Exception:
+            try:
+                self.wfile.write(b'event: error\ndata: {"error": "relay interrupted"}\n\n')
+                self.wfile.flush()
+            except Exception:
+                pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
     def do_GET(self):
         self._handle("GET")
