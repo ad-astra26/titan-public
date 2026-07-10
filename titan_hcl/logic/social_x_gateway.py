@@ -3690,18 +3690,18 @@ class SocialXGateway:
         #    still commits atomically in post(); MAX_PENDING is never bypassed.
         _cand = getattr(context, "archetype_candidate", None)
         _bypass = bool(getattr(_cand, "bypass_rate_limit", False))
-        # 5.OUTER — fleet post-budget ceiling (shared-timeline, coordination-free;
-        #           SPEC §23.15.2 / RFP_social_x §5.FX.1). Runs BEFORE the per-box
-        #           caps so the shared @your_x_handle account is bounded fleet-wide.
-        fleet_result = self._check_fleet_ceiling(
-            config, context, bypass_caps=_bypass)
-        if fleet_result:
-            self._log_telemetry({
-                "event": "post_blocked", "reason": fleet_result.status,
-                "detail": fleet_result.reason, "titan_id": context.titan_id,
-                "post_type": post_type,
-            })
-            return fleet_result, None
+        # 5. Per-box caps FIRST — a purely LOCAL social_x.db read, ZERO
+        #    twitterapi.io credits — then the fleet ceiling (a PAID shared-
+        #    timeline last_tweets read, ~300cr). Order flipped 2026-07-10
+        #    (credit-spend fix): the fleet ceiling formerly ran ahead of the
+        #    per-box caps and burned a ~300cr last_tweets read on EVERY post
+        #    attempt, including the many that the free per-box cap rejects
+        #    anyway (a box already at its daily cap re-paid the read on every
+        #    30s tick → ~130k cr/day fleet-wide). Running the local caps first
+        #    means the shared-timeline read fires ONLY when this box has truly
+        #    cleared its own budget and is about to publish. Correctness is
+        #    preserved: a post must still pass BOTH gates, and the fleet ceiling
+        #    still blocks when the shared @your_x_handle account is at its fleet cap.
         limit_result = self._check_rate_limits(
             self.A_POST, config, titan_id=context.titan_id,
             bypass_caps=_bypass,
@@ -3713,6 +3713,19 @@ class SocialXGateway:
                 "post_type": post_type,
             })
             return limit_result, None
+        # 5.OUTER — fleet post-budget ceiling (shared-timeline, coordination-free;
+        #           SPEC §23.15.2 / RFP_social_x §5.FX.1). Now runs AFTER the
+        #           per-box caps (above) so the paid last_tweets timeline read
+        #           only fires for a genuinely post-ready attempt.
+        fleet_result = self._check_fleet_ceiling(
+            config, context, bypass_caps=_bypass)
+        if fleet_result:
+            self._log_telemetry({
+                "event": "post_blocked", "reason": fleet_result.status,
+                "detail": fleet_result.reason, "titan_id": context.titan_id,
+                "post_type": post_type,
+            })
+            return fleet_result, None
 
         # 5b. Grounding gate
         voice_cfg = config.get("voice", {})
