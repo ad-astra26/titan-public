@@ -494,6 +494,8 @@
 "synthesis.self_learning.research_curiosity_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.curiosity_research_reward_weight" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.curiosity_min_evidence_chars" = {type="int", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.skill_reuse_reward_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
+"synthesis.self_learning.curiosity_reuse_weight" = {type="float", constraint=">=0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_enabled" = {type="bool", constraint="", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_interval_s" = {type="float", constraint=">0", reload="hot", owner=["synthesis"], sensitive=false}
 "synthesis.self_learning.failure_replay_max_revisits" = {type="int", constraint=">=1", reload="hot", owner=["synthesis"], sensitive=false}

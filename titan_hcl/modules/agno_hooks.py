@@ -612,6 +612,65 @@ def _emit_idk_oracle_reward(plugin, features, action, prompt_text, user_id, oc) 
         logger.debug("[PreHook] P6 idk-oracle reward skipped: %s", e)
 
 
+def _skill_reuse_cfg(plugin):
+    """P8.3 — the skill-reuse-reward config (mirrors `_idk_oracle_cfg`'s read; defaults
+    match `self_learning_worker._DEFAULTS`). Returns a dict when enabled, else None
+    (→ caller emits nothing; a skill_delegate turn stays unrewarded, byte-identical to
+    the pre-P8.3 dead loop)."""
+    try:
+        cfg = (getattr(plugin, "_full_config", {}) or {}).get("synthesis", {}) or {}
+        sl = cfg.get("self_learning", {}) or {}
+        if not bool(sl.get("skill_reuse_reward_enabled", True)):
+            return None
+        return {"weight": float(sl.get("curiosity_reuse_weight", 0.5))}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _emit_skill_reuse_reward(plugin, features, action, prompt_text, match_score,
+                             utility, cfg) -> None:
+    """P8.3 (RFP_titan_research_agent §7.P8.3) — close the dead `skill_delegate` loop.
+
+    A KNOWLEDGE / ground-concept skill match on a `skill_delegate` turn is an
+    oracle-VERIFIED reuse — the delegate-gate itself is the oracle (match ≥ floor AND
+    `verified_at IS NOT NULL` AND utility ≥ 0; INV-Syn-20 / INV-EEL-2), NOT an LLM/quality
+    self-claim. There is no sandbox verdict (knowledge skills have no executable_spec),
+    so the reward is SYNCHRONOUS: features+action+reward present → the reward travels the
+    v1.1 'decision+outcome together' DIRECT path (`_handle_reward` trains it, no async
+    join, no quality-judge) — mirroring `_emit_idk_oracle_reward`. The reward is INTRINSIC
+    to the verified match quality (weight·match·util), so the policy learns
+    verified-knowledge-reuse as its OWN route (`skill_delegate` was 0 reward-tuples
+    all-time). Never raises (hot path; INV-OML-7)."""
+    try:
+        from titan_hcl import bus as _bus_mod
+        from titan_hcl.bus import make_msg as _mk
+        _bus = getattr(plugin, "bus", None)
+        if _bus is None:
+            return
+        _m = max(0.0, min(1.0, float(match_score)))
+        _u = max(0.0, min(1.0, float(utility)))
+        reward = float(cfg["weight"]) * _m * _u   # intrinsic to the VERIFIED reuse
+        try:
+            from titan_hcl.synthesis.goal_class import goal_class as _gc_fn
+            gc = _gc_fn(prompt_text or "")
+        except Exception:
+            gc = ""
+        _bus.publish(_mk(
+            _bus_mod.SELF_LEARN_REWARD, "pre_hook", "self_learning", {
+                "features": list(features),
+                "action": int(action),
+                "reward": reward,
+                "goal_class": gc,
+                "source": "skill_reuse_oracle",
+            }))
+        logger.info(
+            "[PreHook] P8.3 skill-reuse reward: action=%d reward=%.3f "
+            "(match=%.2f util=%.2f) — verified-knowledge reuse credited",
+            int(action), reward, _m, _u)
+    except Exception as e:  # noqa: BLE001 — never break chat
+        logger.debug("[PreHook] P8.3 skill-reuse reward skipped: %s", e)
+
+
 def _emit_research_confirmed(plugin, node) -> None:
     """DK.1 (§7.D-knowledge) — a researched finding the user just CONFIRMED → tell
     memory_worker to promote+anchor it NOW + seed the declarative concept
@@ -2030,6 +2089,8 @@ def create_pre_hook(plugin):
                 # consistent. Soft-fail = dormant (parity with the prior behavior).
                 _skill_util = None
                 _skill_matched = False
+                _skill_match_score = 0.0   # P8.3 — preserved for the reuse reward
+                _skill_oracle_id = ""      # P8.3 — knowledge vs coding-skill split
                 try:
                     _sk_rc = getattr(plugin, "engine_recall", None)
                     if _sk_rc is not None and prompt_text:
@@ -2043,11 +2104,14 @@ def create_pre_hook(plugin):
                                 _skill_util = float(
                                     getattr(_sk_top, "importance", 0.0) or 0.0)
                                 _skill_matched = True
+                                _skill_match_score = _sk_match
+                                _skill_oracle_id = str(
+                                    getattr(_sk_top, "oracle_id", "") or "")
                                 logger.info(
                                     "[PreHook] procedural skill matched: '%s' "
-                                    "(match=%.2f util=%.2f) → skill lane live",
+                                    "(match=%.2f util=%.2f oracle=%s) → skill lane live",
                                     str(getattr(_sk_top, "summary", ""))[:48],
-                                    _sk_match, _skill_util)
+                                    _sk_match, _skill_util, _skill_oracle_id)
                 except Exception as _sk_err:
                     logger.debug("[PreHook] procedural skill match skipped: %s",
                                  _sk_err)
@@ -2106,11 +2170,27 @@ def create_pre_hook(plugin):
                         # stash for an async reward (byte-identical, INV-MC-7).
                         from titan_hcl.synthesis.outer_meta_policy import (
                             OUTER_ACTIONS as _OA_p6)
+                        _act_name = _OA_p6[int(_action)]
                         _oc_p6 = (_idk_oracle_cfg(plugin)
-                                  if _OA_p6[int(_action)] == "IDK" else None)
+                                  if _act_name == "IDK" else None)
+                        # P8.3 — a skill_delegate turn on a matched KNOWLEDGE skill
+                        # (oracle != coding_sandbox; coding = Lane-2 sandbox-verdict,
+                        # reserved so the two never double-credit) is an oracle-verified
+                        # REUSE → synchronous intrinsic reward (closes skill_delegate=0).
+                        _sr_p83 = (
+                            _skill_reuse_cfg(plugin)
+                            if (_act_name == "skill_delegate"
+                                and bool(locals().get("_skill_matched"))
+                                and locals().get("_skill_oracle_id", "") != "coding_sandbox")
+                            else None)
                         if _oc_p6:
                             _emit_idk_oracle_reward(
                                 plugin, _features, _action, prompt_text, user_id, _oc_p6)
+                        elif _sr_p83:
+                            _emit_skill_reuse_reward(
+                                plugin, _features, _action, prompt_text,
+                                float(locals().get("_skill_match_score", 0.0) or 0.0),
+                                float(locals().get("_skill_util", 0.0) or 0.0), _sr_p83)
                         else:
                             plugin._last_reasoning_id = _emit_nonverifiable_decision(
                                 plugin, _features, _action, prompt_text, user_id)

@@ -138,6 +138,10 @@ class RecallResult:
     base_level: float = 0.0
     norm_base_level: float = 0.0
     importance: float = 0.0
+    # P8.3 — the scoring oracle behind a procedural-skill match ("web_api_oracle"
+    # = knowledge/ground-concept → synchronous reuse-reward lane; "coding_sandbox"
+    # = executable → sandbox-verdict lane). "" for non-procedural results.
+    oracle_id: str = ""
 
 
 # ── Engine recall ────────────────────────────────────────────────────────
@@ -345,6 +349,7 @@ class EngineRecall:
                     summary=row.get("name") or row.get("nl_description") or "",
                     cosine=float(row.get("cosine_surrogate") or 0.0),
                     importance=float(row.get("utility_score") or 0.0),
+                    oracle_id=str(row.get("oracle_id") or ""),  # P8.3 knowledge/coding split
                 )
                 for row in skill_rows
             ]

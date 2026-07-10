@@ -278,6 +278,15 @@ _DEFAULTS = {
     "idk_oracle_enabled": True,
     "idk_verified_reward": 0.15,     # honest verified-IDK reward (slightly > a damped direct)
     "idk_unverified_penalty": -0.5,  # IDK chosen with strong recall (knew & bailed)
+    # ── P8.3 — skill_delegate reuse reward (RFP_titan_research_agent §7.P8.3) ──
+    # Close the dead skill_delegate loop: a knowledge/ground-concept skill match on a
+    # skill_delegate turn is an oracle-VERIFIED reuse (the delegate-gate itself, INV-Syn-20)
+    # → a SYNCHRONOUS reward (mirrors the idk-oracle path, NOT the quality judge). Reward
+    # is INTRINSIC to the verified match quality (weight·match·util), not a flat constant,
+    # so the policy learns verified-knowledge-reuse as its own route (was 0 tuples all-time).
+    # Read AGNO-side in agno_hooks._emit_skill_reuse_reward. flag-off ⇒ delegate stays unrewarded.
+    "skill_reuse_reward_enabled": True,   # kill-switch (off ⇒ no sync reuse reward)
+    "curiosity_reuse_weight": 0.5,        # reward = weight · match_score · utility (verified skill)
     # ── P8 — engagement-independent experience (ARCHITECTURE §7.P8.1/§7.P8.2) ──
     # Score agency's AUTONOMOUS (no-chat) tool/research outcomes into the outer IQL
     # so a low-traffic Titan still accrues correctness-grounded experience (INV-MC-8).
@@ -342,7 +351,13 @@ _REWARD_SOURCE_RANK = {"llm_judge": 0, "user": 1, "maker": 2, "oracle": 3,
                        # Introspection (§7.P-B): grepping his OWN telemetry → a
                        # verifiable self-fact = a correctness-grounded oracle reward,
                        # same rank as curiosity (it IS curiosity pointed inward).
-                       "introspection": 3}
+                       "introspection": 3,
+                       # P8.3 skill_delegate reuse: the delegate-GATE itself is the
+                       # oracle (match≥floor ∧ verified_at NOT NULL ∧ util≥0; INV-Syn-20)
+                       # → a correctness-grounded reuse reward, peer to the other oracles.
+                       # Travels the v1.1 direct path (bypasses this gate); registered
+                       # defensively so a future async correction is never rank-0-dropped.
+                       "skill_reuse_oracle": 3}
 # (_SURVIVAL_STATES removed 2026-06-20 — survival/starvation no longer gates the
 #  mastery explore tick; metabolism is not design-complete. See _explore_tick.)
 
