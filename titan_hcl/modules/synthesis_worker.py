@@ -2274,17 +2274,20 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             os.path.dirname(db_path) or ".", "timechain", "index.db")
         index_db_conn = None
         if os.path.exists(index_db_path):
-            # Read-only URI open — never writes.
-            index_db_conn = _sqlite3.connect(
-                f"file:{index_db_path}?mode=ro", uri=True,
-                check_same_thread=False, timeout=1.0)
-            # sqlite3.Row so consumers (TxIndexBuilder, RuleEvaluator, EngineRecall)
-            # can use string-key access. Row is tuple-compatible (positional access
-            # still works), so this is safe for positional consumers. WITHOUT this,
-            # TxIndexBuilder._resolve_fork_ids did `r["fork_name"]` on a plain tuple
-            # → "tuple indices must be integers or slices, not str" → the incremental
-            # tx-index builder failed every boot ("no incremental growth"). (2026-06-01)
-            index_db_conn.row_factory = _sqlite3.Row
+            # Read-only URI open — never writes. THREAD-LOCAL (one conn per thread):
+            # the synthesis worker's daemon threads can run recall concurrently on this
+            # shared index.db — a single sqlite connection is NOT safe for concurrent
+            # execute() (→ sqlite3.InterfaceError). mode=ro → contention-free concurrent
+            # readers. See titan_hcl/synthesis/ro_sqlite.py.
+            # row_factory=sqlite3.Row (set per-connection in the wrapper): consumers
+            # (TxIndexBuilder, RuleEvaluator, EngineRecall) use string-key access. Row is
+            # tuple-compatible (positional still works). WITHOUT it, TxIndexBuilder
+            # ._resolve_fork_ids did `r["fork_name"]` on a plain tuple → "tuple indices
+            # must be integers" → the incremental tx-index builder failed every boot. (2026-06-01)
+            from titan_hcl.synthesis.ro_sqlite import ThreadLocalRoSqlite
+            index_db_conn = ThreadLocalRoSqlite(
+                f"file:{index_db_path}?mode=ro", timeout=1.0,
+                row_factory=_sqlite3.Row)
         from titan_hcl.logic.timechain_v2 import RuleEvaluator
         evaluator = RuleEvaluator(
             orchestrator=None,

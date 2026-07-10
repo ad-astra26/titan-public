@@ -69,15 +69,18 @@ def build_recall_reader(
         )
         return None
 
-    # Read-only index.db (URI mode=ro — never writes; INV-Syn-22).
+    # Read-only index.db (URI mode=ro — never writes; INV-Syn-22). THREAD-LOCAL:
+    # one connection per accessing thread — a single shared connection is NOT safe
+    # for concurrent execute() across threads (the agno PreHook runs FORK_READ recall
+    # concurrently → sqlite3.InterfaceError). mode=ro → unlimited concurrent readers,
+    # contention-free. See titan_hcl/synthesis/ro_sqlite.py.
     index_db_conn = None
     try:
+        from titan_hcl.synthesis.ro_sqlite import ThreadLocalRoSqlite
         index_db_path = os.path.join(data_dir, "timechain", "index.db")
         if os.path.exists(index_db_path):
-            index_db_conn = sqlite3.connect(
-                f"file:{index_db_path}?mode=ro", uri=True,
-                check_same_thread=False, timeout=1.0,
-            )
+            index_db_conn = ThreadLocalRoSqlite(
+                f"file:{index_db_path}?mode=ro", timeout=1.0)
         else:
             logger.info(
                 "[recall_reader] index.db not present at %s — FORK_READ/"
