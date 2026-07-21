@@ -525,6 +525,21 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
     // empty registry is retained only to future-proof a direct-spawn path.
     let children = SpawnedChildren::new();
 
+    // Orphan reaper (F2, 2026-07-21): the kernel is a PR_SET_CHILD_SUBREAPER, so
+    // orphaned grandchildren of its workers (e.g. offhost_mirror's `rsync -e ssh`,
+    // whose ssh outlives rsync) reparent HERE. tokio's per-worker `Child::wait()`
+    // reaps only the workers we spawned; without this task the adopted orphans
+    // zombie forever (measured ~12 zombie ssh/day on T1). Race-free: it skips
+    // tracked pids and requires a zombie to persist two ticks before reaping, so a
+    // just-exited worker tokio hasn't reaped yet is never stolen (see the module).
+    let _orphan_reaper_handle = {
+        let ks = kernel_supervisor.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(
+            async move { crate::orphan_reaper::run_orphan_reaper_loop(ks, shutdown).await },
+        )
+    };
+
     let mut substrate_watch_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut python_watch_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut titan_hcl_watch_handle: Option<tokio::task::JoinHandle<()>> = None;

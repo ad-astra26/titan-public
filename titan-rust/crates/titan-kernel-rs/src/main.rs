@@ -25,6 +25,7 @@ pub mod identity_load;
 pub mod kernel;
 pub mod kernel_supervisor;
 pub mod logging;
+pub mod orphan_reaper;
 pub mod persistence;
 pub mod spawn;
 pub mod substrate_watch;

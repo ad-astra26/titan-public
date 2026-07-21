@@ -298,6 +298,19 @@ impl KernelChildSupervisor {
         }
     }
 
+    /// The pids of currently-tracked (tokio-managed) children. The orphan reaper
+    /// (`crate::orphan_reaper`) uses this to distinguish OUR workers — which tokio's
+    /// per-worker `Child::wait()` reaps — from adopted orphans, which nothing else
+    /// reaps. It must never reap a pid in this set.
+    pub fn tracked_pids(&self) -> std::collections::HashSet<i32> {
+        self.supervisor
+            .lock()
+            .running_pids()
+            .into_iter()
+            .map(|(_, pid)| pid as i32)
+            .collect()
+    }
+
     /// True iff a watch task escalated to Terminate (kernel must exit
     /// with code 64 so systemd cascades a fresh restart per SPEC §11.B.1
     /// step 6b + §15 escalation range).

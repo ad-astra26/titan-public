@@ -43,7 +43,7 @@ rmpv.workspace = true
 parking_lot.workspace = true
 
 # Unix syscalls (prctl)
-nix = { workspace = true, features = ["signal"] }
+nix = { workspace = true, features = ["signal", "process"] }
 
 # SPEC §11.B.5 socket activation — bind the api listening socket
 # (SO_REUSEADDR) the kernel hands to api children; libc::dup2 in the child's
