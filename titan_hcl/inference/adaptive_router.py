@@ -82,21 +82,20 @@ class AdaptiveRouter:
         self.cfg = cfg or {}
         self.managed = managed_model
         # The offload ladder MUST be models the live provider serves AND whose
-        # quality holds under load. Re-probed live 2026-07-04 (ollama_cloud_probe
-        # sweep N=1..16 + a 6-register quality read):
-        #   • ministral-3:14b — served 16/16, p95 7.7s @ N=16, GOOD quality (warm,
-        #     coherent, safe refusal-with-redirect). (The earlier "doesn't exist"
-        #     claim was FALSE — it serves fine; it had been dropped in error.)
-        #   • gemma3:12b — p95 12.6s @ N=16, same-family, good quality — 2nd offload.
-        #   • gemini-3-flash-preview — DROPPED: fast but returned broken ~6-token
-        #     output (quality-disqualified).
-        #   • gemma3:4b — DROPPED as offload target: ministral is strictly better
-        #     quality at comparable speed (quality-safe offload, not a downgrade).
+        # quality holds under load. ⚠ PROVIDER MODELS ROT: Ollama Cloud silently
+        # retired BOTH prior offload arms (ministral-3:14b + gemma3:12b) on
+        # 2026-07-15 → every load-offload failed with "model was retired" until
+        # re-probed 2026-07-21. Re-probed live 2026-07-21 (warm latency + a
+        # quality read against the LIVE provider model list):
+        #   • gpt-oss:20b — 1.7s warm, fluent + coherent chat — the offload arm.
+        #     (nemotron-3-nano:30b was fast but telegraphic; deepseek-v4-flash
+        #     returned empty — both quality-disqualified as chat arms.)
+        # ALWAYS validate a new arm against the live provider list before adding.
         # B.2 learns each arm's REAL in-situ quality from the turn-judge, so a poor
         # arm self-corrects. Override per-install via [inference.autoscale] model_ladder.
         self.ladder = list(self.cfg.get(
             "model_ladder",
-            [managed_model, "ministral-3:14b", "gemma3:12b"]))
+            [managed_model, "gpt-oss:20b"]))
         if self.managed not in self.ladder:
             self.ladder = [self.managed] + self.ladder
         self.monitor = InferenceLatencyMonitor()
@@ -114,11 +113,7 @@ class AdaptiveRouter:
         self._switched_at = 0.0
         self._last_logged: Optional[str] = None   # §8 G3 — log only on route change
         # quality / cost priors (B; B.2 will LEARN quality from the turn-judge).
-        # gemma is the strongest + priciest; fallbacks descend.
-        _q = [1.0, 0.72, 0.66, 0.6]
-        _c = [0.3, 0.7, 0.82, 0.9]   # cheaper → higher cost-reward
-        self._qprior = {m: _q[min(i, len(_q) - 1)] for i, m in enumerate(self.ladder)}
-        self._cprior = {m: _c[min(i, len(_c) - 1)] for i, m in enumerate(self.ladder)}
+        self._rebuild_priors()
         self._load()
 
     # ── config knobs (re-read live so config hot-reload tunes the router) ──
@@ -138,10 +133,32 @@ class AdaptiveRouter:
         # serves the common case and fast fallbacks absorb concurrent spikes.
         return bool(self.cfg.get("router_enabled", True))
 
+    def _rebuild_priors(self) -> None:
+        """Quality/cost priors indexed by ladder position — the managed head is the
+        strongest + priciest; fallbacks descend. B.2 LEARNS the real quality from the
+        turn-judge and supersedes these once a model has min_quality_samples obs.
+        Single source of truth for the priors so __init__ and update_cfg agree."""
+        _q = [1.0, 0.72, 0.66, 0.6]
+        _c = [0.3, 0.7, 0.82, 0.9]   # cheaper → higher cost-reward
+        self._qprior = {m: _q[min(i, len(_q) - 1)] for i, m in enumerate(self.ladder)}
+        self._cprior = {m: _c[min(i, len(_c) - 1)] for i, m in enumerate(self.ladder)}
+
     def update_cfg(self, cfg: dict) -> None:
-        """Live config hot-reload — adopt new knobs without a restart."""
-        if cfg:
-            self.cfg = cfg
+        """Live config hot-reload — adopt new knobs without a restart. Re-derives the
+        offload ladder + priors so a live [inference.autoscale] model_ladder change
+        actually takes effect (config_schema declares model_ladder reload='hot').
+        Before 2026-07-21 this only swapped self.cfg and left self.ladder cached from
+        __init__ — a FALSE hot-reload that stranded a retired-model ladder live until
+        the next agno restart (the ministral-3:14b/gemma3:12b retirement, 2026-07-15)."""
+        if not cfg:
+            return
+        self.cfg = cfg
+        new_ladder = list(cfg.get("model_ladder", self.ladder))
+        if self.managed not in new_ladder:
+            new_ladder = [self.managed] + new_ladder
+        if new_ladder != self.ladder:
+            self.ladder = new_ladder
+            self._rebuild_priors()
 
     def _heaviness_bucket(self, heaviness: float) -> str:
         """Coarse session-depth dim (§7.C). 2-level keeps the contextual bandit's

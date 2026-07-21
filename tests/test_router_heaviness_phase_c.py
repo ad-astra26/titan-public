@@ -103,10 +103,14 @@ def test_exploration_clamped_for_heavy_session_under_high_load():
 
 def test_light_session_under_load_still_explores():
     """Control: the clamp is specific to heavy+high-load — a light session still explores."""
-    r = _router(explore_eps=1.0, min_samples=1, min_dwell_s=0.0, in_flight_ceiling=8)
+    # Explicit 3-arm ladder fixture (this test exercises multi-arm exploration
+    # logic, independent of the production default — which rotates as the provider
+    # retires models; see the 2026-07-15 ministral/gemma3 retirement).
+    r = _router(explore_eps=1.0, min_samples=1, min_dwell_s=0.0, in_flight_ceiling=8,
+                model_ladder=["gemma4:31b", "arm_b", "arm_c"])
     bucket = r._bucket(20, True, 0.0)
     r._table[bucket] = {"gemma4:31b": {"r": 1.0, "n": 50},
-                        "ministral-3:14b": {"r": 0.1, "n": 50},
-                        "gemma3:12b": {"r": 0.1, "n": 50}}
+                        "arm_b": {"r": 0.1, "n": 50},
+                        "arm_c": {"r": 0.1, "n": 50}}
     picks = {r._bandit_choose(20, True, heaviness=0.0) for _ in range(60)}
     assert len(picks) > 1                # explored (eps=1.0 not clamped)
