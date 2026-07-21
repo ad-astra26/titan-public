@@ -125,7 +125,7 @@ class LLMJudge:
       llm_provider: `(prompt: str, timeout_s: float) -> str` returns raw text.
                     Tests inject a deterministic mock; production wires the
                     Ollama Cloud provider (mirrors P4 ConsolidationPass).
-      model_id: identifier baked into version_tag (e.g. "deepseek-v3.1:671b").
+      model_id: identifier baked into version_tag (e.g. "gemma4:31b").
       outer_memory_writer: anchors the verdict batch + scored_by patch.
       bus_emit: optional `(event, payload)` callable for telemetry.
       clock: time source (overridable for tests).

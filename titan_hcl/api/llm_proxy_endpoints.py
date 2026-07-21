@@ -68,7 +68,7 @@ class DistillRequest(BaseModel):
                                          "telling the LLM what to do with the text.")
     model: Optional[str] = Field(None,
                                  description="Provider model override (e.g. "
-                                             "'deepseek-v3.1:671b'). None → "
+                                             "'gemma4:31b'). None → "
                                              "provider default.")
     max_tokens: Optional[int] = Field(None, ge=1, le=8192,
                                       description="Cap response length. None → "

@@ -1708,7 +1708,7 @@ def _wire_ollama_cloud(sage, config: dict) -> None:
     # _cloud_api_key is set. For Ollama Cloud, we override directly.
     base_url = config.get("ollama_cloud_base_url", "")
     api_key = config.get("ollama_cloud_api_key", "")
-    model = config.get("ollama_cloud_chat_model", "deepseek-v3.1:671b")
+    model = config.get("ollama_cloud_chat_model", config.get("ollama_cloud_heavy_model", "gemma4:31b"))
 
     if base_url and api_key:
         # Override Sage's cloud inference to use Ollama Cloud

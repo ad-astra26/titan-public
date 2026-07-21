@@ -34,7 +34,7 @@ class InferenceProvider(abc.ABC):
     @property
     @abc.abstractmethod
     def id(self) -> str:
-        """Model identifier (e.g. 'llama-3.3-70b', 'deepseek-v3.1:671b')."""
+        """Model identifier (e.g. 'llama-3.3-70b', 'gemma4:31b')."""
 
     @property
     @abc.abstractmethod

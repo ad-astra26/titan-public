@@ -179,12 +179,15 @@ class PostDispatchOrchestrator:
             return ""
         try:
             import httpx
+            # Heavy-distill model — the live heavy tier (config-sourced; default gemma4:31b).
+            _inf = get_params("inference") or {}
+            _distill_model = _inf.get("ollama_cloud_heavy_model", "gemma4:31b")
             payload = {
                 "text": descriptor.user_prompt,
                 "instruction": descriptor.system_prompt,
                 "max_tokens": descriptor.max_tokens,
                 "temperature": descriptor.temperature,
-                "model": "deepseek-v3.1:671b",
+                "model": _distill_model,
                 "consumer": f"social_x_post.{self._worker_name}",
                 "timeout_s": 45.0,
             }
@@ -410,7 +413,8 @@ class PostDispatchOrchestrator:
             llm_url=inf.get("ollama_cloud_base_url", ""),
             llm_key=inf.get("ollama_cloud_api_key", ""),
             llm_model=inf.get(
-                "ollama_cloud_chat_model", "deepseek-v3.1:671b"),
+                "ollama_cloud_chat_model",
+                inf.get("ollama_cloud_heavy_model", "gemma4:31b")),
             catalysts=list(catalysts),
             chi=chi, i_confidence=i_confidence,
             concept_confidences=concept_confidences,

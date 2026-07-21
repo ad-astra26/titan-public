@@ -47,7 +47,7 @@ MIN_WINDOW_INTERVAL = 600  # 10 min minimum between runs (supports 15-min cron)
 #
 # ROOT CAUSE of `felt_experiences` freeze (events_stored=0 since 2026-05-18):
 # _distill_content sent ALL items in a single 5-item LLM call asking for a
-# 5-element JSON array (max_tokens=800). deepseek-v3.1:671b takes ~21s for 2
+# 5-element JSON array (max_tokens=800). The heavy distill model took ~21s for 2
 # items, so 5 items ran ~45-50s and hit the hardcoded 45s endpoint timeout →
 # the call returned [] → nothing stored, every window, fleet-wide.
 #
@@ -2524,7 +2524,7 @@ class EventsTeacher:
             inference = get_params("inference")
             llm_url = inference.get("ollama_cloud_base_url", "https://ollama.com/v1")
             llm_key = inference.get("ollama_cloud_api_key", "")
-            llm_model = "deepseek-v3.1:671b"
+            llm_model = inference.get("ollama_cloud_heavy_model", "gemma4:31b")  # config-sourced heavy tier
             internal_key = get_params("api").get("internal_key", "")
 
             events, latency = self._distill_content(

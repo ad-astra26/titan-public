@@ -83,8 +83,8 @@ class AdaptiveRouter:
         self.managed = managed_model
         # The offload ladder MUST be models the live provider serves AND whose
         # quality holds under load. ⚠ PROVIDER MODELS ROT: Ollama Cloud silently
-        # retired BOTH prior offload arms (ministral-3:14b + gemma3:12b) on
-        # 2026-07-15 → every load-offload failed with "model was retired" until
+        # retired BOTH prior offload arms on 2026-07-15 → every load-offload
+        # failed with "model was retired" until
         # re-probed 2026-07-21. Re-probed live 2026-07-21 (warm latency + a
         # quality read against the LIVE provider model list):
         #   • gpt-oss:20b — 1.7s warm, fluent + coherent chat — the offload arm.
@@ -149,7 +149,7 @@ class AdaptiveRouter:
         actually takes effect (config_schema declares model_ladder reload='hot').
         Before 2026-07-21 this only swapped self.cfg and left self.ladder cached from
         __init__ — a FALSE hot-reload that stranded a retired-model ladder live until
-        the next agno restart (the ministral-3:14b/gemma3:12b retirement, 2026-07-15)."""
+        the next agno restart (the 2026-07-15 offload-arm retirement)."""
         if not cfg:
             return
         self.cfg = cfg

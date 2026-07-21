@@ -549,7 +549,7 @@ class SocialManager:
         # --- Tier 1: LLM Reply via /v4/llm-distill (D-SPEC-88 Chunk χ-bis) ---
         try:
             # Load inference config — still need ollama_cloud_chat_model for
-            # the model override (default 'deepseek-v3.1:671b'). The api_key
+            # the model override (default 'gemma4:31b'). The api_key
             # / base_url / provider dispatch is GONE; llm_worker now owns
             # provider abstraction + failover.
             # RFP_config_as_shm_state §7.C/C.3b: read [inference]/[api] from the
@@ -563,7 +563,8 @@ class SocialManager:
                 inference_cfg = {}
                 api_cfg = {}
             model_id = inference_cfg.get(
-                "ollama_cloud_chat_model", "deepseek-v3.1:671b")
+                "ollama_cloud_chat_model",
+                inference_cfg.get("ollama_cloud_heavy_model", "gemma4:31b"))
             _api_port = int(api_cfg.get("port", 7777))
             _api_base = f"http://127.0.0.1:{_api_port}"
             _internal_key = api_cfg.get("internal_key", "") or ""

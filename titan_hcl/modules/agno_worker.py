@@ -482,7 +482,7 @@ _PITCH_MODEL_BY_TITAN = {
 # Rejected after the 2026-06-25 quality pass: ministral-3:8b (slow+verbose),
 # gemma3:4b (low quality — tripped the OVG injection guard), gemma3:27b (20s),
 # glm-5 (empty), gemini-3-flash-preview (weak/short raw — revisit in-context).
-# NEVER use the heavy reasoning models here (deepseek-v3.1:671b / mistral-large-3:675b
+# NEVER use the heavy reasoning models here (mistral-large-3:675b
 # / qwen3.5:397b) — they are 90s+ and unusable for a live demo.
 
 
@@ -1752,8 +1752,8 @@ def _keepalive_loop(worker_plugin, stats_ref: dict,
                 except Exception:
                     _ka_router = None
                 # R2.1 (§R2) — keep the OFFLOAD LADDER arms minimally warm too, not
-                # just gemma4 + the pitch model. Before this, an offload to ministral-
-                # 3:14b / gemma3:12b hit a COLD cloud pool → the fallback paid a
+                # just gemma4 + the pitch model. Before this, an offload to a
+                # lighter ladder arm hit a COLD cloud pool → the fallback paid a
                 # cold-start that defeated the offload. Warm 1 unit of each ladder arm
                 # (config keepalive_ladder, default ON) so a mid-burst offload lands
                 # on a warm fallback. Cheap (1 ping/arm/interval), gated + soft.

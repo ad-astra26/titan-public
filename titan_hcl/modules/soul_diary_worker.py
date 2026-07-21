@@ -76,7 +76,7 @@ def _resolve_provider_name(inference_cfg: dict) -> str:
 
     Canonical config key = ``inference_provider`` (``config.toml [inference]``);
     ``provider`` accepted as a legacy alias; ``"ollama_cloud"`` last-resort (the
-    fleet default — Ollama Cloud ``deepseek-v3.1:671b``, per topic_infra_stack;
+    fleet default — Ollama Cloud ``gemma4:31b``, per topic_infra_stack;
     venice is NOT a current provider).
     BUGFIX 2026-06-10: previously read only ``provider`` (the WRONG key) and fell
     back to ``"venice"`` — which is 402-dead on the fleet — so every diary entry

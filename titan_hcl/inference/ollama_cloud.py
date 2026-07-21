@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 _LIGHT_MODEL = "gemma4:31b"
 _MEDIUM_MODEL = "ministral-3:8b"
-_HEAVY_MODEL = "deepseek-v3.1:671b"
+_HEAVY_MODEL = "gemma4:31b"  # live heavy tier (config-overridable via ollama_cloud_heavy_model)
 # Dedicated language-teacher model (2026-05-30). qwen3-next:80b was tried but the
 # 80B is too slow on Ollama Cloud — chat() times out at >30s / returns 0 chars,
 # breaking the teacher. gemma4:31b is fast + reliable, and PATH 3 (giving the model
@@ -114,7 +114,7 @@ class OllamaCloudProvider(InferenceProvider):
             cfg: dict — typically the merged inference+agent config block.
                 Required: ollama_cloud_api_key OR api_key.
                 Optional: ollama_cloud_base_url (default 'https://ollama.com/v1'),
-                         ollama_cloud_chat_model (default 'deepseek-v3.1:671b').
+                         ollama_cloud_chat_model (default 'gemma4:31b').
         """
         self._api_key = cfg.get("ollama_cloud_api_key", cfg.get("api_key", ""))
         base_url = cfg.get(
@@ -124,7 +124,7 @@ class OllamaCloudProvider(InferenceProvider):
         self._base_url = base_url.rstrip("/").replace(
             "://api.ollama.com", "://ollama.com"
         )
-        # Agno chat path uses deepseek-v3.1:671b (highest quality available);
+        # Agno chat path uses gemma4:31b (highest quality available);
         # internal RPC callers pass model= explicitly via get_model_for_task.
         self._chat_model = cfg.get(
             "ollama_cloud_chat_model", _HEAVY_MODEL
@@ -176,7 +176,7 @@ class OllamaCloudProvider(InferenceProvider):
             from titan_hcl.params import get_params
             # Default 8 = gemma4:31b's live-probed concurrency sweet-spot (ollama
             # sweep 2026-07-09: gemma4 p95 3.4s @ N=8, then the tail explodes at
-            # N=16 → 36s; the fallback ladder gemma3:12b/ministral scale past 16).
+            # N=16 → 36s; the lighter offload-ladder arms scale past 16).
             # Config-overridable per box; re-probe as ollama raises capacity.
             limit = int((get_params("inference").get("autoscale", {}) or {}).get(
                 "provider_max_concurrent", 8) or 8)

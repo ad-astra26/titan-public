@@ -4476,7 +4476,7 @@ class SocialXGateway:
             )
 
             url = context.llm_url.rstrip("/") + "/chat/completions"
-            model = context.llm_model or "deepseek-v3.1:671b"
+            model = context.llm_model or "gemma4:31b"  # config-sourced upstream
             resp = httpx.post(url,
                 headers={"Authorization": f"Bearer {context.llm_key}",
                          "Content-Type": "application/json"},

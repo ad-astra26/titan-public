@@ -186,8 +186,8 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None,
         # HTTP proxy to LLM_DISTILL_REQUEST / LLM_SCORE_REQUEST bus topics
         # for out-of-kernel cron callers (events_teacher, persona_endurance,
         # persona_social_v2). The bus round-trip + Ollama Cloud generation
-        # legitimately takes 1-45s (deepseek-v3.1:671b heavy distill on T1
-        # peaks ~40s; gemma3:4b on greeting-style ~1s). Internal timeout
+        # legitimately takes 1-45s (heavy distill on T1
+        # peaks ~40s; light greeting-style ~1s). Internal timeout
         # lives in the request payload (timeout_s, default 30s).
         if path in ("/v4/llm-distill", "/v4/llm-score"):
             return await call_next(request)
