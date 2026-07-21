@@ -7,13 +7,18 @@ a literal/comment anywhere under titan_hcl/ turns this RED.
 
 Run: python -m pytest tests/test_no_retired_model_refs.py -q -p no:anchorpy
 """
+import importlib.util
 import pathlib
-import sys
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT / "scripts"))
 
-from check_retired_models import scan, RETIRED_MODELS  # noqa: E402
+# Load the guard script by path — do NOT insert scripts/ onto sys.path (that
+# shadows same-named modules other conftest imports pull in → ModuleNotFoundError).
+_spec = importlib.util.spec_from_file_location(
+    "check_retired_models", _ROOT / "scripts" / "check_retired_models.py")
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+scan, RETIRED_MODELS = _mod.scan, _mod.RETIRED_MODELS
 
 
 def test_no_retired_model_references():
